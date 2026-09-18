@@ -19,3 +19,7 @@ JSON es `rukh/artifacts/tokenizer/` (y, una vez publicado, `chorcat/rukh-tokeniz
 - `pnpm sync:tokenizer` vuelve a copiarlos (`scripts/sync-tokenizer.mjs`).
 - `tests/tokenizer-copies.test.ts` compara el sha256 de cada copia con el original cuando la
   carpeta `../rukh-web` existe; si no existe (clon aislado, CI), el test se salta con un mensaje.
+- `tests/parity.test.ts` codifica aquí las 20 partidas de `fixtures/games.json` con los tres
+  esquemas y las compara id a id con lo que exportó Python. Es imprescindible además del hash: dos
+  copias idénticas a las de `rukh-web` pasan el hash aunque el par `bpe.json` + fixture esté
+  desfasado.

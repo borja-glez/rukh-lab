@@ -307,6 +307,7 @@ export default function TokenizerPlayground() {
             const over = n > BLOCK;
             return (
               <section
+                key={row.scheme}
                 class="tp-row"
                 data-scheme={row.scheme}
                 aria-labelledby={`${base}-${row.scheme}`}
@@ -342,11 +343,16 @@ export default function TokenizerPlayground() {
           </p>
         </div>
       ) : (
-        <p class="tp__error" role="alert">
-          No he podido leer ese PGN: {outcome.message}. Comprueba que cada jugada es legal en su
-          posición y que no falta ninguna; es lo mismo que hace <code>san_to_uci</code> al devolver{' '}
-          <code>None</code>.
-        </p>
+        <div class="tp__error" role="alert">
+          <p class="tp__error-main">
+            No he podido leer ese PGN. Comprueba que cada jugada es legal en su posición y que no
+            falta ninguna; es lo mismo que hace <code>san_to_uci</code> en Python al devolver{' '}
+            <code>None</code>.
+          </p>
+          <p class="caption tp__error-detail" title={outcome.message}>
+            Detalle del analizador: <code>{outcome.message}</code>
+          </p>
+        </div>
       )}
     </div>
   );

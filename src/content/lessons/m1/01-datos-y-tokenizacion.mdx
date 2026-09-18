@@ -38,6 +38,11 @@ modelo no puede leer eso. Un modelo lee tensores de enteros, de tamaño fijo, se
 Este módulo es el camino completo entre las dos cosas, y en ese camino aparece la primera decisión
 de modelado del curso: **qué es un <Term id="token">token</Term>**.
 
+Las cifras de esta lección (el 95 % de cobertura, la tabla de `tokenizer-stats.json` y las salidas
+pegadas de los labs) salen de la ejecución real del pipeline en la máquina de referencia; mientras
+esta lección esté en `borrador` son la estimación previa y se sustituyen por las medidas cuando esa
+ejecución se regenere.
+
 Al terminar tendrás:
 
 - El pipeline `rukh data` ejecutado de principio a fin: partidas limpias en
@@ -377,9 +382,10 @@ jugadas se verifican legales con `python-chess`. Es la decisión D-018.
 con el mismo `uci.py`, mismas columnas, para el SFT "como los maestros" de M4.
 
 **`elo-bins`** toma los dos meses, calcula el tramo de cada partida como la media de los dos Elo
-redondeada a la centena, y muestrea hasta 50 000 partidas por tramo con semilla. Es el dataset
-equilibrado con el que se afina el condicionamiento por Elo en M4: sin él, el modelo vería diez
-veces más partidas de 1800 que de 2400 y el token `<w2400>` apenas se entrenaría.
+truncada a la centena (`((white_elo + black_elo) // 2) // 100 * 100`, división entera, no redondeo:
+un 1899 de media cae en el tramo 1800), y muestrea hasta 50 000 partidas por tramo con semilla. Es
+el dataset equilibrado con el que se afina el condicionamiento por Elo en M4: sin él, el modelo
+vería diez veces más partidas de 1800 que de 2400 y el token `<w2400>` apenas se entrenaría.
 
 **`publish`** renderiza una card por dataset (Jinja, en inglés, con la licencia CC0 y la atribución
 a Lichess), crea el repo bajo `chorcat/` y sube parquet, manifiesto y card. `--dry-run` escribe la
@@ -567,8 +573,10 @@ máquina de referencia (RTX 5090), pegadas tal cual.
 ### Lab 1 · Explorar el parquet con DuckDB
 
 Antes de tokenizar nada, mira los datos. DuckDB lee parquet en local igual que en remoto, y en
-Python es una línea. Guarda este script como `labs/m1/explore.py` y ejecútalo desde la raíz de
-`rukh`; cada consulta va sobre el parquet de enero convertido a UCI.
+Python es una línea. Guarda este script como `labs/m1/explore.py` en el repo `rukh` y ejecútalo
+desde su raíz; cada consulta va sobre el parquet de enero convertido a UCI. Ojo con un detalle de
+DuckDB que muerde a todo el mundo: `avg()` no acepta booleanos, así que un porcentaje sobre una
+condición se escribe `avg(CAST(cond AS DOUBLE))` y no `avg(cond)`.
 
 ```python title="labs/m1/explore.py"
 import duckdb
@@ -596,7 +604,7 @@ print(
            quantile_cont(n_plies, 0.5)         AS p50,
            quantile_cont(n_plies, 0.95)        AS p95,
            max(n_plies)                        AS max,
-           round(100.0 * avg(n_plies <= 195), 1) AS pct_cabe_en_200
+           round(100.0 * avg(CAST(n_plies <= 195 AS DOUBLE)), 1) AS pct_cabe_en_200
     FROM read_parquet('{GAMES}')
     """)
 )
@@ -605,7 +613,7 @@ print("== Aperturas más frecuentes (código ECO) ==")
 print(
     con.sql(f"""
     SELECT eco, count(*) AS partidas,
-           round(100.0 * avg(result = '1-0'), 1) AS pct_blancas
+           round(100.0 * avg(CAST(result = '1-0' AS DOUBLE)), 1) AS pct_blancas
     FROM read_parquet('{GAMES}')
     GROUP BY eco
     ORDER BY partidas DESC
@@ -638,11 +646,24 @@ blancas no son iguales: el modelo va a ver esa asimetría y la va a aprender.
 
   <Solution>
     `SELECT (n_plies // 100) * 100 AS tramo, count(*) FROM read_parquet(...) WHERE n_plies > 195
-    GROUP BY tramo ORDER BY tramo`. La más larga se saca con `ORDER BY n_plies DESC LIMIT 1`. Al
-    tokenizar, `encode_game` se queda con los primeros 199 tokens (control más 196 jugadas) y
-    añade `<eos>` en la posición 200: el modelo aprende que esa partida "termina" ahí, con un
-    resultado que no ve. Son menos del 5 % de las partidas y la mayoría de esos finales largos son
-    posiciones de tablas teóricas; aceptamos el sesgo y lo dejamos anotado en el manifiesto.
+    GROUP BY tramo ORDER BY tramo`. La más larga se saca con `ORDER BY n_plies DESC LIMIT 1`.
+
+    Al tokenizar pasa algo más brusco de lo que suele suponerse. `encode_game` construye la
+    secuencia entera (`<bos>`, los dos tokens de Elo, todas las jugadas, el resultado y `<eos>`) y
+    después hace `ids[:max_len]`, un corte seco por el token 200. **No hay ningún `<eos>` al
+    final**: el resultado y el `<eos>` estaban en las dos últimas posiciones y el corte se los ha
+    llevado por delante. La partida truncada termina en una jugada cualquiera de la mitad del
+    medio juego.
+
+    Y eso es justo lo que importa. Si el corte añadiera `<eos>`, el modelo aprendería un final
+    falso (una partida que "acaba" en tablas invisibles); como no lo añade, lo que aprende es una
+    secuencia que simplemente no termina, y nunca ve `<eos>` después de una posición de medio
+    juego. Es el mal menor de los dos, pero sigue siendo ruido: cada partida truncada gasta 200
+    posiciones de contexto sin enseñar cómo se acaba una partida. Por eso la cifra que se mide en
+    el lab 1 es la que decide `max_len`: con 200 tokens se cubre alrededor del 95 % de las
+    partidas, el 5 % restante aporta ese ruido y la mayoría de esos finales largos son tablas
+    teóricas. Aceptamos el sesgo y lo dejamos anotado en el manifiesto.
+
   </Solution>
 </Exercise>
 
@@ -673,10 +694,11 @@ Salida en la máquina de referencia (RTX 5090):
 
 {/* OUTPUT: uv run rukh data uci */}
 
-Los conteos que imprime son los que van al manifiesto: filas leídas, partidas conservadas,
-descartadas por jugada ilegal y descartadas por cortas (menos de 20 plies). El número de ilegales
-debería ser minúsculo (Lichess valida las partidas al guardarlas); si no lo es, algo está mal en la
-limpieza, no en los datos.
+El comando imprime poco: los meses convertidos, cuántas partidas se conservan en cada uno y la
+ruta del manifiesto. El desglose completo está en ese `data/uci/manifest.json`, bajo
+`filters.conversion`: filas leídas, conservadas, descartadas por jugada ilegal, por cortas (menos
+de 20 plies) y por largas (más de 300). El número de ilegales debería ser minúsculo (Lichess valida
+las partidas al guardarlas); si no lo es, algo está mal en la limpieza, no en los datos.
 
 <Exercise n="02" title="Rompe la conversión a propósito">
   Toma una partida del parquet de enero (`SELECT uci FROM read_parquet(...) LIMIT 1`), reconstruye
@@ -817,15 +839,27 @@ tengan la misma forma) y un `torch.Generator` sembrado con `seed`, que es lo ún
 orden. Dos loaders con la misma semilla devuelven los mismos lotes en el mismo orden: es lo que te
 permite reproducir un entrenamiento y lo que comprueba uno de los tests.
 
+Guarda este script como `labs/m1/loader_check.py` en el repo `rukh` y ejecútalo desde su raíz. El
+`if __name__ == "__main__":` no es decorativo: en Windows los workers del `DataLoader` arrancan con
+`spawn`, es decir, reimportando el módulo, y sin esa guarda cada worker volvería a ejecutar el
+script entero y el proceso se multiplicaría hasta morir (con `workers=0` no haría falta, pero
+tampoco medirías el coste real).
+
 ```python title="labs/m1/loader_check.py"
 from rukh.tokenize.loader import PackedDataset, make_loader
 
-ds = PackedDataset("data/tokens/uci/train", block=200)
-x, y = ds[0]
-print(len(ds), x.shape, y.shape, x[:6].tolist(), y[:6].tolist())
-loader = make_loader(ds, batch_size=64, seed=0, workers=4)
-xb, yb = next(iter(loader))
-print(xb.shape, yb.shape, xb.dtype, (yb == 0).float().mean().item())
+
+def main() -> None:
+    ds = PackedDataset("data/tokens/uci/train", block=200)
+    x, y = ds[0]
+    print(len(ds), x.shape, y.shape, x[:6].tolist(), y[:6].tolist())
+    loader = make_loader(ds, batch_size=64, seed=0, workers=4)
+    xb, yb = next(iter(loader))
+    print(xb.shape, yb.shape, xb.dtype, (yb == 0).float().mean().item())
+
+
+if __name__ == "__main__":  # obligatorio en Windows: los workers arrancan con spawn
+    main()
 ```
 
 ```bash title="Terminal"
@@ -861,7 +895,8 @@ tirado a la basura.
 
 El BPE que usa el esquema `bpe` se entrena con la librería `tokenizers` sobre 200 000 partidas UCI
 de enero. Lo interesante no es entrenarlo (es una llamada) sino mirar qué ha aprendido: la lista de
-fusiones es una radiografía de la frecuencia de las aperturas en el recorte.
+fusiones es una radiografía de la frecuencia de las aperturas en el recorte. Guarda este script como
+`labs/m1/bpe_merges.py` en el repo `rukh` y ejecútalo desde su raíz.
 
 ```python title="labs/m1/bpe_merges.py"
 import json
@@ -926,9 +961,9 @@ resaltadas.
 
 Tres PGN que conviene probar:
 
-1. **El de ejemplo**, el mate de Légal (siete jugadas). Cuenta las fichas: 13 jugadas más cinco de
-   control en UCI, y compáralo con los caracteres de SAN. Cambia el Elo de blancas a 2450 y mira qué
-   ficha cambia y cuál no.
+1. **El de ejemplo**, el mate de Légal (siete jugadas). Cuenta las fichas: 13 medias jugadas más
+   cinco de control en UCI, y compáralo con los caracteres de SAN. Cambia el Elo de blancas a 2450
+   y mira qué ficha cambia y cuál no.
 2. **El mate del pastor**, `1. e4 e5 2. Bc4 Nc6 3. Qh5 Nf6 4. Qxf7#`. Fíjate en cómo el `#` y la
    `x` ocupan un carácter cada uno en SAN y ninguno en UCI: la captura y el jaque mate están
    implícitos en `h5f7`.
@@ -996,8 +1031,10 @@ tokenizador que corre igual en Python y en el navegador.
 - **Tamaño de vocabulario**: 2 030 (UCI), 35 (SAN carácter), 4 096 (BPE), y `len(vocab) == 2030`
   como test unitario en Python y `buildVocab().length === 2030` en TypeScript.
 - **Paridad Python ↔ TypeScript**: la fixture de 20 partidas (`fixtures/games.json`) se reproduce
-  id a id en las dos webs; `pnpm test` falla si cambia la enumeración en un lado y no en el otro, y
-  un test de hash falla si las copias del tokenizador en `rukh-lab` divergen de las de `rukh-web`.
+  id a id en las dos webs, cada una con su propio `tests/parity.test.ts`, así que `pnpm test` falla
+  si cambia la enumeración en un lado y no en el otro. Además, un test de hash comprueba que las
+  copias del tokenizador en `rukh-lab` son byte a byte las de `rukh-web`: el hash solo detecta
+  divergencias entre las dos webs, y por eso hace falta también la paridad en las dos.
 - **Conteos y hashes del manifiesto**: cada paso del pipeline registra filas leídas y conservadas,
   el sha256 de cada parquet y los parámetros con los que se ejecutó. Es la procedencia que va en las
   dataset cards, y es lo que permite decir "este modelo se entrenó con estas partidas exactamente".
