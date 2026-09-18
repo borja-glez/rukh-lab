@@ -1,0 +1,500 @@
+---
+import { getCollection, getEntry, render, type CollectionEntry } from 'astro:content';
+import Base from './Base.astro';
+import Rail from '../components/Rail.astro';
+import { components } from '../components/mdx/index';
+import { buildToc } from '../lib/toc';
+
+interface Props {
+  lesson: CollectionEntry<'lessons'>;
+}
+
+const { lesson } = Astro.props;
+const [moduleId, lessonId] = lesson.id.split('/');
+const module = await getEntry('modules', moduleId);
+if (!module) throw new Error(`Lesson ${lesson.id}: module ${moduleId} not found`);
+
+const { Content, headings } = await render(lesson);
+const toc = buildToc(headings);
+const railTicks = toc.map((item) => ({ id: item.slug, label: item.text }));
+
+/* Module nav and prev/next across the whole course, in module/lesson order. */
+const modules = (await getCollection('modules')).sort((a, b) => a.data.order - b.data.order);
+const moduleOrder = new Map(modules.map((m) => [m.id, m.data.order]));
+const all = (await getCollection('lessons')).sort((a, b) => {
+  const am = moduleOrder.get(a.data.module) ?? 0;
+  const bm = moduleOrder.get(b.data.module) ?? 0;
+  return am - bm || a.data.order - b.data.order;
+});
+const siblings = all.filter((l) => l.data.module === moduleId);
+const index = all.findIndex((l) => l.id === lesson.id);
+const prev = index > 0 ? all[index - 1] : null;
+const next = index < all.length - 1 ? all[index + 1] : null;
+const hrefOf = (l: CollectionEntry<'lessons'>) => `/curso/${l.id}/`;
+
+const cheatsheet = await getEntry('cheatsheets', moduleId);
+const path = `/curso/${lesson.id}/`;
+const moduleLabel = moduleId.toUpperCase();
+const lessonNumber = String(lesson.data.order).padStart(2, '0');
+const updated = lesson.data.updated.toLocaleDateString('es-ES', {
+  year: 'numeric',
+  month: 'long',
+  day: 'numeric',
+});
+const levelLabel = { base: 'nivel base', medio: 'nivel medio', avanzado: 'nivel avanzado' }[
+  lesson.data.level
+];
+---
+
+<Base title={lesson.data.title} description={lesson.data.description} path={path} ogType="article">
+  <main id="main" class="page container lesson">
+    <div class="lesson__grid">
+      <aside class="lesson__side">
+        <div class="lesson__sticky">
+          <nav class="lesson__module" aria-label="Lecciones del módulo">
+            <a class="label label--ink lesson__module-title" href="/curso/#{moduleId}">
+              {moduleLabel} · {module.data.title}
+            </a>
+            <ol class="lesson__list">
+              {siblings.map((l) => {
+                const id = l.id.split('/')[1];
+                return (
+                  <li
+                    class:list={['lesson__item', { 'is-current': l.id === lesson.id }]}
+                    data-progress-lesson
+                    data-module={moduleId}
+                    data-lesson={id}
+                  >
+                    <a
+                      class="lesson__item-link"
+                      href={hrefOf(l)}
+                      aria-current={l.id === lesson.id ? 'page' : undefined}
+                    >
+                      <span class="mono lesson__item-n">
+                        {String(l.data.order).padStart(2, '0')}
+                      </span>
+                      <span>{l.data.title}</span>
+                    </a>
+                  </li>
+                );
+              })}
+            </ol>
+          </nav>
+          {toc.length > 0 && (
+            <nav class="lesson__toc" aria-label="En esta lección">
+              <span class="label">// en esta lección</span>
+              <ol class="toc">
+                {toc.map((item) => (
+                  <li>
+                    <a class="toc__link" href={`#${item.slug}`} data-toc-link={item.slug}>
+                      {item.text}
+                    </a>
+                    {item.children.length > 0 && (
+                      <ol class="toc toc--sub">
+                        {item.children.map((child) => (
+                          <li>
+                            <a class="toc__link" href={`#${child.slug}`} data-toc-link={child.slug}>
+                              {child.text}
+                            </a>
+                          </li>
+                        ))}
+                      </ol>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            </nav>
+          )}
+        </div>
+      </aside>
+
+      <div class="lesson__rail">
+        <Rail ticks={railTicks} />
+      </div>
+
+      <article class="lesson__main">
+        <header class="lesson__head">
+          <p class="label label--accent">
+            // {moduleLabel} · lección {lessonNumber}
+          </p>
+          <h1 class="lesson__title">{lesson.data.title}</h1>
+          <p class="body lesson__desc pretty">{lesson.data.description}</p>
+          <ul class="lesson__meta">
+            <li class="chip">{lesson.data.duration} min</li>
+            <li class="chip">{levelLabel}</li>
+            <li
+              class:list={['chip', lesson.data.status === 'vigente' ? 'chip--live' : 'chip--draft']}
+            >
+              {lesson.data.status}
+            </li>
+            <li class="chip">
+              <span class="sr-only">actualizado el</span>
+              {updated}
+            </li>
+          </ul>
+        </header>
+
+        <div class="prose">
+          <Content components={components} />
+        </div>
+
+        <footer class="lesson__foot">
+          <div class="lesson__done">
+            <button
+              class="btn btn--secondary"
+              type="button"
+              data-progress-toggle
+              data-module={moduleId}
+              data-lesson={lessonId}
+              data-label-todo="Marcar completada"
+              data-label-done="Completada"
+              aria-pressed="false"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="m5 12 5 5L19 7"></path>
+              </svg>
+              <span data-progress-label>Marcar completada</span>
+            </button>
+            <span class="caption">El progreso se guarda solo en este navegador.</span>
+          </div>
+          <nav class="lesson__nav" aria-label="Lección anterior y siguiente">
+            {prev ? (
+              <a class="lesson__nav-link" href={hrefOf(prev)} rel="prev">
+                <span class="label">← anterior</span>
+                <span>{prev.data.title}</span>
+              </a>
+            ) : (
+              <a class="lesson__nav-link" href="/curso/">
+                <span class="label">← curso</span>
+                <span>Mapa de módulos</span>
+              </a>
+            )}
+            {next ? (
+              <a class="lesson__nav-link lesson__nav-link--next" href={hrefOf(next)} rel="next">
+                <span class="label">siguiente →</span>
+                <span>{next.data.title}</span>
+              </a>
+            ) : (
+              <a class="lesson__nav-link lesson__nav-link--next" href="/curso/">
+                <span class="label">siguiente →</span>
+                <span>Próximo módulo, en cuanto se publique</span>
+              </a>
+            )}
+          </nav>
+        </footer>
+
+        {cheatsheet && (
+          <section class="cheat" aria-labelledby="cheatsheet-title">
+            <p class="label label--ink">// cheatsheet {moduleLabel}</p>
+            <h2 id="cheatsheet-title" class="cheat__title">
+              Ocho preguntas para llevarte
+            </h2>
+            <dl class="cheat__list">
+              {cheatsheet.data.items.map((item, i) => (
+                <div class="cheat__item">
+                  <dt>
+                    <span class="mono cheat__n">{String(i + 1).padStart(2, '0')}</span>
+                    {item.q}
+                  </dt>
+                  <dd>{item.a}</dd>
+                </div>
+              ))}
+            </dl>
+            <a class="caption cheat__all" href="/cheatsheets/">
+              Todas las cheatsheets, imprimibles →
+            </a>
+          </section>
+        )}
+      </article>
+    </div>
+  </main>
+  <script>
+    import '../scripts/progress';
+    import '../scripts/toc';
+  </script>
+</Base>
+
+<style>
+  .lesson__grid {
+    display: grid;
+    grid-template-columns: 260px 40px minmax(0, 1fr);
+    gap: 0 40px;
+    align-items: start;
+  }
+
+  .lesson__side {
+    min-width: 0;
+  }
+
+  .lesson__sticky {
+    position: sticky;
+    top: calc(var(--header-h) + 24px);
+    display: flex;
+    flex-direction: column;
+    gap: 32px;
+    max-height: calc(100vh - var(--header-h) - 48px);
+    overflow-y: auto;
+    padding-right: 8px;
+  }
+
+  .lesson__module-title {
+    display: block;
+    margin-bottom: 12px;
+    text-decoration: none;
+    line-height: 1.5;
+  }
+
+  .lesson__module-title:hover {
+    color: var(--brand);
+  }
+
+  .lesson__list {
+    padding: 0;
+    margin: 0;
+    list-style: none;
+    border-top: 1px solid var(--line);
+  }
+
+  .lesson__item {
+    border-bottom: 1px solid var(--line-soft);
+  }
+
+  .lesson__item-link {
+    display: flex;
+    gap: 12px;
+    min-height: 44px;
+    padding: 10px 0;
+    font-size: 14px;
+    color: var(--ink-2);
+    text-decoration: none;
+    align-items: center;
+  }
+
+  .lesson__item-link:hover {
+    color: var(--ink);
+  }
+
+  .lesson__item.is-current .lesson__item-link {
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  .lesson__item-n {
+    font-size: 11px;
+    color: var(--muted);
+    width: 20px;
+    flex: none;
+  }
+
+  .lesson__item.is-done .lesson__item-n {
+    color: var(--ok);
+  }
+
+  .lesson__item.is-done .lesson__item-n::after {
+    content: ' ✓';
+  }
+
+  .toc {
+    margin: 8px 0 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .toc--sub {
+    margin: 0 0 0 14px;
+  }
+
+  .toc__link {
+    display: block;
+    padding: 6px 0 6px 10px;
+    border-left: 1px solid var(--line);
+    font-size: 13px;
+    line-height: 1.4;
+    color: var(--muted);
+    text-decoration: none;
+  }
+
+  .toc__link:hover {
+    color: var(--ink);
+  }
+
+  .toc__link.is-active {
+    color: var(--ink);
+    border-left-color: var(--accent);
+  }
+
+  .lesson__head {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding-bottom: 32px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .lesson__title {
+    font-size: clamp(32px, 4vw, 52px);
+    font-weight: 600;
+    letter-spacing: -0.035em;
+    line-height: 1.05;
+    max-width: 22ch;
+    text-wrap: pretty;
+  }
+
+  .lesson__desc {
+    max-width: 62ch;
+  }
+
+  .lesson__meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .lesson__foot {
+    margin-top: 64px;
+    padding-top: 32px;
+    border-top: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    gap: 32px;
+  }
+
+  .lesson__done {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px 20px;
+    min-height: 44px;
+  }
+
+  .lesson__done svg {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2.2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .lesson__nav {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1px;
+    padding: 1px;
+  }
+
+  .lesson__nav-link {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: 44px;
+    padding: 18px 20px;
+    box-shadow: 0 0 0 1px var(--line);
+    color: var(--ink);
+    text-decoration: none;
+    background: var(--frame-bg);
+  }
+
+  .lesson__nav-link:hover {
+    background: var(--card-hover);
+    color: var(--ink);
+  }
+
+  .lesson__nav-link--next {
+    text-align: right;
+    align-items: flex-end;
+  }
+
+  .cheat {
+    margin-top: 64px;
+    padding: 28px;
+    border: 1px solid var(--ink);
+    background: var(--frame-bg);
+  }
+
+  .cheat__title {
+    margin: 8px 0 20px;
+    font-size: clamp(22px, 2.4vw, 30px);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+
+  .cheat__list {
+    margin: 0;
+    display: grid;
+    gap: 16px;
+  }
+
+  .cheat__item {
+    padding-top: 14px;
+    border-top: 1px solid var(--line-soft);
+  }
+
+  .cheat__item dt {
+    display: flex;
+    gap: 12px;
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  .cheat__n {
+    font-size: 11px;
+    color: var(--accent-text);
+    padding-top: 4px;
+    flex: none;
+  }
+
+  .cheat__item dd {
+    margin: 6px 0 0 32px;
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-2);
+  }
+
+  .cheat__all {
+    display: inline-block;
+    margin-top: 20px;
+    color: var(--brand);
+  }
+
+  @media (max-width: 1100px) {
+    .lesson__grid {
+      grid-template-columns: 240px minmax(0, 1fr);
+      gap: 0 32px;
+    }
+
+    .lesson__rail {
+      display: none;
+    }
+  }
+
+  @media (max-width: 860px) {
+    .lesson__grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .lesson__side {
+      order: 2;
+      margin-top: 48px;
+    }
+
+    .lesson__sticky {
+      position: static;
+      max-height: none;
+      overflow: visible;
+    }
+
+    .lesson__toc {
+      display: none;
+    }
+
+    .lesson__nav {
+      grid-template-columns: 1fr;
+    }
+
+    .lesson__nav-link--next {
+      text-align: left;
+      align-items: flex-start;
+    }
+  }
+</style>

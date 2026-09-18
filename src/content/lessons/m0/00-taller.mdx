@@ -1,0 +1,514 @@
+---
+title: 'Taller: repo, entorno, datos y tablero'
+description: 'Qué vas a construir en trece módulos, cómo se estudia este curso, y el taller del módulo 0: uv con CUDA, Stockfish verificado, MLflow local, el recorte de datos de Lichess con sus filtros explicados y un tablero que solo acepta jugadas legales.'
+module: m0
+order: 0
+duration: 90
+level: base
+status: vigente
+updated: 2026-09-18
+keywords:
+  - modelo de lenguaje
+  - ajedrez
+  - uv
+  - Stockfish
+  - MLflow
+  - Lichess
+  - DuckDB
+  - cm-chessboard
+artifacts:
+  - kind: repo
+    label: borja-glez/rukh
+    href: https://github.com/borja-glez/rukh
+  - kind: demo
+    label: Tablero con jugadas legales
+    href: https://rukh.borjaglez.com/?mock=1
+demo: '?mock=1'
+---
+
+## Qué vas a construir
+
+Vas a construir un <Term id="modelo-de-lenguaje">modelo de lenguaje</Term> que juega al ajedrez.
+No un programa que calcula jugadas, como Stockfish, sino una red neuronal que ha leído millones de
+partidas y que, dada la secuencia de jugadas de una partida, propone la siguiente. La misma idea que
+hay detrás de un LLM de texto, con una diferencia que lo cambia todo: aquí cada <Term id="token">token</Term>
+es una jugada, y un motor de ajedrez puede decir en milisegundos si esa jugada es legal, buena o mala.
+
+Eso es lo que hace del ajedrez un dominio perfecto para aprender IA generativa de verdad, no de
+oídas:
+
+- **Es verificable.** La legalidad y la calidad de cada jugada las decide <Term id="stockfish">Stockfish</Term>,
+  no una persona con un formulario. Cuando lleguemos al alineamiento (reward model, DPO, GRPO), las
+  recompensas serán reales, baratas y reproducibles.
+- **Los datos son abiertos.** Lichess publica miles de millones de partidas, puzles y evaluaciones
+  bajo <Term id="cc0">CC0</Term>. No hay que negociar licencias ni esconder de dónde salen.
+- **Los modelos son pequeños.** Decenas de millones de parámetros bastan para jugar por encima de
+  1200 <Term id="elo">Elo</Term>. Se entrenan en horas en una sola GPU y caben en el navegador, así
+  que puedes medirlo todo y publicarlo todo.
+- **La demo se entiende en cinco segundos.** Un tablero, y juegas contra lo que has entrenado.
+
+El curso tiene dos fases y trece módulos. En la primera (M0-M6) construyes el modelo de principio a
+fin; en la segunda (A1-A6) lo conviertes en un entrenador con herramientas, memoria y trazas.
+
+<div class="table-wrap">
+
+| Módulo                           | Qué entra                                                    | Qué funciona al terminar                                   |
+| -------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------------- |
+| M0 · Taller                      | Repos, entorno, datos, tablero                               | `rukh info`, datos recortados, tablero con jugadas legales |
+| M1 · Datos y tokenización        | Tokens, vocabularios, dataloaders, fugas entre splits        | Lotes de las tres tokenizaciones y una comparativa         |
+| M2 · El decoder                  | Atención causal, receta de entrenamiento, muestreo, ONNX     | `rukh-small` a ≥ 1200 Elo, jugable en la web               |
+| M3 · El encoder                  | Bidireccional, masked move modeling, pooling, cabezas        | Valor y alerta de error en vivo                            |
+| M4 · Fine-tuning e instrucción   | SFT, tokens de control, LoRA, QLoRA, ecosistema HF           | Selector "juega como 1500/2000/2400"                       |
+| M5 · Alineamiento                | Reward model, DPO, GRPO, reward hacking                      | Modelos DPO y GRPO medibles                                |
+| M6 · Evaluar, exportar, publicar | Métricas, intervalos de confianza, cuantización, model cards | Tabla única y demo final                                   |
+| A1 · Embeddings y RAG            | Vector DB, recuperación, RAGAS                               | Comentarios con citas de Capablanca                        |
+| A2 · Agente con herramientas     | LangGraph, LangSmith                                         | Un entrenador que analiza partidas                         |
+| A3 · Evaluación y observabilidad | Suites de evaluación, regresión                              | Suite en verde por commit                                  |
+| A4 · Multiagente                 | Roles, orquestación                                          | Jugador, entrenador y redactor                             |
+| A5 · MCP                         | Servidores y clientes MCP                                    | Herramientas de ajedrez desde cualquier cliente            |
+| A6 · Capstone                    | Backend, web del entrenador                                  | Juegas, te comenta en vivo, informe final                  |
+
+</div>
+
+Y esta es la tabla que convierte una lista de módulos en un programa de estudio: cada concepto de
+IA generativa y agéntica entra cuando un lab lo necesita para tomar una decisión.
+
+<div class="table-wrap">
+
+| Concepto                                                    | Dónde se aprende con el proyecto               |
+| ----------------------------------------------------------- | ---------------------------------------------- |
+| Tokenización (vocabulario fijo, BPE, tokens especiales)     | M1: tres tokenizaciones de partidas comparadas |
+| Datasets, dataloaders, padding, máscaras, streaming         | M1: de parquet a lotes                         |
+| Embeddings y posiciones (aprendidas, RoPE)                  | M2                                             |
+| Atención, multi-cabeza, máscara causal, decoder GPT         | M2: decoder a mano                             |
+| Receta de entrenamiento (AdamW, warmup, bf16, clipping)     | M2                                             |
+| Muestreo (temperatura, top-k, enmascarado)                  | M2                                             |
+| Encoder bidireccional, MLM, pooling, clasificación          | M3: masked move modeling y cabezas             |
+| Fine-tuning completo frente a parcial, curvas por etiquetas | M3-M4                                          |
+| Instruction tuning (condicionar el comportamiento)          | M4: token de Elo objetivo                      |
+| LoRA, QLoRA, adaptadores intercambiables                    | M4                                             |
+| Ecosistema HF (transformers, peft, trl, datasets)           | M4: QLoRA de Qwen sobre PGN                    |
+| Reward model, Bradley-Terry                                 | M5                                             |
+| DPO (β, referencia implícita)                               | M5                                             |
+| GRPO / RL con recompensas verificables, reward hacking      | M5                                             |
+| Evaluación, harness reproducible, model cards               | M6                                             |
+| Cuantización, ONNX, inferencia en navegador                 | M2 y M6                                        |
+| Embeddings para recuperación, vector DB, RAG, RAGAS         | A1                                             |
+| Agentes con herramientas, LangGraph, LangSmith              | A2-A3                                          |
+| Multiagente, MCP, capstone                                  | A4-A6                                          |
+
+</div>
+
+<Callout kind="teoria" title="¿Qué es exactamente un modelo de lenguaje?">
+  Una función que, dada una secuencia de tokens, devuelve una distribución de probabilidad sobre el
+  siguiente. Se entrena para que esa distribución dé mucha probabilidad al token que de verdad venía
+  a continuación en los datos. Nada más. Que de esa tarea tan tonta salga un jugador que conoce las
+  reglas, prefiere jugadas buenas y "ve" el tablero sin haberlo visto nunca es lo que vamos a
+  comprobar, medir y explicar a lo largo del curso.
+</Callout>
+
+## Cómo estudiar este curso
+
+Cada módulo sigue el mismo patrón, y conviene saberlo antes de empezar:
+
+1. **Teoría justa.** Solo la que el lab necesita para tomar una decisión: qué tokenización, qué
+   pooling, qué β en DPO. Ningún capítulo de teoría suelto. Si un concepto no cambia una decisión del
+   proyecto, no está.
+2. **Labs guiados.** Notebooks finos en `rukh/labs/` con huecos que rellenas y una solución de
+   referencia. Casi todo el código pesado vive en el paquete `rukh`, con tests, para que el notebook
+   sea el sitio donde piensas y no donde copias.
+3. **Artefactos públicos.** Cada módulo termina con algo publicado: un dataset, un modelo con su
+   card en Hugging Face, una versión nueva de la demo, un post. Si no está publicado, no está hecho.
+4. **Tabla única.** Toda etapa se mide igual (ver abajo) y se compara con la anterior y con
+   modelos públicos. Sin número no hay model card.
+5. **Demo siempre verde.** Cada semana acaba con algo jugable en `rukh.borjaglez.com`.
+
+**Cómo se mide** es lo primero que hay que fijar, porque decide todo lo demás. Las métricas de la
+tabla única son cuatro:
+
+- **Tasa de <Term id="legalidad">jugadas legales</Term> sin máscara**: qué porcentaje de las jugadas
+  que propone el modelo, sin ayuda, son legales. Mide si ha aprendido las reglas.
+- **Exactitud de siguiente jugada**: top-1 y top-3 frente a la jugada humana en partidas que no ha
+  visto, por tramo de Elo.
+- **Puzles resueltos** por dificultad (1000-1500, 1500-2000, 2000+).
+- **Elo estimado** contra Stockfish con fuerza limitada (`UCI_Elo`), cien partidas por nivel, con
+  intervalo de confianza.
+
+<Callout kind="mundo-real" title="Por qué la tabla única importa más que cualquier lección">
+  En un equipo de ML, la conversación que más tiempo ahorra es "¿medido cómo?". Una tabla con las
+  mismas columnas para todas las etapas, el baseline público al lado y el intervalo de confianza
+  visible evita el 90 % de las discusiones sobre si un cambio "mejora". Aquí la tabla existe desde
+  el módulo 0, vacía, y se llena a medida que avanzas: puedes verla en la página del proyecto.
+</Callout>
+
+El ritmo objetivo son 8-10 horas por semana: M0 y M1 en la primera, M2 en la segunda, y así hasta
+cerrar la fase 1 en cinco semanas. Los entrenamientos largos se lanzan al final de una sesión y se
+recogen en la siguiente; mientras corren, se escribe la lección del módulo. El progreso de las
+lecciones lo guarda tu navegador (botón "Marcar completada" al final), sin cuentas ni servidores.
+
+## El entorno
+
+El proyecto vive en tres repositorios independientes: `rukh` (Python: datos, modelo, entrenamiento,
+evaluación, agentes), `rukh-lab` (este sitio) y `rukh-web` (la demo para jugar). No comparten
+paquetes: lo que necesitan en común (tokens CSS, tokenizador en TypeScript, JSON precomputado) se
+copia con un script y un test de hash vigila que no diverja.
+
+### Python 3.12 con uv
+
+`uv` gestiona la versión de Python, el entorno virtual y el fichero de bloqueo. El proyecto fija
+Python 3.12 en `.python-version` y dos extras excluyentes para PyTorch: `cpu` (para la CI) y `cu128`
+(CUDA 12.8, la que necesita una RTX 5090).
+
+```bash title="Terminal"
+git clone https://github.com/borja-glez/rukh
+cd rukh
+uv sync --extra cu128 --group dev
+uv run rukh info
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+```text title="uv run rukh info"
+rukh 0.0.1
+python       3.12.11 (CPython) on Windows-11
+torch        2.11.0+cu128
+cuda         True
+gpu          NVIDIA GeForce RTX 5090
+stockfish    E:\work\ai\chess-lm\rukh\tools\stockfish\stockfish.exe
+mlflow_uri   sqlite:///E:/work/ai/chess-lm/rukh/mlruns/mlflow.db
+data_dir     E:\work\ai\chess-lm\rukh\data
+mlruns_dir   E:\work\ai\chess-lm\rukh\mlruns
+```
+
+`rukh info --json` devuelve lo mismo como JSON, que es lo que usan los tests. Si `cuda` sale
+`False`, lo primero que hay que mirar es que el extra instalado sea `cu128` y no `cpu`: el fichero
+`uv.lock` fija `torch==2.11.0` para los dos índices, y un test (`test_lock_guard.py`) falla si alguien
+cambia la restricción en uno solo.
+
+<Callout kind="roto" title="Dos extras de torch en el mismo entorno">
+  `uv sync --extra cpu --extra cu128` no funciona, y no debe: los dos extras están declarados en
+  conflicto (`tool.uv.conflicts`) porque instalan el mismo paquete desde índices distintos. Si te
+  pasa, borra `.venv` y sincroniza con uno solo.
+</Callout>
+
+### Stockfish
+
+Stockfish es el juez del curso: no juega por el modelo, lo evalúa. El script `scripts/get_stockfish.py`
+descarga la versión 19 oficial a `tools/stockfish/` (carpeta ignorada por git) y `rukh engine check`
+abre el motor por el protocolo <Term id="uci">UCI</Term>, lee el rango de `UCI_Elo`, lo limita a un Elo
+concreto y juega unas cuantas medias jugadas contra un jugador aleatorio para comprobar que todo
+responde.
+
+```bash title="Terminal"
+uv run python scripts/get_stockfish.py
+uv run rukh engine check --elo 1400 --plies 40
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+```text title="uv run rukh engine check --elo 1400 --plies 40"
+engine        Stockfish 19
+path          tools\stockfish\stockfish.exe
+UCI_Elo       min 1320 · max 3190 · set 1400 (UCI_LimitStrength=True)
+plies_played  40
+result        * (game not finished after 40 plies)
+nodes_hint    limit strength active; depth-limited search
+```
+
+Los dos números que importan son `min 1320` y `max 3190`: es el rango en el que podemos pedirle a
+Stockfish que juegue peor de lo que sabe. Con eso estimaremos el Elo de cada modelo jugando cien
+partidas por nivel.
+
+<Callout kind="entrevista" title="¿Por qué no usas Stockfish para jugar y ya está?">
+  Porque el objetivo no es jugar bien, sino aprender cómo un modelo de lenguaje llega a jugar bien
+  sin que nadie le programe las reglas. Stockfish calcula; el modelo predice. La gracia (y lo que se
+  puede medir) es cuánto de lo que calcula el primero acaba emergiendo en el segundo solo por leer
+  partidas. En la práctica, además, un modelo pequeño corre en el navegador y un motor completo no
+  cabe en una demo estática.
+</Callout>
+
+### MLflow
+
+Cada entrenamiento se registra en <Term id="mlflow">MLflow</Term> con su configuración, sus métricas
+por paso y sus artefactos, en una base SQLite local. Las model cards de los módulos siguientes se
+generan desde ahí, para que ningún número de la tabla única se escriba a mano.
+
+```bash title="Terminal"
+uv run rukh mlflow ui
+# abre http://127.0.0.1:5000 sobre sqlite:///<repo>/mlruns/mlflow.db
+```
+
+### Node 24 y pnpm 10 para las webs
+
+Las dos webs son sitios estáticos hechos con Astro. Necesitas Node 24 y pnpm 10 (`corepack enable`
+lo activa). En cada repo web, `pnpm install` y `pnpm dev`; `pnpm check`, `pnpm lint`, `pnpm test`,
+`pnpm build`, `pnpm e2e` y `pnpm lighthouse` son la cadena completa que también corre en la CI.
+
+<Exercise n="01" title="Comprueba tu entorno">
+  Ejecuta `uv run rukh info --json` y responde: ¿qué versión de torch tienes, con qué índice, y qué
+  ruta de Stockfish detecta? Si `stockfish` es `null`, ejecuta el script de descarga y vuelve a mirar.
+  Después, `uv run pytest -m unit -q` tiene que estar en verde.
+
+  <Solution>
+    La clave `torch` termina en `+cu128` cuando el extra correcto está instalado (`+cpu` en la CI).
+    `stockfish` se resuelve en este orden: variable de entorno `RUKH_STOCKFISH`, después
+    `tools/stockfish/stockfish(.exe)`, después `stockfish` en el `PATH`. Si sigue en `null`, la
+    causa más habitual en Windows es que el zip se descomprimió con una carpeta intermedia: el
+    script lo normaliza, pero comprueba que el ejecutable está exactamente en `tools/stockfish/`.
+  </Solution>
+</Exercise>
+
+## Los datos
+
+Lichess es el servidor de ajedrez libre más grande del mundo y publica todo lo que se juega en él.
+Sus volcados mensuales, las copias en Hugging Face (`Lichess/standard-chess-games`, más de 6 700
+millones de partidas), los seis millones de puzles y los casi 400 millones de posiciones evaluadas
+con Stockfish están bajo CC0: dominio público. Es la razón por la que este curso no necesita pedir
+permiso a nadie.
+
+Un mes reciente ocupa unos 73 GB en <Term id="parquet">parquet</Term>. No vamos a descargarlo. El
+recorte de trabajo se hace con <Term id="duckdb">DuckDB</Term> leyendo los ficheros en remoto
+(`hf://…`) y aplicando los filtros antes de traer nada: solo se materializa lo que pasa el filtro
+(_predicate pushdown_). Con dos meses salen entre tres y seis millones de partidas, unos 2-3 GB de
+texto UCI, que es exactamente el volumen con el que se entrenaron los modelos públicos de 25-50M
+parámetros que usaremos como referencia.
+
+```bash title="Terminal"
+uv run rukh data fetch --config configs/data/lichess-2025-01-02.yaml --dry-run
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+```text title="uv run rukh data fetch --dry-run"
+FetchPlan
+  dataset   Lichess/standard-chess-games
+  months    2025-01, 2025-02
+  out       data/raw/month=2025-01.parquet
+            data/raw/month=2025-02.parquet
+  manifest  data/raw/manifest.json
+  query
+    SELECT Event, Site, White, Black, Result, WhiteElo, BlackElo, UTCDate,
+           ECO, Opening, Termination, TimeControl, movetext
+    FROM read_parquet('hf://datasets/Lichess/standard-chess-games/data/year=2025/month=01/*.parquet')
+    WHERE WhiteElo >= 1800 AND BlackElo >= 1800
+      AND CAST(split_part(TimeControl, '+', 1) AS INTEGER) >= 180
+      AND Termination IN ('Normal', 'Time forfeit')
+      AND Event NOT ILIKE '%variant%'
+    UNION ALL
+    SELECT ... FROM read_parquet('hf://datasets/Lichess/standard-chess-games/data/year=2025/month=02/*.parquet')
+    WHERE ... (same filters)
+dry run: nothing was downloaded or written.
+```
+
+Cada filtro tiene una razón, y conviene tenerlas claras porque son decisiones que condicionan lo que
+el modelo aprende:
+
+<div class="table-wrap">
+
+| Filtro                                                      | Por qué                                                                                                                                                                        |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `WhiteElo >= 1800 AND BlackElo >= 1800`                     | Calidad: por debajo de 1800 abundan los errores groseros y el modelo los imitaría. Los Elo de Lichess son Glicko-2; a este nivel la diferencia con Elo clásico es irrelevante. |
+| Base de tiempo ≥ 180 s (`TimeControl` es `base+incremento`) | Excluye bullet, donde se juega a ciegas contra el reloj. Blitz (3+0) y superiores tienen jugadas pensadas.                                                                     |
+| `Termination IN ('Normal', 'Time forfeit')`                 | Excluye abandonos, desconexiones y partidas anuladas por trampas (`Rules infraction`, `Abandoned`).                                                                            |
+| ≥ 20 <Term id="ply">plies</Term>                            | Una partida de cinco jugadas no enseña nada; el conteo se hace en M1 después de convertir a UCI, porque hay que parsear el `movetext`.                                         |
+| Sin `Event` de variantes                                    | Chess960, crazyhouse o atomic tienen otras reglas y romperían la legalidad que queremos medir.                                                                                 |
+
+</div>
+
+Además, se eliminan los comentarios `%clk` y `%eval` del `movetext` y las jugadas pasan de
+
+<Term id="san">SAN</Term> a UCI con `python-chess`, verificando la legalidad de cada una (una
+partida corrupta se descarta entera). El resultado se guarda en `data/raw/` con un
+<Term id="manifiesto">manifiesto</Term> JSON: filtros exactos, meses, conteos y hash de cada
+fichero.
+
+<Callout kind="hoy" title="Así se hace hoy: filtrar en remoto, materializar poco">
+  Hace unos años el flujo era descargar el `.pgn.zst` de 30 GB, descomprimirlo y filtrar con
+  scripts. Hoy, con datos en parquet particionado y motores como DuckDB o Polars que hablan `hf://`,
+  el filtro viaja al fichero y solo baja lo que pasa. La misma consulta sirve para explorar (`LIMIT
+  1000`) y para producir el recorte completo. En M1 la usaremos también para mirar distribuciones de
+  Elo, duración y aperturas.
+</Callout>
+
+La descarga real tarda entre una y dos horas: se lanza al terminar esta lección y se recoge en M1.
+Los splits se hacen por **mes** (entrenar con enero-febrero, validar con un tercer mes), no al azar,
+para evitar fugas por partidas repetidas de los mismos jugadores.
+
+<Exercise n="02" title="Lee el plan antes de descargar">
+  Ejecuta el `--dry-run` y localiza en la SQL los cuatro filtros. Después cambia `min_elo` a `2000` en
+  una copia del YAML y vuelve a ejecutarlo: ¿qué cambia en la consulta? ¿Qué pasa si añades una clave
+  que no existe, por ejemplo `min_rating`?
+
+  <Solution>
+    Solo cambia la comparación de `WhiteElo` y `BlackElo`; el resto de la consulta es idéntico.
+    Una clave desconocida hace que `rukh` falle antes de tocar la red con un error de validación:
+    las configuraciones son modelos pydantic con `extra="forbid"`, y es intencionado. Una errata en
+    un fichero de configuración que se ignora en silencio es la forma más cara de perder una noche
+    de GPU.
+  </Solution>
+</Exercise>
+
+## El tablero
+
+La demo (`rukh.borjaglez.com`) es una sola pantalla: tablero, panel del modelo y lista de jugadas.
+En este hito no hay modelo todavía; el rival es "primera jugada legal", un oponente de mentira que
+sirve para probar todo lo demás. Se activa con `?mock=1` y es el que usa la CI.
+
+Dos librerías hacen el trabajo:
+
+- **cm-chessboard** dibuja el tablero en SVG, responsive, con piezas que siguen los colores del tema,
+  y gestiona la entrada con ratón y con el dedo (tocar-tocar y arrastrar).
+- **chess.js** conoce las reglas: genera las jugadas legales de una posición, aplica una jugada,
+  detecta jaque mate, tablas y promociones, y exporta <Term id="pgn">PGN</Term> y
+  <Term id="fen">FEN</Term>.
+
+<Figure
+  n="01"
+  caption="Quién decide qué en la demo: el modelo propone una distribución sobre jugadas; el navegador la filtra con las reglas y muestrea."
+>
+  <svg
+    viewBox="0 0 640 200"
+    role="img"
+    aria-label="Flujo: historial de jugadas, modelo, logits, máscara de legalidad con chess.js, muestreo, jugada en el tablero"
+  >
+    <g
+      font-family="var(--font-mono)"
+      font-size="12"
+      fill="var(--ink)"
+      text-anchor="middle"
+      dominant-baseline="middle"
+    >
+      <rect
+        x="10"
+        y="70"
+        width="120"
+        height="60"
+        fill="var(--box-fill)"
+        stroke="var(--ink)"
+        stroke-width="1.25"
+      />
+      <text x="70" y="94">
+        historial
+      </text>
+      <text x="70" y="112" font-size="10" fill="var(--muted)">
+        e2e4 e7e5 g1f3 …
+      </text>
+      <rect
+        x="170"
+        y="70"
+        width="120"
+        height="60"
+        fill="var(--ink)"
+        stroke="var(--ink)"
+        stroke-width="1.25"
+      />
+      <text x="230" y="94" fill="var(--paper)">
+        modelo
+      </text>
+      <text x="230" y="112" font-size="10" fill="var(--paper)">
+        logits por token
+      </text>
+      <rect
+        x="330"
+        y="70"
+        width="140"
+        height="60"
+        fill="var(--box-fill)"
+        stroke="var(--accent-text)"
+        stroke-width="1.25"
+      />
+      <text x="400" y="94">
+        máscara legal
+      </text>
+      <text x="400" y="112" font-size="10" fill="var(--muted)">
+        chess.js · moves()
+      </text>
+      <rect
+        x="510"
+        y="70"
+        width="120"
+        height="60"
+        fill="var(--box-fill)"
+        stroke="var(--ink)"
+        stroke-width="1.25"
+      />
+      <text x="570" y="94">
+        muestreo
+      </text>
+      <text x="570" y="112" font-size="10" fill="var(--muted)">
+        temperatura, top-k
+      </text>
+    </g>
+    <g fill="none" stroke="var(--diagram-stroke)" stroke-width="1.25">
+      <path d="M130 100h40" />
+      <path d="M290 100h40" />
+      <path d="M470 100h40" />
+      <path d="M570 130v30H70v-30" stroke-dasharray="3 3" />
+    </g>
+    <text
+      x="320"
+      y="180"
+      font-family="var(--font-mono)"
+      font-size="10"
+      fill="var(--diagram-stroke)"
+      text-anchor="middle"
+    >
+      la jugada elegida vuelve al historial y al tablero
+    </text>
+  </svg>
+</Figure>
+
+La decisión de diseño importante es esta: **la legalidad la decide el navegador, el modelo solo
+propone**. El modelo devuelve una distribución sobre todos los tokens de su vocabulario (unas 1 900
+jugadas UCI posibles); chess.js calcula cuáles son legales en la posición actual, el navegador pone
+a cero las demás y muestrea entre las que quedan. Así el modelo nunca hace una jugada ilegal en la
+demo, aunque la proponga.
+
+Y como la propone, se puede medir. El modo "sin máscara" de la demo (a partir de M2) enseña la
+jugada cruda que el modelo quería hacer y la marca si es ilegal; la tasa de legalidad sin máscara es
+la primera columna de la tabla única precisamente porque mide cuánto ha aprendido las reglas un
+modelo al que nadie se las ha programado.
+
+<Callout kind="teoria" title="Enmascarar no es hacer trampa">
+  Poner a cero la probabilidad de los tokens que no pueden aparecer es una técnica general de
+  decodificación (*constrained decoding*): se usa para forzar JSON válido, gramáticas o llamadas a
+  herramientas bien formadas en LLMs de texto. La máscara no cambia lo que el modelo sabe; cambia lo
+  que le dejamos decir. Por eso se mide siempre con y sin ella.
+</Callout>
+
+<DemoEmbed
+  query="?mock=1"
+  title="Tablero con jugadas legales contra 'primera jugada legal'"
+  note="Sin modelo todavía: el rival elige la primera jugada legal que devuelve chess.js. Sirve para probar el tablero, la lista de jugadas, deshacer, nueva partida y exportar PGN."
+/>
+
+<Exercise n="03" title="Gana en cuatro jugadas al rival de mentira">
+  Abre la demo con `?mock=1` y juega. El rival hace siempre la primera jugada legal en el orden que
+  devuelve `chess.js`. ¿Puedes darle mate en pocas jugadas? Exporta el PGN y mira las cabeceras.
+
+  <Solution>
+    Desde la posición inicial, la primera jugada legal de las negras en el orden de `chess.js` es
+    `a7a6`, y en cuanto puede mueve el peón de a o la torre. Con `1. e4 a6 2. Bc4 a5 3. Qh5 Ra6
+    4. Qxf7#` hay mate en cuatro. El PGN lleva `[White "Humano"]`, `[Black "Primera jugada legal"]` y
+    el resultado `1-0`. En M2 este rival se sustituye por el decoder entrenado y la partida deja de
+    ser tan fácil.
+  </Solution>
+</Exercise>
+
+## Qué has aprendido
+
+En este módulo no has entrenado nada, y eso es a propósito. Lo que tienes ahora es lo que casi
+nadie tiene cuando empieza un proyecto de ML: un entorno reproducible (`uv.lock` con torch fijado y
+vigilado por un test), un juez verificado (Stockfish con `UCI_Elo` en 1320-3190), un sistema de
+registro (MLflow local), un recorte de datos con cada filtro justificado y un manifiesto, y una demo
+en la que la legalidad está resuelta antes de que exista el modelo.
+
+**Cómo se mide el módulo 0**: `uv run rukh info` muestra `cuda: True`; `uv run pytest -m unit -q` en
+verde; `uv run rukh engine check` devuelve el rango de `UCI_Elo`; el `--dry-run` imprime la SQL con
+los cuatro filtros; y la demo permite jugar una partida completa contra "primera jugada legal" en
+ordenador y en móvil. Cuando la descarga real termine, el manifiesto tendrá los conteos por mes.
+
+Lo siguiente es M1: de la partida en SAN a tensores. Ahí aparece la primera decisión de modelado
+del curso, qué es un token, y se compara con datos, no con opiniones.
+
+La cheatsheet del módulo, ocho preguntas con su respuesta corta, está justo debajo.
