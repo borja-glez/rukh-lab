@@ -92,6 +92,41 @@ Qué se ha hecho, cómo se mide (columnas de la tabla única que cambian) y qué
 | `ResultsTable` | La tabla única desde `src/data/results.json`                            | `lang?`, `emptyText?`                                                       |
 | `DemoEmbed`    | Tarjeta con enlace a la demo (iframe opcional con `embed`)              | `query`, `title`, `note?`, `embed?`                                         |
 
+## Islas (componentes Preact)
+
+Las islas no van en el mapa `components` de `src/components/mdx/index.ts`: una directiva de cliente
+(`client:visible`) solo funciona sobre un componente que el propio MDX importa, así que la lección
+lo importa y Astro lo hidrata. Aun así **se registran** en ese fichero, en el export `islands`, para
+que haya una sola lista de lo que una lección puede incrustar; `tests/mdx-registry.test.ts` lo
+comprueba.
+
+| Isla              | Lección | Datos                        |
+| ----------------- | ------- | ---------------------------- |
+| `TokenizerPlayground` | M1  | ninguno (corre en el navegador) |
+| `TrainingReplay`  | M2      | `src/data/training-replay.json` |
+| `AttentionMap`    | M2      | `src/data/attention.json`    |
+
+Convenciones de una isla nueva:
+
+1. Un fichero por isla en `src/islands/<Nombre>.tsx`, con un comentario de cabecera que diga qué
+   dibuja, de qué JSON lee y dónde están sus estilos.
+2. **Estado "pendiente".** Toda isla que lea un JSON de `src/data/` tiene que funcionar con el
+   marcador de posición (colección vacía, `meta.generated: null`) y explicar en pantalla qué lab lo
+   genera. Nunca se dibujan cifras inventadas, ni siquiera de ejemplo.
+3. El esquema del JSON se documenta en `src/data/README.md` antes de escribir la isla, y el fichero
+   se versiona vacío para que el build y los tests no dependan del repo de ML.
+4. **CSS en `src/styles/global.css`**, con un prefijo propio (`.tp*`, `.am*`, `.tr*`) y la altura
+   reservada (`min-height`, también en la consulta de 720 px) para no provocar CLS. Nada de
+   `<style>` en la isla: la CSP solo admite estilos por atributo.
+5. Colores desde los tokens de diseño. Para escalas continuas, buckets en un atributo `data-*` que
+   solo mueven una custom property (ver `--am-level`), nunca un color literal.
+6. Atributos de estado en la raíz (`data-<isla>`, `data-state="pending|ready"`) para que el E2E
+   pueda comprobar las dos ramas sin depender de los datos.
+7. Accesibilidad: cada control con su `<label>`, objetivo táctil de 44 px, nada que dependa del
+   hover (el valor numérico de un tooltip tiene que estar también en el DOM), y `aria-valuetext` en
+   los deslizadores.
+8. En la lección, un párrafo antes de la isla diciendo **exactamente qué hay que mirar**.
+
 El popover de `Term` existe solo en dispositivos con `(hover: hover)` (ratón o trackpad, al pasar por
 encima o al enfocar con teclado); en pantallas táctiles el término es un enlace normal al glosario,
 así que la definición nunca debe ser imprescindible para seguir el párrafo.

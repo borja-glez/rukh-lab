@@ -1,0 +1,45 @@
+{
+  "module": "m2",
+  "items": [
+    {
+      "q": "Explica la atención en tres frases.",
+      "a": "Cada posición proyecta su vector en una consulta (Q), una clave (K) y un valor (V). El producto escalar entre la consulta de una posición y las claves de todas las demás, dividido por la raíz de la dimensión de la cabeza y pasado por softmax, da un reparto de pesos que suma 1. La salida es la media de los valores ponderada por esos pesos: softmax(QKᵀ/√d)·V. La escala 1/√d existe porque el producto escalar de d dimensiones tiene varianza d y sin ella el softmax saturaría y el gradiente se anularía."
+    },
+    {
+      "q": "¿Qué es la máscara causal y qué pasa si falta?",
+      "a": "Poner a menos infinito, antes del softmax, el peso de toda clave posterior a la consulta, de modo que la matriz de atención queda triangular inferior. Sin ella la posición t puede leer el token t+1, que es justo el que tiene que predecir: la tarea pasa de predecir a copiar, la pérdida se desploma y el top-1 se dispara, pero al generar (donde no hay futuro) el modelo juega al azar. Se detecta porque la legalidad sin máscara se hunde, y se verifica con un test: cambiar un token futuro no debe mover los logits pasados ni un decimal."
+    },
+    {
+      "q": "¿Por qué pre-norm y no post-norm?",
+      "a": "Pre-norm pone el LayerNorm dentro de la rama, antes de la subcapa (x = x + attn(ln(x))), así que la conexión residual queda libre: la derivada de cada bloque es la identidad más la de la subcapa y el gradiente llega íntegro desde la pérdida hasta el embedding. Post-norm normaliza después de la suma, mete la normalización en el camino residual y hace que una pila profunda solo entrene con warmup largo e inicialización muy cuidada. Es un cambio de dos caracteres que convierte doce capas entrenables con suerte en doce capas entrenables."
+    },
+    {
+      "q": "¿Qué hace el warmup y qué pasa sin él?",
+      "a": "Sube la tasa de aprendizaje linealmente desde cero durante los primeros pasos (1 000 en rukh-small) antes de empezar el coseno. En los primeros pasos, Adam estima el segundo momento con un puñado de gradientes y su paso normalizado puede mover un parámetro tanto como la tasa entera; sobre una red recién inicializada eso satura la atención y el modelo cae en predecir siempre las jugadas más frecuentes. No suele explotar con un NaN: se queda en una pérdida mediocre que ya no baja, que es peor porque no se nota."
+    },
+    {
+      "q": "Temperatura y top-k: ¿en qué se diferencian?",
+      "a": "La temperatura divide los logits antes del softmax y reescala toda la distribución: por debajo de 1 la concentra (con 0 es el argmax), por encima la aplana. El top-k no reescala, recorta: deja solo los k tokens de mayor probabilidad y pone el resto a cero. Son complementarios, no alternativas. Con 2 030 jugadas, la cola de mil opciones improbables suma un porcentaje apreciable de disparates; el top-k la elimina y la temperatura decide cuánto arriesga el modelo dentro de lo que queda. Rukh usa temperatura 0,6 y k = 20."
+    },
+    {
+      "q": "¿Qué mide la legalidad sin máscara y por qué no vale medirla con máscara?",
+      "a": "Mide el porcentaje de jugadas legales que propone el modelo cuando se le deja emitir el token que quiera, sobre 10 000 posiciones de validación. Con la máscara de legalidad puesta el 100 % está garantizado por construcción, así que estarías midiendo a python-chess y no al modelo. Sin máscara, la cifra dice si ha aprendido las reglas y la posición del tablero solo viendo secuencias: es la métrica de comprensión del proyecto, y el objetivo para rukh-small es ≥ 99 %."
+    },
+    {
+      "q": "¿Por qué bf16 y no fp16?",
+      "a": "Los dos ocupan 16 bits, pero reparten distinto. fp16 tiene 5 bits de exponente y 10 de mantisa: mucha precisión y poco rango, con el mínimo normal en torno a 6e-5, justo donde viven los gradientes de una red profunda, así que se van a cero y hace falta un GradScaler con escalado dinámico de la pérdida. bf16 tiene 8 bits de exponente (el mismo rango que fp32) y 7 de mantisa: menos precisión por número y nada que se desborde por abajo, así que entrena sin escalar nada. En una GPU moderna es nativo, así que la simplicidad sale gratis."
+    },
+    {
+      "q": "¿Qué es un checkpoint y qué tiene que llevar dentro?",
+      "a": "Una fotografía del entrenamiento en disco. No basta con los pesos: lleva el paso alcanzado, el estado del optimizador (los momentos de Adam), el estado de los generadores aleatorios, la configuración del modelo y de la tirada y la procedencia (hash del vocabulario, hash del manifiesto de datos y SHA de git). Con eso se puede reanudar exactamente donde se cortó, evaluar el modelo meses después y decir con qué datos exactos se entrenó. Rukh escribe uno cada 1 000 pasos más best.pt por pérdida de validación."
+    },
+    {
+      "q": "¿Qué es la perplejidad?",
+      "a": "La exponencial de la entropía cruzada media. Se lee como entre cuántas opciones equiprobables duda el modelo: con un vocabulario de 2 030 jugadas, un modelo sin entrenar tiene perplejidad 2 030 y pérdida ln(2030) ≈ 7,6; una pérdida de 3,0 es perplejidad 20, es decir, acierta como si eligiera al azar entre veinte jugadas. Como en una posición típica hay unas treinta legales, esa cifra ya implica bastante aprendizaje. No es una métrica aparte: es la misma pérdida en otra escala."
+    },
+    {
+      "q": "¿Qué significa un intervalo de confianza del Elo y por qué importa?",
+      "a": "El Elo estimado es el valor que mejor explica los resultados contra rivales de fuerza conocida según la fórmula logística P = 1/(1+10^((rival−modelo)/400)); el intervalo del 95 % dice cuánto podría moverse ese valor si se repitieran las partidas, y se calcula por bootstrap remuestreando los resultados y reajustando mil veces. Con 100 partidas al 50 % la desviación típica ronda los 35 puntos; con las 800 de la suite completa, unos 12. Es decir: una mejora de 10 o 20 puntos de Elo medida con cien partidas no es una mejora, es ruido, y presumir de ella es el error clásico de los benchmarks."
+    }
+  ]
+}

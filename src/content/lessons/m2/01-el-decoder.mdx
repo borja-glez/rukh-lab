@@ -1,0 +1,1308 @@
+---
+title: 'El decoder: un GPT que juega al ajedrez'
+description: 'El módulo central del curso: embeddings, atención con máscara causal, multi-cabeza, bloques pre-norm y tied embeddings escritos a mano, la receta de entrenamiento que hace que 39 millones de parámetros converjan en una sola GPU, el harness que mide si el modelo entendió el tablero y la exportación a ONNX que lo pone a jugar en el navegador.'
+module: m2
+order: 1
+duration: 480
+level: base
+status: borrador
+updated: 2026-09-19
+keywords:
+  - decoder
+  - atención
+  - máscara causal
+  - embedding
+  - RoPE
+  - pre-norm
+  - AdamW
+  - warmup
+  - bf16
+  - temperatura
+  - top-k
+  - ONNX
+  - Elo
+artifacts:
+  - kind: model
+    label: chorcat/rukh-tiny
+    href: https://huggingface.co/chorcat/rukh-tiny
+  - kind: model
+    label: chorcat/rukh-small
+    href: https://huggingface.co/chorcat/rukh-small
+  - kind: demo
+    label: Demo v1
+    href: https://rukh.borjaglez.com
+demo: '?stage=small'
+---
+
+import AttentionMap from '../../../islands/AttentionMap.tsx';
+import TrainingReplay from '../../../islands/TrainingReplay.tsx';
+
+## Qué vas a construir
+
+Al terminar esta sección sabrás exactamente qué objeto vas a escribir, cuánto ocupa, cuánto tarda
+en entrenarse y dónde acaba.
+
+Vas a construir un GPT de **38 971 392 parámetros** —treinta y nueve millones— que juega al ajedrez.
+Escrito a mano, sin `transformers`, sin `nn.TransformerDecoder`: doce bloques, ocho cabezas, 512
+dimensiones, un vocabulario de 2 030 jugadas <Term id="uci">UCI</Term> y una ventana de
+
+<Term id="contexto">contexto</Term> de 200 <Term id="token">tokens</Term>. Se entrena desde cero
+sobre los lotes que dejaste preparados en M1, en tu GPU, en una noche. Y no acaba en un fichero
+`.pt` olvidado en una carpeta: acaba exportado a <Term id="onnx">ONNX</Term>, cuantizado, publicado
+en Hugging Face y jugando contra ti en una pestaña del navegador, sin servidor.
+
+Este es **el módulo central del curso**. Todo lo anterior existía para llegar aquí y todo lo
+posterior modifica esto. El encoder de M3 es este mismo bloque sin la
+
+<Term id="mascara-causal">máscara causal</Term>. El fine-tuning de M4 son estos mismos pesos con un
+gradiente más pequeño. El DPO de M5 es esta misma red con otra pérdida. Si entiendes de verdad lo
+que hay dentro de `MoveDecoder`, el resto del curso es vocabulario nuevo sobre una idea que ya
+tienes; si lo sobrevuelas, cada módulo siguiente será un truco que funciona por razones que no
+sabes.
+
+Al terminar tendrás:
+
+- `src/rukh/models/decoder.py`: el modelo completo en unas doscientas líneas, con tests que
+  comprueban formas, causalidad, determinismo y número de parámetros. Es código que puedes leer
+  entero en una sentada, y esa es la razón de escribirlo a mano en lugar de importarlo.
+- Dos modelos entrenados: `tiny` (6 capas, 256 dimensiones, 5 309 952 parámetros, menos de veinte
+  minutos) para iterar sin miedo, y `small` (el de 39 millones) como modelo del curso.
+- Un harness de evaluación que produce **una fila de la tabla única**: legalidad sin máscara,
+  top-1 y top-3, puzles por tramo, <Term id="elo-estimado">Elo estimado</Term> contra Stockfish con
+  intervalo de confianza, Δcp y diversidad.
+- El modelo en ONNX, en fp16 y en int8, con una prueba de paridad que garantiza que el fichero que
+  descarga el navegador elige la misma jugada que PyTorch en el 99,9 % de las posiciones.
+- Dos visualizaciones en esta misma página: el mapa de <Term id="atencion">atención</Term> de una
+  partida y la repetición del entrenamiento <Term id="checkpoint">checkpoint</Term> a checkpoint.
+
+Las cifras medidas de esta lección (curvas, legalidad, Elo, tamaños de fichero) se pegan cuando el
+entrenamiento real termina; mientras el `status` sea `borrador`, donde va una salida hay un hueco
+marcado y las islas dicen "pendiente". Las cifras que sí están —parámetros, dimensiones, la
+aritmética de la atención— son aritmética, no medidas, y puedes comprobarlas tú mismo con una
+calculadora.
+
+## Teoría justa
+
+Al terminar esta sección podrás dibujar el modelo entero de memoria, explicar por qué cada pieza
+está donde está y predecir qué se rompe si la quitas. Nada de esto es teoría por la teoría: cada
+apartado termina en una decisión que está escrita en `DecoderConfig` o en `configs/train/small.yaml`.
+
+### Embeddings: por qué 2 030 × 512
+
+El modelo no sabe qué es `e2e4`. Recibe el entero 47, o el 312, o el que le haya tocado a esa
+jugada en la enumeración de M1. Un entero no sirve para nada: no puedes sumarlo, no puedes decir
+que el 47 se parece al 312, y si el modelo aprendiera algo de la magnitud del número aprendería
+una propiedad del orden alfabético de las casillas, que es ruido puro.
+
+La solución es una tabla: **una fila de números reales por cada id del vocabulario**. Eso es un
+
+<Term id="embedding">embedding</Term>. En `rukh-small` la tabla es de 2 030 filas (el vocabulario
+completo de M1: 1 968 jugadas, 8 tokens especiales y 54 tramos de Elo) por 512 columnas, que es la
+anchura del modelo:
+
+```python
+self.tokens = nn.Embedding(self.cfg.vocab_size, self.cfg.d_model)  # 2030 x 512
+```
+
+Son 1 039 360 parámetros, el 2,7 % del modelo. Se inicializan con ruido gaussiano de desviación
+0,02 —es decir, al principio `e2e4` y `a1h8` son dos puntos al azar sin relación— y se aprenden
+con el resto de la red por descenso de gradiente. Al final del entrenamiento, los vectores de
+jugadas que aparecen en contextos parecidos habrán acabado cerca: `g1f3` y `b1c3` (los dos
+desarrollan un caballo en la apertura) tendrán un producto escalar alto, y el vector de `e2e4`
+apuntará hacia una zona del espacio que el modelo asocia con "apertura abierta". Nadie le dice eso;
+sale de la única presión que hay, que es predecir bien la siguiente jugada.
+
+¿Por qué 512 y no 128 o 2 048? Porque `d_model` es el presupuesto de información que fluye por el
+modelo, y todo escala con él: las matrices de atención son `d × 3d` y `d × d`, las del MLP `d × 4d`
+y `4d × d`, así que el número de parámetros por bloque crece con `d²`. Con 512 y 12 capas salen 39
+millones, que es lo que cabe cómodo en una noche de RTX 5090 con 6 millones de partidas. Con 768 y
+16 capas (el preset `medium`) salen 110 millones y la noche se convierte en un fin de semana. La
+elección no es teórica: es el punto donde el modelo es lo bastante grande para aprender ajedrez y
+lo bastante pequeño para que puedas repetir el experimento.
+
+<Callout kind="teoria" title="Una tabla, dos lecturas">
+  Un embedding se puede leer de dos maneras y las dos son correctas. Como diccionario: la fila 47 es
+  "lo que significa `e2e4`". Como capa lineal: multiplicar un vector one-hot de 2 030 entradas por
+  la matriz de 2 030 × 512 da exactamente esa fila. La segunda lectura es la que explica por qué el
+  gradiente funciona (es una capa lineal normal) y por qué los
+  <Term id="tied-embeddings">tied embeddings</Term> del final de esta sección son posibles.
+</Callout>
+
+### Posiciones: tabla aprendida o RoPE
+
+Hay un problema con lo que acabamos de montar. Si el modelo solo suma vectores de tokens, la
+secuencia `e2e4 e7e5 g1f3` y la secuencia `g1f3 e7e5 e2e4` le llegan idénticas: la atención, como
+verás en un momento, es una suma ponderada, y las sumas no tienen orden. Un <Term id="modelo-de-lenguaje">modelo de lenguaje</Term>
+sin información de posición es un modelo de bolsa de palabras muy caro.
+
+En ajedrez eso sería fatal por una razón más fuerte que en texto. Una partida **es** su orden: las
+mismas tres jugadas en otro orden dan otra posición, o ni siquiera son legales. El modelo tiene que
+saber que `e2e4` fue la primera y `g1f3` la tercera, porque la posición del tablero es una función
+de la secuencia ordenada y de nada más.
+
+**Opción 1: posiciones aprendidas.** Una segunda tabla, de `block × d_model` = 200 × 512 = 102 400
+parámetros, que se suma al embedding del token:
+
+```python
+steps = torch.arange(seq, device=idx.device)
+x = self.tokens(idx) + self.positions(steps)
+```
+
+La fila 0 es "lo que significa estar en la primera posición", la fila 7 es lo mismo para la octava.
+Son 102 400 parámetros, el 0,26 % del modelo, y es lo que hace GPT-2. Ventaja: simplísimo, y el
+modelo aprende lo que quiera de cada posición (por ejemplo, que las diez primeras son apertura).
+Desventaja: **no hay fila 201**. El modelo no puede procesar una secuencia más larga que la tabla,
+y las posiciones altas se entrenan mucho menos que las bajas, porque muchas partidas terminan
+antes.
+
+**Opción 2: RoPE.** En vez de sumar un vector de posición al token, <Term id="rope">RoPE</Term>
+rota los vectores de consulta y de clave dentro de la atención, con un ángulo proporcional a la
+posición. La idea es geométrica y elegante: si tomas dos dimensiones del vector como un plano y
+giras ese plano un ángulo `m·θ` para la posición `m`, entonces el producto escalar entre la
+posición `m` y la posición `n` depende solo de la diferencia `m − n`. La atención pasa a ver
+distancias relativas ("la jugada de hace dos") en vez de índices absolutos ("la jugada número 7"),
+gratis y sin parámetros nuevos.
+
+En el código, `head_dim` es 64, así que hay 32 pares de dimensiones, cada uno con su propia
+frecuencia:
+
+```python
+inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+```
+
+Con `base = 10 000`, el primer par gira 1 radián por posición —da la vuelta cada seis jugadas, así
+que codifica distancias muy cortas con mucha resolución— y el último gira 0,000133 radianes por
+posición: en las 200 posiciones enteras del contexto apenas recorre 0,027 radianes, así que lo que
+codifica es "principio o final de la partida". Entre medias hay 30 frecuencias más, como las agujas
+de un reloj con 32 manecillas: leyendo todas a la vez se reconstruye la posición sin ambigüedad.
+La implementación de Rukh usa la variante por mitades, que es la de GPT-NeoX y la de Llama:
+
+```python
+half = x.shape[-1] // 2
+rotated = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+return x * cos_t + rotated * sin_t
+```
+
+Esas dos líneas son la fórmula de la rotación de toda la vida, `x·cos − y·sin` y `x·sin + y·cos`,
+escritas de golpe para las 32 parejas.
+
+Rukh entrena con posiciones aprendidas por defecto (`pos: "learned"`) y deja RoPE detrás de una
+opción de configuración, porque con contexto fijo de 200 tokens el argumento de la extrapolación no
+aplica: ninguna partida va a ser más larga que la tabla. El lab 1 te propone entrenar `tiny` con
+las dos y comparar; si RoPE gana algo, la decisión cambia y se anota. Esa es la forma sana de
+elegir entre dos técnicas: no por cuál se publicó después.
+
+### Atención, con números
+
+Esta es la pieza. Todo lo demás del Transformer es plomería.
+
+Cada posición de la secuencia produce tres vectores a partir de su representación actual, con tres
+matrices aprendidas (en el código, una sola matriz `qkv` que las calcula de golpe y se parte en
+tres):
+
+- **Q, la consulta** (_query_): qué estoy buscando.
+- **K, la clave** (_key_): qué ofrezco yo a quien me busque.
+- **V, el valor** (_value_): qué información entrego si me eligen.
+
+La metáfora útil es un archivo. Cada jugada anterior deja una ficha con una etiqueta (K) y un
+contenido (V). La jugada actual escribe una búsqueda (Q). El parecido entre la búsqueda y cada
+etiqueta decide cuánto pesa cada contenido en el resultado.
+
+Hagámoslo con números, en un modelo de juguete de dos dimensiones por cabeza. Tres jugadas:
+
+```text
+posición 1: e2e4      posición 2: e7e5      posición 3: g1f3
+```
+
+Supón que después de sus proyecciones los vectores son:
+
+```text
+k1 = (1, 0)   v1 = (2, 0)
+k2 = (1, 1)   v2 = (0, 2)
+k3 = (0, 1)   v3 = (1, 1)
+
+q3 = (1, 1)        <- la consulta de la tercera jugada
+```
+
+**Paso 1, producto escalar.** El parecido entre la consulta y cada clave:
+
+```text
+q3 · k1 = 1*1 + 1*0 = 1
+q3 · k2 = 1*1 + 1*1 = 2
+q3 · k3 = 1*0 + 1*1 = 1
+```
+
+**Paso 2, escala 1/√d.** Se divide por la raíz de la dimensión de la cabeza, aquí √2 = 1,4142:
+
+```text
+1 / 1,4142 = 0,7071
+2 / 1,4142 = 1,4142
+1 / 1,4142 = 0,7071
+```
+
+¿Por qué? Si Q y K tienen componentes independientes de varianza 1, el producto escalar de `d`
+dimensiones tiene varianza `d`: con `d = 64`, los valores se mueven en un rango ocho veces mayor
+que con `d = 1`. Y el softmax es exponencial: una diferencia de 8 entre dos puntuaciones se
+convierte en una probabilidad de 0,9997 frente a 0,0003. Sin la escala, un modelo ancho empezaría
+con atenciones prácticamente binarias, y donde el softmax satura el gradiente es cero. Dividir por
+√d mantiene las puntuaciones en un rango donde el softmax todavía tiene pendiente. Es una línea de
+código que decide si el modelo aprende o se queda clavado.
+
+**Paso 3, softmax.** Exponenciar y normalizar:
+
+```text
+exp(0,7071) = 2,0281
+exp(1,4142) = 4,1133
+exp(0,7071) = 2,0281
+suma        = 8,1695
+
+pesos = 0,2483   0,5035   0,2483      (suman 1)
+```
+
+Compara con lo que habría salido **sin** la escala, partiendo de 1, 2 y 1: `0,2120 · 0,5761 ·
+0,2120`. Con dos dimensiones la diferencia es pequeña; con 64 es la diferencia entre un reparto y
+un interruptor.
+
+**Paso 4, mezcla.** La salida es la media de los valores ponderada por esos pesos:
+
+```text
+0,2483 * (2, 0) = (0,4966 , 0     )
+0,5035 * (0, 2) = (0      , 1,0070)
+0,2483 * (1, 1) = (0,2483 , 0,2483)
+                  -------------------
+salida de q3    = (0,7449 , 1,2553)
+```
+
+Eso es todo. `softmax(QKᵀ/√d)·V`, tres líneas de álgebra que puedes hacer a mano, repetidas para
+cada posición, para cada cabeza y para cada capa. En PyTorch es una llamada:
+
+```python
+out = F.scaled_dot_product_attention(q, k, v, dropout_p=..., is_causal=True)
+```
+
+<Callout kind="mundo-real" title="Por qué una sola llamada y no las tres líneas">
+  `F.scaled_dot_product_attention` elige en tiempo de ejecución entre varias implementaciones
+  (memoria eficiente, fusionada tipo FlashAttention o la ingenua) según la GPU y las formas. La
+  materializada explícitamente necesita una matriz de `T × T` por cabeza y por lote; la fusionada
+  nunca la escribe en memoria. Con 200 tokens la diferencia es tolerable, con 4 000 es la diferencia
+  entre entrenar y no entrenar. El precio: **no te devuelve los pesos**. Por eso el lab 5, que
+  exporta el mapa de atención, tiene que recalcularlos a mano.
+</Callout>
+
+### La máscara causal, que aquí no es opcional
+
+En el ejemplo anterior, la consulta de la posición 3 miró a las claves 1, 2 y 3. ¿Y la consulta de
+la posición 1? Si mirase a las claves 2 y 3, estaría mirando el futuro.
+
+Eso, en un modelo entrenado para predecir la siguiente jugada, no es una imprecisión: **es hacer
+trampa, y el modelo la encuentra inmediatamente**. El entrenamiento es _teacher forcing_: se le da
+la partida entera y se le pide que en cada posición prediga el token siguiente. Si la posición `t`
+puede leer el token `t+1`, la tarea deja de ser "predice" y pasa a ser "copia lo que tienes al
+lado". La pérdida se desploma hasta casi cero en unos cientos de pasos, las curvas parecen un
+éxito, y el modelo generando de verdad —donde el futuro no existe todavía— juega como un
+generador de números aleatorios. Es el error más caro que se puede cometer en este módulo, porque
+no se manifiesta como un fallo sino como un resultado buenísimo.
+
+La <Term id="mascara-causal">máscara causal</Term> lo impide. Antes del softmax, toda puntuación de
+una clave posterior a la consulta se pone a menos infinito; `exp(-inf) = 0`, así que esos pesos
+salen exactamente cero:
+
+```text
+             clave 1   clave 2   clave 3
+consulta 1     0,71      -inf      -inf      -> pesos  1     0     0
+consulta 2     0,35      1,06      -inf      -> pesos  0,33  0,67  0
+consulta 3     0,71      1,41      0,71      -> pesos  0,25  0,50  0,25
+```
+
+Una matriz triangular inferior. La primera posición solo se ve a sí misma (y por eso el
+`<bos>` de M1 no es decorativo: es el único contexto que tiene la primera jugada). En el código es
+un argumento, `is_causal=True`, y en el lab 2 la vas a dibujar y, sobre todo, a **verificar
+empíricamente**: cambiar un token futuro no debe mover ni un decimal de los logits pasados. Un test
+que se escribe una vez y protege el proyecto entero.
+
+<Callout kind="roto" title="Cómo se nota que la máscara no está">
+  Pérdida de validación por debajo de 0,1 en menos de mil pasos. Top-1 de siguiente jugada superior
+  al 90 %. Y legalidad sin máscara del 20 % cuando generas. Si ves las dos primeras cifras en este
+  módulo, no celebres: busca la fuga.
+</Callout>
+
+### Multi-cabeza: ocho de 64 en vez de una de 512
+
+Una <Term id="cabeza-de-atencion">cabeza de atención</Term> con `d = 512` calcula un único reparto
+de pesos por posición. Es un único criterio de
+parecido: todo lo que el modelo quiera mirar en esa capa tiene que caber en esa comparación.
+
+Multi-cabeza parte las 512 dimensiones en 8 trozos de 64 y ejecuta la misma operación **ocho veces
+en paralelo**, cada una en su subespacio, con sus propios pesos dentro de la misma matriz `qkv`.
+Después concatena las ocho salidas (8 × 64 = 512) y las pasa por una proyección de salida que las
+mezcla.
+
+Lo notable es lo que cuesta: **nada**. La matriz `qkv` es de 512 × 1536 tanto si hay una cabeza
+como si hay ocho; lo único que cambia es cómo se reinterpretan sus columnas. Mismo número de
+parámetros, prácticamente los mismos FLOPs, y a cambio ocho patrones de atención distintos por
+capa en vez de uno. Con 12 capas, el modelo tiene 96 cabezas y por tanto 96 formas simultáneas de
+relacionar jugadas.
+
+¿Qué aprende cada una? En los Transformers de texto se han encontrado cabezas muy especializadas:
+una que mira siempre al token anterior, otra que busca la aparición previa del mismo token, otra
+que empareja comillas de apertura y cierre. En ajedrez cabe esperar cosas análogas: una cabeza
+"jugada anterior" (la diagonal encendida que verás en el mapa), una cabeza que mira a la última vez
+que se movió una pieza de la casilla de destino, una que se fija en el token de Elo del principio.
+No tenemos garantía de ninguna, y por eso la isla de esta lección deja elegir capa y cabeza en vez
+de enseñarte la que confirma la historia.
+
+Lo que sí se sabe es la contrapartida: 64 dimensiones por cabeza es poco espacio, y con demasiadas
+cabezas cada una se queda sin resolución. La regla que siguen casi todos los modelos —y Rukh— es
+mantener `head_dim` entre 64 y 128. 8 × 64 en `small`, 4 × 64 en `tiny`, 12 × 64 en `medium`.
+
+### El bloque pre-norm y por qué doce capas se dejan entrenar
+
+Un bloque de Rukh son cuatro líneas:
+
+```python
+def forward(self, x, cos=None, sin=None):
+    x = x + self.attn(self.ln1(x), cos, sin)
+    return x + self.mlp(self.ln2(x))
+```
+
+Dos subcapas —atención y MLP— cada una precedida de una normalización y sumada a su entrada. Hay
+dos ideas juntas y conviene separarlas.
+
+**La conexión <Term id="residual">residual</Term>** es el `x +`. Sin ella, la salida de la capa 12
+es una composición de doce funciones, y el gradiente que llega a la capa 1 es el producto de doce
+jacobianas: si cada una encoge el gradiente a la mitad, llega dividido por 4 096 y la primera capa
+no aprende. Con la suma, la derivada de cada bloque es **la identidad más** la derivada de la
+subcapa: el gradiente llega íntegro a todas las capas por el camino recto, y lo que cada bloque
+aporta es una corrección. Por eso una pila de 12 (o de 96) se entrena, y por eso al vector que
+recorre el modelo de arriba abajo se le llama _corriente residual_: es una especie de memoria
+compartida que cada bloque lee, modifica un poco y devuelve.
+
+**El <Term id="pre-norm">pre-norm</Term>** es dónde va el `LayerNorm`. El artículo original ponía
+la normalización después de la suma (`x = ln(x + attn(x))`, post-norm), y así es como se entrenaron
+los primeros Transformers: con warmup largo, inicialización cuidadosa y bastante mala suerte. El
+problema es que la normalización está **en** el camino residual, así que ya no hay identidad: cada
+capa reescala lo que pasa por ella. Pre-norm mueve el `LayerNorm` dentro de la rama, antes de la
+subcapa, y deja la autopista libre desde la pérdida hasta el embedding. Es un cambio de dos
+caracteres en el código que convierte "entrenable con cuidado" en "entrenable".
+
+Queda un detalle que parece cosmético y no lo es. La corriente residual recibe **24 aportaciones**
+(12 bloques × 2 subcapas), y si cada una tiene la varianza de una inicialización normal, la
+varianza total crece con el número de capas y el modelo arranca con activaciones enormes. Por eso
+las proyecciones de salida se inicializan más pequeñas:
+
+```python
+scale = 0.02 / math.sqrt(2 * self.cfg.n_layer)   # 0.02 / sqrt(24) = 0.00408
+```
+
+Es el truco de GPT-2 y está en `MoveDecoder.__init__`. Divide la desviación por √24: las escrituras
+en la corriente residual empiezan pequeñas y el modelo va subiendo el volumen de las que le sirven.
+
+El MLP, por cierto, es la parte aburrida y la mitad de los parámetros: `512 → 2048 → 512` con GELU
+en medio. La atención mezcla posiciones; el MLP procesa cada posición por separado. Se suele
+describir como la memoria del modelo: donde vive "después de esta configuración, esta jugada".
+
+### Tied embeddings: la misma tabla para leer y para escribir
+
+Al final del modelo hay una capa que convierte el vector de 512 dimensiones de la última posición
+en 2 030 <Term id="logits">logits</Term>, uno por jugada posible. Esa capa es una matriz de
+512 × 2 030… que tiene exactamente la misma forma, traspuesta, que la tabla de embeddings de la
+entrada. Rukh no crea una nueva: usa la misma.
+
+```python
+self.lm_head = nn.Linear(self.cfg.d_model, self.cfg.vocab_size, bias=False)
+if self.cfg.tie_embeddings:
+    self.lm_head.weight = self.tokens.weight
+```
+
+Qué ahorra: 1 039 360 parámetros, un 2,7 % del total. En un modelo grande sería irrelevante; en
+uno de 39 millones con un vocabulario pequeño es un descuento honesto, y sobre todo son parámetros
+que reciben **el doble de gradiente**, porque se entrenan por los dos extremos.
+
+Qué supone, que es lo interesante. El logit de la jugada `j` pasa a ser el producto escalar entre
+el estado final del modelo y **el vector con el que se lee** `j`. Es decir: predecir una jugada es
+apuntar, en el espacio de embeddings, hacia el sitio donde vive esa jugada. Se impone que "lo que
+significa `e2e4` a la entrada" y "lo que hay que pensar para decir `e2e4`" sean lo mismo. Es una
+hipótesis fuerte, casi siempre buena, y ocasionalmente limitante: si un token quisiera significar
+cosas muy distintas leído y escrito, atarlos le quita esa libertad.
+
+<Callout kind="entrevista" title="¿Los tied embeddings ayudan o solo ahorran?">
+  Las dos cosas, y en modelos pequeños con vocabularios grandes en proporción, ayudan más de lo que
+  ahorran: la capa de salida es la que más sufre de escasez de datos (hay jugadas que aparecen
+  cuatro veces en el corpus) y atarla al embedding le regala todo el gradiente del lado de la
+  entrada. En modelos muy grandes la práctica se abandona a veces, porque el vocabulario pesa poco y
+  la restricción ya no compensa.
+</Callout>
+
+### La receta: AdamW, warmup, coseno, clipping, bf16
+
+Un modelo bien construido no entrena solo. La receta de `configs/train/small.yaml` es casi la misma
+que usaría cualquiera para un GPT pequeño, y cada número tiene un motivo.
+
+**<Term id="adamw">AdamW</Term> con β = 0,9 / 0,95.** Adam guarda dos medias móviles por parámetro:
+la del gradiente (β₁ = 0,9, una especie de inercia) y la de su cuadrado (β₂), y divide la primera
+por la raíz de la segunda, de manera que cada parámetro recibe un paso normalizado por lo ruidoso
+que es su gradiente. El valor por defecto de β₂ en PyTorch es 0,999, que promedia sobre unos mil
+pasos; en modelos de lenguaje se baja a 0,95 (unos veinte pasos) porque la escala de los gradientes
+cambia deprisa al principio y una media demasiado larga reacciona tarde. Es el valor de GPT-3 y el
+de nanoGPT.
+
+**Weight decay 0,1, solo en las matrices.** El decaimiento de pesos resta en cada paso una fracción
+del propio peso: empuja todo hacia cero salvo que el gradiente lo sostenga. En las matrices —la
+atención, el MLP, los embeddings— eso es regularización clásica. En los parámetros de `LayerNorm` y
+en los sesgos, no:
+
+```python
+decay = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
+no_decay = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
+```
+
+La regla es literalmente "tensores de dos dimensiones o más". Un `LayerNorm` tiene una ganancia por
+canal inicializada a 1, y su trabajo es reescalar la señal; empujarla hacia cero es apagar el
+canal, no regularizarlo. Un sesgo tiene una dimensión y desplaza, no escala: no aporta capacidad
+que haga falta contener. Son unos pocos miles de parámetros de los 39 millones, pero meterlos en el
+grupo equivocado degrada el entrenamiento de forma silenciosa, que es la peor.
+
+**<Term id="warmup">Warmup</Term> de 1 000 pasos y después coseno.** La tasa de aprendizaje empieza
+en cero, sube en línea recta hasta 6e-4 en el paso 1 000 y desde ahí baja siguiendo medio coseno
+hasta el 10 % de ese valor en el paso 20 000, donde se queda:
+
+```python
+if step < cfg.warmup:
+    return cfg.lr * step / cfg.warmup
+progress = min(1.0, (step - cfg.warmup) / (cfg.max_steps - cfg.warmup))
+return floor + 0.5 * (1.0 + math.cos(math.pi * progress)) * (cfg.lr - floor)
+```
+
+Qué pasa sin warmup. En el paso 1, Adam tiene una estimación del segundo momento hecha con un único
+gradiente; el cociente que calcula es casi arbitrario, y como el paso de Adam está normalizado, un
+parámetro puede moverse tanto como la tasa de aprendizaje de golpe. Sobre una red recién
+inicializada, con 24 escrituras en la corriente residual, eso basta para que las activaciones
+exploten, el softmax de la atención sature y el modelo caiga en un mínimo tonto: predecir siempre
+las jugadas más frecuentes del corpus. La curva no revienta con un `NaN` espectacular; se queda
+plana en una pérdida mediocre y no baja nunca. El warmup cuesta el 5 % de los pasos y elimina ese
+riesgo entero.
+
+La bajada en coseno tiene una lógica parecida por el otro lado: al final del entrenamiento el
+modelo está cerca de un mínimo y pasos grandes solo lo sacan de él. El suelo del 10 % evita que los
+últimos miles de pasos no hagan nada.
+
+**Clipping a 1,0.** Antes de cada `optimizer.step()` se calcula la norma global del gradiente y, si
+pasa de 1,0, se reescala el vector entero para que valga 1,0. Es un seguro contra un lote raro: sin
+él, una única secuencia patológica puede mover los pesos lo suficiente como para tirar horas de
+entrenamiento. El `grad_norm` se registra en MLflow en cada paso, y mirarlo es la mejor forma de
+saber si el entrenamiento está sano: debe bajar y estabilizarse, no dar picos.
+
+**<Term id="bf16">bf16</Term>, y por qué no fp16.** Los dos son formatos de 16 bits y los dos
+doblan el rendimiento en una GPU moderna. La diferencia está en cómo reparten los bits. fp16 usa 5
+para el exponente y 10 para la mantisa: mucha precisión, poco rango, con el número normal más
+pequeño alrededor de 6·10⁻⁵. Los gradientes de una red profunda viven justo ahí abajo, así que en
+fp16 se van a cero: por eso entrenar en fp16 obliga a un `GradScaler` que multiplica la pérdida por
+un factor grande, lo baja si aparecen infinitos, y de vez en cuando te regala un `NaN` a las tres
+de la mañana. bf16 usa 8 bits de exponente —**el mismo rango que fp32**— y 7 de mantisa: menos
+precisión por número, pero nada se desborda por abajo. No hace falta escalar nada. En la RTX 5090
+(sm_120) bf16 es nativo, así que la elección es gratis:
+
+```yaml
+precision: bf16
+compile: true
+```
+
+Los pesos maestros siguen en fp32 y el optimizador acumula en fp32; bf16 es solo la precisión de
+las operaciones dentro del `autocast`. Y `torch.compile` está activado con una salvaguarda: en
+Windows sin MSVC la compilación puede fallar, así que el bucle la fuerza con un lote de prueba y,
+si revienta, avisa y entrena en modo _eager_ en vez de morirse.
+
+### Muestrear una jugada: temperatura, top-k y la máscara de legalidad
+
+El modelo da 2 030 logits. Convertirlos en una jugada es una decisión de diseño con tres perillas.
+
+**<Term id="temperatura">Temperatura</Term>.** Se dividen los logits por `T` antes del softmax. Con
+`T = 1` la distribución es la que el modelo aprendió; con `T` pequeña las diferencias se amplifican
+y la mejor jugada se lleva casi toda la probabilidad (en el límite, `T → 0`, es el argmax); con `T`
+grande todo se aplana hacia el azar. Rukh usa 0,6 por defecto: suficiente para que dos partidas no
+sean idénticas, poco para que el modelo se tire a la piscina.
+
+**<Term id="top-k">Top-k</Term>.** Se conservan solo los `k` logits mayores y el resto pasa a menos
+infinito. Con `k = 20` de 2 030 jugadas, la cola —donde hay mil jugadas con probabilidad 0,0001
+cada una, que sumadas son un 10 % de probabilidad de hacer una tontería— desaparece. Temperatura y
+top-k no son alternativas sino complementarias: la temperatura reescala, el top-k recorta. Sin
+top-k, una temperatura alta muestrea basura; sin temperatura, el top-k solo limita cuánta basura.
+
+**La máscara de legalidad.** Antes de nada, se calcula con `python-chess` la lista de jugadas
+legales en la posición y se ponen a menos infinito todos los demás logits:
+
+```python
+keep = torch.zeros_like(out, dtype=torch.bool)
+keep[torch.tensor(legal, dtype=torch.long, device=out.device)] = True
+out = out.masked_fill(~keep, float("-inf"))
+```
+
+Con la máscara puesta, el modelo **no puede** proponer una jugada ilegal. Eso hace la demo jugable
+y es lo que se usa en las partidas contra Stockfish. Y aquí está el argumento honesto de todo el
+módulo:
+
+<Callout kind="hoy" title="La máscara hace la demo jugable y la evaluación mentirosa">
+  Si solo mides con máscara, estás midiendo a `python-chess`, no a tu modelo. La pregunta
+  interesante —¿ha aprendido las reglas del ajedrez solo viendo secuencias de texto?— únicamente se
+  responde **sin** máscara: sueltas el argmax crudo del modelo en diez mil posiciones de validación
+  y cuentas qué porcentaje de sus propuestas son legales. Esa es la columna "legalidad sin máscara"
+  de la tabla única, y es la métrica de comprensión del curso. El objetivo de GOAL es ≥ 99 %, el
+  mismo orden que consiguió Karvonen. Por eso `SampleConfig` tiene `mask_illegal` y por eso `rukh
+  play` tiene `--no-mask`: no es un modo de depuración, es el experimento.
+</Callout>
+
+## Cómo se mide
+
+Al terminar esta sección sabrás leer cada columna de la tabla única, explicar de dónde sale el
+intervalo de confianza del Elo y decir con cuántas partidas una mejora es real.
+
+Un modelo sin números es una anécdota. `rukh eval --model <ckpt> --suite full` produce una fila
+completa, con caché SQLite para que repetir la evaluación no vuelva a jugar las mismas partidas.
+Seis medidas, cada una respondiendo a una pregunta distinta.
+
+**Legalidad sin máscara.** Diez mil prefijos de partidas de validación; en cada uno se muestrea sin
+máscara y se comprueba si el token propuesto es una jugada legal en esa posición. Es lo primero que
+sube durante el entrenamiento y lo que más impresiona: el modelo no tiene tablero, no tiene reglas,
+no sabe qué es un alfil, y aun así acaba proponiendo jugadas legales casi siempre. Ojo con el sesgo
+de la medida: las posiciones de apertura son fáciles (casi cualquier desarrollo razonable es legal)
+y los finales son difíciles (pocas jugadas legales, muchas parecidas). Una legalidad global del
+95 % puede esconder un 99 % en apertura y un 70 % en finales.
+
+**Top-1 y top-3 de siguiente jugada.** Porcentaje de posiciones en que la jugada más probable del
+modelo (o alguna de sus tres primeras) coincide con la que jugó el humano. Es la métrica más
+directa de "imita bien", y también la más engañosa como medida de fuerza: el techo no es el 100 %,
+porque en muchas posiciones hay tres jugadas razonables y el humano eligió una. Los modelos
+públicos de este tamaño rondan el 35-45 % de top-1 contra jugadores de club. Se desglosa por tramo
+de Elo, y ese desglose es lo que hace posible el Elo-conditioning de M4: si el modelo predice mejor
+a los 1800 que a los 2400, es que ha aprendido a imitar el nivel medio de sus datos.
+
+**Puzles por tramo.** Dos mil puzles de Lichess por banda de dificultad (1000-1500, 1500-2000,
+2000+), con un criterio duro: un puzle cuenta como resuelto solo si el modelo acierta **toda** la
+secuencia, no la primera jugada. Mide algo distinto de la imitación: encontrar la jugada única que
+gana. Un modelo entrenado solo para imitar suele ir mal en puzles, y ver cuánto sube eso con DPO y
+GRPO en M5 es uno de los resultados bonitos del curso.
+
+**Elo estimado con intervalo de confianza.** El modelo juega contra Stockfish en ocho escalones
+—cuatro por `Skill Level` (por debajo de 1320, que es el suelo de `UCI_Elo`) y cuatro por `UCI_Elo`
+en 1320, 1500, 1800 y 2000— con ambos colores y con máscara de legalidad. Después se ajusta el
+número que mejor explica esos resultados. La fórmula es la logística de Elo de toda la vida:
+
+```text
+P(puntuación) = 1 / (1 + 10 ** ((elo_rival − elo_modelo) / 400))
+```
+
+Se lee así: 400 puntos de diferencia son una probabilidad de ganar de 10 a 1; 0 puntos, 50 %. El
+ajuste es encontrar el `elo_modelo` que hace más verosímiles los resultados observados, y se
+resuelve por Newton en un par de líneas, sin SciPy. Con `c = ln(10)/400 = 0,005756`, el gradiente
+de la log-verosimilitud es `c · Σ(s − p)` y la curvatura `−c² · Σ p(1−p)`, así que cada paso es
+`Σ(s − p) / (c · Σ p(1−p))`. Las tablas entran como puntuación 0,5.
+
+**Y ahora la parte que casi nadie cuenta.** La misma curvatura que resuelve el ajuste da la
+varianza del resultado: `1 / (c² · Σ p(1−p))`. Haz el número. Si juegas 100 partidas contra un
+rival donde rindes al 50 %, `Σ p(1−p) = 25`, la varianza es `1 / (0,005756² · 25) ≈ 1 207` y la
+desviación típica **35 puntos de Elo**: el intervalo del 95 % mide unos ±68. Con los ocho escalones
+de la suite completa, 800 partidas, la desviación baja a unos 12 puntos y el intervalo a ±24. En
+la práctica el harness no usa esa fórmula sino un **bootstrap percentil**: remuestrea con
+reemplazo las partidas jugadas mil veces, reajusta el Elo en cada remuestreo y se queda con los
+percentiles 2,5 y 97,5. Da un intervalo parecido sin suponer que la verosimilitud es gaussiana, y
+las tablas —que reducen la varianza— quedan contadas tal como ocurrieron.
+
+La conclusión práctica: **con 100 partidas por escalón no puedes presumir de 10 puntos de Elo**.
+Ni de 30. La mejora que Elo-conditioning o DPO produzcan en M4 y M5 tiene que superar el ancho del
+intervalo para que signifique algo, y si no lo supera, lo honesto es escribir "no medimos una
+diferencia" en vez de "mejoró un poco". Es exactamente el mismo error que cometen los benchmarks de
+LLM que celebran medio punto en una evaluación de 200 ejemplos.
+
+<Callout kind="entrevista" title="¿Por qué los rivales por debajo de 1320 no son Elo de verdad?">
+  Porque `UCI_Elo` de Stockfish no baja de 1320; para escalones más bajos se usa `Skill Level`, que
+  es otro mecanismo (introduce errores deliberados) y cuya equivalencia en Elo es una convención, no
+  una medida. Los escalones bajos existen porque un modelo débil que pierde todas las partidas no da
+  información: la verosimilitud es monótona y el ajuste se escapa a menos infinito. Si el Elo final
+  se apoya sobre todo en esos escalones, hay que decirlo en la model card. Un número sin sus
+  supuestos es propaganda.
+</Callout>
+
+**Δcp medio.** Pérdida media en centipeones respecto a la mejor jugada según Stockfish a
+profundidad 12, sobre 500 posiciones. Es la métrica que mejor correlaciona con "juega bien", porque
+no penaliza elegir una jugada distinta de la del humano si es igual de buena.
+
+**Diversidad.** Entropía de las aperturas jugadas en 200 partidas propias. Es la métrica de
+guardia: cuando en M5 empieces a optimizar recompensas, lo primero que hace un modelo alineado es
+colapsar en una sola línea que funciona. Una diversidad que se hunde mientras el Elo sube es la
+firma del _reward hacking_.
+
+Δcp y diversidad se calculan en un hito posterior, así que en las primeras filas de la tabla
+aparecen como `null`. Un hueco explícito es información; un cero inventado, no.
+
+<Callout kind="teoria" title="Perplejidad: la misma pérdida en otra escala">
+  La <Term id="perplejidad">perplejidad</Term> es `exp(entropía cruzada)` y se lee como "entre
+  cuántas opciones equiprobables duda el modelo". Un modelo sin entrenar, sobre 2 030 jugadas, tiene
+  perplejidad ≈ 2 030 y pérdida ≈ 7,6 (`ln 2030`). Si la pérdida baja a 3,0, la perplejidad es 20:
+  duda como si eligiera al azar entre veinte jugadas. Como en una posición típica hay unas treinta
+  legales, esa cifra ya implica que ha aprendido bastante. No es una métrica extra que haya que
+  calcular: es la columna de pérdida mirada de otra manera, y por eso el harness no la reporta
+  aparte.
+</Callout>
+
+## Labs
+
+Al terminar esta sección tendrás el modelo escrito, entrenado, evaluado, exportado y jugando, y los
+cuatro scripts de `labs/m2/` que hacen falta para verlo por dentro. Todos los comandos se ejecutan
+desde la raíz del repo `rukh`. Donde va una salida real hay un hueco marcado hasta que el
+entrenamiento termine.
+
+### Lab 1 · `MoveDecoder` a mano, y contar sus parámetros
+
+Escribe `src/rukh/models/decoder.py` siguiendo el plan: `CausalSelfAttention` con una `qkv`
+fusionada, `Mlp` con GELU, `Block` pre-norm, `MoveDecoder` con embeddings, posiciones, la pila de
+bloques, el `LayerNorm` final y el `lm_head` atado. Los tests de formas y causalidad son la parte
+que no se salta.
+
+Y después cuenta. Guarda este script como **`labs/m2/params.py`** en el repo `rukh`: recorre el
+modelo bloque a bloque, suma, y compara con la fórmula escrita a mano. Si las dos cifras no
+coinciden, es que tienes una idea equivocada de tu propio modelo.
+
+```python title="labs/m2/params.py"
+"""Parameter count of a MoveDecoder, block by block, against the closed-form formula."""
+
+from rukh.models import MoveDecoder, preset
+
+
+def formula(cfg) -> int:
+    """What the architecture says it should be, computed by hand."""
+    d, ff, v = cfg.d_model, cfg.ff, cfg.vocab_size
+    per_block = (
+        2 * d  # ln1
+        + (d * 3 * d + 3 * d)  # qkv
+        + (d * d + d)  # attn out projection
+        + 2 * d  # ln2
+        + (d * ff + ff)  # mlp in
+        + (ff * d + d)  # mlp out
+    )
+    total = v * d + per_block * cfg.n_layer + 2 * d  # tokens + blocks + final ln
+    if cfg.pos == "learned":
+        total += cfg.block * d
+    if not cfg.tie_embeddings:
+        total += v * d
+    return total
+
+
+for name in ("tiny", "small", "medium"):
+    cfg = preset(name)
+    model = MoveDecoder(cfg)
+    counted = sum(p.numel() for p in model.parameters())
+    groups = {
+        "tokens": model.tokens.weight.numel(),
+        "positions": model.positions.weight.numel() if model.positions is not None else 0,
+        "blocks": sum(p.numel() for p in model.blocks.parameters()),
+        "ln_f": sum(p.numel() for p in model.ln_f.parameters()),
+        "lm_head (tied)": 0 if cfg.tie_embeddings else model.lm_head.weight.numel(),
+    }
+    print(f"== {name}: {cfg.n_layer} layers, d={cfg.d_model}, {cfg.n_head} heads ==")
+    for key, value in groups.items():
+        print(f"  {key:<16} {value:>12,}")
+    print(f"  {'total':<16} {counted:>12,}   formula {formula(cfg):>12,}")
+    print(f"  {'non-embedding':<16} {model.num_params():>12,}")
+    assert counted == formula(cfg), f"{name}: the formula does not match the model"
+```
+
+```bash title="Terminal"
+uv run python labs/m2/params.py
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run python labs/m2/params.py */}
+
+Lo que debe salir para `small`, y que puedes verificar con una calculadora antes de ejecutarlo:
+embeddings 2 030 × 512 = 1 039 360; posiciones 200 × 512 = 102 400; por bloque 1 024 + 787 968 +
+262 656 + 1 024 + 1 050 624 + 1 049 088 = 3 152 384, que por 12 capas son 37 828 608; el `LayerNorm`
+final, 1 024. Total **38 971 392**, y 38 868 992 sin contar la tabla de posiciones. Fíjate en el
+reparto: el 97 % de los parámetros está en los bloques, y dentro de un bloque, dos tercios están en
+el MLP. La atención, que es la idea, es la minoría de los pesos.
+
+<Exercise n="01" title="¿Dónde meterías el próximo millón de parámetros?">
+  Tienes un millón de parámetros extra de presupuesto para `small`. Calcula, con la fórmula del
+  script, cuánto cuesta cada una de estas tres opciones y cuál cabe: (a) una capa más, (b) subir
+  `d_ff` de 2 048 a 2 304, (c) subir `d_model` de 512 a 528 (y ajustar `n_head` para que siga
+  dividiendo). ¿Cuál elegirías y por qué?
+
+  <Solution>
+    (a) Una capa más son 3 152 384 parámetros: **no cabe**, se pasa tres veces. (b) Subir `d_ff` en
+    256 añade `d·256 + 256 + 256·d + d` = 262 912 por bloque, 3 154 944 en total: tampoco cabe.
+    (c) Subir `d_model` a 528 recalcula todo: el término `d²` de cada bloque crece un 6,3 %, y sale
+    en torno a 41,4 millones, más de dos millones por encima. Con un millón de margen no cabe
+    ninguna de las tres a lo largo de las doce capas; lo único que cabría es aplicar (b) a la mitad
+    de los bloques, que es una arquitectura rara.
+
+    La lección es la que cuenta: en un Transformer el presupuesto **no es continuo**. Los
+    parámetros van en cuantos de una capa entera o de un incremento de anchura multiplicado por
+    `n_layer`, y por eso los modelos publicados vienen en tallas y no en cualquier tamaño. Y si
+    hubiera que elegir, el consenso empírico (las leyes de escala de Kaplan y las correcciones de
+    Chinchilla) es que profundidad y anchura deben crecer juntas: un modelo muy profundo y estrecho
+    o muy ancho y plano rinde peor que el cuadrado a igualdad de parámetros. Nuestros tres presets
+    —6×256, 12×512, 16×768— siguen esa diagonal.
+
+  </Solution>
+</Exercise>
+
+### Lab 2 · Dibujar la máscara causal y demostrar que funciona
+
+Un test que pasa no te enseña nada si no ves lo que comprueba. Guarda este script como
+**`labs/m2/causal_mask.py`**: dibuja la máscara en la terminal y después hace el experimento que
+importa, que es cambiar un token del futuro y comprobar que los logits del pasado no se mueven ni
+un bit.
+
+```python title="labs/m2/causal_mask.py"
+"""Draw the causal mask and prove causality empirically on a real MoveDecoder."""
+
+import torch
+
+from rukh.models import DecoderConfig, MoveDecoder
+
+T = 8
+mask = torch.ones(T, T, dtype=torch.bool).tril()
+print("Causal mask (row = query, column = key):")
+print("      " + " ".join(f"{j:>2}" for j in range(T)))
+for i in range(T):
+    cells = " ".join(" #" if mask[i, j] else " ." for j in range(T))
+    print(f"  q{i:<3} {cells}")
+print(f"\nVisible pairs: {int(mask.sum())} of {T * T} ({100 * mask.float().mean():.1f} %)\n")
+
+torch.manual_seed(0)
+model = MoveDecoder(DecoderConfig(n_layer=2, n_head=2, d_model=32, vocab_size=64, block=T)).eval()
+idx = torch.randint(1, 64, (1, T))
+
+with torch.no_grad():
+    base, _ = model(idx)
+    for t in range(T - 1):
+        changed = idx.clone()
+        # Replace every token after t with a different one.
+        changed[:, t + 1 :] = (changed[:, t + 1 :] + 7) % 63 + 1
+        other, _ = model(changed)
+        past = (base[:, : t + 1] - other[:, : t + 1]).abs().max().item()
+        future = (base[:, t + 1 :] - other[:, t + 1 :]).abs().max().item()
+        print(f"  cut after position {t}: max |delta| past {past:.3e}   future {future:.3e}")
+        assert past == 0.0, "the past moved: the mask is not causal"
+```
+
+```bash title="Terminal"
+uv run python labs/m2/causal_mask.py
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run python labs/m2/causal_mask.py */}
+
+Lo que tiene que salir: la diferencia en el pasado es **exactamente** 0,0 —no 1e-7, cero— y la del
+futuro es grande. Cero exacto porque no es una cuestión de precisión numérica sino de grafo: los
+tokens futuros ni siquiera entran en el cálculo de las posiciones pasadas. Si alguna vez ves 1e-7
+ahí, tienes una fuga sutil, típicamente una normalización aplicada a lo largo del eje de tiempo en
+vez del de canales.
+
+<Exercise n="02" title="Rompe la causalidad a propósito">
+  Cambia `is_causal=True` por `is_causal=False` en `CausalSelfAttention` y vuelve a ejecutar el
+  script. Después entrena `tiny` durante 200 pasos con y sin máscara y compara las dos curvas de
+  pérdida. ¿Cuál baja más rápido? ¿Cuál modelo es mejor? ¿Qué medirías para no dejarte engañar?
+
+  <Solution>
+    Sin máscara, el `assert` del script salta en la primera iteración: los logits pasados cambian
+    al tocar el futuro. Entrenando, la curva sin máscara baja muchísimo más rápido y llega a
+    pérdidas que la causal no alcanza jamás, porque la tarea es distinta: con acceso al futuro,
+    predecir el token `t+1` se resuelve leyendo el token `t+1`. En el límite, la pérdida tiende a
+    cero y el top-1 al 100 %.
+
+    El modelo es basura y no hay forma de verlo en la curva de entrenamiento. Lo que lo delata es
+    **generar**: en inferencia el futuro no existe, el modelo recibe una secuencia que no se parece
+    a ninguna que haya visto y propone jugadas al azar. Las dos métricas que lo cazan en un minuto
+    son la **legalidad sin máscara** (se hunde) y una partida de `rukh play` (jugadas sin sentido
+    desde el ply 2). Es el caso general de una lección que vale para cualquier proyecto de ML: una
+    pérdida sospechosamente buena es casi siempre una fuga, y la única defensa fiable es una métrica
+    calculada como se va a usar el modelo, no como se entrena.
+
+  </Solution>
+</Exercise>
+
+### Lab 3 · Entrenar `tiny` en veinte minutos
+
+Ahora sí. `tiny` son 6 capas, 256 dimensiones, 4 cabezas y 5 309 952 parámetros; la configuración
+pide 6 000 pasos con lotes de 128 × 2 acumulaciones (256 secuencias efectivas de 200 tokens, unos
+51 200 tokens por paso) y tasa de aprendizaje 1e-3 con 500 pasos de warmup. Es el modelo con el que
+se itera: si algo está mal, lo sabes en veinte minutos y no en ocho horas.
+
+```bash title="Terminal"
+uv run rukh train --config configs/train/tiny.yaml
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run rukh train --config configs/train/tiny.yaml */}
+
+Mientras corre, abre MLflow (`uv run rukh mlflow ui`) y mira cuatro series. `train/loss` debe bajar
+deprisa los primeros cientos de pasos y después despacio. `val/loss` debe acompañarla; cuando se
+separen —la de entrenamiento sigue bajando y la de validación se queda plana o sube— has llegado al
+sobreajuste y el `best.pt` ya está guardado del paso anterior. `lr` debe dibujar la rampa de warmup
+y el coseno. Y `grad_norm` debe estabilizarse: picos recurrentes significan que el clipping está
+trabajando demasiado y que la tasa de aprendizaje es alta para este modelo.
+
+Cada 1 000 pasos se escribe un checkpoint, y esos checkpoints son exactamente los que alimentan la
+repetición del entrenamiento que hay más abajo en esta página.
+
+Después, la evaluación rápida —una décima parte del trabajo de la completa, pensada para iterar:
+
+```bash title="Terminal"
+uv run rukh eval --model checkpoints/tiny/best.pt --suite quick
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run rukh eval --model checkpoints/tiny/best.pt --suite quick */}
+
+<Exercise n="03" title="Dos entrenamientos de 300 pasos que explican la receta">
+  Con `--max-steps 300`, lanza `tiny` tres veces: (a) tal cual; (b) con `warmup: 0` en una copia de
+  la configuración; (c) con `lr: 1.0e-2`. Compara las tres curvas de `train/loss` y de `grad_norm`
+  en MLflow. Después responde: ¿cuál de las dos variantes rotas se parece más a la sana en los
+  primeros diez pasos, y por qué es eso peligroso?
+
+  <Solution>
+    (a) baja suave desde `ln(2030) ≈ 7,6`. (b) sin warmup pega un salto en los primeros pasos: o la
+    pérdida sube por encima de 8 antes de volver, o se queda estancada alrededor de 6, que es
+    aproximadamente la entropía de la distribución de jugadas más frecuentes del corpus; el modelo
+    ha caído en "predecir siempre lo común". (c) con lr diez veces mayor, `grad_norm` se pega al
+    techo del clipping en casi todos los pasos, señal de que el paso real es el que decide el
+    clipping y no el optimizador; la pérdida oscila o diverge.
+
+    Lo peligroso es la comparación en los primeros diez pasos: **las tres bajan**. Cualquier
+    configuración razonable baja de 7,6 a 5 en unos pocos cientos de pasos, simplemente aprendiendo
+    la frecuencia marginal de cada jugada. Mirar la curva al principio no distingue un
+    entrenamiento sano de uno roto; hay que esperar a la zona donde la pendiente se suaviza, o
+    mirar métricas que no sean la pérdida (legalidad, top-1). Es la razón de que `eval_every` sea
+    250 en `tiny`: la señal útil llega de la validación, no del bucle.
+
+  </Solution>
+</Exercise>
+
+### Lab 4 · `small` de noche, y la evaluación completa
+
+`small` es el modelo del curso: 12 capas, 512 dimensiones, 8 cabezas, 38 971 392 parámetros,
+20 000 pasos de 64 × 4 secuencias (51 200 tokens por paso, algo más de mil millones de tokens en
+total), tasa 6e-4 con 1 000 de warmup. Entre cuatro y ocho horas en la 5090. Se lanza y se deja.
+
+```bash title="Terminal"
+uv run rukh train --config configs/train/small.yaml
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run rukh train --config configs/train/small.yaml */}
+
+Si el proceso se corta —se reinicia la máquina, se cae el driver—, no se pierde nada: cada
+checkpoint lleva el estado del optimizador y el de los generadores aleatorios, así que
+`--resume checkpoints/small/step-12000.pt` continúa exactamente donde estaba. Esa es la diferencia
+entre guardar los pesos y guardar un checkpoint.
+
+A la mañana siguiente, la suite completa: diez mil posiciones de legalidad, diez mil de exactitud,
+dos mil puzles por banda y cien partidas contra cada uno de los ocho escalones de Stockfish. Son
+varias horas de partidas, y la caché SQLite hace que repetirla sea casi gratis.
+
+```bash title="Terminal"
+uv run rukh eval --model checkpoints/small/best.pt --suite full
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run rukh eval --model checkpoints/small/best.pt --suite full */}
+
+Y una partida, para verlo con tus ojos, que es una forma de evaluación que ninguna tabla sustituye:
+
+```bash title="Terminal"
+uv run rukh play --ckpt checkpoints/small/best.pt --games 1
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run rukh play --ckpt checkpoints/small/best.pt --games 1 */}
+
+La misma partida sin máscara enseña el otro lado: cada vez que el modelo propone algo ilegal se
+cuenta y se rescata con un muestreo enmascarado, así que la partida siempre termina y el contador
+`illegal` es la señal cruda.
+
+```bash title="Terminal"
+uv run rukh play --ckpt checkpoints/small/best.pt --games 1 --no-mask
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run rukh play --ckpt checkpoints/small/best.pt --games 1 --no-mask */}
+
+<Exercise n="04" title="¿Cuántas partidas necesitas para creerte una mejora de 40 Elo?">
+  Usando la fórmula de la varianza de la sección anterior —`var = 1 / (c² · Σ p(1−p))` con
+  `c = 0,005756`— calcula cuántas partidas con resultados cercanos al 50 % hacen falta para que la
+  desviación típica del Elo baje a 20 puntos. Después: si comparas dos modelos, ¿basta con que sus
+  intervalos del 95 % no se solapen?
+
+  <Solution>
+    Con `p = 0,5`, `Σ p(1−p) = 0,25·n`, así que `var = 1 / (0,005756² · 0,25 n) = 1 / (8,28e-6 · n)`.
+    Para una desviación de 20 hace falta `var = 400`, es decir `n = 1 / (8,28e-6 · 400) ≈ 302`
+    partidas. Para 10 puntos harían falta unas 1 208: la precisión va con la raíz, así que **dividir
+    el error por dos cuesta cuatro veces más partidas**. Con 800 partidas la desviación ronda los
+    12 puntos y el intervalo del 95 % mide unos 48 de ancho: una mejora de 40 puntos es detectable,
+    una de 15 no.
+
+    Y no, los intervalos que no se solapan no son el criterio correcto: es una prueba demasiado
+    conservadora (dos intervalos pueden solaparse y la diferencia ser significativa). Lo correcto
+    es estimar el intervalo **de la diferencia**. Y, mucho mejor que cualquiera de las dos cosas,
+    enfrentar los dos modelos directamente entre sí: comparar A y B contra un tercero acumula el
+    error de dos estimaciones, mientras que el emparejamiento directo mide lo que te importa. Es la
+    misma razón por la que las listas de motores se construyen con torneos y no con puntuaciones
+    independientes.
+
+  </Solution>
+</Exercise>
+
+### Lab 5 · Exportar a ONNX y sacar los mapas de atención
+
+El navegador no ejecuta PyTorch. El puente es <Term id="onnx">ONNX</Term>: un formato que describe
+el grafo y los pesos, que `onnxruntime-web` sabe ejecutar con WebGPU o con WASM.
+
+Con un detalle de diseño que vale la pena entender. El modelo devuelve logits de forma
+`(B, T, 2030)`, pero la demo solo necesita la distribución de la **siguiente** jugada. Exportar la
+salida completa serían 200 veces más números por inferencia, así que el exportador envuelve el
+modelo y devuelve solo el último paso:
+
+```python
+class LastStepLogits(nn.Module):
+    def forward(self, idx):
+        logits, _ = self.model(idx)
+        return logits[:, -1, :]
+```
+
+Después se generan las dos variantes con <Term id="cuantizacion">cuantización</Term> —fp16 para
+WebGPU (unos 80 MB) e int8 dinámico para el respaldo en WASM (unos 40 MB), convirtiendo solo
+`MatMul` y `Gemm`— y se comprueba la paridad: en mil posiciones de partidas legales aleatorias, el
+fichero exportado debe elegir la misma jugada que PyTorch en al menos el 99,9 % de los casos, y se
+registra además la mayor diferencia absoluta en los logits.
+
+```bash title="Terminal"
+uv run rukh export --ckpt checkpoints/small/best.pt --out artifacts/onnx/small --fp16 --int8 --check-parity
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run rukh export --ckpt checkpoints/small/best.pt --out artifacts/onnx/small --fp16 --int8 --check-parity */}
+
+El criterio es la **jugada**, no los logits, y el matiz importa: int8 mueve los logits bastante
+(verás una diferencia máxima grande) y aun así casi nunca cambia el argmax, porque el error es
+mucho menor que el margen que suele haber entre la primera y la segunda jugada. Un fichero que
+coincidiera en los números y no en la jugada sería inútil; uno que difiere en los números y acierta
+la jugada es exactamente lo que quieres.
+
+Queda el segundo script del lab: sacar los pesos de atención para la isla de esta página. Y aquí
+aparece el precio de usar la llamada rápida. `F.scaled_dot_product_attention` no devuelve la matriz
+de pesos, así que hay que recalcularla: se engancha un hook a la proyección `qkv` de cada bloque,
+se parten sus salidas en Q, K y V, se aplica RoPE si el modelo lo usa y se calcula el softmax a
+mano con la máscara triangular. Guarda esto como **`labs/m2/attention_export.py`**:
+
+```python title="labs/m2/attention_export.py"
+"""Export the attention weights of one short game to artifacts/web/attention.json."""
+
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+import chess
+import torch
+from torch.nn import functional as F
+
+from rukh.models.decoder import apply_rope
+from rukh.tokenize.uci_vocab import UciTokenizer
+from rukh.train import load_model
+
+CKPT = Path("checkpoints/small/best.pt")
+OUT = Path("artifacts/web/attention.json")
+# Legal's mate: short, famous and every move is easy to follow in the heat map.
+MOVES = "e2e4 e7e5 g1f3 b8c6 f1c4 d7d6 b1c3 c8g4 f3e5 g4d1 c4f7 e8e7 c3d5".split()
+
+model, _ = load_model(CKPT)
+tok = UciTokenizer()
+board = chess.Board()
+for uci in MOVES:  # fail loudly if the line is not legal
+    board.push(chess.Move.from_uci(uci))
+
+ids = [tok.bos_id, tok.vocab["<w1800>"], tok.vocab["<b1800>"]]
+ids += [tok.vocab[uci] for uci in MOVES]
+labels = ["<bos>", "<w1800>", "<b1800>", *MOVES]
+idx = torch.tensor([ids], dtype=torch.long)
+
+captured: list[torch.Tensor] = []
+
+
+def hook(module, args, output):  # noqa: ARG001 - torch hook signature
+    captured.append(output.detach())
+
+
+handles = [block.attn.qkv.register_forward_hook(hook) for block in model.blocks]
+with torch.no_grad():
+    model(idx)
+for handle in handles:
+    handle.remove()
+
+cfg = model.cfg
+weights = []
+mask = torch.ones(len(ids), len(ids), dtype=torch.bool).tril()
+for layer, qkv in enumerate(captured):
+    q, k, _ = qkv.split(cfg.d_model, dim=2)
+    shape = (1, len(ids), cfg.n_head, cfg.head_dim)
+    q = q.view(shape).transpose(1, 2)
+    k = k.view(shape).transpose(1, 2)
+    if cfg.pos == "rope":
+        q = apply_rope(q, model.rope_cos, model.rope_sin)
+        k = apply_rope(k, model.rope_cos, model.rope_sin)
+    scores = (q @ k.transpose(-2, -1)) / (cfg.head_dim**0.5)
+    probs = F.softmax(scores.masked_fill(~mask, float("-inf")), dim=-1)[0]
+    weights.append([[[round(v, 4) for v in row] for row in head] for head in probs.tolist()])
+
+OUT.parent.mkdir(parents=True, exist_ok=True)
+OUT.write_text(
+    json.dumps(
+        {
+            "schema": "rukh-attention/1",
+            "game": {"moves": labels},
+            "layers": cfg.n_layer,
+            "heads": cfg.n_head,
+            "weights": weights,
+            "meta": {
+                "model": "rukh-small",
+                "checkpoint": str(CKPT),
+                "generated": datetime.now(UTC).isoformat(timespec="seconds"),
+            },
+        }
+    ),
+    encoding="utf-8",
+)
+print(f"wrote {OUT} ({cfg.n_layer} layers x {cfg.n_head} heads x {len(ids)}^2)")
+```
+
+```bash title="Terminal"
+uv run python labs/m2/attention_export.py
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run python labs/m2/attention_export.py */}
+
+Falta un cuarto script, corto, que lee las métricas de MLflow del run y escribe la repetición del
+entrenamiento: **`labs/m2/replay_export.py`** produce `artifacts/web/training-replay.json` con un
+elemento por checkpoint (`step`, `train_loss`, `val_loss`, `val_top1` y, donde se haya evaluado,
+`legality` y `elo`). El esquema exacto de los dos ficheros está documentado en
+`rukh-lab/src/data/README.md`; los dos llegan a esta web con `pnpm sync:data`.
+
+```bash title="Terminal"
+uv run python labs/m2/replay_export.py
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run python labs/m2/replay_export.py */}
+
+<Exercise n="05" title="¿Por qué int8 cambia los logits y no la jugada?">
+  Mira la salida de la exportación: la diferencia máxima de logits del fichero int8 es varios
+  órdenes de magnitud mayor que la del fp16, y sin embargo la paridad de jugada de los dos supera
+  el 99,9 %. Explica por qué, y di en qué tipo de posición esperarías que int8 falle.
+
+  <Solution>
+    La cuantización dinámica a int8 representa cada matriz con 256 niveles y una escala por tensor:
+    el error relativo por peso es del orden del 0,4 %, y ese error se acumula a lo largo de doce
+    capas. Los logits resultantes se desplazan de forma perceptible. Pero elegir una jugada no
+    depende del valor de los logits sino de su **orden**, y en la mayoría de posiciones la
+    diferencia entre el primero y el segundo es mucho mayor que el ruido introducido. fp16, con 10
+    bits de mantisa y el mismo rango relativo en toda la escala, introduce un error unas cien veces
+    menor.
+
+    Int8 fallará justo donde el margen es pequeño: posiciones en las que dos o tres jugadas están
+    casi empatadas —aperturas muy conocidas con varias continuaciones estándar, finales simples
+    donde varias jugadas mantienen la evaluación— y también en las posiciones donde el modelo está
+    poco seguro en general. La buena noticia es que ahí las dos jugadas suelen ser igual de
+    razonables, así que el efecto sobre la fuerza es menor de lo que sugiere el 0,1 % de
+    discrepancia. La mala: esa discrepancia no se reparte uniformemente y por eso la paridad se
+    mide sobre posiciones de partidas reales, no sobre ruido.
+
+  </Solution>
+</Exercise>
+
+## Ver el entrenamiento: TrainingReplay
+
+Al terminar esta sección sabrás leer una curva de entrenamiento como quien lee un
+electrocardiograma: dónde está sano, dónde se está sobreajustando y en qué momento el modelo dejó
+de decir tonterías.
+
+La isla de abajo recorre los checkpoints de la tirada real. El deslizador elige uno; el gráfico
+dibuja la pérdida de entrenamiento y la de validación contra el eje izquierdo y el top-1 de
+siguiente jugada contra el derecho, con una línea vertical en el checkpoint seleccionado, y debajo
+están sus números exactos, incluidas la legalidad sin máscara y el Elo estimado de los checkpoints
+que se evaluaron.
+
+Tres cosas concretas que mirar, en este orden:
+
+1. **Dónde se separan las dos pérdidas.** Mientras van juntas, el modelo generaliza: lo que aprende
+   del entrenamiento le sirve para partidas que no ha visto. El punto donde la de validación se
+   aplana mientras la otra sigue bajando es el principio del sobreajuste, y es el punto que decide
+   cuál es el `best.pt`. Con 6 millones de partidas y 39 millones de parámetros esa separación
+   debería llegar tarde o no llegar; si llega pronto, sobran parámetros o faltan datos.
+2. **Cuándo despega la legalidad.** Es la métrica emergente del curso. Al principio el modelo
+   propone jugadas bien formadas pero imposibles en la posición; en algún momento del entrenamiento
+   esa cifra se dispara y no vuelve a bajar. Fíjate en si ese salto coincide con algún codo de la
+   curva de pérdida o si ocurre en una zona donde la pérdida bajaba plácidamente. Lo segundo es lo
+   habitual y es lo interesante: **la pérdida no sabe qué es una jugada legal**, y aun así aprender
+   a bajarla obliga al modelo a representar la posición.
+3. **La relación entre top-1 y Elo.** No son la misma cosa. El top-1 mide imitar al humano medio; el
+   Elo mide ganar partidas. Puedes ver tramos donde el top-1 apenas se mueve y el Elo sube, porque
+   el modelo está mejorando en las posiciones que deciden la partida aunque no acierte más jugadas
+   en total.
+
+<TrainingReplay client:visible />
+
+## Ver la atención: AttentionMap
+
+Al terminar esta sección sabrás mirar una matriz de atención sin contarte una película: qué
+patrones son reales, cuáles son artefactos y qué no se puede concluir de un mapa bonito.
+
+Abajo está la matriz de una cabeza de una capa sobre una partida corta (el mate de Légal, trece
+jugadas más los tokens de control). Cada **fila** es una jugada que mira; cada **columna**, una
+jugada mirada. La mitad superior derecha está siempre vacía: eso es la máscara causal, que ahora
+puedes ver en lugar de creértela. El color es relativo al máximo de la cabeza seleccionada, así que
+comparar intensidades entre cabezas distintas no significa nada; comparar dentro de una, sí. El
+valor exacto de cada celda está en su título y en el resumen de arriba, que te dice las tres
+jugadas a las que más mira la fila que elijas con el selector.
+
+Qué buscar mientras cambias de capa y de cabeza:
+
+- **La diagonal encendida.** La casilla inmediatamente a la izquierda de la diagonal es "la jugada
+  anterior". Casi siempre hay alguna cabeza dedicada a eso, y tiene todo el sentido: la jugada
+  anterior es el vecino más informativo de una secuencia.
+- **Columnas verticales.** Una columna entera encendida es una jugada a la que mira todo el mundo,
+  normalmente porque acumula contexto. El `<bos>` del principio suele comportarse así en varias
+  cabezas y, en los Transformers de texto, se conoce como sumidero de atención: la cabeza no tiene
+  nada que mirar y vuelca su peso en el primer token, que es su forma de decir "no aporto nada
+  aquí". Si ves una columna así en el `<bos>`, no es un hallazgo: es el estado de reposo.
+- **Bloques y saltos.** Lo interesante son las celdas lejos de la diagonal: la jugada 12 mirando a
+  la 5, que es cuando se movió la pieza que ahora se captura. Algunas cabezas de capas intermedias
+  hacen eso, y es lo más cerca que se está de ver el modelo "razonando" sobre el tablero.
+- **Diferencias entre capas.** Las primeras capas suelen tener patrones locales y regulares; las
+  del medio, los más estructurados; las últimas, algo más difusos, porque ya trabajan sobre
+  representaciones muy mezcladas.
+
+<AttentionMap client:visible />
+
+<Callout kind="roto" title="Lo que un mapa de atención no demuestra">
+  Es tentador señalar una celda encendida y decir "aquí el modelo se da cuenta de que el caballo
+  está clavado". No lo sabes. Los pesos de atención dicen de dónde se copió información, no qué
+  información era ni para qué se usó; la interpretabilidad moderna es bastante escéptica con la
+  atención como explicación, porque hay modelos con atenciones muy distintas y el mismo
+  comportamiento. Un mapa es una pista y un instrumento de depuración excelente (una cabeza que mira
+  siempre al mismo sitio suele estar muerta), no una prueba. La prueba necesita intervenir: cambiar
+  algo y ver si el comportamiento cambia. De eso va la sección siguiente.
+</Callout>
+
+## Por qué el modelo "aprende el tablero" sin verlo
+
+Al terminar esta sección sabrás qué se ha demostrado exactamente sobre los modelos de lenguaje de
+ajedrez y sus representaciones internas, y —más importante para no hacer el ridículo— qué no.
+
+El hecho que sostiene este módulo entero es raro cuando te paras a pensarlo. El modelo nunca ha
+visto un tablero. No tiene casillas, ni piezas, ni reglas; tiene 2 030 símbolos y seis millones de
+secuencias. Y acaba proponiendo jugadas legales el 99 % de las veces, lo que exige saber dónde está
+cada pieza después de cuarenta movimientos, incluida la torre que no se mueve desde la jugada 3.
+Esa información no está en el token actual: está repartida por toda la historia y hay que
+reconstruirla.
+
+La lectura obligatoria de este módulo es el trabajo de **Adam Karvonen**,
+_Chess-GPT's Internal World Model_ (2024). Es corto, es claro y es la referencia que usa el curso
+para calibrar expectativas: un nanoGPT de 50 millones de parámetros, entrenado sobre 16 millones de
+partidas de Lichess en PGN **a nivel de carácter**, alcanzó alrededor de 1300 de Elo con un 99,8 %
+de jugadas legales en un día de GPU. Léelo en
+[adamkarvonen.github.io](https://adamkarvonen.github.io/machine_learning/2024/01/03/chess-world-models.html);
+el código y los modelos están publicados con licencia MIT.
+
+**Qué se demostró exactamente.** El método son _sondas lineales_ (linear probes). Se congela el
+modelo, se toman las activaciones de una capa intermedia en una posición concreta de la secuencia, y
+se entrena **una regresión lineal** —nada más: una matriz, sin capas ocultas— para predecir el
+estado del tablero, casilla a casilla, a partir de esas activaciones. La sonda acierta qué pieza hay
+en cada una de las 64 casillas con una exactitud altísima. Es decir: **el estado del tablero está
+presente en las activaciones del modelo de forma linealmente legible**, aunque nadie se lo enseñara
+y aunque su entrada sean caracteres de texto. Se entrenaron también sondas para la fuerza estimada
+de los jugadores, con resultados análogos.
+
+Y hay una segunda parte, que es la que convierte una correlación en algo más fuerte. Karvonen
+**interviene**: toma la dirección que la sonda asocia a "hay una pieza en esta casilla" y modifica
+las activaciones del modelo a lo largo de esa dirección, como si borrase una pieza del tablero
+interno. Las jugadas que el modelo propone después cambian de forma coherente con el tablero
+editado. Eso descarta la explicación aburrida de que la sonda esté leyendo algo incidental: la
+representación no solo está ahí, sino que el modelo **la usa**.
+
+**Qué no se demostró**, y esto importa más para tu criterio:
+
+- No se demostró que el modelo tenga reglas. Que pueda reconstruir el tablero no implica que
+  represente "el alfil se mueve en diagonal"; puede haber aprendido las regularidades estadísticas
+  que el tablero produce, sin la regla que las genera. Las dos cosas son distintas, y la segunda
+  generaliza a posiciones raras mientras que la primera no.
+- No se demostró que busque ni calcule. No hay nada parecido a una exploración de variantes: hay
+  una única pasada hacia delante con un número fijo de operaciones. Ese es, seguramente, el techo
+  de este enfoque, y es el motivo de que 2895 de Elo se consiguieran con 270 millones de parámetros
+  y diez millones de partidas anotadas por Stockfish, no con trucos.
+- No se demostró que **cualquier** representación interna sea recuperable. Una sonda lineal encuentra
+  lo que es linealmente legible; que no encuentres algo no significa que no esté, solo que no está
+  de esa forma. El resultado negativo de una sonda no es un resultado.
+- No se demostró nada sobre nuestra tokenización. Karvonen usó PGN por carácter; Rukh usa una
+  jugada por token. Es razonable esperar un comportamiento parecido o mejor —al modelo se le ahorra
+  reconstruir la noción de jugada— pero **es una hipótesis hasta que la midas**, y por eso M3 monta
+  sondas lineales sobre nuestro propio encoder en vez de citar el artículo.
+- Y una trampa lógica que conviene nombrar: el estado del tablero es una función determinista de la
+  lista de jugadas, así que la información **está** necesariamente en la entrada. Lo sorprendente
+  no es que esté, sino que el modelo la haya destilado en una forma explícita y lineal; esa es la
+  frontera exacta entre "memoriza la secuencia" y "modela el dominio".
+
+<Callout kind="mundo-real" title="Por qué esto es la discusión de los LLM en miniatura">
+  "¿Los modelos de lenguaje entienden o solo predicen la siguiente palabra?" es una pregunta que en
+  texto no se puede responder, porque no hay un estado del mundo con el que contrastar las
+  activaciones. En ajedrez sí lo hay: el tablero es objetivo, pequeño y verificable. Por eso este
+  dominio se ha convertido en un banco de pruebas de interpretabilidad, y por eso el curso está
+  construido sobre él. Cuando en A1 discutas si un LLM "sabe" algo, tendrás una intuición anclada en
+  un experimento que has hecho tú, no en una opinión de internet.
+</Callout>
+
+## Qué has aprendido, cómo se mide
+
+Has escrito un Transformer decoder entero, línea a línea, y puedes defender cada decisión: por qué
+los embeddings son 2 030 × 512, por qué la máscara causal no es un detalle sino la definición de la
+tarea, por qué ocho cabezas de 64 valen más que una de 512 al mismo precio, por qué pre-norm hace
+entrenable una pila de doce, por qué el weight decay no toca las normas y por qué bf16 te ahorra
+una noche de `NaN`. Lo has entrenado con una receta que sabes justificar número a número, lo has
+medido con un harness que no se engaña a sí mismo y lo has puesto a jugar en un navegador.
+
+**Cómo se mide el módulo 2.** Todo lo que sigue es un número o un test:
+
+- **Legalidad sin máscara** sobre 10 000 posiciones de validación. Es la primera columna de la
+  tabla única y la métrica de comprensión: el objetivo de GOAL para `small` es ≥ 99 %.
+- **Top-1 y top-3** de siguiente jugada contra la humana, global y por tramo de Elo. Baja la línea
+  de base para todo lo que venga después.
+- **Puzles resueltos** por tramo de dificultad, con la secuencia completa como criterio.
+- **Elo estimado con intervalo de confianza del 95 %** por bootstrap sobre las partidas contra los
+  ocho escalones de Stockfish. Objetivo de GOAL: ≥ 1200 para `small`. Si no se llega, se documenta
+  la cifra real; no se mueve el objetivo.
+- **Paridad ONNX ≥ 99,9 %** de jugadas idénticas a PyTorch en 1 000 posiciones, para fp32, fp16 e
+  int8, más la diferencia máxima de logits de cada uno.
+- **Tests unitarios** que se quedan para siempre: formas `(B, T, V)`, causalidad con diferencia
+  exactamente nula en el pasado, pérdida escalar con `ignore_index=0`, `num_params` de `small`
+  entre 38 y 45 millones, determinismo con semilla, y mil muestreos enmascarados sin una sola
+  jugada ilegal.
+- **Reproducibilidad**: cada checkpoint lleva el paso, la configuración, el hash del vocabulario, el
+  del manifiesto de datos y el SHA de git, y cada run está en MLflow con sus curvas.
+
+Lo siguiente es M3, el encoder: el mismo bloque **sin** la máscara causal, entrenado con una tarea
+distinta (tapar jugadas en medio de la partida y reconstruirlas) para producir representaciones que
+miran hacia los dos lados. Sobre él montarás cabezas de valor y de error, y las sondas lineales que
+aquí has leído en un artículo las vas a entrenar tú sobre tu propio modelo. Y en M4 volverás a estos
+mismos pesos para enseñarles a jugar como un 1500 o como un 2200 cambiando dos tokens del principio.
+
+La cheatsheet del módulo, diez preguntas con su respuesta corta, está justo debajo.

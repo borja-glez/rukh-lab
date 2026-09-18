@@ -14,6 +14,8 @@ import ModelBadge from './ModelBadge.astro';
 import ResultsTable from './ResultsTable.astro';
 import DemoEmbed from './DemoEmbed.astro';
 import TokenizerStats from './TokenizerStats.astro';
+import AttentionMap from '../../islands/AttentionMap';
+import TrainingReplay from '../../islands/TrainingReplay';
 
 export {
   Callout,
@@ -27,6 +29,8 @@ export {
   ResultsTable,
   DemoEmbed,
   TokenizerStats,
+  AttentionMap,
+  TrainingReplay,
 };
 
 export const components = {
@@ -41,4 +45,15 @@ export const components = {
   ResultsTable,
   DemoEmbed,
   TokenizerStats,
+};
+
+/*
+ * Preact islands a lesson may embed. They are registered here so there is one list of everything
+ * MDX can use, but they are deliberately NOT part of `components`: a client directive
+ * (`client:visible`) only works on a component the MDX file imports itself, so a lesson imports
+ * the island directly and Astro hydrates it. See docs/runbooks/lessons.md.
+ */
+export const islands = {
+  AttentionMap,
+  TrainingReplay,
 };
