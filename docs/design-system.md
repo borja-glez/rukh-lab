@@ -108,6 +108,11 @@ Las fuentes las sirve la API de fuentes de Astro (`fontProviders.fontsource()`),
 - `Rail` es `position: sticky` dentro del layout de lección y sus ticks son secciones de la lección,
   no un rail fijo de página.
 - Foco visible global con `--accent` (el portfolio solo lo define en el toggle de tema).
+- Dos tokens derivados en `global.css`, no en `tokens.css`: `--accent-text-aa`
+  (`light-dark(#9a5809, #f2a23a)`) y `--event-text-aa` (`light-dark(#2f6a99, #6fa8d6)`). Los
+  originales `--accent-text` (#b86a0b) y `--event` (#3f7cac) dan 3,8:1 y 4,1:1 sobre `--paper` en
+  claro, por debajo de AA para etiquetas de 11 px; el texto pequeño usa las variantes `-aa` y
+  los bordes y trazos siguen usando los originales.
 - Favicon SVG con una torre (`--ink`) en lugar de PNG.
 - Clave de tema en `localStorage`: `rukh:theme` (en el portfolio, `bg-portfolio-theme`).
 - CSP con hashes generada por Astro. Como expressive-code colorea la sintaxis con atributos
