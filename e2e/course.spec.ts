@@ -46,16 +46,19 @@ test.describe('course navigation', () => {
   test('prev/next navigation links exist and resolve', async ({ page }) => {
     await page.goto(LESSON);
     const nav = page.getByRole('navigation', { name: 'Lección anterior y siguiente' });
-    const links = nav.getByRole('link');
-    await expect(links).toHaveCount(2);
-    for (const href of await links.evaluateAll((els) =>
-      els.map((el) => (el as HTMLAnchorElement).getAttribute('href')),
-    )) {
+    const prev = nav.locator('a[rel="prev"]');
+    const next = nav.locator('a[rel="next"]');
+    await expect(prev).toHaveCount(1);
+    await expect(next).toHaveCount(1);
+    /* The first lesson of M0 has no previous lesson: "prev" goes back to the course map. */
+    await expect(prev).toHaveAttribute('href', '/curso/');
+    for (const link of [prev, next]) {
+      const href = await link.getAttribute('href');
       expect(href).toBeTruthy();
       const response = await page.request.get(href as string);
       expect(response.status(), `${href} should resolve`).toBe(200);
     }
-    await links.first().click();
+    await prev.click();
     await expect(page).toHaveURL(/\/curso\/$/);
   });
 

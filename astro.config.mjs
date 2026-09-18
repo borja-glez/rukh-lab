@@ -48,12 +48,9 @@ export default defineConfig({
     }),
     mdx(),
     preact(),
-    sitemap({
-      i18n: {
-        defaultLocale: 'es',
-        locales: { es: 'es-ES', en: 'en' },
-      },
-    }),
+    // No i18n option: it would advertise /en/curso/ etc., which do not exist. The two
+    // real English pages declare their alternates in Base.astro.
+    sitemap(),
   ],
   fonts: [
     {

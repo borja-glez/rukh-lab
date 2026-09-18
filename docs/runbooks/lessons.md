@@ -84,13 +84,17 @@ Qué se ha hecho, cómo se mide (columnas de la tabla única que cambian) y qué
 | `Callout`      | Aparte con etiqueta                                                     | `kind`: `teoria` · `mundo-real` · `entrevista` · `hoy` · `roto`; `title?`   |
 | `Exercise`     | Ejercicio enmarcado                                                     | `title`, `n?`                                                               |
 | `Solution`     | Desplegable con la solución (dentro de `Exercise`)                      | `label?`                                                                    |
-| `Term`         | Término enlazado al glosario con popover                                | `id` (de `terms.json`)                                                      |
+| `Term`         | Término enlazado al glosario; popover solo con `(hover: hover)`, en táctil es un enlace | `id` (de `terms.json`)                                                      |
 | `Figure`       | Figura con marco y pie                                                  | `caption`, `n?`                                                             |
 | `Tabs`         | Pestañas accesibles; contenido en `slot="tab-0"`, `slot="tab-1"`…       | `labels: string[]`                                                          |
 | `NotebookLink` | Enlace a un notebook del repo ML                                        | `path` (p. ej. `labs/m1/01-explore.ipynb`), `label?`                        |
 | `ModelBadge`   | Insignia a una model/dataset card del Hub                               | `repo` (`chorcat/rukh-small`), `kind?: model \| dataset`, `label?`          |
 | `ResultsTable` | La tabla única desde `src/data/results.json`                            | `lang?`, `emptyText?`                                                       |
 | `DemoEmbed`    | Tarjeta con enlace a la demo (iframe opcional con `embed`)              | `query`, `title`, `note?`, `embed?`                                         |
+
+El popover de `Term` existe solo en dispositivos con `(hover: hover)` (ratón o trackpad, al pasar por
+encima o al enfocar con teclado); en pantallas táctiles el término es un enlace normal al glosario,
+así que la definición nunca debe ser imprescindible para seguir el párrafo.
 
 Los bloques de código usan expressive-code: ` ```bash title="Terminal" ` pone la barra de título;
 ` ```text ` para salidas. Los temas claro/oscuro siguen el tema del sitio.

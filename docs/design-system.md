@@ -2,7 +2,7 @@
 
 Fuente de verdad del sistema de diseño compartido por la web del curso (`rukh-lab`) y la demo
 (`rukh-web`). Los tokens viven en `src/styles/tokens.css` y se copiaron tal cual del portfolio
-(`E:\work\borjaglez.com\src\styles\global.css`, bloque `:root` más `color-scheme`). La demo guarda una
+(repo `borjaglez.com`, `src/styles/global.css`, bloque `:root` más `color-scheme`). La demo guarda una
 copia sincronizada con `pnpm sync:tokens` y un test de hash falla si diverge. La última línea de este
 documento registra el sha256 del fichero; `pnpm tokens:hash --write` la recalcula y
 `tests/tokens-hash.test.ts` la comprueba.
