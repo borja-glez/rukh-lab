@@ -13,6 +13,7 @@ import NotebookLink from './NotebookLink.astro';
 import ModelBadge from './ModelBadge.astro';
 import ResultsTable from './ResultsTable.astro';
 import DemoEmbed from './DemoEmbed.astro';
+import TokenizerStats from './TokenizerStats.astro';
 
 export {
   Callout,
@@ -25,6 +26,7 @@ export {
   ModelBadge,
   ResultsTable,
   DemoEmbed,
+  TokenizerStats,
 };
 
 export const components = {
@@ -38,4 +40,5 @@ export const components = {
   ModelBadge,
   ResultsTable,
   DemoEmbed,
+  TokenizerStats,
 };

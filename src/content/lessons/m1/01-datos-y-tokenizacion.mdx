@@ -1,0 +1,1011 @@
+---
+title: 'Del PGN al tensor: datos y tokenización'
+description: 'La primera decisión de modelado del curso: qué es un token. Tres tokenizaciones de la misma partida (UCI de vocabulario fijo, SAN por carácter y BPE) comparadas con datos, el pipeline que convierte seis millones de partidas de Lichess en tensores, dataloaders con empaquetado en flujo y un tokenizador que corre en el navegador.'
+module: m1
+order: 1
+duration: 360
+level: base
+status: borrador
+updated: 2026-09-18
+keywords:
+  - token
+  - tokenización
+  - BPE
+  - vocabulario
+  - dataloader
+  - padding
+  - máscara
+  - DuckDB
+  - parquet
+  - memmap
+artifacts:
+  - kind: dataset
+    label: chorcat/rukh-games-1800
+    href: https://huggingface.co/datasets/chorcat/rukh-games-1800
+  - kind: tokenizer
+    label: chorcat/rukh-tokenizer
+    href: https://huggingface.co/chorcat/rukh-tokenizer
+---
+
+import TokenizerPlayground from '../../../islands/TokenizerPlayground.tsx';
+
+## Qué vas a construir
+
+En M0 lanzaste una descarga y te fuiste. Ahora hay seis millones de partidas en `data/raw/`, en
+formato <Term id="parquet">parquet</Term>, con las jugadas escritas como en los libros
+(`1. e4 e5 2. Nf3`) y un <Term id="manifiesto">manifiesto</Term> que dice de dónde salieron. Un
+modelo no puede leer eso. Un modelo lee tensores de enteros, de tamaño fijo, servidos en lotes.
+Este módulo es el camino completo entre las dos cosas, y en ese camino aparece la primera decisión
+de modelado del curso: **qué es un <Term id="token">token</Term>**.
+
+Al terminar tendrás:
+
+- El pipeline `rukh data` ejecutado de principio a fin: partidas limpias en
+  <Term id="uci">UCI</Term>, posiciones cruzadas con evaluaciones de Stockfish, puzles con split
+  fijo, pares de preferencia para DPO, la base Elite y un muestreo equilibrado por tramo de
+  <Term id="elo">Elo</Term>. Seis datasets con su card en Hugging Face.
+- Tres tokenizadores de la misma partida: uno de <Term id="vocabulario">vocabulario</Term> fijo
+  (una jugada, un token), uno por carácter sobre <Term id="san">SAN</Term> y uno aprendido con
+  <Term id="bpe">BPE</Term>. Y una tabla, medida sobre datos reales, que dice cuántos tokens ocupa
+  una partida con cada uno y cuántas partidas caben en 200 tokens.
+- Un <Term id="dataloader">dataloader</Term> que sirve lotes `(x, y)` de 200 tokens desde un
+  fichero <Term id="memmap">memmap</Term> sin cargar nada en memoria, con
+  <Term id="padding">padding</Term> ignorado por la pérdida.
+- El tokenizador UCI implementado dos veces, en Python y en TypeScript, con una fixture de
+  paridad que garantiza que el navegador y el entrenamiento hablan el mismo idioma. Es el que usa
+  la visualización de esta lección y el que usará la demo en M2.
+
+Todo lo que hagas aquí lo heredan los módulos siguientes: el decoder de M2 se entrena sobre estos
+lotes, el token de Elo de M4 se decide en esta lección y los pares DPO de M5 salen de este pipeline.
+Si M1 está mal, todo lo demás está mal y no se nota hasta muy tarde. Por eso este módulo es largo y
+por eso cada decisión lleva un número al lado.
+
+## Teoría justa
+
+### Qué es un token y por qué la elección importa
+
+Un modelo de lenguaje predice el siguiente símbolo de una secuencia. La pregunta que casi nadie se
+hace, porque en los LLM de texto viene decidida de fábrica, es **qué cuenta como símbolo**. Un token
+es la unidad mínima que el modelo lee y escribe; el tokenizador es la función que convierte texto en
+una lista de enteros (ids) y de vuelta. El modelo nunca ve letras, jugadas ni tableros: ve ids, y
+para cada id aprende un vector. Cambiar el tokenizador cambia qué tiene que aprender la red, cuánto
+cuesta cada partida y qué errores puede cometer.
+
+Piensa en la jugada `e2e4`. Hay dos formas obvias de dársela al modelo:
+
+- **Como un solo token.** Existe un id para `e2e4`, otro para `e7e5`, otro para `g1f3`. Una
+  partida de 40 jugadas son 80 tokens, más unos pocos de control.
+- **Como cuatro caracteres.** `e`, `2`, `e`, `4`. La misma partida son unos 320 tokens solo en
+  jugadas, y el modelo tiene que descubrir que los caracteres van de cuatro en cuatro, que el primer
+  par es la casilla de origen y el segundo la de destino, y que `e2e4` no tiene nada que ver con
+  `e2e3` aunque compartan tres caracteres de cuatro.
+
+Las consecuencias se miden en tres sitios:
+
+1. **Longitud de <Term id="secuencia">secuencia</Term>.** Con un token por jugada, el 95 % de las
+   partidas de nuestro recorte cabe en 200 tokens. Por carácter no cabe casi ninguna: la
+   <Term id="contexto">ventana de contexto</Term> que necesita el modelo para ver una partida entera
+   se multiplica por cuatro o cinco.
+2. **Qué tiene que aprender el modelo.** Con vocabulario fijo, el modelo recibe cada jugada ya
+   "entera" y dedica su capacidad a lo que importa: qué jugada viene después de estas. Por carácter,
+   una parte de las capas se gasta en reconstruir la noción de jugada a partir de trozos. No es
+   imposible (los modelos públicos de referencia de 25-50M parámetros se entrenaron por carácter y
+   llegaron a jugar), pero es capacidad que se paga.
+3. **Coste de atención.** La atención compara cada token con todos los anteriores: su coste crece
+   con el cuadrado de la longitud, O(n²). Pasar de 200 a 800 tokens no es cuatro veces más caro,
+   son dieciséis. Con una sola GPU, esa diferencia es la que separa "entrena en dos horas" de "no
+   entrena esta noche".
+
+<Callout kind="teoria" title="El vocabulario es la primera hipótesis sobre los datos">
+  Elegir "una jugada es un token" es afirmar que la jugada es la unidad natural del ajedrez, igual
+  que "una palabra es un token" lo sería para el inglés. Elegir carácter es no afirmar nada y dejar
+  que el modelo lo descubra. BPE está en medio: deja que los datos decidan qué trozos merecen ser
+  unidad. Las tres son hipótesis legítimas y por eso este módulo las compara con números, no con
+  argumentos.
+</Callout>
+
+Hay un cuarto sitio donde importa, más sutil: **lo que el modelo puede decir**. Con vocabulario
+fijo solo puede emitir jugadas bien formadas (`e2e4`, nunca `e2e9`), pero puede emitir jugadas
+imposibles en la posición actual (`e2e4` con el peón ya en e4). Por carácter puede emitir cualquier
+cosa, incluidas cadenas que no son jugadas. La tasa de legalidad sin máscara de la tabla única mide
+exactamente eso, y por eso se compara entre tokenizaciones con el mismo modelo.
+
+### Vocabulario fijo, BPE y carácter
+
+Las tres tokenizaciones se construyen de forma distinta, y entender cómo se construye cada una es
+lo que te permite predecir cómo falla.
+
+**Vocabulario fijo UCI.** Enumeramos todas las cadenas UCI que pueden ser una jugada de ajedrez,
+sin mirar ningún dato. Una jugada UCI es casilla de origen, casilla de destino y, en promociones,
+la pieza. Un par de casillas es una jugada posible si una dama o un caballo podrían ir de la
+primera a la segunda en un tablero vacío: eso cubre todas las piezas (el peón y el rey se mueven
+como una dama recortada) y descarta `a1b3` o `a1c2`, que ninguna pieza puede hacer. Salen 1 792
+pares. Las promociones son los pares del rango 7 al 8 (blancas) y del 2 al 1 (negras) con
+desplazamiento de columna de como mucho uno, por cuatro piezas (`q`, `r`, `b`, `n`): 176 más. Total,
+**1 968 jugadas**. Añadimos 8 tokens especiales y 54 tramos de Elo (27 por bando) y el vocabulario
+tiene **2 030 entradas**, con cada id fijado por la enumeración. No depende de los datos, así que
+dos implementaciones independientes (Python y TypeScript) producen la misma tabla, y una fixture de
+20 partidas codificadas desde Python vigila que sea así.
+
+Qué pasa con una jugada nunca vista: no existe. Todas las jugadas legales del ajedrez están en la
+tabla, así que el token `<unk>` (desconocido) solo aparece si el texto está corrupto. Lo que sí pasa
+es que algunas entradas son rarísimas en los datos (`a1h8` como movimiento de alfil desde la esquina)
+y el modelo aprenderá poco de ellas: su vector existe, pero casi no se entrena.
+
+**Carácter sobre SAN.** El texto es la partida en notación algebraica numerada, sin comentarios:
+`1.e4 e5 2.Nf3 Nc6 3.Bb5 a6`, más el resultado. El alfabeto es fijo y pequeño: espacio, `#`, `+`,
+`-`, `.`, dígitos, las letras de las piezas (`B K N O Q R`), las columnas (`a`-`h`), `x`, `=` y `/`.
+Treinta y dos símbolos más `<pad>`, `<bos>` y `<eos>`: **35 tokens**. Es el vocabulario más
+pequeño posible y el que menos sabe de ajedrez. Su virtud es que no hay nada fuera de vocabulario y
+que reproduce exactamente el formato en que la gente escribe partidas; su precio es la longitud.
+
+**BPE (byte-pair encoding).** Es la familia que usan casi todos los LLM de texto, y conviene
+saber construirla a mano una vez. Se parte de los caracteres como tokens iniciales. Se cuenta, en un
+corpus de entrenamiento, qué par de tokens adyacentes aparece más veces; ese par se fusiona en un
+token nuevo y se añade al vocabulario; se vuelve a contar; se repite hasta llegar al tamaño de
+vocabulario que se ha pedido (4 096 en nuestro caso). Cada fusión queda registrada con su orden, y
+tokenizar un texto nuevo es aplicar las fusiones en ese mismo orden.
+
+Sobre texto UCI las primeras fusiones son aburridas y muy reveladoras: `e` + `2` → `e2`, `e` + `4`
+→ `e4`, `e2` + `e4` → `e2e4`. BPE **redescubre las casillas y después las jugadas**, porque son
+los pares más frecuentes. Lo interesante viene después, cuando las jugadas más frecuentes empiezan
+a fusionarse entre sí y aparecen trozos de apertura: la secuencia inicial de una española o de una
+siciliana como un solo token. En el lab 5 vas a mirar las fusiones más largas del BPE entrenado sobre
+200 000 partidas y ver hasta dónde llega.
+
+Qué pasa con una jugada nunca vista en BPE: se descompone en trozos más cortos que sí están en el
+vocabulario, hasta los caracteres si hace falta. Nunca hay `<unk>`, pero una jugada rara cuesta
+tres o cuatro tokens y una común, uno. Esa es la propiedad que hace BPE tan bueno para texto libre
+(cualquier palabra nueva se puede escribir) y que aquí es un arma de doble filo: la longitud de una
+partida depende de lo previsible que sea, y el modelo tiene que aprender que `e2e4` y `e2` + `e4`
+son la misma jugada según el contexto.
+
+<div class="table-wrap">
+
+| Esquema      | Cómo se construye                       | Tamaño | Jugada rara            | Riesgo principal                                  |
+| ------------ | --------------------------------------- | ------ | ---------------------- | ------------------------------------------------- |
+| UCI fijo     | Enumeración determinista, sin datos     | 2 030  | Existe, poco entrenada | Puede emitir jugadas ilegales bien formadas       |
+| SAN carácter | Alfabeto fijo de 32 símbolos            | 35     | Se escribe igual       | Secuencias 4-5 veces más largas                   |
+| BPE          | Fusiones aprendidas de 200 000 partidas | 4 096  | Se parte en trozos     | Longitud variable; una jugada tiene varias formas |
+
+</div>
+
+### Tokens especiales como interfaz de control
+
+Además de las jugadas, el vocabulario tiene unos pocos tokens que no son jugadas. No son un detalle
+de implementación: son la **interfaz de control** del modelo, la única forma que tienes de decirle
+algo que no sea "esta es la siguiente jugada".
+
+- `<pad>` (id 0) rellena las secuencias cortas hasta la longitud del bloque. La pérdida lo ignora;
+  el modelo no aprende a predecirlo ni a partir de él.
+- `<bos>` (id 1), _beginning of sequence_, marca el principio de una partida. Es lo que el modelo ve
+  cuando todavía no hay jugadas y lo que le permite aprender "así empiezan las partidas".
+- `<eos>` (id 2), _end of sequence_, marca el final. Cuando el modelo lo emite, la generación para.
+- `<mask>` (id 3) no se usa en este módulo: es el hueco que rellenará el encoder de M3 (masked move
+  modeling), y está en el vocabulario desde ahora para que el encoder y el decoder compartan la
+  misma tabla.
+- `<unk>` (id 4), desconocido, no debería aparecer nunca con datos limpios; que exista es una red
+  de seguridad para que un fichero corrupto no rompa el entrenamiento.
+- `<1-0>`, `<0-1>`, `<1/2>` (ids 5-7) codifican el resultado.
+- `<w0600>` … `<w3200>` y `<b0600>` … `<b3200>` (ids 8-61): el Elo de blancas y de negras en
+  tramos de 100, con el número recortado al rango 600-3299.
+
+Y la secuencia codificada de una partida es siempre:
+
+```text
+<bos> <w1800> <b1900> e2e4 e7e5 g1f3 b8c6 … <1-0> <eos>
+```
+
+Fíjate en dónde van el Elo y el resultado. **El Elo va al principio**, antes de la primera
+jugada, y esto es una decisión con consecuencias hasta M4. El modelo es causal: cada posición solo
+ve lo anterior. Si el Elo va al principio, cada jugada que predice está condicionada a "una partida
+entre un 1800 y un 1900"; el modelo aprende que después de `<w1500>` vienen unas jugadas y
+después de `<w2400>` otras. En M4, cuando quieras que juegue "como un 1500", no habrá que entrenar
+nada nuevo: bastará con poner `<w1500>` al principio y muestrear. Ese selector de la demo se decide
+aquí, con dos tokens de control. Es la versión más pequeña posible de lo que en los LLM de texto se
+llama _instruction tuning_: condicionar el comportamiento con tokens que van delante.
+
+El resultado, en cambio, va al final. Si fuera al principio, el modelo sabría quién gana antes de
+ver la partida y aprendería a jugar "como el que ganó", lo cual suena bien hasta que piensas que
+para generar tendrías que decidir el resultado antes de jugar. Al final, el modelo aprende a
+predecir el resultado desde las jugadas, que es una señal útil (una cabeza de valor gratis) y no
+contamina la generación.
+
+<Callout kind="entrevista" title="¿Por qué no pones el Elo como una característica numérica?">
+  Porque el modelo solo tiene una entrada: tokens. Todo lo que quieras decirle tiene que ser un
+  token, y los tokens son discretos. Un tramo de 100 puntos es una resolución más que suficiente
+  (la diferencia entre 1850 y 1899 no cambia cómo se juega) y convierte el problema en el mismo que
+  ya resuelve el modelo: aprender qué viene después de un símbolo. Es la misma razón por la que los
+  LLM de chat usan tokens como `<|system|>` o `<|user|>` en vez de un campo aparte.
+</Callout>
+
+### Padding, máscaras y streaming
+
+Una GPU quiere tensores rectangulares: un lote de 64 secuencias de exactamente 200 tokens. Las
+partidas no son rectangulares: unas duran 25 jugadas y otras 90. Hay dos formas de cuadrar el
+círculo, y elegimos la segunda.
+
+**Una partida por fila, con padding.** Cada partida se rellena con `<pad>` hasta 200 (o se corta
+si es más larga). Es lo más fácil de entender y lo más caro: en una partida de 60 tokens, 140 son
+relleno, y la GPU calcula atención sobre relleno. Además hay que decirle a la pérdida que no cuente
+los `<pad>`: eso es `ignore_index`. En PyTorch, `CrossEntropyLoss(ignore_index=0)` hace que
+cualquier posición cuyo objetivo sea el id 0 no contribuya a la pérdida ni al gradiente. Si se te
+olvida, el modelo aprende que después de cualquier cosa viene `<pad>` y lo predice con confianza.
+
+**Empaquetado en flujo.** Concatenamos todas las partidas codificadas, una detrás de otra, en un
+único vector de enteros: `<bos> … <eos> <bos> … <eos> <bos> …`. Guardamos aparte la lista de
+posiciones donde empieza cada partida. Un ejemplo de entrenamiento es una ventana de 200 tokens
+que empieza en un `<bos>`: incluye una partida entera y, si sobra sitio, el principio de la
+siguiente. Solo la última ventana del fichero necesita padding. Casi no hay relleno, la GPU calcula
+sobre jugadas reales y el fichero es un solo array `uint16` que se lee con memmap.
+
+La alternativa que descartamos es el empaquetado "a bloques puros", el de nanoGPT: trocear el flujo
+en ventanas de 200 tokens en posiciones arbitrarias, sin alinear con `<bos>`. Es todavía más simple
+y funciona para texto, pero aquí una ventana que empieza en la jugada 23 de una partida no lleva el
+Elo (que iba al principio) y el modelo estaría prediciendo jugadas sin saber quién juega. Alinear
+las ventanas a `<bos>` cuesta un índice de partidas de unos pocos MB y garantiza que **cada ejemplo
+empieza con los tokens de control**. Es la decisión D-019 del registro de ejecución.
+
+Queda una cosa: la ventana incluye a veces el final de una partida y el principio de la siguiente.
+¿No debería el modelo dejar de mirar hacia atrás cuando cruza un `<eos>`? En rigor sí, y hay
+modelos que lo hacen con una máscara de atención por documento. Nosotros no, a propósito: el modelo
+aprende que después de `<eos>` viene `<bos>` y después de `<bos>` viene un tramo de Elo, y lo que
+ve de la partida anterior es ruido que aprende a ignorar. Cuesta una fracción de capacidad y evita
+una máscara dinámica por lote. Si en M2 resulta que importa, la <Term id="mascara">máscara</Term>
+causal se convierte en una máscara por documento cambiando una función.
+
+<Callout kind="mundo-real" title="Tres máscaras con el mismo nombre">
+  En este curso vas a oír "máscara" para tres cosas distintas y conviene separarlas ya. La máscara
+  **causal** (M2) impide que una posición mire hacia delante. La máscara de **padding** dice qué
+  posiciones son relleno, y aquí se resuelve con `ignore_index`. La máscara de **legalidad** (la
+  demo) pone a cero las jugadas ilegales antes de muestrear. Las tres son tensores de ceros y unos;
+  las tres actúan en sitios distintos.
+</Callout>
+
+El dataloader completa el cuadro. Un `Dataset` de PyTorch responde a dos preguntas: cuántos
+ejemplos hay y cuál es el ejemplo `i`. Un `DataLoader` los junta en lotes, los baraja y, con varios
+_workers_, los prepara en paralelo mientras la GPU calcula el lote anterior. Con memmap, cada
+worker abre el mismo fichero y el sistema operativo comparte las páginas; nadie copia un GB en
+memoria.
+
+### Fugas entre splits
+
+Una <Term id="fuga-de-datos">fuga</Term> es cualquier camino por el que información del conjunto de
+validación llega al de entrenamiento. Es el error más caro del aprendizaje automático porque no
+falla: al contrario, los números mejoran. Descubres que era mentira cuando el modelo sale al mundo.
+
+Con partidas de ajedrez, la fuga obvia son las partidas duplicadas, y la menos obvia son los
+**jugadores repetidos**. Imagina que partes al azar: el 90 % de las partidas a entrenamiento, el
+10 % a validación. Un jugador activo de Lichess juega 400 partidas al mes con el mismo repertorio,
+las mismas trampas de apertura y los mismos errores en los finales. 360 de sus partidas están en
+entrenamiento; las otras 40, en validación. Cuando el modelo "acierta" la siguiente jugada de ese
+jugador en validación, ¿ha aprendido ajedrez o ha aprendido a ese jugador? No lo sabes, y la
+exactitud top-1 que publicas está inflada por una cantidad que no puedes medir.
+
+La solución es partir por algo que **separe el mundo, no las filas**: por tiempo. Entrenamos con
+enero de 2025 y validamos con febrero. Los jugadores se repiten entre meses, claro, pero febrero
+está en el futuro de enero, que es exactamente la situación en la que va a estar el modelo cuando
+juegue: partidas que todavía no existían. Si el modelo memoriza a un jugador de enero, en febrero
+esa memoria vale menos, y la métrica lo refleja.
+
+Con los puzles pasa algo parecido, con otra clave. Un puzle tiene un `PuzzleId` único, pero varios
+puzles vienen de la misma partida (`GameId`) y muchos comparten la posición inicial con pequeñas
+variaciones. Partimos por `PuzzleId` con una semilla fija (42), de modo que el split es
+reproducible y el conjunto de test (2 000 por tramo de dificultad) no cambia aunque se vuelva a
+ejecutar el pipeline. Ese conjunto de test es el que usa la tabla única desde M2 hasta M6, y lo
+peor que le puede pasar a una tabla de resultados es que el conjunto sobre el que se mide cambie
+por el camino.
+
+<Callout kind="roto" title="La fuga que no ves: normalizar con estadísticas del total">
+  Hay fugas más finas. Si entrenas un BPE sobre todos los datos, incluido el mes de validación, el
+  tokenizador "ha visto" febrero: las fusiones reflejan aperturas que aparecen allí. Es una fuga
+  pequeña, pero es una fuga. Por eso el BPE se entrena sobre 200 000 partidas de enero, nunca de
+  febrero, y el manifiesto registra de qué mes salieron.
+</Callout>
+
+## Los datos: del parquet al tensor
+
+El pipeline es una cadena de comandos, cada uno un módulo de `src/rukh/data/` con su configuración
+pydantic (`extra="forbid"`, como en M0: una clave mal escrita falla, no se ignora), su salida en
+`data/` (fuera de git) y una entrada en el manifiesto:
+
+```text
+rukh data fetch → uci → tokenize → positions → evals → puzzles → pairs → elite → elo-bins → publish
+```
+
+Merece la pena saber qué escribe cada paso y por qué existe, porque son los datasets que van a
+aparecer en la tabla única con nombre propio.
+
+**`fetch`** (ya ejecutado en M0) filtra en remoto con <Term id="duckdb">DuckDB</Term> sobre
+`hf://datasets/Lichess/standard-chess-games/…` y materializa solo lo que pasa: ambos Elo ≥ 1800,
+base de tiempo ≥ 180 s, terminación `Normal` o `Time forfeit`, sin variantes. Dos detalles de la
+consulta ya los viste: `TRY_CAST` para que las partidas por correspondencia (`TimeControl = '-'`) se
+descarten en vez de abortar el `COPY` entero, y `hive_partitioning = false` para que DuckDB no
+invente columnas `year` y `month` a partir de la ruta. Lo que no viste en M0 es el número que salió
+del sondeo: de un fichero de 1 394 617 partidas del 1 de enero de 2025, los filtros dejan 251 618,
+**el 18 %**. Un mes de Lichess son unos cien millones de partidas, así que quedarían unos 18
+millones por mes, muy por encima de los 3-6 millones por dos meses que pedía el diseño. La decisión
+(D-017) es un tope de **3 millones por mes**: los ficheros del mes están en orden cronológico, así que
+el tope se lleva los primeros doce ficheros, unos cinco días de enero y otros cinco de febrero. Seis
+millones de partidas en total, registrado en el manifiesto como recorte temporal. Es más que lo que
+usaron los modelos públicos de 25-50M parámetros que tomamos de referencia.
+
+**`uci`** convierte el `movetext` SAN de cada partida a UCI con `python-chess`, jugada a jugada
+sobre un tablero real, verificando la legalidad. Antes limpia los comentarios `{[%clk 0:03:00]}` y
+`{[%eval 0.3]}`, los números de jugada y el resultado final. Una partida con una jugada ilegal o un
+SAN que no se puede resolver se descarta entera (no se "arregla"), y aquí se aplica por fin el
+filtro de ≥ 20 <Term id="ply">plies</Term> que M0 dejó pendiente porque necesitaba parsear las
+jugadas. Escribe `data/uci/year=YYYY/month=MM/games.parquet` con `game_id` (hash de la URL de
+Lichess), `uci`, `n_plies`, `white_elo`, `black_elo`, `result`, `time_control`, `utc_date`, `eco` y
+`month`. Está paralelizado por lotes de 20 000 partidas porque una conversión son unos 0,3 ms y seis
+millones son media hora en un solo proceso.
+
+**`tokenize`** codifica las partidas con uno de los tres esquemas y las empaqueta en un flujo
+`uint16` (`tokens.npy`) con un índice de inicios (`starts.npy`) y un `meta.json` con conteos y el
+hash del vocabulario. Con `--stats` calcula tokens por partida (media, p50, p95), el porcentaje de
+partidas que caben en 200 tokens y el tamaño de vocabulario, y lo escribe en
+`artifacts/web/tokenizer-stats.json`, que es lo que ves en la tabla de esta lección. Con
+`--export-fixture` escribe `vocab.json` y las 20 partidas de paridad.
+
+**`positions`** recorre hasta 300 000 partidas de enero con `python-chess`, escribe cada posición
+como un FEN de cuatro campos (piezas, turno, enroques, al paso; sin los contadores de jugadas, que
+harían que dos posiciones idénticas parecieran distintas), la etiqueta con su fase (apertura ≤ 10
+plies, medio juego con ≥ 14 piezas, final) y deduplica por FEN contando cuántas veces se ha visto.
+
+**`evals`** es el paso caro y el más interesante. Lichess publica 395 millones de posiciones
+evaluadas por Stockfish en 20 ficheros parquet (42 GB). No los descargamos: para cada fichero
+remoto, DuckDB hace un _semi join_ con nuestras posiciones (`SELECT e.* FROM read_parquet(remoto) e
+SEMI JOIN positions p ON e.fen = p.fen4`) y solo trae las filas cuyo FEN tenemos. Es resumible: cada
+parte escribe su parquet y las partes ya escritas se saltan, porque 42 GB por la red es algo que se
+deja corriendo entre sesiones. Lo que hace especial a este dataset es que tiene **varias filas por
+posición**: una por línea principal (multi-PV), ordenadas de mejor a peor para el bando que mueve.
+Al consolidar nos quedamos con la mejor línea (el valor de la posición) y guardamos todas las demás
+en una columna `pvs`.
+
+**`puzzles`** descarga los seis millones de puzles con DuckDB, filtra los mal calibrados
+(`RatingDeviation ≤ 100`, `NbPlays ≥ 100`), los agrupa en tres tramos (1000-1500, 1500-2000, 2000+)
+y hace el split por `PuzzleId` con semilla: 2 000 de test por tramo, hasta 50 000 de entrenamiento.
+
+**`pairs`** es donde las líneas múltiples de `evals` dan un dataset entero gratis. Para cada
+posición con al menos dos líneas, la primera jugada de la mejor línea es la jugada _elegida_ y la
+primera jugada de una línea peor en al menos 100 centipeones es la _rechazada_. Eso es exactamente
+un par de preferencia para DPO (M5), **sin ejecutar Stockfish ni una vez**: la evaluación ya está
+hecha y publicada. Se equilibra por fase para que el dataset no sea solo aperturas, y las dos
+jugadas se verifican legales con `python-chess`. Es la decisión D-018.
+
+**`elite`** descarga la base de partidas 2500+ (dos zips mensuales de unos 80 MB) y las convierte
+con el mismo `uci.py`, mismas columnas, para el SFT "como los maestros" de M4.
+
+**`elo-bins`** toma los dos meses, calcula el tramo de cada partida como la media de los dos Elo
+redondeada a la centena, y muestrea hasta 50 000 partidas por tramo con semilla. Es el dataset
+equilibrado con el que se afina el condicionamiento por Elo en M4: sin él, el modelo vería diez
+veces más partidas de 1800 que de 2400 y el token `<w2400>` apenas se entrenaría.
+
+**`publish`** renderiza una card por dataset (Jinja, en inglés, con la licencia CC0 y la atribución
+a Lichess), crea el repo bajo `chorcat/` y sube parquet, manifiesto y card. `--dry-run` escribe la
+card en local sin tocar la red. La publicación real necesita `HF_TOKEN` y es el punto donde
+intervienes tú.
+
+<Figure
+  n="01"
+  caption="El pipeline de M1. Cada caja escribe en data/ y añade una entrada al manifiesto; las de la fila inferior alimentan módulos posteriores."
+>
+  <svg
+    viewBox="0 0 640 240"
+    role="img"
+    aria-label="Pipeline de datos: fetch, uci, tokenize; positions, evals, pairs; puzzles, elite, elo-bins; publish"
+  >
+    <g
+      font-family="var(--font-mono)"
+      font-size="11"
+      fill="var(--ink)"
+      text-anchor="middle"
+      dominant-baseline="middle"
+    >
+      <rect
+        x="10"
+        y="20"
+        width="90"
+        height="44"
+        fill="var(--box-fill)"
+        stroke="var(--ink)"
+        stroke-width="1.25"
+      />
+      <text x="55" y="42">
+        fetch
+      </text>
+      <rect
+        x="130"
+        y="20"
+        width="90"
+        height="44"
+        fill="var(--box-fill)"
+        stroke="var(--ink)"
+        stroke-width="1.25"
+      />
+      <text x="175" y="42">
+        uci
+      </text>
+      <rect
+        x="250"
+        y="20"
+        width="90"
+        height="44"
+        fill="var(--ink)"
+        stroke="var(--ink)"
+        stroke-width="1.25"
+      />
+      <text x="295" y="42" fill="var(--paper)">
+        tokenize
+      </text>
+      <rect
+        x="370"
+        y="20"
+        width="90"
+        height="44"
+        fill="var(--box-fill)"
+        stroke="var(--ink)"
+        stroke-width="1.25"
+      />
+      <text x="415" y="42">
+        positions
+      </text>
+      <rect
+        x="490"
+        y="20"
+        width="90"
+        height="44"
+        fill="var(--box-fill)"
+        stroke="var(--accent-text)"
+        stroke-width="1.25"
+      />
+      <text x="535" y="42">
+        evals
+      </text>
+      <rect
+        x="130"
+        y="110"
+        width="90"
+        height="44"
+        fill="var(--box-fill)"
+        stroke="var(--ink)"
+        stroke-width="1.25"
+      />
+      <text x="175" y="132">
+        elite
+      </text>
+      <rect
+        x="250"
+        y="110"
+        width="90"
+        height="44"
+        fill="var(--box-fill)"
+        stroke="var(--ink)"
+        stroke-width="1.25"
+      />
+      <text x="295" y="132">
+        elo-bins
+      </text>
+      <rect
+        x="370"
+        y="110"
+        width="90"
+        height="44"
+        fill="var(--box-fill)"
+        stroke="var(--ink)"
+        stroke-width="1.25"
+      />
+      <text x="415" y="132">
+        puzzles
+      </text>
+      <rect
+        x="490"
+        y="110"
+        width="90"
+        height="44"
+        fill="var(--box-fill)"
+        stroke="var(--accent-text)"
+        stroke-width="1.25"
+      />
+      <text x="535" y="132">
+        pairs
+      </text>
+      <rect
+        x="250"
+        y="190"
+        width="140"
+        height="36"
+        fill="var(--box-fill)"
+        stroke="var(--ink)"
+        stroke-width="1.25"
+      />
+      <text x="320" y="208">
+        publish → chorcat/
+      </text>
+    </g>
+    <g fill="none" stroke="var(--diagram-stroke)" stroke-width="1.25">
+      <path d="M100 42h30" />
+      <path d="M220 42h30" />
+      <path d="M340 42h30" />
+      <path d="M460 42h30" />
+      <path d="M535 64v46" />
+      <path d="M175 64v46" stroke-dasharray="3 3" />
+      <path d="M295 64v46" stroke-dasharray="3 3" />
+      <path d="M415 64v46" stroke-dasharray="3 3" />
+      <path d="M320 154v36" />
+    </g>
+    <g
+      font-family="var(--font-mono)"
+      font-size="9"
+      fill="var(--diagram-stroke)"
+      text-anchor="middle"
+    >
+      <text x="120" y="98">
+        mismo uci.py
+      </text>
+      <text x="580" y="98">
+        multi-PV
+      </text>
+    </g>
+  </svg>
+</Figure>
+
+<Callout kind="hoy" title="Así se hace hoy: el join viaja a los datos">
+  Hace unos años, cruzar tus posiciones con 42 GB de evaluaciones significaba descargar los 42 GB.
+  Con parquet remoto y un motor que empuja predicados y proyecciones al fichero, el semi join lee
+  solo la columna `fen` de cada bloque, decide qué bloques tienen alguna coincidencia y trae solo
+  esas filas. El mismo patrón (predicado al origen, materializar poco, resumible por partes) es el
+  que usarías con un lago de datos en S3 y es una de las habilidades más rentables de un ingeniero
+  de ML.
+</Callout>
+
+## Labs
+
+Los cinco labs siguen el orden del pipeline. Los comandos son los reales; las salidas son las de la
+máquina de referencia (RTX 5090), pegadas tal cual.
+
+### Lab 1 · Explorar el parquet con DuckDB
+
+Antes de tokenizar nada, mira los datos. DuckDB lee parquet en local igual que en remoto, y en
+Python es una línea. Guarda este script como `labs/m1/explore.py` y ejecútalo desde la raíz de
+`rukh`; cada consulta va sobre el parquet de enero convertido a UCI.
+
+```python title="labs/m1/explore.py"
+import duckdb
+
+GAMES = "data/uci/year=2025/month=01/games.parquet"
+con = duckdb.connect()
+
+print("== Distribución de Elo (blancas), tramos de 100 ==")
+print(
+    con.sql(f"""
+    SELECT (white_elo // 100) * 100 AS tramo,
+           count(*)                  AS partidas,
+           round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+    FROM read_parquet('{GAMES}')
+    GROUP BY tramo
+    ORDER BY tramo
+    """)
+)
+
+print("== Duración en plies ==")
+print(
+    con.sql(f"""
+    SELECT count(*)                            AS partidas,
+           round(avg(n_plies), 1)              AS media,
+           quantile_cont(n_plies, 0.5)         AS p50,
+           quantile_cont(n_plies, 0.95)        AS p95,
+           max(n_plies)                        AS max,
+           round(100.0 * avg(n_plies <= 195), 1) AS pct_cabe_en_200
+    FROM read_parquet('{GAMES}')
+    """)
+)
+
+print("== Aperturas más frecuentes (código ECO) ==")
+print(
+    con.sql(f"""
+    SELECT eco, count(*) AS partidas,
+           round(100.0 * avg(result = '1-0'), 1) AS pct_blancas
+    FROM read_parquet('{GAMES}')
+    GROUP BY eco
+    ORDER BY partidas DESC
+    LIMIT 10
+    """)
+)
+```
+
+```bash title="Terminal"
+uv run python labs/m1/explore.py
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run python labs/m1/explore.py */}
+
+Tres cosas que mirar en esa salida. La distribución de Elo empieza en 1800 por construcción (es el
+filtro) y cae rápido: hay muchos más 1800 que 2200, y eso es lo que justifica `elo-bins` en M4. La
+duración tiene una cola larga: la mediana anda por las 70 medias jugadas, pero el máximo pasa de
+300, y el porcentaje que cabe en 195 plies (200 tokens menos los cinco de control) es la primera
+estimación de cobertura del vocabulario UCI. Y las aperturas más jugadas a este nivel son las de
+siempre (siciliana, española, italiana, gambito de dama), pero sus porcentajes de victoria de
+blancas no son iguales: el modelo va a ver esa asimetría y la va a aprender.
+
+<Exercise n="01" title="¿Cuántas partidas duran más de 200 tokens?">
+  Modifica la segunda consulta para contar cuántas partidas tienen más de 195 plies (las que el
+  tokenizador UCI va a truncar), agrupadas por tramo de 100 plies a partir de 200. Después responde:
+  ¿cuál es la partida más larga de enero y cuánto dura? ¿Qué pasa con ella al tokenizar con
+  `max_len = 200`?
+
+  <Solution>
+    `SELECT (n_plies // 100) * 100 AS tramo, count(*) FROM read_parquet(...) WHERE n_plies > 195
+    GROUP BY tramo ORDER BY tramo`. La más larga se saca con `ORDER BY n_plies DESC LIMIT 1`. Al
+    tokenizar, `encode_game` se queda con los primeros 199 tokens (control más 196 jugadas) y
+    añade `<eos>` en la posición 200: el modelo aprende que esa partida "termina" ahí, con un
+    resultado que no ve. Son menos del 5 % de las partidas y la mayoría de esos finales largos son
+    posiciones de tablas teóricas; aceptamos el sesgo y lo dejamos anotado en el manifiesto.
+  </Solution>
+</Exercise>
+
+### Lab 2 · De SAN a UCI con python-chess
+
+El texto de Lichess trae comentarios, números de jugada y el resultado dentro del `movetext`:
+
+```text
+1. e4 { [%clk 0:03:00] } 1... c5 { [%clk 0:03:00] } 2. Nf3 { [%clk 0:02:58] } 2... d6 … 1-0
+```
+
+`clean_movetext` quita las llaves con su contenido, las anotaciones `$1`, los números (`1.` y
+`1...`) y el resultado. `san_to_uci` empieza con un tablero en la posición inicial, va leyendo cada
+SAN, pregunta al tablero qué jugada es (`board.parse_san`), la aplica y anota su UCI. Si el SAN no
+corresponde a ninguna jugada legal, la función devuelve `None` y la partida se descarta.
+
+Hay dos casos que conviene tener en la cabeza porque son los que rompen las implementaciones
+ingenuas. El enroque, `O-O`, se escribe en UCI como el movimiento del rey, `e1g1`; y la promoción,
+`e8=Q+`, es `e7e8q`, con la pieza en minúscula al final y sin el `+`. Por eso la conversión pasa por
+un tablero real y no por expresiones regulares: solo el tablero sabe desde qué casilla vino el
+caballo de `Nf3`.
+
+```bash title="Terminal"
+uv run rukh data uci
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run rukh data uci */}
+
+Los conteos que imprime son los que van al manifiesto: filas leídas, partidas conservadas,
+descartadas por jugada ilegal y descartadas por cortas (menos de 20 plies). El número de ilegales
+debería ser minúsculo (Lichess valida las partidas al guardarlas); si no lo es, algo está mal en la
+limpieza, no en los datos.
+
+<Exercise n="02" title="Rompe la conversión a propósito">
+  Toma una partida del parquet de enero (`SELECT uci FROM read_parquet(...) LIMIT 1`), reconstruye
+  su SAN con `python-chess` (`board.san(move)` jugada a jugada) y vuelve a convertirla con
+  `san_to_uci`: tiene que dar exactamente la cadena original. Después cambia una jugada del SAN por
+  otra ilegal (un caballo que salta tres casillas) y comprueba qué devuelve la función.
+
+  <Solution>
+    La ida y vuelta es exacta porque tanto `san` como `parse_san` usan el mismo tablero y las mismas
+    reglas de desambiguación. Con la jugada ilegal, `parse_san` lanza `IllegalMoveError` (o
+    `InvalidMoveError` si la cadena ni siquiera parece una jugada) y `san_to_uci` lo captura y
+    devuelve `None`. Que sea `None` y no una excepción es deliberado: dentro de un `Pool` de
+    procesos, una excepción por partida corrupta interrumpiría el lote entero.
+  </Solution>
+</Exercise>
+
+### Lab 3 · Las tres tokenizaciones y sus estadísticas
+
+Ahora sí, la comparación. El mismo comando con tres esquemas y tres banderas: `--pack` escribe el
+flujo de tokens empaquetado de cada esquema en `data/tokens/<esquema>/` (lo que usa el lab 4),
+`--stats` calcula las estadísticas de los tres esquemas a la vez y `--export-fixture` escribe el
+vocabulario y la fixture de paridad que después se copian a las dos webs. El orden importa:
+`--scheme bpe` entrena el BPE (`artifacts/tokenizer/bpe.json`) y la fixture solo incluye los ids
+BPE si ese fichero ya existe, así que el BPE va primero y el `uci` con la fixture, al final.
+
+```bash title="Terminal"
+uv run rukh data tokenize --scheme bpe --pack
+uv run rukh data tokenize --scheme san --pack
+uv run rukh data tokenize --scheme uci --stats --export-fixture --pack
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run rukh data tokenize --scheme bpe --pack */}
+
+{/* OUTPUT: uv run rukh data tokenize --scheme san --pack */}
+
+{/* OUTPUT: uv run rukh data tokenize --scheme uci --stats --export-fixture --pack */}
+
+La tabla siguiente se genera desde `artifacts/web/tokenizer-stats.json` (`pnpm sync:data` la copia
+al sitio), así que es la misma que verás en la página del proyecto:
+
+<TokenizerStats />
+
+Cómo leerla. Las estadísticas se calculan sobre las primeras 20 000 partidas de enero, y los tres
+esquemas cuentan los mismos cinco tokens de encuadre (`<bos>`, dos de Elo, resultado, `<eos>`)
+para que la comparación sea justa. **Tokens por partida** es la columna que decide el coste: la media dice cuánto cuesta
+una época y el p95 dice qué ventana de contexto necesitas para no truncar casi nada. **% ≤ 200** es
+la cobertura del bloque de 200 tokens que usa el dataloader: con UCI fijo debería estar por encima
+del 95 %; con carácter, cerca de cero (una partida de 35 jugadas ya son más de 200 caracteres). Y
+**vocabulario** es lo que decide el tamaño de la capa de embeddings y de la capa de salida: 2 030
+frente a 35 frente a 4 096 vectores de la dimensión del modelo. Con BPE, fíjate en que la media de
+tokens por partida es menor que con UCI (las fusiones de aperturas ahorran tokens) pero la varianza
+es mayor.
+
+<Callout kind="teoria" title="Lo que la tabla no puede decir">
+  Ninguna estadística del tokenizador dice cuál tokenización juega mejor. Solo dice cuánto cuesta
+  cada una y qué tiene que aprender el modelo por su cuenta. La respuesta a "cuál es mejor" la da la
+  tabla única en M2, entrenando el mismo decoder sobre las tres con el mismo presupuesto. Lo que sí
+  sabes ya es que, si dos tokenizaciones jugaran igual, la de secuencias más cortas es la que
+  querrías: entrena más rápido y cabe en el navegador con menos memoria.
+</Callout>
+
+<Exercise n="03" title="Codifica una partida a mano">
+  Sin ejecutar nada, escribe la secuencia de ids del tokenizador UCI para la partida `e2e4 e7e5
+  g1f3` entre un 1850 y un 1920 que termina en tablas. Después comprueba con
+  `UciTokenizer().encode_game("e2e4 e7e5 g1f3", 1850, 1920, "1/2-1/2")`.
+
+  <Solution>
+    `[1, 20, 48, ?, ?, ?, 7, 2]`. El `<bos>` es 1; `<w1800>` es el tramo 12 desde 600 (1800 = 600 +
+    12 × 100), y los tramos blancos empiezan en el id 8, así que 8 + 12 = 20; `<b1900>` es el tramo
+    13 desde el id 35, así que 48; `<1/2>` es 7 y `<eos>` es 2. Los ids de las jugadas dependen de
+    la enumeración (`e2e4` es el índice de ese par dentro de las 1 792 jugadas más 62) y no hace
+    falta calcularlos a mano: lo que tiene que quedar claro es que la posición de los tokens de
+    control es fija y sus ids también, y que eso es lo que permite que la implementación en
+    TypeScript sea idéntica sin compartir código.
+  </Solution>
+</Exercise>
+
+### Lab 4 · Dataset y DataLoader con empaquetado por bloques
+
+`tokenize --pack` ha dejado en `data/tokens/uci/train/` (enero) y `data/tokens/uci/val/`
+(febrero) tres ficheros por carpeta: `tokens.npy` (el flujo `uint16`), `starts.npy` (el offset de
+cada `<bos>`, `int64`) y `meta.json` (partidas, tokens, esquema y hash del vocabulario). `PackedDataset` es la clase que
+los convierte en ejemplos de entrenamiento, y merece la pena leerla entera porque es el contrato
+entre los datos y el modelo.
+
+```python title="src/rukh/tokenize/loader.py (esquema)"
+class PackedDataset(Dataset):
+    def __init__(self, directory: Path, block: int = 200, start_at_game: bool = True):
+        self.tokens = np.load(directory / "tokens.npy", mmap_mode="r")  # nunca en RAM entero
+        self.starts = np.load(directory / "starts.npy")                 # un int64 por partida
+        self.block = block
+        self.pad_id = 0
+
+    def __len__(self) -> int:
+        return len(self.starts)                          # un ejemplo por partida
+
+    def window(self, index: int) -> np.ndarray:
+        origin = int(self.starts[index])                 # la ventana empieza en un <bos>
+        chunk = np.asarray(self.tokens[origin : origin + self.block + 1], dtype=np.int64)
+        if len(chunk) < self.block + 1:                  # solo al final del flujo
+            chunk = np.concatenate([chunk, np.full(self.block + 1 - len(chunk), self.pad_id)])
+        return chunk
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        chunk = self.window(index)
+        x = torch.from_numpy(chunk[: self.block].copy())
+        y = torch.from_numpy(chunk[1 : self.block + 1].copy())
+        y[-1] = self.pad_id                              # la última posición no se entrena
+        return x, y
+```
+
+Léelo con calma, porque cada línea es una decisión de las que hablamos arriba:
+
+- `mmap_mode="r"` es el memmap: `tokens.npy` puede medir un GB y `np.load` no lo lee; mapea el
+  fichero en el espacio de direcciones y el sistema operativo trae las páginas cuando se tocan. Con
+  cuatro workers, los cuatro comparten las mismas páginas físicas.
+- `__len__` es el número de partidas, no de tokens: un ejemplo por partida y época. Barajar es
+  barajar índices de partida, y lo hace el `DataLoader` con su semilla. Con `start_at_game=False`
+  el mismo dataset corta el flujo en bloques consecutivos sin alinear: es la alternativa
+  descartada, y está ahí para poder medirla en M2.
+- La ventana pide `block + 1` tokens porque el objetivo `y` es la entrada desplazada una posición:
+  `y[t]` es el token que viene después de `x[t]`. Por eso `y[:-1] == x[1:]` en todos los ejemplos,
+  y es una de las aserciones de los tests. La última posición de `y` se pone a `<pad>` a propósito:
+  su objetivo real estaría fuera de la ventana, y es más honesto no entrenarla que inventarlo.
+- El padding solo aparece en la última partida del flujo, cuando no quedan 201 tokens por delante.
+  Se rellena con `<pad>` (id 0), que es exactamente el `ignore_index` de la pérdida
+  (`IGNORE_INDEX = 0` en el módulo): esas posiciones no cuentan.
+- `dtype=np.int64`: se guarda en `uint16` (2 bytes, suficiente para 4 096 ids) para que el fichero
+  sea pequeño, y se convierte a `int64` al salir porque es lo que `nn.Embedding` y la pérdida
+  esperan como índices. El `.copy()` es necesario porque un trozo de memmap es de solo lectura y
+  `torch.from_numpy` quiere memoria escribible.
+
+`make_loader(dataset, batch_size, seed, workers)` envuelve el dataset en un `DataLoader` con
+`shuffle=True`, `drop_last=True` (el último lote incompleto se descarta para que todos los lotes
+tengan la misma forma) y un `torch.Generator` sembrado con `seed`, que es lo único que decide el
+orden. Dos loaders con la misma semilla devuelven los mismos lotes en el mismo orden: es lo que te
+permite reproducir un entrenamiento y lo que comprueba uno de los tests.
+
+```python title="labs/m1/loader_check.py"
+from rukh.tokenize.loader import PackedDataset, make_loader
+
+ds = PackedDataset("data/tokens/uci/train", block=200)
+x, y = ds[0]
+print(len(ds), x.shape, y.shape, x[:6].tolist(), y[:6].tolist())
+loader = make_loader(ds, batch_size=64, seed=0, workers=4)
+xb, yb = next(iter(loader))
+print(xb.shape, yb.shape, xb.dtype, (yb == 0).float().mean().item())
+```
+
+```bash title="Terminal"
+uv run python labs/m1/loader_check.py
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run python labs/m1/loader_check.py */}
+
+La última cifra, la fracción de `<pad>` en los objetivos de un lote, es la medida directa de lo que
+se ahorra con el empaquetado en flujo: debería ser prácticamente cero. Con una partida por fila
+rellenada a 200 estaría alrededor del 50-60 %, es decir, más de la mitad del cálculo de atención
+tirado a la basura.
+
+<Exercise n="04" title="Mide el precio del padding">
+  Escribe una variante `PaddedDataset` que devuelva una partida por ejemplo, rellenada con `<pad>`
+  hasta 200 y truncada si es más larga. Con el mismo lote de 64, calcula la fracción de objetivos
+  que son `<pad>` y compárala con la de `PackedDataset`. ¿Cuántas veces más tokens "útiles" por
+  lote sirve el empaquetado?
+
+  <Solution>
+    Con la mediana de duración del lab 1 (unas 70 medias jugadas, 75 tokens con el control), una
+    partida por fila deja de media unos 125 `<pad>` por ejemplo: alrededor del 60 % del lote es
+    relleno y `ignore_index` lo descarta, pero la atención ya lo ha calculado. `PackedDataset` sirve
+    un lote casi entero de tokens reales, así que por lote de 64 × 200 hay unas 2,5 veces más
+    posiciones que contribuyen a la pérdida. Con el mismo presupuesto de GPU, el modelo ve 2,5
+    veces más jugadas.
+  </Solution>
+</Exercise>
+
+### Lab 5 · Entrenar un BPE y mirar las fusiones
+
+El BPE que usa el esquema `bpe` se entrena con la librería `tokenizers` sobre 200 000 partidas UCI
+de enero. Lo interesante no es entrenarlo (es una llamada) sino mirar qué ha aprendido: la lista de
+fusiones es una radiografía de la frecuencia de las aperturas en el recorte.
+
+```python title="labs/m1/bpe_merges.py"
+import json
+from pathlib import Path
+
+bpe = json.loads(Path("artifacts/tokenizer/bpe.json").read_text(encoding="utf-8"))
+merges = bpe["model"]["merges"]
+vocab = bpe["model"]["vocab"]
+
+print("fusiones:", len(merges), " vocabulario:", len(vocab))
+print("== primeras 10 fusiones (las más frecuentes) ==")
+for pair in merges[:10]:
+    print(" ", pair)
+
+print("== 10 tokens más largos del vocabulario ==")
+longest = sorted(vocab, key=len, reverse=True)[:10]
+for token in longest:
+    print(f"  {len(token):3d}  {token}")
+```
+
+```bash title="Terminal"
+uv run python labs/m1/bpe_merges.py
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+{/* OUTPUT: uv run python labs/m1/bpe_merges.py */}
+
+Las primeras fusiones son casillas y jugadas, como predijimos en la teoría. Los tokens más largos
+son trozos de apertura: si reconoces en ellos los primeros movimientos de la española o de la
+siciliana, es porque son las secuencias que más se repiten en 200 000 partidas de Lichess a 1800+.
+El BPE no sabe ajedrez; ha contado pares. Que contar pares baste para "descubrir" aperturas es la
+intuición que necesitas para entender por qué los LLM de texto tienen tokens para `ing`, `tion` o
+` the`.
+
+<Exercise n="05" title="Un BPE de tamaño distinto">
+  Entrena un BPE de 1 024 tokens con `train_bpe` sobre las mismas 200 000 partidas y compáralo con
+  el de 4 096: ¿cuál es el token más largo de cada uno? ¿Cuántos tokens por partida de media? Sin
+  ejecutar nada, predice primero qué va a pasar con las dos cifras al reducir el vocabulario.
+
+  <Solution>
+    Con 1 024 tokens apenas hay sitio para las 1 968 jugadas posibles, así que muchas jugadas
+    poco frecuentes se quedan partidas en casillas (`e2` + `e4`) y casi no hay fusiones de varias
+    jugadas: el token más largo será una jugada o, como mucho, un par de ellas, y la media de tokens
+    por partida sube claramente por encima de la del UCI fijo. Con 4 096 sobra sitio para todas las
+    jugadas y unos dos mil trozos de apertura, y la media baja por debajo del UCI fijo. La regla
+    general: cuanto mayor el vocabulario, más cortas las secuencias y más grande la capa de
+    embeddings; el punto óptimo depende del modelo, y por eso en M2 se entrena con los tres.
+  </Solution>
+</Exercise>
+
+## Visualización: TokenizerPlayground
+
+Lo de abajo corre en tu navegador, sin red y sin modelo: es el tokenizador UCI en TypeScript (el
+mismo que la demo usará en M2), el tokenizador por carácter y el BPE cargado desde el `bpe.json`
+que entrenaste en el lab 5. `chess.js` convierte el PGN a UCI y a SAN; cada esquema tokeniza lo
+suyo y muestra las fichas con su id. Las fichas de control van en un color, las de Elo en otro y
+las jugadas en el de siempre; en la fila de BPE, las fichas que abarcan más de una jugada van
+resaltadas.
+
+<TokenizerPlayground client:visible />
+
+Tres PGN que conviene probar:
+
+1. **El de ejemplo**, el mate de Légal (siete jugadas). Cuenta las fichas: 13 jugadas más cinco de
+   control en UCI, y compáralo con los caracteres de SAN. Cambia el Elo de blancas a 2450 y mira qué
+   ficha cambia y cuál no.
+2. **El mate del pastor**, `1. e4 e5 2. Bc4 Nc6 3. Qh5 Nf6 4. Qxf7#`. Fíjate en cómo el `#` y la
+   `x` ocupan un carácter cada uno en SAN y ninguno en UCI: la captura y el jaque mate están
+   implícitos en `h5f7`.
+3. **Una partida larga.** El botón "Partida larga" genera una partida legal de más de cien jugadas
+   con `chess.js`; también puedes pegar cualquier PGN exportado desde la demo o desde Lichess. El
+   aviso de "más de 200 tokens" aparece en los esquemas que truncarían, y con SAN por carácter
+   aparece con casi cualquier partida real.
+
+Y un PGN inválido (borra una jugada a la mitad, o escribe `Nf9`) muestra el error en vez de
+tokens: es exactamente lo que hace `san_to_uci` en Python al devolver `None`.
+
+## Lectura de 10 minutos: n-gramas, word2vec y RNN
+
+Antes de los Transformers hubo tres formas de hacer lo que hace este módulo, y las tres dejaron
+algo que seguimos usando. No vas a implementarlas; sí conviene saber qué eran, por qué no las usamos
+y qué se quedó.
+
+**N-gramas.** El modelo de lenguaje más antiguo es una tabla de conteos: cuántas veces, en el
+corpus, después de `e2e4 e7e5` viene `g1f3`. La probabilidad del siguiente token es el conteo del
+n-grama dividido por el conteo del contexto. Funciona sorprendentemente bien para contextos cortos
+(un modelo de 3-gramas sobre nuestro recorte acertaría muchas jugadas de apertura) y se hunde en
+cuanto el contexto crece: casi ninguna secuencia de diez jugadas aparece dos veces en seis millones
+de partidas, y la tabla no puede generalizar de `e2e4 e7e5 g1f3` a `e2e4 e7e5 f1c4`, aunque se
+parezcan. Lo que sobrevive: **la tarea**. Predecir el siguiente símbolo dado el contexto es la
+misma pérdida, con la misma entropía cruzada, que entrena hoy a un modelo de miles de millones de
+parámetros. Cambió la función; la pregunta es la de los años cincuenta.
+
+**word2vec.** El paso siguiente fue dejar de contar símbolos y representarlos con vectores densos:
+cada token es un punto en un espacio de unas cientos de dimensiones, aprendido para que tokens que
+aparecen en contextos parecidos estén cerca. Con jugadas, `g1f3` y `b1c3` acabarían cerca (los
+dos desarrollan un caballo en la apertura) sin que nadie se lo diga. Lo que sobrevive: **la
+representación distribuida**. La capa `nn.Embedding` del decoder de M2 es exactamente eso, una
+tabla de 2 030 vectores que se aprende junto con el resto del modelo, y en A1 usarás embeddings de
+frases para recuperar comentarios de libros. Lo que no usamos: word2vec aprende un vector por token
+independiente del contexto, y una jugada significa cosas distintas según la posición.
+
+**RNN.** Las redes recurrentes leen la secuencia de izquierda a derecha manteniendo un estado que
+resume todo lo anterior. Resolvían el problema de los n-gramas (contexto ilimitado, en teoría) con
+un coste lineal en la longitud. Su límite era doble: el estado es un cuello de botella de tamaño
+fijo, así que lo que pasó hace cincuenta jugadas se difumina, y cada paso depende del anterior, así
+que no se paralelizan: una GPU con veinte mil núcleos calcula una jugada cada vez. El Transformer
+sustituyó el estado por atención (cada posición mira directamente a todas las anteriores, en
+paralelo) y ahí está el O(n²) de la teoría: es el precio de haber quitado la recurrencia. Lo que
+sobrevive: **el entrenamiento por _teacher forcing_**, es decir, alimentar la secuencia real y
+predecir cada siguiente token a la vez, que es exactamente lo que hacen las ventanas `(x, y)` del
+lab 4.
+
+En resumen: de los n-gramas nos quedamos con la tarea, de word2vec con los embeddings y de las RNN
+con la forma de entrenar. Lo que aporta el Transformer, y lo que vas a construir en M2, es la forma
+de mezclar el contexto.
+
+## Qué has aprendido, cómo se mide
+
+Has tomado la primera decisión de modelado del curso con datos delante: un token es una jugada UCI
+de un vocabulario fijo de 2 030 entradas, con el Elo de los dos jugadores como tokens de control al
+principio y el resultado al final. Sabes por qué las otras dos opciones existen y qué cuestan, y
+puedes defender la elección con la tabla de estadísticas y no con una opinión. Tienes seis
+datasets con manifiesto y card, un dataloader que no desperdicia cálculo en relleno y un
+tokenizador que corre igual en Python y en el navegador.
+
+**Cómo se mide el módulo 1.** Todo lo que sigue es un número o un test:
+
+- **Tokens por partida** por esquema (media, p50, p95) en `tokenizer-stats.json`, y el **porcentaje
+  de partidas ≤ 200 tokens**: con UCI fijo, por encima del 95 %.
+- **Tamaño de vocabulario**: 2 030 (UCI), 35 (SAN carácter), 4 096 (BPE), y `len(vocab) == 2030`
+  como test unitario en Python y `buildVocab().length === 2030` en TypeScript.
+- **Paridad Python ↔ TypeScript**: la fixture de 20 partidas (`fixtures/games.json`) se reproduce
+  id a id en las dos webs; `pnpm test` falla si cambia la enumeración en un lado y no en el otro, y
+  un test de hash falla si las copias del tokenizador en `rukh-lab` divergen de las de `rukh-web`.
+- **Conteos y hashes del manifiesto**: cada paso del pipeline registra filas leídas y conservadas,
+  el sha256 de cada parquet y los parámetros con los que se ejecutó. Es la procedencia que va en las
+  dataset cards, y es lo que permite decir "este modelo se entrenó con estas partidas exactamente".
+- **Fracción de `<pad>`** en un lote del dataloader: prácticamente cero.
+
+Lo siguiente es M2: el decoder. Con los lotes `(x, y)` de este módulo vas a construir la atención
+causal a mano, entrenar `rukh-small` sobre las tres tokenizaciones con el mismo presupuesto y
+poner la primera fila con números en la tabla única. El tokenizador de TypeScript que has visto
+funcionar aquí es el que convertirá tus jugadas en ids dentro del navegador.
+
+La cheatsheet del módulo, diez preguntas con su respuesta corta, está justo debajo.

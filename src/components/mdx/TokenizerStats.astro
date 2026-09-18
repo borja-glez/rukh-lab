@@ -1,0 +1,223 @@
+---
+import stats from '../../data/tokenizer-stats.json';
+
+/**
+ * Tokenizer comparison table (M1), read from src/data/tokenizer-stats.json which
+ * `pnpm sync:data` copies from `rukh/artifacts/tokenizer-stats.json` (written by
+ * `rukh data tokenize --stats`). Renders "pendiente" until the file has schemes.
+ *
+ * Shape written by the ML repo (read defensively; `schemes` may also be an array):
+ * {
+ *   "source": { "games": "games.parquet", "n_games": 20, "max_len": 200 },
+ *   "schemes": {
+ *     "uci": { "vocab_size": 2030, "mean": 87.2, "p50": 82.5, "p95": 182.1, "pct_le_max_len": 95.0 },
+ *     "san": { ... }, "bpe": { ... }
+ *   },
+ *   "bpe_longest_tokens": [{ "token": "e2e4c7c6d2d4d7d5", "id": 441, "length": 16, "moves": 4 }]
+ * }
+ */
+interface Props {
+  emptyText?: string;
+}
+
+const {
+  emptyText = 'Pendiente: la tabla se rellena con `rukh data tokenize --stats` y `pnpm sync:data`.',
+} = Astro.props;
+
+type Row = Record<string, unknown>;
+const raw = stats as Row;
+
+function pick(row: Row, ...keys: string[]): unknown {
+  for (const key of keys) {
+    let value: unknown = row;
+    for (const part of key.split('.')) {
+      if (value && typeof value === 'object' && part in (value as Row)) {
+        value = (value as Row)[part];
+      } else {
+        value = undefined;
+        break;
+      }
+    }
+    if (value !== undefined && value !== null) return value;
+  }
+  return undefined;
+}
+
+function num(value: unknown, digits = 1): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) return '—';
+  return value.toLocaleString('es-ES', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: digits,
+  });
+}
+
+/* `schemes` is an object keyed by scheme name; an array of rows is accepted too. */
+const schemeEntries: [string, Row][] = Array.isArray(raw.schemes)
+  ? (raw.schemes as Row[]).map((row) => [String(pick(row, 'scheme', 'name', 'id') ?? ''), row])
+  : raw.schemes && typeof raw.schemes === 'object'
+    ? Object.entries(raw.schemes as Record<string, Row>)
+    : [];
+
+const labels: Record<string, string> = {
+  uci: 'UCI (vocabulario fijo)',
+  san: 'SAN (carácter)',
+  bpe: 'BPE',
+};
+
+const rows = schemeEntries.map(([id, row]) => ({
+  id,
+  label: labels[id] ?? id,
+  vocab: num(pick(row, 'vocab_size', 'vocab'), 0),
+  mean: num(pick(row, 'mean', 'tokens_per_game.mean', 'avg')),
+  p50: num(pick(row, 'p50', 'tokens_per_game.p50', 'median')),
+  p95: num(pick(row, 'p95', 'tokens_per_game.p95')),
+  coverage: num(pick(row, 'pct_le_max_len', 'pct_le_200', 'coverage_200', 'coverage')),
+}));
+
+const maxLen = pick(raw, 'source.max_len', 'max_len');
+const nGames = pick(raw, 'source.n_games', 'n_games');
+const generated = pick(raw, 'generated');
+const longestRaw = pick(raw, 'bpe_longest_tokens', 'bpe_longest_merges', 'longest_merges');
+const longest = Array.isArray(longestRaw)
+  ? (longestRaw as unknown[]).map((entry) => {
+      if (typeof entry === 'string')
+        return { token: entry, moves: undefined as number | undefined };
+      const row = entry as Row;
+      return {
+        token: String(pick(row, 'token', 'merge') ?? ''),
+        moves: typeof row.moves === 'number' ? row.moves : undefined,
+      };
+    })
+  : [];
+
+const meta: string[] = [];
+if (typeof nGames === 'number') meta.push(`${num(nGames, 0)} partidas`);
+if (typeof generated === 'string') {
+  meta.push(
+    `generado el ${new Date(generated).toLocaleDateString('es-ES', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+    })}`,
+  );
+}
+---
+
+<div class="tstats" data-tokenizer-stats={rows.length > 0 ? 'ready' : 'pending'}>
+  <div class="table-wrap">
+    <table class="tstats__table">
+      <thead>
+        <tr>
+          <th scope="col">Esquema</th>
+          <th scope="col">Vocabulario</th>
+          <th scope="col">Tokens/partida (media)</th>
+          <th scope="col">p50</th>
+          <th scope="col">p95</th>
+          <th scope="col">% ≤ {typeof maxLen === 'number' ? maxLen : 200} tokens</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.length === 0 ? (
+          <tr>
+            <td class="tstats__empty" colspan="6">
+              {emptyText}
+            </td>
+          </tr>
+        ) : (
+          rows.map((r) => (
+            <tr>
+              <th scope="row">{r.label}</th>
+              <td>{r.vocab}</td>
+              <td>{r.mean}</td>
+              <td>{r.p50}</td>
+              <td>{r.p95}</td>
+              <td>{r.coverage}</td>
+            </tr>
+          ))
+        )}
+      </tbody>
+    </table>
+  </div>
+  {longest.length > 0 && (
+    <div class="tstats__merges">
+      <span class="label">// tokens BPE más largos</span>
+      <ol class="tstats__list">
+        {longest.map((m) => (
+          <li>
+            <code>{m.token}</code>
+            {m.moves !== undefined && <span class="caption"> · {m.moves} jugadas</span>}
+          </li>
+        ))}
+      </ol>
+    </div>
+  )}
+  <p class="caption tstats__meta">
+    Fuente: <code>rukh data tokenize --stats</code>
+    {meta.length > 0 ? ` · ${meta.join(' · ')}` : rows.length === 0 ? ' · pendiente' : ''}
+  </p>
+</div>
+
+<style>
+  .tstats {
+    margin-top: 1.6em;
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    background: var(--frame-bg);
+  }
+
+  .tstats__table {
+    width: 100%;
+    min-width: 640px;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+
+  .tstats__table th,
+  .tstats__table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line-soft);
+    text-align: left;
+    white-space: nowrap;
+  }
+
+  .tstats__table thead th {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--ink);
+  }
+
+  .tstats__table tbody th {
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  .tstats__empty {
+    color: var(--muted);
+    white-space: normal;
+  }
+
+  .tstats__merges {
+    margin-top: 12px;
+  }
+
+  .tstats__list {
+    margin-top: 6px;
+    padding-left: 1.4em;
+    list-style: decimal;
+    font-size: 14px;
+  }
+
+  .tstats__list li + li {
+    margin-top: 4px;
+  }
+
+  .tstats__meta {
+    margin-top: 8px;
+  }
+</style>
