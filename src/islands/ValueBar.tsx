@@ -16,7 +16,7 @@
  */
 import { useId, useMemo, useState } from 'preact/hooks';
 
-/** One played ply. `encoder` and `stockfish` are optional: a missing one is a gap, never a zero. */
+/** One played ply. `encoder` and `stockfish` are optional: a missing one is skipped, never a zero. */
 export interface ValuePoint {
   ply: number;
   encoder?: number | null;
@@ -108,10 +108,14 @@ export function moveLabel(ply: number): string {
   return `${Math.floor((ply - 1) / 2) + 1}${ply % 2 === 1 ? '.' : '...'}`;
 }
 
-const num = (value: number | null | undefined) =>
-  typeof value === 'number' && Number.isFinite(value)
-    ? `${value > 0 ? '+' : ''}${value.toFixed(2)}`.replace('.', ',').replace('-', '−')
-    : '—';
+const num = (value: number | null | undefined) => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+  // Rounded first, and `-0` folded into `0`: `−0,00` would hand the advantage to a side that
+  // does not have it. The demo's bar guards the same way (`formatValue` in rukh-web's EvalBar).
+  const rounded = Math.round(value * 100) / 100;
+  const shown = Object.is(rounded, -0) ? 0 : rounded;
+  return `${shown > 0 ? '+' : ''}${shown.toFixed(2)}`.replace('.', ',').replace('-', '−');
+};
 
 function Pending() {
   return (

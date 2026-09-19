@@ -84,7 +84,9 @@ de MLflow cuando esa métrica se registró en ese paso exacto: con las configura
 repo (`log_every: 10`, `eval_every: 250`/`500`, `ckpt_every: 1000`) siempre están, pero el escritor
 no lo promete. `legality` exige `--with-legality` y `elo` exige `--with-elo`, que juega partidas
 contra Stockfish para cada checkpoint y cuesta horas: lo normal es rellenarlo en unos pocos o en
-ninguno. La isla escribe un guion en los que falten y deja un hueco en la línea correspondiente.
+ninguno. La isla escribe un guion en los que falten y **se salta ese paso al dibujar la línea**: el
+trazo une los dos puntos que sí tiene en vez de bajar a cero, que es lo que haría creer que la
+métrica se desplomó.
 
 `legality` es la tasa **por argmax** (el token más probable, sin temperatura, sin top-k y sin
 máscara), que es la definición del listón del ≥ 99 % de `GOAL.md` (D-026), no la muestreada.
@@ -130,7 +132,8 @@ máscara), que es la definición del listón del ≥ 99 % de `GOAL.md` (D-026), 
 y siempre desde el punto de vista de las blancas: positivo, ventaja blanca; negativo, ventaja negra.
 Es lo que hace que las dos curvas se puedan dibujar sobre el mismo eje y que la distancia vertical
 entre ellas signifique algo. Los dos campos son **opcionales** (`null` cuando esa fuente no valoró
-ese ply): la isla deja un hueco en la línea en vez de bajarla a cero, igual que `TrainingReplay`.
+ese ply): la isla se salta ese ply al dibujar la línea —une los dos que sí tiene, nunca la baja a
+cero— y escribe un guion en la lectura, igual que `TrainingReplay`.
 
 Una partida de 40-60 plies es el tamaño cómodo. Por encima de 80 las etiquetas del eje dejan de
 leerse en un móvil, y el deslizador pasa a necesitar demasiados pasos para llegar a un ply concreto.

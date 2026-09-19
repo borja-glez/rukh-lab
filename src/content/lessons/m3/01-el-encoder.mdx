@@ -29,8 +29,8 @@ artifacts:
     href: https://huggingface.co/chorcat/rukh-encoder
   - kind: demo
     label: 'Demo v2: barra de evaluación'
-    href: https://rukh.borjaglez.com/?stage=encoder
-demo: '?stage=encoder'
+    href: https://rukh.borjaglez.com/?stage=small-int8&encoder=encoder-int8
+demo: '?stage=small-int8&encoder=encoder-int8'
 ---
 
 import ValueBar from '../../../islands/ValueBar.tsx';
@@ -48,11 +48,10 @@ mismo MLP y la misma normalización previa; lo único que cambia es la máscara,
 línea convierte un generador en un lector.
 
 Ocho capas, seis cabezas de <Term id="atencion">atención</Term>, 384 dimensiones, y dos
-representaciones de entrada que vas a comparar: la partida como secuencia de jugadas
-
-<Term id="uci">UCI</Term> —los mismos 2 030 <Term id="token">tokens</Term> del decoder— o la
-posición como 69 casillas leídas de un <Term id="fen">FEN</Term>. El preentrenamiento es
-<Term id="mlm">masked move modeling</Term>: se tapa el 15 % de las jugadas de una partida y el
+representaciones de entrada que vas a comparar: la partida como secuencia de
+jugadas <Term id="uci">UCI</Term> —los mismos 2 030 <Term id="token">tokens</Term> del decoder— o
+la posición como 69 casillas leídas de un <Term id="fen">FEN</Term>. El preentrenamiento
+es <Term id="mlm">masked move modeling</Term>: se tapa el 15 % de las jugadas de una partida y el
 modelo las reconstruye mirando a los dos lados del agujero. Encima de eso montas tres cabezas
 lineales y las afinas en tres etapas, midiendo en cada una si el trabajo lo estaba haciendo el
 preentrenamiento o la cabeza.
@@ -96,9 +95,8 @@ qué el preentrenamiento es el que es hasta en los decimales de sus proporciones
 ### Causal frente a bidireccional: la línea que lo cambia todo
 
 Abre `src/rukh/models/decoder.py` y `src/rukh/models/encoder.py` uno al lado del otro. Los dos
-importan sus bloques del mismo sitio, `rukh.models.layers`. Los dos suman un
-
-<Term id="embedding">embedding</Term> de token y uno de posición, aplican dropout, pasan por una
+importan sus bloques del mismo sitio, `rukh.models.layers`. Los dos suman
+un <Term id="embedding">embedding</Term> de token y uno de posición, aplican dropout, pasan por una
 pila de bloques pre-norm y terminan en un `LayerNorm`. La atención es la misma llamada,
 `F.scaled_dot_product_attention`, con las mismas proyecciones fusionadas. La diferencia cabe en un
 argumento:
@@ -141,9 +139,18 @@ por bloque:  2·384 (ln1) + (384·1152 + 1152) (qkv) + (384·384 + 384) (proyecc
 embedding de tokens   2030 · 384                                   =    779 520
 posiciones            200 · 384                                    =     76 800
 LayerNorm final       2 · 384                                      =        768
+cabeza MMM            atada al embedding                           =          0
                                                                      ----------
 total                                                              = 15 052 800
 ```
+
+La última fila es la que más gente se salta, y sin ella la cuenta sale en 15 832 320: la cabeza que
+predice el token tapado es una matriz de `384 × 2030`, exactamente la traspuesta del embedding, y el
+código **ata las dos** (`tie_embeddings`, en `EncoderConfig`), así que son los mismos 779 520 números
+contados una vez y no dos. Atar no es solo ahorrar memoria: obliga a que "el vector que representa
+`e2e4`" y "el vector contra el que se puntúa `e2e4`" sean el mismo objeto, que es lo que uno quiere
+que signifique un embedding. Solo se ata en el esquema de jugadas, donde entrada y salida son el
+mismo vocabulario de 2 030 movimientos; con 47 tokens de casillas no compensa y el código no lo hace.
 
 Quince millones. El plan de P3 llegó a proponer "entre 18 y 25 millones" a ojo y la configuración del
 spec dice otra cosa; manda la configuración, y la errata está anotada en el plan. Es un detalle
@@ -170,9 +177,8 @@ desperdicio y en parte lo es —por eso BERT necesita más épocas que GPT para 
 cambio cada predicción se hace con el doble de contexto. Es un intercambio, no una mejora gratis, y
 conviene saber cuál de los dos lados estás comprando.
 
-**Un vector de la posición.** Esto es lo que de verdad justifica el módulo. Del encoder sale, con un
-
-<Term id="pooling">pooling</Term>, un único vector por posición sobre el que se pueden montar
+**Un vector de la posición.** Esto es lo que de verdad justifica el módulo. Del encoder sale,
+con un <Term id="pooling">pooling</Term>, un único vector por posición sobre el que se pueden montar
 cabezas baratas, y que además sirve para buscar posiciones parecidas en la fase 2 del curso. Un
 decoder también tiene estados internos, pero están sesgados hacia "qué viene ahora" en vez de hacia
 "qué es esto".
@@ -314,7 +320,8 @@ La **cabeza de valor** es una regresión con `tanh`, contra la etiqueta `tanh(cp
 decisiones ahí. La primera, por qué acotar: los centipeones no están acotados y un mate vale ±10 000
 en la convención del repo, así que un puñado de mates dominaría el error cuadrático y el modelo
 gastaría su capacidad en clavar posiciones que ya están decididas. El `tanh` comprime: 400
-centipeones —una torre— son 0,76; 1 000 son 0,99; un mate es 1. La segunda, por qué 400 y no otro
+centipeones —cuatro peones, algo menos que la torre de la tabla de material de aquí abajo, que vale
+500— son 0,76; 1 000 son 0,99; un mate es 1. La segunda, por qué 400 y no otro
 número: es el divisor que hace que la zona interesante (de −300 a +300 centipeones, donde una
 partida todavía se juega) caiga en la parte de la curva que tiene pendiente, y es un parámetro de
 configuración (`value_scale`) por si alguien quiere discutirlo con datos. El repo publica además una
@@ -413,7 +420,11 @@ central.
 **Casillas.** El FEN convertido en 69 tokens fijos: un `<cls>`, las 64 casillas (pieza o vacío, en
 orden por columnas, a1, a2, …, h8), el turno, los derechos de enroque, la casilla de al paso y el
 reloj de 50 jugadas por tramos. El vocabulario es de 47 tokens y está fijado por construcción, con
-un hash que lo pinta igual que el del vocabulario UCI. Aquí la posición está **explícita**: la capa
+un hash que lo pinta igual que el del vocabulario UCI. Un aviso sobre el reloj: las filas de P1 se
+identifican por un FEN de **cuatro campos**, sin contadores, así que el esquema las lee todas como
+`clock:0` y ese token es constante en toda la tabla supervisada. Es decir: en este afinado el
+tramo de reloj no aporta ni un bit, y solo empezará a distinguir posiciones cuando los datos traigan
+el FEN completo. Aquí la posición está **explícita**: la capa
 1 ya sabe que hay un caballo en f3 sin tener que deducirlo de nada. A cambio, la historia desaparece
 por completo.
 
@@ -458,7 +469,8 @@ qué la línea base es deliberadamente mala y decir qué significa cada métrica
 una clase es rara.
 
 Un encoder no juega partidas, así que no se puede medir como al decoder. Se mide por lo que sabe de
-posiciones que no ha visto, sobre la mitad de validación del reparto por partidas, y **con la línea
+posiciones que no ha visto: la partición de validación del reparto por partidas, que es el **10 %**
+de las partidas (`val_fraction: 0.1`, nunca el 10 % de las posiciones sueltas), y **con la línea
 base medida sobre exactamente las mismas filas**.
 
 ### La heurística de material y movilidad
@@ -476,6 +488,14 @@ entendiera los sacrificios no sería un suelo: sería un competidor, y el margen
 "el modelo aprendió algo más que contar piezas". Lo que sí es innegociable es medirla **igual**:
 mismas filas, misma definición de acierto, mismo umbral de 100 centipeones en la etiqueta. Un margen
 medido sobre dos conjuntos distintos no es un margen, es una comparación de anécdotas.
+
+Y hay una asimetría que conviene decir antes de leer el margen, porque no juega a favor del modelo:
+la heurística recibe **la posición anterior y la jugada** —vuelve a jugarla en un tablero para saber
+qué cambió—, mientras que el encoder de casillas solo ve el FEN resultante. Detectar un error sin
+ver de dónde vienes es más difícil que detectarlo viéndolo, así que el margen que salga está medido
+en contra: si aun así gana, ha aprendido algo que no es contar piezas. Es también la razón concreta
+por la que el esquema de jugadas debería ir mejor en esta cabeza, y la razón por la que la
+comparación entre las dos entradas es la pregunta abierta del módulo.
 
 ### Qué no puede ver
 
@@ -504,9 +524,8 @@ Arreglarlas convertiría la línea base en un pequeño motor, y entonces ya no s
 
 ### Precisión, exhaustividad y F1 cuando una clase es rara
 
-Los errores de 100 centipeones o más son minoría en las partidas de club, y ese
-
-<Term id="desbalanceo">desbalanceo</Term> lo cambia todo.
+Los errores de 100 centipeones o más son minoría en las partidas de club, y
+ese <Term id="desbalanceo">desbalanceo</Term> lo cambia todo.
 
 Si el 10 % de las jugadas son errores, un detector que diga siempre "no es error" acierta el 90 % de
 las veces. Su **exactitud** es 0,9 y su utilidad es cero. Por eso la exactitud no se publica como
@@ -822,22 +841,38 @@ con `probe`, que es el modo barato, antes de gastarla con `full`.
 
 ### Lab 4 · Medir contra la heurística
 
+Antes de nada, la ruta del checkpoint, que no es la que uno escribiría de memoria.
+`configs/train/encoder-heads.yaml` trae `run_name: encoder-heads` y `unique_run_name: true`, así que
+cada ejecución escribe en un directorio **con marca de tiempo**: `checkpoints/encoder-heads-<fecha>/`.
+El modo (`probe`, `last-n`, `full`) no aparece en el nombre —lo elige `--mode` y queda dentro del
+checkpoint, no en la carpeta—, así que un `checkpoints/encoder-heads-full/` no existe. El último
+directorio de una serie sale así, y en los comandos de abajo se escribe `checkpoints/encoder-heads/`
+por brevedad: sustitúyelo por el que te salga aquí.
+
+```bash title="Terminal"
+ls -td checkpoints/encoder-heads-*/ | head -1
+```
+
 La suite del encoder se ejecuta sobre un checkpoint de las cabezas, no del preentrenamiento:
 
 ```bash title="Terminal"
-uv run rukh eval encoder --model checkpoints/encoder-heads-full/best.pt
+uv run rukh eval encoder --model checkpoints/encoder-heads/best.pt --stage encoder
 ```
 
 Salida en la máquina de referencia (RTX 5090):
 
-{/* OUTPUT: uv run rukh eval encoder --model checkpoints/encoder-heads-full/best.pt */}
+{/* OUTPUT: uv run rukh eval encoder --model checkpoints/encoder-heads/best.pt --stage encoder */}
 
 La salida trae, en este orden: cuántas posiciones se evaluaron y cuántas de ellas tenían etiqueta de
 error; precisión, exhaustividad y F1 del encoder y de la heurística; el margen en puntos de F1 y si
 llega al listón de cinco; Pearson y Spearman del valor contra `cp`; la exactitud del resultado; y la
 curva por etiquetas si el checkpoint la lleva. Escribe además
-`artifacts/eval/encoder/report.md` y una fila en `artifacts/web/results.json`, que es la que llega a
-la tabla única de esta web con `pnpm sync:data`.
+`artifacts/eval/<stage>/report.md` y una fila en `artifacts/web/results.json`, que es la que llega a
+la tabla única de esta web con `pnpm sync:data`. `<stage>` es lo que pases en `--stage`; sin esa
+opción es el **nombre del directorio del checkpoint**, o sea `encoder-heads-<marca de tiempo>`, y
+tanto la carpeta del informe como la fila de la tabla cambiarían de nombre en cada ejecución. Por
+eso el comando de arriba lo fija en `encoder`: el informe queda en `artifacts/eval/encoder/report.md`
+y la fila se actualiza en vez de duplicarse.
 
 La heurística es la parte lenta —un tablero de `python-chess` por fila—, así que sus veredictos van
 a una caché SQLite bajo una clave propia: no dependen de los pesos, así que evaluar un segundo
@@ -877,12 +912,12 @@ El navegador necesita el encoder en ONNX, y con dos salidas nada más: la demo p
 alerta de error, y no tiene ningún uso para los logits del MLM ni para el resultado.
 
 ```bash title="Terminal"
-uv run rukh export --ckpt checkpoints/encoder-heads-full/best.pt --out artifacts/onnx/encoder --kind encoder --fp16 --int8 --check-parity
+uv run rukh export --ckpt checkpoints/encoder-heads/best.pt --out artifacts/onnx/encoder --kind encoder --fp16 --int8 --check-parity
 ```
 
 Salida en la máquina de referencia (RTX 5090):
 
-{/* OUTPUT: uv run rukh export --ckpt checkpoints/encoder-heads-full/best.pt --out artifacts/onnx/encoder --kind encoder --fp16 --int8 --check-parity */}
+{/* OUTPUT: uv run rukh export --ckpt checkpoints/encoder-heads/best.pt --out artifacts/onnx/encoder --kind encoder --fp16 --int8 --check-parity */}
 
 Tres diferencias con la exportación del decoder que hiciste en M2. La primera: el esquema de
 casillas **no tiene eje dinámico de secuencia**, porque siempre son 69 tokens; no hace falta y no se
@@ -896,12 +931,12 @@ La salida secundaria del encoder son los embeddings de posición, que no usa la 
 2 del curso, cuando montes recuperación de posiciones parecidas:
 
 ```bash title="Terminal"
-uv run rukh encoder embed --positions data/evals/positions-eval.parquet --out artifacts/embeddings/positions.npy --ckpt checkpoints/encoder-heads-full/best.pt
+uv run rukh encoder embed --positions data/evals/positions-eval.parquet --out artifacts/embeddings/positions.npy --ckpt checkpoints/encoder-heads/best.pt
 ```
 
 Salida en la máquina de referencia (RTX 5090):
 
-{/* OUTPUT: uv run rukh encoder embed --positions data/evals/positions-eval.parquet --out artifacts/embeddings/positions.npy --ckpt checkpoints/encoder-heads-full/best.pt */}
+{/* OUTPUT: uv run rukh encoder embed --positions data/evals/positions-eval.parquet --out artifacts/embeddings/positions.npy --ckpt checkpoints/encoder-heads/best.pt */}
 
 Fíjate en que escribe **dos** ficheros: la matriz `.npy` y un `.parquet` de acompañamiento con `row`
 y `fen4` en el mismo orden. Una matriz de flotantes sin saber qué fila es qué posición no sirve para
@@ -929,7 +964,7 @@ from rukh.engine import find_stockfish
 from rukh.models.squares import fen_to_tokens
 from rukh.train import load_any
 
-CKPT = Path("checkpoints/encoder-heads-full/best.pt")
+CKPT = Path("checkpoints/encoder-heads/best.pt")  # el directorio real lleva marca de tiempo
 OUT = Path("artifacts/web/value-bar.json")
 VALUE_SCALE = 400.0  # the tanh(cp / 400) of rukh.data.labels: both curves must share it
 THRESHOLD = 0.5  # the blunder threshold of configs/eval/encoder.yaml
@@ -1086,7 +1121,7 @@ Cuatro cosas concretas que mirar, en este orden:
 </Callout>
 
 <DemoEmbed
-  query="?stage=encoder"
+  query="?stage=small-int8&encoder=encoder-int8"
   title="La barra de evaluación en la demo"
   note="La barra es opcional y solo se descarga si aceptas el encoder (~30 MB además del decoder). Sin consentimiento la pantalla queda exactamente como estaba."
 />
@@ -1130,9 +1165,9 @@ decide presupuestos: cuántas etiquetas hacen falta.
 Lo siguiente es M4, donde vuelves al decoder de M2 y le enseñas a jugar como un 1500 o como un 2200
 cambiando dos tokens del principio, con LoRA para no tener que mover treinta y nueve millones de
 pesos cada vez. El encoder que acabas de construir no se queda ahí parado: su barra sigue en la
-demo, sus embeddings son la entrada de la recuperación de posiciones de la fase 2, y su
-
-<Term id="probe-lineal">probe lineal</Term> es la misma técnica con la que en M2 leíste que se puede
+demo, sus embeddings son la entrada de la recuperación de posiciones de la fase 2, y
+su <Term id="probe-lineal">probe lineal</Term> es la misma técnica con la que en M2 leíste que se
+puede
 extraer el tablero de las activaciones de un modelo de ajedrez —solo que ahora la has montado tú
 sobre tu propio modelo en vez de citarla de un artículo.
 

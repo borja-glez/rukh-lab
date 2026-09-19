@@ -8,7 +8,8 @@ Todo lo que hay en esta carpeta (salvo este fichero) es una **copia** de
 | `tokenizer.ts`        | Vocabulario fijo UCI (`buildVocab`, `UciTokenizer`, `eloBin`)              |
 | `san-chars.ts`        | Tokenizador a nivel de carácter sobre SAN numerado                         |
 | `bpe.ts`              | Aplicación de fusiones BPE (formato `tokenizers`) sobre texto UCI          |
-| `index.ts`            | Reexporta los tres                                                         |
+| `squares.ts`          | Esquema `squares` del encoder: un FEN como 69 ids fijos (M3)               |
+| `index.ts`            | Reexporta los cuatro                                                       |
 | `vocab.json`          | Vocabulario exportado desde Python (`rukh data tokenize --export-fixture`) |
 | `bpe.json`            | BPE entrenado sobre 200 000 partidas UCI de 2025-01                        |
 | `fixtures/games.json` | 20 partidas codificadas desde Python para las pruebas de paridad           |
@@ -23,3 +24,7 @@ JSON es `rukh/artifacts/tokenizer/` (y, una vez publicado, `chorcat/rukh-tokeniz
   esquemas y las compara id a id con lo que exportó Python. Es imprescindible además del hash: dos
   copias idénticas a las de `rukh-web` pasan el hash aunque el par `bpe.json` + fixture esté
   desfasado.
+- `squares.ts` no trae su fixture de paridad (`fixtures/squares.json`): aquí no se ejecuta, solo
+  se cita en la lección de M3. Quien lo compara con Python es `rukh-web`, que lo genera desde
+  `rukh/src/rukh/models/squares.py` con su `pnpm sync:tokenizer` y lo reproduce en
+  `tests/squares.test.ts`; el hash de arriba encadena esta copia con esa comprobación.

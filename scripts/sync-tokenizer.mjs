@@ -18,6 +18,7 @@ const FILES = [
   'tokenizer.ts',
   'san-chars.ts',
   'bpe.ts',
+  'squares.ts',
   'index.ts',
   'vocab.json',
   'bpe.json',
