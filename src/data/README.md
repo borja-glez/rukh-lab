@@ -54,25 +54,36 @@ encima de 40 la tabla deja de leerse en un móvil.
 ```jsonc
 {
   "schema": "rukh-training-replay/1",
-  // Un elemento por checkpoint evaluado, ordenados por `step` ascendente.
+  // Un elemento por **checkpoint** (`step-*.pt` del run), ordenados por `step` ascendente.
+  // No uno por paso registrado en MLflow: el deslizador de la isla recorre checkpoints, y la
+  // legalidad y el Elo solo se pueden medir donde quedan pesos en disco.
   "steps": [
     {
-      "step": 1000, // pasos de optimizador completados
+      "step": 1000, // pasos de optimizador completados; es el único campo garantizado
       "train_loss": 3.41, // entropía cruzada media del paso (métrica train/loss de MLflow)
       "val_loss": 3.38, // val/loss
       "val_top1": 0.29, // val/top1, fracción en [0, 1]
-      "legality": 0.71, // opcional: legalidad sin máscara del checkpoint, fracción en [0, 1]
-      "elo": 620, // opcional: Elo estimado; null cuando ese checkpoint no se evaluó
+      "legality": 0.71, // opcional: legalidad sin máscara **por argmax**, fracción en [0, 1]
+      "elo": 620, // opcional: Elo estimado; ausente cuando ese checkpoint no se evaluó
     },
   ],
   "meta": {
-    "run": "small", // nombre del run de MLflow
+    "run": "small-20260919-013000", // nombre del run de MLflow
+    "run_id": "f926711687b24bcca1712a314db977ac",
     "preset": "small",
     "max_steps": 20000,
+    "checkpoints": "E:/.../checkpoints/small-20260919-013000", // de dónde salió cada entrada
     "generated": "2026-09-20T22:14:03Z", // null en el marcador de posición
   },
 }
 ```
 
-`legality` y `elo` son opcionales porque evaluar cada checkpoint contra Stockfish cuesta horas: lo
-normal es rellenarlos solo en unos pocos. La isla escribe un guion en los que falten.
+**Todos los campos menos `step` son opcionales.** `train_loss`, `val_loss` y `val_top1` se copian
+de MLflow cuando esa métrica se registró en ese paso exacto: con las configuraciones que trae el
+repo (`log_every: 10`, `eval_every: 250`/`500`, `ckpt_every: 1000`) siempre están, pero el escritor
+no lo promete. `legality` exige `--with-legality` y `elo` exige `--with-elo`, que juega partidas
+contra Stockfish para cada checkpoint y cuesta horas: lo normal es rellenarlo en unos pocos o en
+ninguno. La isla escribe un guion en los que falten y deja un hueco en la línea correspondiente.
+
+`legality` es la tasa **por argmax** (el token más probable, sin temperatura, sin top-k y sin
+máscara), que es la definición del listón del ≥ 99 % de `GOAL.md` (D-026), no la muestreada.

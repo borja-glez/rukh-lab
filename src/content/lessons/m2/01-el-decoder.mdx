@@ -47,9 +47,9 @@ Escrito a mano, sin `transformers`, sin `nn.TransformerDecoder`: doce bloques, o
 dimensiones, un vocabulario de 2 030 jugadas <Term id="uci">UCI</Term> y una ventana de
 
 <Term id="contexto">contexto</Term> de 200 <Term id="token">tokens</Term>. Se entrena desde cero
-sobre los lotes que dejaste preparados en M1, en tu GPU, en una noche. Y no acaba en un fichero
-`.pt` olvidado en una carpeta: acaba exportado a <Term id="onnx">ONNX</Term>, cuantizado, publicado
-en Hugging Face y jugando contra ti en una pestaña del navegador, sin servidor.
+sobre los lotes que dejaste preparados en M1, en tu GPU, en menos de una hora. Y no acaba en un
+fichero `.pt` olvidado en una carpeta: acaba exportado a <Term id="onnx">ONNX</Term>, cuantizado,
+publicado en Hugging Face y jugando contra ti en una pestaña del navegador, sin servidor.
 
 Este es **el módulo central del curso**. Todo lo anterior existía para llegar aquí y todo lo
 posterior modifica esto. El encoder de M3 es este mismo bloque sin la
@@ -114,11 +114,14 @@ sale de la única presión que hay, que es predecir bien la siguiente jugada.
 
 ¿Por qué 512 y no 128 o 2 048? Porque `d_model` es el presupuesto de información que fluye por el
 modelo, y todo escala con él: las matrices de atención son `d × 3d` y `d × d`, las del MLP `d × 4d`
-y `4d × d`, así que el número de parámetros por bloque crece con `d²`. Con 512 y 12 capas salen 39
-millones, que es lo que cabe cómodo en una noche de RTX 5090 con 6 millones de partidas. Con 768 y
-16 capas (el preset `medium`) salen 110 millones y la noche se convierte en un fin de semana. La
-elección no es teórica: es el punto donde el modelo es lo bastante grande para aprender ajedrez y
-lo bastante pequeño para que puedas repetir el experimento.
+y `4d × d`, así que el número de parámetros por bloque crece con `d²`. Con 512 y 12 capas salen
+38 971 392 parámetros, y eso, medido en esta RTX 5090, son **440 000 tokens por segundo** en el
+bucle de entrenamiento: los 20 000 pasos de `small`, a 51 200 tokens cada uno, son 1 024 millones
+de tokens, o sea unos **40 minutos**. Con 768 y 16 capas (el preset `medium`) salen 115 120 128
+parámetros, casi el triple de cómputo por token, así que por regla de tres serían un par de horas
+—cifra estimada, no medida—. La elección no es teórica: es el punto donde el modelo es lo bastante
+grande para aprender ajedrez y lo bastante pequeño para que puedas repetir el experimento un
+martes por la tarde.
 
 <Callout kind="teoria" title="Una tabla, dos lecturas">
   Un embedding se puede leer de dos maneras y las dos son correctas. Como diccionario: la fila 47 es
@@ -188,9 +191,9 @@ escritas de golpe para las 32 parejas.
 
 Rukh entrena con posiciones aprendidas por defecto (`pos: "learned"`) y deja RoPE detrás de una
 opción de configuración, porque con contexto fijo de 200 tokens el argumento de la extrapolación no
-aplica: ninguna partida va a ser más larga que la tabla. El lab 1 te propone entrenar `tiny` con
-las dos y comparar; si RoPE gana algo, la decisión cambia y se anota. Esa es la forma sana de
-elegir entre dos técnicas: no por cuál se publicó después.
+aplica: ninguna partida va a ser más larga que la tabla. Es una decisión tomada por el argumento,
+no por medida: el día que alguien entrene las dos y RoPE gane algo, la decisión cambia y se anota.
+Esa es la forma sana de elegir entre dos técnicas: no por cuál se publicó después.
 
 ### Atención, con números
 
@@ -397,8 +400,8 @@ scale = 0.02 / math.sqrt(2 * self.cfg.n_layer)   # 0.02 / sqrt(24) = 0.00408
 Es el truco de GPT-2 y está en `MoveDecoder.__init__`. Divide la desviación por √24: las escrituras
 en la corriente residual empiezan pequeñas y el modelo va subiendo el volumen de las que le sirven.
 
-El MLP, por cierto, es la parte aburrida y la mitad de los parámetros: `512 → 2048 → 512` con GELU
-en medio. La atención mezcla posiciones; el MLP procesa cada posición por separado. Se suele
+El MLP, por cierto, es la parte aburrida y **dos tercios de los parámetros de un bloque**:
+`512 → 2048 → 512` con GELU en medio. La atención mezcla posiciones; el MLP procesa cada posición por separado. Se suele
 describir como la memoria del modelo: donde vive "después de esta configuración, esta jugada".
 
 ### Tied embeddings: la misma tabla para leer y para escribir
@@ -544,11 +547,16 @@ módulo:
 <Callout kind="hoy" title="La máscara hace la demo jugable y la evaluación mentirosa">
   Si solo mides con máscara, estás midiendo a `python-chess`, no a tu modelo. La pregunta
   interesante —¿ha aprendido las reglas del ajedrez solo viendo secuencias de texto?— únicamente se
-  responde **sin** máscara: sueltas el argmax crudo del modelo en diez mil posiciones de validación
-  y cuentas qué porcentaje de sus propuestas son legales. Esa es la columna "legalidad sin máscara"
-  de la tabla única, y es la métrica de comprensión del curso. El objetivo de GOAL es ≥ 99 %, el
-  mismo orden que consiguió Karvonen. Por eso `SampleConfig` tiene `mask_illegal` y por eso `rukh
-  play` tiene `--no-mask`: no es un modo de depuración, es el experimento.
+  responde **sin** máscara: sueltas al modelo en diez mil posiciones de validación y cuentas qué
+  porcentaje de sus propuestas son legales. El harness la mide y la publica **dos veces**, porque
+  dentro hay dos preguntas distintas: `legality_argmax` toma el token más probable, sin temperatura
+  ni top-k, y `legality_sampled` saca uno como lo saca la demo (temperatura 0,6 y top-k 20). La
+  segunda es siempre la menor de las dos: es lo que vive un jugador. El listón de GOAL, ≥ 99 %,
+  habla de lo que saben los pesos y no de un ajuste del muestreador, así que es el **argmax** —el
+  mismo orden que consiguió Karvonen—, y la muestreada va al lado con su definición escrita.
+  Publicar solo una de las dos sería quedarse con el número que conviene. Por eso `SampleConfig`
+  tiene `mask_illegal` y por eso `rukh play` tiene `--no-mask`: no es un modo de depuración, es el
+  experimento.
 </Callout>
 
 ## Cómo se mide
@@ -560,21 +568,26 @@ Un modelo sin números es una anécdota. `rukh eval --model <ckpt> --suite full`
 completa, con caché SQLite para que repetir la evaluación no vuelva a jugar las mismas partidas.
 Seis medidas, cada una respondiendo a una pregunta distinta.
 
-**Legalidad sin máscara.** Diez mil prefijos de partidas de validación; en cada uno se muestrea sin
-máscara y se comprueba si el token propuesto es una jugada legal en esa posición. Es lo primero que
-sube durante el entrenamiento y lo que más impresiona: el modelo no tiene tablero, no tiene reglas,
-no sabe qué es un alfil, y aun así acaba proponiendo jugadas legales casi siempre. Ojo con el sesgo
-de la medida: las posiciones de apertura son fáciles (casi cualquier desarrollo razonable es legal)
-y los finales son difíciles (pocas jugadas legales, muchas parecidas). Una legalidad global del
-95 % puede esconder un 99 % en apertura y un 70 % en finales.
+**Legalidad sin máscara, en sus dos versiones.** Diez mil prefijos de partidas de validación; en
+cada uno se le pide una jugada sin máscara y se comprueba si el token propuesto es legal en esa
+posición. Salen dos columnas: `legality_argmax` (el token más probable; es el titular y el listón
+de GOAL) y `legality_sampled` (temperatura 0,6 y top-k 20, como juega la demo), que es siempre
+menor porque muestrear mete cola. Es lo primero que sube durante el entrenamiento y lo que más
+impresiona: el modelo no tiene tablero, no tiene reglas, no sabe qué es un alfil, y aun así acaba
+proponiendo jugadas legales casi siempre. Ojo con el sesgo de la medida: las posiciones de apertura
+son fáciles (casi cualquier desarrollo razonable es legal) y los finales son difíciles (pocas
+jugadas legales, muchas parecidas). Una legalidad global del 95 % puede esconder un 99 % en
+apertura y un 70 % en finales.
 
 **Top-1 y top-3 de siguiente jugada.** Porcentaje de posiciones en que la jugada más probable del
 modelo (o alguna de sus tres primeras) coincide con la que jugó el humano. Es la métrica más
 directa de "imita bien", y también la más engañosa como medida de fuerza: el techo no es el 100 %,
-porque en muchas posiciones hay tres jugadas razonables y el humano eligió una. Los modelos
-públicos de este tamaño rondan el 35-45 % de top-1 contra jugadores de club. Se desglosa por tramo
-de Elo, y ese desglose es lo que hace posible el Elo-conditioning de M4: si el modelo predice mejor
-a los 1800 que a los 2400, es que ha aprendido a imitar el nivel medio de sus datos.
+porque en muchas posiciones hay tres jugadas razonables y el humano eligió una. La expectativa con
+la que se entra al lab 4 es un top-1 del 35-45 % contra jugadores de club; es una horquilla de
+andar por casa, sin fuente detrás, así que trátala como hipótesis y compárala con la cifra que
+salga de `rukh eval`, que es la que vale. Se desglosa por tramo de Elo, y ese desglose es lo que
+hace posible el Elo-conditioning de M4: si el modelo predice mejor a los 1800 que a los 2400, es
+que ha aprendido a imitar el nivel medio de sus datos.
 
 **Puzles por tramo.** Dos mil puzles de Lichess por banda de dificultad (1000-1500, 1500-2000,
 2000+), con un criterio duro: un puzle cuenta como resuelto solo si el modelo acierta **toda** la
@@ -805,6 +818,11 @@ vez del de canales.
   script. Después entrena `tiny` durante 200 pasos con y sin máscara y compara las dos curvas de
   pérdida. ¿Cuál baja más rápido? ¿Cuál modelo es mejor? ¿Qué medirías para no dejarte engañar?
 
+Aviso práctico: esto **no** es una opción de configuración, es una edición de
+`src/rukh/models/decoder.py`. Deshazla en cuanto termines (`git checkout -- src/rukh/models/`),
+porque un modelo entrenado con ese cambio puesto pasa los tests de forma y falla el de
+causalidad, y un checkpoint contaminado no se distingue de uno bueno mirando los pesos.
+
   <Solution>
     Sin máscara, el `assert` del script salta en la primera iteración: los logits pasados cambian
     al tocar el futuro. Entrenando, la curva sin máscara baja muchísimo más rápido y llega a
@@ -882,11 +900,19 @@ Salida en la máquina de referencia (RTX 5090):
   </Solution>
 </Exercise>
 
-### Lab 4 · `small` de noche, y la evaluación completa
+### Lab 4 · `small` entero, y la evaluación completa
 
 `small` es el modelo del curso: 12 capas, 512 dimensiones, 8 cabezas, 38 971 392 parámetros,
-20 000 pasos de 64 × 4 secuencias (51 200 tokens por paso, algo más de mil millones de tokens en
-total), tasa 6e-4 con 1 000 de warmup. Entre cuatro y ocho horas en la 5090. Se lanza y se deja.
+20 000 pasos de 64 × 4 secuencias (51 200 tokens por paso, 1 024 millones de tokens en total), tasa
+6e-4 con 1 000 de warmup.
+
+Cuánto tarda, con la cuenta hecha en vez de estimada: el bucle mide **440 000 tokens/s** en esta
+5090, en modo eager (`torch.compile` no arranca en este Windows porque no hay Triton, y el bucle
+cae a eager sin romperse). Mil veinticuatro millones de tokens entre 440 000 son 2 330 segundos:
+**unos 40 minutos**. El spec del proyecto estimaba entre cuatro y ocho horas; era una estimación
+conservadora escrita antes de medir nada, y la dejamos dicha aquí para que se vea la diferencia
+entre estimar y medir. Los ficheros de configuración que vienen en el repo todavía llevan la
+estimación vieja en un comentario.
 
 ```bash title="Terminal"
 uv run rukh train --config configs/train/small.yaml
@@ -901,9 +927,10 @@ checkpoint lleva el estado del optimizador y el de los generadores aleatorios, a
 `--resume checkpoints/small/step-12000.pt` continúa exactamente donde estaba. Esa es la diferencia
 entre guardar los pesos y guardar un checkpoint.
 
-A la mañana siguiente, la suite completa: diez mil posiciones de legalidad, diez mil de exactitud,
-dos mil puzles por banda y cien partidas contra cada uno de los ocho escalones de Stockfish. Son
-varias horas de partidas, y la caché SQLite hace que repetirla sea casi gratis.
+Cuando termina, la suite completa: diez mil posiciones de legalidad —con sus dos definiciones—,
+diez mil de exactitud, dos mil puzles por banda y cien partidas contra cada uno de los ocho
+escalones de Stockfish. Aquí sí hay horas, y no de entrenamiento sino de partidas; la caché SQLite
+hace que repetirla sea casi gratis.
 
 ```bash title="Terminal"
 uv run rukh eval --model checkpoints/small/best.pt --suite full
@@ -991,6 +1018,15 @@ Salida en la máquina de referencia (RTX 5090):
 
 {/* OUTPUT: uv run rukh export --ckpt checkpoints/small/best.pt --out artifacts/onnx/small --fp16 --int8 --check-parity */}
 
+Tres cosas que la exportación hace por debajo y conviene saber. Sale por el exportador
+**dynamo** de `torch.onnx.export` (el antiguo tracer de TorchScript sigue ahí como respaldo, y su
+grafo produce un fp16 que onnxruntime rechaza, así que cuál corrió se anota en el fichero). El eje
+dinámico de secuencia no se cree: se comprueba **ejecutando el fichero a dos longitudes** distintas
+y lo que se publica es lo que funcionó, no lo que se pidió; hace falta, porque la demo alarga la
+secuencia una jugada por turno. Y el contexto del modelo viaja con el fichero como metadatos
+`rukh_*` (`rukh_block`, `rukh_vocab_size`, `rukh_exporter`…), de modo que un `.onnx` suelto sigue
+sabiendo decir de cuántos tokens es su ventana.
+
 El criterio es la **jugada**, no los logits, y el matiz importa: int8 mueve los logits bastante
 (verás una diferencia máxima grande) y aun así casi nunca cambia el argmax, porque el error es
 mucho menor que el margen que suele haber entre la primera y la segunda jugada. Un fichero que
@@ -1050,7 +1086,7 @@ for handle in handles:
 cfg = model.cfg
 weights = []
 mask = torch.ones(len(ids), len(ids), dtype=torch.bool).tril()
-for layer, qkv in enumerate(captured):
+for _layer, qkv in enumerate(captured):
     q, k, _ = qkv.split(cfg.d_model, dim=2)
     shape = (1, len(ids), cfg.n_head, cfg.head_dim)
     q = q.view(shape).transpose(1, 2)
@@ -1093,9 +1129,14 @@ Salida en la máquina de referencia (RTX 5090):
 
 Falta un cuarto script, corto, que lee las métricas de MLflow del run y escribe la repetición del
 entrenamiento: **`labs/m2/replay_export.py`** produce `artifacts/web/training-replay.json` con un
-elemento por checkpoint (`step`, `train_loss`, `val_loss`, `val_top1` y, donde se haya evaluado,
-`legality` y `elo`). El esquema exacto de los dos ficheros está documentado en
-`rukh-lab/src/data/README.md`; los dos llegan a esta web con `pnpm sync:data`.
+elemento **por checkpoint** —no por paso registrado en MLflow: el deslizador de la isla recorre los
+`step-*.pt` que dejó la tirada, que es lo único sobre lo que se puede medir algo más que la
+pérdida—. De cada entrada solo `step` está garantizado: `train_loss`, `val_loss` y `val_top1` se
+copian si MLflow registró esa métrica en ese paso exacto (con las configuraciones del repo siempre
+lo hace), `legality` exige `--with-legality` y `elo` exige `--with-elo`, que juega partidas de
+verdad y cuesta horas. Lo que falte sale como un guion en la isla. El esquema exacto de los dos
+ficheros está documentado en `rukh-lab/src/data/README.md`; los dos llegan a esta web con
+`pnpm sync:data`.
 
 ```bash title="Terminal"
 uv run python labs/m2/replay_export.py
@@ -1136,11 +1177,12 @@ Al terminar esta sección sabrás leer una curva de entrenamiento como quien lee
 electrocardiograma: dónde está sano, dónde se está sobreajustando y en qué momento el modelo dejó
 de decir tonterías.
 
-La isla de abajo recorre los checkpoints de la tirada real. El deslizador elige uno; el gráfico
-dibuja la pérdida de entrenamiento y la de validación contra el eje izquierdo y el top-1 de
-siguiente jugada contra el derecho, con una línea vertical en el checkpoint seleccionado, y debajo
-están sus números exactos, incluidas la legalidad sin máscara y el Elo estimado de los checkpoints
-que se evaluaron.
+La isla de abajo recorre los checkpoints de la tirada real: un paso del deslizador, un
+`step-*.pt`. El deslizador elige uno; el gráfico dibuja la pérdida de entrenamiento y la de
+validación contra el eje izquierdo y el top-1 de siguiente jugada contra el derecho, con una línea
+vertical en el checkpoint seleccionado, y debajo están sus números exactos, incluidas la legalidad
+sin máscara por argmax y el Elo estimado de los checkpoints que se evaluaron. Los campos que no se
+midieron salen como un guion, y su línea deja un hueco en vez de bajar a cero.
 
 Tres cosas concretas que mirar, en este orden:
 
@@ -1282,8 +1324,9 @@ medido con un harness que no se engaña a sí mismo y lo has puesto a jugar en u
 
 **Cómo se mide el módulo 2.** Todo lo que sigue es un número o un test:
 
-- **Legalidad sin máscara** sobre 10 000 posiciones de validación. Es la primera columna de la
-  tabla única y la métrica de comprensión: el objetivo de GOAL para `small` es ≥ 99 %.
+- **Legalidad sin máscara** sobre 10 000 posiciones de validación, medida por argmax y muestreada.
+  Es la primera columna de la tabla única y la métrica de comprensión: el objetivo de GOAL para
+  `small` es ≥ 99 % **en el argmax**, y la muestreada se publica al lado por ser siempre menor.
 - **Top-1 y top-3** de siguiente jugada contra la humana, global y por tramo de Elo. Baja la línea
   de base para todo lo que venga después.
 - **Puzles resueltos** por tramo de dificultad, con la secuencia completa como criterio.

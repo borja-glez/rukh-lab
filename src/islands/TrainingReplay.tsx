@@ -1,8 +1,9 @@
 /**
  * TrainingReplay (lesson M2): the training run replayed checkpoint by checkpoint. A slider walks
- * the evaluated steps; the chart draws training and validation loss against the left axis and
- * next-move top-1 against the right one, with a marker on the selected step and its numbers
- * underneath. Data comes from `src/data/training-replay.json`, exported from MLflow by
+ * the checkpoints the run left behind; the chart draws training and validation loss against the
+ * left axis and next-move top-1 against the right one, with a marker on the selected step and its
+ * numbers underneath. Every field but `step` is optional (see `ReplayStep`): a missing one is a
+ * dash and a gap in its line, never a zero. Data comes from `src/data/training-replay.json`, exported from MLflow by
  * `labs/m2/replay_export.py` and copied here with `pnpm sync:data`; the schema is documented in
  * `src/data/README.md`. Styles live in `src/styles/global.css` (`.tr*`), never inline (CSP).
  *
@@ -10,12 +11,19 @@
  */
 import { useId, useMemo, useState } from 'preact/hooks';
 
+/**
+ * One checkpoint of the run. Only `step` is guaranteed: `replay_export.py` copies a metric when
+ * MLflow logged it at that exact step (with the shipped configs it always does, because
+ * `log_every` and `eval_every` divide `ckpt_every`, but the writer does not promise it), and the
+ * two measured fields need their own flags (`--with-legality`, `--with-elo`). Everything missing
+ * is drawn as a dash and skipped by the polylines.
+ */
 export interface ReplayStep {
   step: number;
-  train_loss: number;
-  val_loss: number;
-  val_top1: number;
-  /** Optional: only the checkpoints that were evaluated with `rukh eval` carry these. */
+  train_loss?: number | null;
+  val_loss?: number | null;
+  val_top1?: number | null;
+  /** Unmasked **argmax** legality (D-026): the >= 99 % bar, not the sampled rate. */
   legality?: number | null;
   elo?: number | null;
 }
@@ -78,12 +86,18 @@ export function polyline(values: number[], bounds: [number, number]): string {
     .join(' ');
 }
 
-const num = (value: number, digits = 3) =>
-  Number.isFinite(value) ? value.toFixed(digits).replace('.', ',') : '—';
+const num = (value: number | null | undefined, digits = 3) =>
+  typeof value === 'number' && Number.isFinite(value)
+    ? value.toFixed(digits).replace('.', ',')
+    : '—';
 const pct = (value: number | null | undefined) =>
   typeof value === 'number' && Number.isFinite(value)
     ? `${(value * 100).toFixed(1).replace('.', ',')} %`
     : '—';
+
+/** A series ready for the chart: a missing entry becomes `NaN`, which `polyline` skips. */
+const series = (steps: readonly ReplayStep[], key: 'train_loss' | 'val_loss' | 'val_top1') =>
+  steps.map((step) => (typeof step[key] === 'number' ? step[key] : Number.NaN));
 
 function Pending() {
   return (
@@ -110,9 +124,9 @@ function Chart({ source }: { source: ReplayData }) {
   const current = steps[Math.min(index, steps.length - 1)];
 
   const chart = useMemo(() => {
-    const train = steps.map((s) => s.train_loss);
-    const val = steps.map((s) => s.val_loss);
-    const top1 = steps.map((s) => s.val_top1);
+    const train = series(steps, 'train_loss');
+    const val = series(steps, 'val_loss');
+    const top1 = series(steps, 'val_top1');
     const lossBounds = range([...train, ...val]);
     const top1Bounds = range(top1);
     return {
