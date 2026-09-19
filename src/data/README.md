@@ -13,6 +13,41 @@ leen detectan ese estado y muestran "pendiente" en vez de dibujar cifras inventa
 | `training-replay.json` | `labs/m2/replay_export.py`    | `src/islands/TrainingReplay.tsx` |
 | `value-bar.json`       | `labs/m3/value_bar_export.py` | `src/islands/ValueBar.tsx`       |
 
+## `results.json` · la tabla única
+
+```jsonc
+{
+  "updated_at": "2026-09-19T08:25:53+00:00", // `updated` en el marcador de posición versionado
+  // Una fila por etapa evaluada. Las etapas no son modelos distintos: `small` y `small-greedy` son
+  // el mismo checkpoint medido con dos muestreos (T=0,6 top-k 20 y T=0,05 top-k 1).
+  "rows": [
+    {
+      "stage": "small-greedy",
+      "params": 38971392,
+      "legality": 0.994, // sin máscara, por argmax: el listón >= 99 % de GOAL.md
+      "legality_sampled": 0.994, // el mismo modelo muestreado como la demo; siempre <= legality
+      "top1": 0.511,
+      "top3": 0.794,
+      "top1_by_band": { "1800-2000": 0.499 }, // la tabla no lo pinta; está para los labs
+      "puzzles": { "1000-1500": 0.347, "1500-2000": 0.2115, "2000+": 0.1035 }, // {} si no se midió
+      "elo": 1006.8,
+      "elo_ci": [919.69, 1100.6], // bootstrap al 95 %
+      "delta_cp": null, // null mientras no se mida: un hueco explícito, nunca un cero inventado
+      "diversity": null,
+      "date": "2026-09-19",
+      "run_id": "be0f6cee4a6e4eaca9081b623bc73412", // run de MLflow, o null
+    },
+  ],
+}
+```
+
+**Todas las fracciones van en [0, 1]**, nunca como porcentajes: quien las pinta las multiplica. El
+componente `<ResultsTable>` decide las columnas, su orden y sus etiquetas en cada idioma, porque el
+repo de ML publica medidas y no decisiones de presentación; acepta también el marcador de posición
+versionado, que sí trae `columns` y filas ya formateadas. Redondea con `toFixed`, igual que el
+`report.md` que escribe `rukh eval`, para que las dos lecturas de la misma medida no discrepen en
+una décima.
+
 ## `attention.json` · esquema `rukh-attention/1`
 
 ```jsonc

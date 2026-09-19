@@ -3,8 +3,19 @@ import results from '../../data/results.json';
 
 /**
  * The single results table (docs/02 §5), read from src/data/results.json which
- * `pnpm sync:data` copies from the ML repo. Renders an "empty" row until the
- * first model is evaluated.
+ * `pnpm sync:data` copies from `rukh/artifacts/web/results.json` (written by `rukh eval`).
+ * Renders an "empty" row until the first model is evaluated.
+ *
+ * Two shapes are accepted, because the placeholder committed here and the file the ML repo
+ * writes are not the same document:
+ *
+ * - placeholder: `{ updated, columns: [{key,label}], rows: [] }` — flat, already formatted.
+ * - `rukh eval`: `{ updated_at, rows: [{ stage, params, legality, legality_sampled, top1, top3,
+ *   puzzles: {"1000-1500": 0.347, …}, elo, elo_ci: [lo, hi], delta_cp, … }] }` — raw numbers as
+ *   fractions, nested puzzle bands, no columns and no labels.
+ *
+ * The columns live here and not in the data: the ML repo publishes measurements, the site decides
+ * how to name and order them, in each language.
  */
 interface Props {
   lang?: 'es' | 'en';
@@ -13,17 +24,121 @@ interface Props {
 
 const { lang = 'es', emptyText } = Astro.props;
 
-type Row = Record<string, string | number | null | undefined>;
-const columns = results.columns as { key: string; label: string }[];
-const rows = results.rows as Row[];
+type Json = Record<string, unknown>;
+type Cell = string | null;
+
+const LABELS: Record<'es' | 'en', { key: string; label: string }[]> = {
+  es: [
+    { key: 'stage', label: 'Etapa' },
+    { key: 'params', label: 'Parámetros' },
+    { key: 'legal', label: 'Legalidad sin máscara (%)' },
+    { key: 'top1', label: 'Top-1 (%)' },
+    { key: 'top3', label: 'Top-3 (%)' },
+    { key: 'puzzles_1000', label: 'Puzles 1000-1500 (%)' },
+    { key: 'puzzles_1500', label: 'Puzles 1500-2000 (%)' },
+    { key: 'puzzles_2000', label: 'Puzles 2000+ (%)' },
+    { key: 'elo', label: 'Elo vs Stockfish (IC 95 %)' },
+    { key: 'dcp', label: 'Δ medio (cp)' },
+    { key: 'hub', label: 'Hugging Face' },
+  ],
+  en: [
+    { key: 'stage', label: 'Stage' },
+    { key: 'params', label: 'Params' },
+    { key: 'legal', label: 'Legal moves, no mask (%)' },
+    { key: 'top1', label: 'Top-1 (%)' },
+    { key: 'top3', label: 'Top-3 (%)' },
+    { key: 'puzzles_1000', label: 'Puzzles 1000-1500 (%)' },
+    { key: 'puzzles_1500', label: 'Puzzles 1500-2000 (%)' },
+    { key: 'puzzles_2000', label: 'Puzzles 2000+ (%)' },
+    { key: 'elo', label: 'Elo vs Stockfish (95% CI)' },
+    { key: 'dcp', label: 'Mean loss (cp)' },
+    { key: 'hub', label: 'Hugging Face' },
+  ],
+};
+
+const raw = results as Json;
+const locale = lang === 'en' ? 'en-GB' : 'es-ES';
+const columns = LABELS[lang];
+const rawRows = Array.isArray(raw.rows) ? (raw.rows as Json[]) : [];
+
+const decimal = lang === 'en' ? '.' : ',';
+
+/**
+ * `toFixed` and not `toLocaleString`: the ML repo's own report.md rounds with Python, which lands
+ * on the binary value (21.15 prints as 21.1), and the two renderings of the same measurement must
+ * not disagree by a tenth. Only the decimal separator is localised; no thousands grouping, because
+ * every number here is a percentage or an Elo.
+ */
+function number(value: unknown, digits = 1): Cell {
+  const n = toNumber(value);
+  return Number.isFinite(n) ? n.toFixed(digits).replace('.', decimal) : null;
+}
+
+/** A fraction in [0, 1] as a percentage; `rukh eval` never writes these as percentages. */
+const percent = (value: unknown, digits = 1): Cell => number(toNumber(value) * 100, digits);
+
+function toNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : NaN;
+}
+
+function params(value: unknown): Cell {
+  const n = toNumber(value);
+  if (!Number.isFinite(n)) return null;
+  return n >= 1e6 ? `${number(n / 1e6)} M` : String(Math.round(n));
+}
+
+function elo(row: Json): Cell {
+  const point = toNumber(row.elo);
+  if (!Number.isFinite(point)) return null;
+  const ci = Array.isArray(row.elo_ci) ? (row.elo_ci as unknown[]) : [];
+  const lo = toNumber(ci[0] ?? row.elo_lower);
+  const hi = toNumber(ci[1] ?? row.elo_upper);
+  const rounded = String(Math.round(point));
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return rounded;
+  return `${rounded} (${Math.round(lo)} … ${Math.round(hi)})`;
+}
+
+function band(row: Json, key: string): Cell {
+  const puzzles = row.puzzles;
+  if (!puzzles || typeof puzzles !== 'object') return null;
+  return percent((puzzles as Json)[key]);
+}
+
+/** A row already written for display (the committed placeholder) passes through untouched. */
+const isMeasured = (row: Json) => 'legality' in row || 'elo_ci' in row || 'top1_by_band' in row;
+
+const rows: Record<string, Cell>[] = rawRows.map((row) => {
+  if (!isMeasured(row)) {
+    const cells: Record<string, Cell> = {};
+    for (const { key } of columns) {
+      const value = row[key];
+      cells[key] = value === undefined || value === null ? null : String(value);
+    }
+    return cells;
+  }
+  return {
+    stage: typeof row.stage === 'string' ? row.stage : null,
+    params: params(row.params),
+    legal: percent(row.legality),
+    top1: percent(row.top1),
+    top3: percent(row.top3),
+    puzzles_1000: band(row, '1000-1500'),
+    puzzles_1500: band(row, '1500-2000'),
+    puzzles_2000: band(row, '2000+'),
+    elo: elo(row),
+    dcp: number(row.delta_cp),
+    hub: typeof row.hub === 'string' ? row.hub : null,
+  };
+});
+
 const empty =
   emptyText ??
   (lang === 'en'
     ? 'No results yet: the first model is trained in module 2.'
     : 'Todavía no hay resultados: el primer modelo se entrena en el módulo 2.');
-const updated = results.updated
-  ? new Date(results.updated).toLocaleDateString(lang === 'en' ? 'en-GB' : 'es-ES')
-  : null;
+const updatedAt = raw.updated_at ?? raw.updated;
+const updated =
+  typeof updatedAt === 'string' ? new Date(updatedAt).toLocaleDateString(locale) : null;
 ---
 
 <div class="results">
@@ -47,10 +162,10 @@ const updated = results.updated
           rows.map((row) => (
             <tr>
               {columns.map((c) =>
-                c.key === 'hub' && typeof row[c.key] === 'string' ? (
+                c.key === 'hub' && row.hub ? (
                   <td>
-                    <a href={`https://huggingface.co/${row[c.key]}`} rel="noopener">
-                      {row[c.key]}
+                    <a href={`https://huggingface.co/${row.hub}`} rel="noopener">
+                      {row.hub}
                     </a>
                   </td>
                 ) : (
