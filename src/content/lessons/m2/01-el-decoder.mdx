@@ -1025,7 +1025,7 @@ va de −200 a 292**, es decir, un intervalo tan ancho que lo único que dice es
 `suite: quick` no se evalúan puzles (el fichero no estaba aún en disco: mira la última línea de las
 notas), así que esa fila sale `n/a`.
 
-`tiny` existe para eso: para que cuando `small` dé 99,4 % de legalidad y 1007 de Elo sepas de dónde
+`tiny` existe para eso: para que cuando `small` dé 99,4 % de legalidad y 1359 de Elo sepas de dónde
 viene y cuánto costó cada punto. Y para descubrir un bug de tubería en tres minutos.
 
 <Exercise n="03" title="Dos entrenamientos de 300 pasos que explican la receta">
@@ -1128,10 +1128,15 @@ Dos cosas de esa salida antes de mirar el informe.
 
 `stage: small-greedy` no es otro modelo: son los mismos pesos evaluados con el muestreo casi
 determinista (temperatura 0,05, top-k 1). La misma suite sobre el mismo `best.pt` con el muestreo
-de la demo (temperatura 0,6, top-k 20) es la fila `small` de la tabla única, y da **785 de Elo (IC
-95 % 680-896)** en vez de 1007. Los dos números están publicados porque miden cosas distintas: uno
-es la fuerza del modelo, el otro es la fuerza con la que juega la demo. **La temperatura vale unos
-220 puntos de Elo**, más que cualquier decisión de arquitectura de este módulo.
+de la demo (temperatura 0,6, top-k 20) es la fila `small` de la tabla única, y da **1181 de Elo (IC
+95 % 1076-1249)** en vez de 1359. Los dos números están publicados porque miden cosas distintas:
+uno es la fuerza del modelo, el otro es la fuerza con la que juega la demo. **La temperatura vale
+unos 180 puntos de Elo**, más que cualquier decisión de arquitectura de este módulo.
+
+Fíjate en lo que eso hace con el criterio: los mismos pesos cumplen el listón de 1200 jugando a lo
+seguro (1359) y no lo cumplen jugando como la demo (1181). Un Elo nunca es del fichero que te
+descargas; es del par modelo+muestreo, y una tabla que compare etapas tiene que fijar el muestreo
+antes de comparar nada.
 
 Y la línea `puzzles: 0.0107` es un error, no un resultado. Esa tirada montaba el prompt del puzle
 mal —le daba al modelo la posición suelta en vez del prefijo real de la partida de la que sale el
@@ -1167,6 +1172,11 @@ El informe completo que escribió la ejecución buena, `artifacts/eval/small-gre
 | Estimated Elo                                        | 1007 (95 % CI 920-1101) |
 | Mean centipawn loss                                  | n/a                     |
 | Opening diversity                                    | n/a                     |
+
+Ese `Estimated Elo` es el que escribió la model card **y está mal**: el ajuste se apoyaba
+en cuatro rivales con el Elo puesto a mano. Se deja tal cual porque es lo que la tirada
+produjo y porque más abajo se cuenta cómo se destapó; con los escalones medidos, las mismas
+160 partidas dan **1359 (IC 1293-1429)**.
 
 ## Legality
 
@@ -1232,18 +1242,41 @@ Qué dice, sin adornos:
 - **Puzles 22,1 %**, con la pendiente que se espera: 34,7 % en 1000-1500, 21,1 % en 1500-2000 y
   10,3 % en 2000+. Resolver un puzle exige acertar **toda** la secuencia, así que es una métrica
   dura, y esa caída por dificultad es la señal de que mide algo real.
-- **Elo 1007, IC 95 % 920-1101.** El objetivo de `GOAL.md` para `small` es **≥ 1200, y no se
-  alcanza**: faltan casi doscientos puntos y el extremo superior del intervalo se queda en 1101.
-  Está escrito así a propósito. `GOAL.md` dice que si no se llega se documenta la cifra real y no se
-  mueve el objetivo, y esta lección es donde se documenta.
+- **Elo 1007, IC 95 % 920-1101.** El objetivo de `GOAL.md` para `small` es ≥ 1200, así que esta
+  cifra decía que faltaban casi doscientos puntos.
 
-Mirar la tabla de partidas explica de dónde sale ese 1007 y por qué hay que leerlo con cuidado. El
-modelo puntúa 0,525 contra `skill-0` y contra `uci-1320`, se hunde a 0,100 contra `skill-2` y a
-0,050 contra `skill-3`, y vuelve a marcar 0,225 contra `uci-1500`. Esa no monotonía es la prueba de
-que los escalones no son una escala calibrada: los cuatro `skill-*` son valores nominales de
-`Skill Level`, no ratings medidos, y Stockfish juega a 0,1 s por jugada, muy por debajo de
-cualquier régimen en el que `UCI_Elo` signifique algo. El intervalo del 95 % solo cubre el ruido de
-muestreo de 160 partidas; el sesgo del banco de pruebas no está dentro de él.
+**Esa cifra era falsa, y la propia tabla de partidas llevaba la pista dentro.** El modelo puntúa
+0,525 contra `skill-0` y contra `uci-1320`, se hunde a 0,100 contra `skill-2` y a 0,050 contra
+`skill-3`, y vuelve a marcar 0,225 contra `uci-1500`. Esa no monotonía es imposible si los ocho
+escalones están en una misma escala: los cuatro `skill-*` son valores nominales de `Skill Level`
+—etiquetas que pusimos a mano— y no ratings medidos.
+
+Ninguna medición del modelo puede resolverlo, porque el modelo es justo lo que se está midiendo.
+Motor contra motor sí: se hicieron jugar los escalones entre ellos, 40 partidas por pareja, a los
+mismos 0,1 s por jugada.
+
+| Escalón | Etiqueta que tenía | Medido | Error |
+|---|---|---|---|
+| `skill-0` | 800 | **1381** | +581 |
+| `skill-1` | 950 | **1467** | +517 |
+| `skill-2` | 1100 | **1589** | +489 |
+| `skill-3` | 1250 | **1678** | +428 |
+
+Los cuatro se habían metido en la escalera para llegar **por debajo** del suelo de 1320 de
+`UCI_Elo`, y ninguno llega. El método se valida con su propio control: `uci-1500` midió **+179**
+Elo sobre `uci-1320` frente a los +180 nominales, así que el procedimiento no está sesgado.
+(`UCI_Elo` sí se comprime más arriba: `uci-1800` midió +215 sobre `uci-1500`, no +300.)
+
+Con las etiquetas medidas, el mismo checkpoint, las mismas 160 partidas y el mismo ajuste dan
+**1359 Elo (IC 1293-1429)**. El listón de 1200 nunca se falló; la regla estaba torcida y lo estuvo
+durante dos hitos enteros.
+
+La lección que hay que llevarse no es el número. Es que **un banco de pruebas es código sin tests**
+mientras nadie lo mida, y que la señal de alarma estaba publicada en una tabla desde el principio,
+mirada muchas veces, sin que nadie tirase del hilo. Cuando una medición contradice a otra, una de
+las dos miente, y averiguar cuál casi siempre es más barato que discutirlo. El intervalo del 95 %
+nunca habría avisado: solo cubre el ruido de muestreo de 160 partidas, y el sesgo del banco de
+pruebas no está dentro de él.
 
 Y una partida, para verlo con tus ojos, que es una forma de evaluación que ninguna tabla sustituye:
 
@@ -1773,7 +1806,7 @@ de jugadas legales en un día de GPU. Léelo en
 el código y los modelos están publicados con licencia MIT.
 
 Conviene poner esa cifra al lado de la nuestra sin maquillarla: 1300 de Elo y 99,8 % de legalidad,
-frente a los **1007 y 99,4 %** que mide `small`. Karvonen usó 16 millones de partidas y un día de
+frente a los **1359 y 99,4 %** que mide `small`. Karvonen usó 16 millones de partidas y un día de
 GPU; nosotros, 5,9 millones y 42 minutos, con un modelo un 22 % más pequeño. El curso no está
 igualando ese resultado, y la lección no finge que sí.
 
@@ -1843,7 +1876,7 @@ más que los aciertos.
    no es anecdótico: si la cifra buena hubiera sido la estimada, medio diseño del curso (iterar,
    repetir, probar tres tokenizaciones) habría sido inviable. Medir una vez al principio vale más
    que estimar diez veces.
-2. **La temperatura de muestreo vale unos 220 puntos de Elo.** Los mismos pesos dan 1007 con
+2. **La temperatura de muestreo vale unos 180 puntos de Elo.** Los mismos pesos dan 1359 con
    muestreo casi determinista y 785 con la temperatura 0,6 de la demo. Es más de lo que separa a
    `small` de su objetivo, y más de lo que cambiaría cualquier ajuste de arquitectura que quepa en
    este módulo. La consecuencia práctica: un Elo publicado sin decir con qué muestreo se midió no
@@ -1867,10 +1900,12 @@ más que los aciertos.
 - **Puzles resueltos** por tramo de dificultad, con la secuencia completa como criterio. Medido:
   **22,1 %** (34,7 / 21,1 / 10,3 % por tramo).
 - **Elo estimado con intervalo de confianza del 95 %** por bootstrap sobre las partidas contra los
-  ocho escalones de Stockfish. Objetivo de GOAL: ≥ 1200 para `small`. Medido: **1007 (IC 920-1101)**
-  con muestreo casi determinista y **785 (IC 680-896)** con la temperatura 0,6 de la demo. **No se
-  alcanza el objetivo**, y la regla se aplica tal cual está escrita: se documenta la cifra real, no
-  se mueve el objetivo.
+  ocho escalones de Stockfish. Objetivo de GOAL: ≥ 1200 para `small`. Este hito publicó **1007
+  (IC 920-1101)** y dio el objetivo por no alcanzado; la cifra estaba mal porque cuatro de los ocho
+  escalones tenían el Elo inventado. Con las etiquetas medidas, las mismas partidas dan **1359
+  (IC 1293-1429)** y el objetivo estaba cumplido desde aquí. Lo que sí se mantiene es la otra mitad
+  del aviso: la temperatura de la demo cuesta unos 220 puntos, así que un Elo es siempre del par
+  modelo+muestreo.
 - **Paridad ONNX ≥ 99,9 %** de jugadas idénticas a PyTorch en 1 000 posiciones, para fp32, fp16 e
   int8, más la diferencia máxima de logits de cada uno. Medido: 100 % en fp32, **99,80 % en fp16**
   y **95,40 % en int8**; las dos cuantizaciones se quedan por debajo del listón.
