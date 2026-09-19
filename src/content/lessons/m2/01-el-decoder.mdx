@@ -5,7 +5,7 @@ module: m2
 order: 1
 duration: 480
 level: base
-status: borrador
+status: vigente
 updated: 2026-09-19
 keywords:
   - decoder
@@ -77,12 +77,12 @@ Al terminar tendrás:
 
 Las cifras medidas de esta lección —curvas, legalidad, top-1, puzles, Elo, tamaños de fichero y
 paridad— son las del entrenamiento real de `small` en la máquina de referencia (RTX 5090, 19 de
-septiembre de 2026), y las dos islas del final dibujan esa misma tirada. El `status` sigue en
-`borrador` por una sola razón: quedan cuatro salidas de consola sin capturar (las dos partidas de
-`rukh play` y la de los dos scripts que exportan los datos de las islas), y esos huecos están
-marcados donde van. Todo lo demás está medido. Las cifras de parámetros, dimensiones y la
-aritmética de la atención no son medidas: son aritmética, y puedes comprobarlas con una
-calculadora.
+septiembre de 2026), y las dos islas del final dibujan esa misma tirada: `TrainingReplay` recorre
+los 20 checkpoints del run `small-20260919-062911` y `AttentionMap` dibuja las 12 capas × 8 cabezas
+exportadas de su `best.pt`. Las salidas de consola están pegadas tal cual, con una sola excepción
+declarada donde ocurre: la del entrenamiento de `tiny`, que no se capturó y cuyos números se leen
+de MLflow. Las cifras de parámetros, dimensiones y la aritmética de la atención no son medidas: son
+aritmética, y puedes comprobarlas con una calculadora.
 
 ## Teoría justa
 
@@ -1251,10 +1251,21 @@ Y una partida, para verlo con tus ojos, que es una forma de evaluación que ning
 uv run rukh play --ckpt checkpoints/small/best.pt --games 1
 ```
 
-La transcripción de esta partida no se capturó en la ejecución de referencia y se pega aquí en
-cuanto se vuelva a lanzar.
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
 
-{/* OUTPUT: uv run rukh play --ckpt checkpoints/small/best.pt --games 1 */}
+```text
+opponent: random
+mask:     on
+  game 1: 1/2-1/2 117 plies  0 illegal  (stalemate)
+illegal:  0 proposals
+```
+
+Ciento diecisiete plies contra un oponente que juega al azar, y tablas por **ahogado**. No es la
+partida lucida que uno querría enseñar, y por eso está aquí. Con la máscara puesta el contador de
+ilegales es **0**, como tiene que ser: el muestreo enmascarado no puede producir una jugada ilegal,
+así que ese cero no dice nada del modelo —dice que la máscara funciona, y si alguna vez ves ahí un
+número distinto de cero, lo que está roto es la máscara—. El ahogado, en cambio, sí es del modelo:
+llegó a un final ganado contra un rival aleatorio y no supo dar mate.
 
 La misma partida sin máscara enseña el otro lado: cada vez que el modelo propone algo ilegal se
 cuenta y se rescata con un muestreo enmascarado, así que la partida siempre termina y el contador
@@ -1264,9 +1275,25 @@ cuenta y se rescata con un muestreo enmascarado, así que la partida siempre ter
 uv run rukh play --ckpt checkpoints/small/best.pt --games 1 --no-mask
 ```
 
-Tampoco se capturó, y queda pendiente igual que la anterior.
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
 
-{/* OUTPUT: uv run rukh play --ckpt checkpoints/small/best.pt --games 1 --no-mask */}
+```text
+opponent: random
+mask:     off
+  game 1: 1-0      79 plies  1 illegal  (checkmate)
+illegal:  1 proposals
+```
+
+Mate en 79 plies y **una sola propuesta ilegal en toda la partida**. Ese `1` es lo que conecta esta
+partida con la tabla de arriba, y merece la pena hacer la cuenta: es la única vez en el módulo en
+que una métrica agregada y un caso concreto se pueden contrastar a mano. Una legalidad por argmax
+del **99,4 %** son 6 fallos por cada 1 000 posiciones, es decir **uno cada 167 jugadas propuestas**.
+En una partida de 79 plies el modelo mueve la mitad de las veces —el otro lado es el oponente
+aleatorio—, así que propone unas 40 jugadas y el número esperado de ilegales es 0,24: sale 1. Con
+una sola partida eso es ruido puro y no confirma nada, pero el orden de magnitud coincide, y esa es
+la comprobación barata que conviene hacerse siempre que tengas una métrica agregada y un caso
+suelto delante. Si aquí hubieran salido quince ilegales, el 99,4 % de la tabla estaría midiendo
+otra cosa.
 
 <Exercise n="04" title="¿Cuántas partidas necesitas para creerte una mejora de 40 Elo?">
   Usando la fórmula de la varianza de la sección anterior —`var = 1 / (c² · Σ p(1−p))` con
@@ -1462,13 +1489,15 @@ print(f"wrote {OUT} ({cfg.n_layer} layers x {cfg.n_head} heads x {len(ids)}^2)")
 uv run python labs/m2/attention_export.py
 ```
 
-La consola de los dos scripts de exportación de datos de visualización —este y el
-`replay_export.py` de aquí abajo— está pendiente de capturar. Los ficheros que escribieron sí están
-sincronizados en el sitio, así que las dos islas del final de esta página ya dibujan la tirada real
-de `small`: `attention.json` con 12 capas × 8 cabezas y `training-replay.json` con los 20
-checkpoints.
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
 
-{/* OUTPUT: uv run python labs/m2/attention_export.py */}
+```text
+wrote artifacts\web\attention.json (12 layers x 8 heads x 16^2)
+```
+
+Una línea y un fichero de 211 KB. El `16^2` es el tamaño de la partida de ejemplo: trece jugadas
+más los tres tokens de control, 16 × 16 celdas por cabeza, 96 matrices en total. Es el fichero que
+`pnpm sync:data` copia a `src/data/attention.json` y que dibuja la segunda isla de esta página.
 
 Falta un cuarto script, corto, que lee las métricas de MLflow del run y escribe la repetición del
 entrenamiento: **`labs/m2/replay_export.py`** produce `artifacts/web/training-replay.json` con un
@@ -1485,9 +1514,18 @@ ficheros está documentado en `rukh-lab/src/data/README.md`; los dos llegan a es
 uv run python labs/m2/replay_export.py
 ```
 
-Pendiente de capturar, igual que la anterior.
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
 
-{/* OUTPUT: uv run python labs/m2/replay_export.py */}
+```text
+20 checkpoints -> E:\work\ai\chess-lm\rukh\artifacts\web\training-replay.json
+```
+
+Veinte checkpoints, uno cada mil pasos, y **ninguna de las dos banderas caras**: la tirada de
+referencia se exportó sin `--with-legality` y sin `--with-elo`, así que esos dos campos salen como
+un guion en los veinte pasos de la isla. No es un descuido que haya que disimular: `--with-elo`
+juega partidas contra Stockfish en cada checkpoint y convierte un script de dos segundos en una
+noche de cómputo. Lo que la isla dibuja son las tres series que MLflow registró gratis durante el
+entrenamiento, y dan de sobra para lo que hay que aprender a leer.
 
 <Exercise n="05" title="¿Por qué int8 cambia los logits y no la jugada?">
   Mira la salida de la exportación: la diferencia máxima de logits del fichero int8 es más de cien
@@ -1529,23 +1567,47 @@ vertical en el checkpoint seleccionado, y debajo están sus números exactos, in
 sin máscara por argmax y el Elo estimado de los checkpoints que se evaluaron. Los campos que no se
 midieron salen como un guion, y su línea deja un hueco en vez de bajar a cero.
 
-Tres cosas concretas que mirar, en este orden:
+Dos cosas concretas que mirar, en este orden:
 
 1. **Dónde se separan las dos pérdidas.** Mientras van juntas, el modelo generaliza: lo que aprende
    del entrenamiento le sirve para partidas que no ha visto. El punto donde la de validación se
    aplana mientras la otra sigue bajando es el principio del sobreajuste, y es el punto que decide
    cuál es el `best.pt`. Con 6 millones de partidas y 39 millones de parámetros esa separación
    debería llegar tarde o no llegar; si llega pronto, sobran parámetros o faltan datos.
-2. **Cuándo despega la legalidad.** Es la métrica emergente del curso. Al principio el modelo
-   propone jugadas bien formadas pero imposibles en la posición; en algún momento del entrenamiento
-   esa cifra se dispara y no vuelve a bajar. Fíjate en si ese salto coincide con algún codo de la
-   curva de pérdida o si ocurre en una zona donde la pérdida bajaba plácidamente. Lo segundo es lo
-   habitual y es lo interesante: **la pérdida no sabe qué es una jugada legal**, y aun así aprender
-   a bajarla obliga al modelo a representar la posición.
-3. **La relación entre top-1 y Elo.** No son la misma cosa. El top-1 mide imitar al humano medio; el
-   Elo mide ganar partidas. Puedes ver tramos donde el top-1 apenas se mueve y el Elo sube, porque
-   el modelo está mejorando en las posiciones que deciden la partida aunque no acierte más jugadas
-   en total.
+2. **Cuánto compra la segunda mitad del entrenamiento.** Lleva el deslizador al paso 10 000 y
+   compara con el 20 000. La diferencia entre esas dos cifras de top-1 es, literalmente, lo que
+   valieron veinte minutos de GPU, y es el número con el que se decide si la tirada siguiente dura
+   más pasos o cambia otra cosa.
+
+Y una tercera que en esta tirada **no** vas a poder mirar, aunque la isla tenga sitio para ella: la
+legalidad y el Elo salen como un guion en los veinte checkpoints, porque el export se lanzó sin
+`--with-legality` ni `--with-elo`. La pregunta que dejan sin responder es buena —si el despegue de
+la legalidad coincide con un codo de la pérdida o si ocurre mientras la pérdida bajaba
+plácidamente, que es lo que la convertiría en una capacidad **emergente** en vez de en un reflejo
+de la pérdida— y queda abierta, anotada como tal, no resuelta de memoria.
+
+Lo que sí dibuja la isla, leído de los números y no de la forma de la curva. Los 20 checkpoints van
+de **2,6531** de pérdida de entrenamiento y **2,6279** de validación en el paso 1 000 a **1,4594** y
+**1,5197** en el 20 000, con el top-1 de validación subiendo de **0,3341** a **0,5120**. Casi todo
+el descenso ocurre pronto: del paso 1 000 al 5 000 la validación cae 0,85 (2,6279 → 1,7822) y en los
+15 000 pasos restantes solo 0,26 más. El top-1 hace exactamente lo mismo: **+12,2 puntos** en los
+primeros 5 000 pasos y **+5,6** en los 15 000 siguientes; la segunda mitad entera del entrenamiento,
+del paso 10 000 al 20 000, compró **2,4 puntos** de top-1.
+
+El hueco entre las dos pérdidas responde a la pregunta del sobreajuste, y la respuesta no es la que
+uno espera. En los pasos 1 000 y 2 000 la validación va **por debajo** de la de entrenamiento
+(−0,025 y −0,015): no es magia, es que la pérdida de entrenamiento se promedia sobre una ventana de
+pasos en los que el modelo todavía era peor, mientras que la de validación se mide con los pesos de
+ese instante. Las dos curvas se cruzan en el paso 3 000 y desde ahí el hueco crece de forma
+monótona: **+0,021** en el 10 000, **+0,046** en el 15 000 y **+0,060** en el 20 000. Sesenta
+milésimas sobre una pérdida de 1,52 es un **4 %**. Hay sobreajuste, sí, y se ve; pero la curva de
+validación **no se ha aplanado**: en los últimos mil pasos todavía baja 0,003 y el top-1 todavía
+sube. Con 240 millones de tokens de entrenamiento —poco más de cuatro épocas de enero— 39 millones
+de parámetros **no son demasiados parámetros**. Por eso el `best.pt` de esta tirada es el último
+checkpoint y no uno intermedio rescatado antes del desastre, y por eso la conclusión honesta del
+módulo es que a `small` no lo limita el sobreajuste sino el presupuesto: **entrenar más pasos era la
+mejora barata que este módulo no llegó a probar**, y esos +2,4 puntos de la segunda mitad son la
+cifra que habría que batir.
 
 <TrainingReplay client:visible />
 
@@ -1565,8 +1627,9 @@ jugadas a las que más mira la fila que elijas con el selector.
 Qué buscar mientras cambias de capa y de cabeza:
 
 - **La diagonal encendida.** La casilla inmediatamente a la izquierda de la diagonal es "la jugada
-  anterior". Casi siempre hay alguna cabeza dedicada a eso, y tiene todo el sentido: la jugada
-  anterior es el vecino más informativo de una secuencia.
+  anterior". Suele haber alguna cabeza dedicada a eso, y tiene todo el sentido: la jugada anterior
+  es el vecino más informativo de una secuencia. En este modelo la hay —una sola, y no en la capa
+  en la que la buscarías—; el apartado que sigue a la lista dice cuál y con qué números.
 - **Columnas verticales.** Una columna entera encendida es una jugada a la que mira todo el mundo,
   normalmente porque acumula contexto. El `<bos>` del principio suele comportarse así en varias
   cabezas y, en los Transformers de texto, se conoce como sumidero de atención: la cabeza no tiene
@@ -1575,9 +1638,52 @@ Qué buscar mientras cambias de capa y de cabeza:
 - **Bloques y saltos.** Lo interesante son las celdas lejos de la diagonal: la jugada 12 mirando a
   la 5, que es cuando se movió la pieza que ahora se captura. Algunas cabezas de capas intermedias
   hacen eso, y es lo más cerca que se está de ver el modelo "razonando" sobre el tablero.
-- **Diferencias entre capas.** Las primeras capas suelen tener patrones locales y regulares; las
-  del medio, los más estructurados; las últimas, algo más difusos, porque ya trabajan sobre
-  representaciones muy mezcladas.
+- **Diferencias entre capas.** Lo que se cuenta habitualmente es que las primeras capas tienen
+  patrones locales y regulares, las del medio los más estructurados y las últimas los más difusos,
+  porque ya trabajan sobre representaciones muy mezcladas. Es una expectativa razonable y conviene
+  comprobarla antes de repetirla: en este modelo la mitad de esa frase no se cumple.
+
+**Lo que hay de verdad en este `attention.json`.** Lo que sigue no es lo que se ve "a ojo" en el
+mapa: es el resultado de leer las 96 matrices de 16 × 16 con un script de veinte líneas, porque
+mirar colores es precisamente la forma de contarse una película. Salen tres cosas: una limpia, una
+que contradice el punto de arriba y una que hay que dejar sin concluir.
+
+Lo limpio: hay **una** cabeza de jugada anterior, y es inequívoca. Es la **capa 9, cabeza 4**
+(L9H4), con una media de **0,80** de peso sobre la celda inmediatamente a la izquierda de la
+diagonal, frente a un máximo de 0,65 en las otras noventa y cinco. Y no es una media de valores
+tibios: en 11 de sus 15 filas el máximo cae justo ahí, con 0,988 (`b1c3` mirando a `d7d6`), 0,994 y
+luego **1,000, 1,000, 1,000, 1,000** en las filas de `f3e5`, `g4d1`, `c4f7` y `e8e7`. Esa cabeza no
+hace otra cosa. Detrás van L8H7 (0,65 de media), L7H7 (0,60) y L4H3 (0,58); las 92 restantes se
+quedan por debajo de 0,45. Las filas en las que L9H4 se sale del guion son las tres primeras jugadas
+negras (`e7e5`, `b8c6`, `d7d6`), donde pone el peso en **sí misma** (0,982 y 0,919 sobre la
+diagonal). No sé por qué, y prefiero dejarlo escrito así a inventarme una explicación.
+
+Lo que contradice el punto de arriba: **la capa 0 no tiene patrones locales; no tiene ninguno**. Sus
+ocho cabezas son casi indistinguibles entre sí y casi uniformes. Midiendo cada fila contra la
+distribución uniforme sobre su propio pasado, la divergencia KL de las ocho cabezas de la capa 0 va
+de 0,23 a 0,34, cuando la media del modelo entero es 0,72 y L9H4 llega a 1,90; en la última fila, la
+celda más alta de L0H0 es el `<bos>` con 0,198 cuando lo uniforme serían 0,062. La primera capa
+reparte, y ya está. La otra mitad de la expectativa sí se cumple: las capas 10 y 11 vuelven a ser
+difusas —la atención a la jugada anterior cae a 0,07-0,17— y vuelcan la masa en los tokens de
+control; en la capa 11, **siete de las ocho cabezas** tienen el máximo de su última fila en el
+`<bos>`, entre 0,345 y 0,513, y la octava en `<b1800>` con 0,570. Con un matiz que el punto del
+sumidero no anticipaba: aquí el sumidero no es solo el `<bos>`. Promediando el modelo entero sobre
+las filas de jugada, el `<bos>` se lleva **0,229** de la atención y `<b1800>` —el último token de
+control, el que va justo antes de la primera jugada— **0,226**, prácticamente lo mismo. Y hay
+cabezas dedicadas a él en exclusiva: L3H7 pone entre 0,746 y 0,986 sobre `<b1800>` en ocho filas
+seguidas.
+
+Y lo que hay que dejar sin concluir, que era lo que más ganas había de encontrar. Sí aparecen celdas
+lejos de la diagonal con pesos altísimos, y son tentadoras: L5H5 pone **0,999** sobre `d7d6` justo en
+la fila en la que toca escribir `f3e5`, que es el caballo capturando en e5 después de que ese `d7d6`
+dejara de defender el peón; L4H0 pone 0,987 sobre `f1c4` en la fila de `g4d1`. Es exactamente la
+película que el aviso de aquí abajo pide no contarse, y los números explican por qué: **esas mismas
+cabezas apuntan al mismo token en varias filas seguidas**. L5H5 tiene su máximo en `d7d6` en tres
+filas distintas, y L1H3 lo tiene en `e7e5` en ocho de las suyas. Eso se parece mucho más a "esta
+cabeza se ha enganchado a una columna" que a "esta cabeza busca la pieza que se captura", y con
+**una** partida de 16 tokens no hay manera de distinguir las dos cosas. Para distinguirlas harían
+falta un centenar de partidas y una estadística sobre ellas; lo de abajo es un instrumento de
+depuración, no un experimento.
 
 <AttentionMap client:visible />
 

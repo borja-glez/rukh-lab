@@ -568,8 +568,8 @@ intervienes tú.
 ## Labs
 
 Los cinco labs siguen el orden del pipeline. Los comandos son los reales y las salidas son las de la
-ejecución de referencia (RTX 5090, 19 de septiembre de 2026), pegadas tal cual. La única que falta
-es la consola del esquema `san` del lab 3, que no se capturó; sus estadísticas sí están medidas.
+ejecución de referencia (RTX 5090, 19 de septiembre de 2026), pegadas tal cual, sin recortes ni
+reconstrucciones.
 
 ### Lab 1 · Explorar el parquet con DuckDB
 
@@ -808,10 +808,32 @@ scheme:     bpe
 vocab_size: 4096
 ```
 
-{/* OUTPUT: uv run rukh data tokenize --scheme san --pack */}
+```text
+scheme:     san
+vocab_size: 35
+  train: 2,949,514 games, 1,258,749,609 tokens
+  val: 2,946,874 games, 1,250,789,500 tokens
+```
 
-La consola del esquema `san` es la única salida de esta lección que no se capturó en la ejecución
-de referencia; sus estadísticas sí, y están en la tabla de aquí abajo.
+Párate en esas dos líneas, porque son el argumento más fuerte de todo el módulo. Son **las mismas
+2 949 514 partidas** de enero y las mismas 2 946 874 de febrero que acaba de empaquetar el esquema
+`bpe` y que empaquetará el `uci` dentro de un comando: no cambia ni un dato, no se filtra ni se
+añade nada, solo cambia la forma de escribir las mismas jugadas. Y el flujo de tokens pasa de
+240 068 954 a **1 258 749 609**. Son **5,2 veces más tokens para exactamente el mismo corpus**
+(5,24× en entrenamiento y 5,24× en validación), con un vocabulario de 35 símbolos en lugar de
+2 030.
+
+Ese 5,2× no se paga en disco —el `tokens.npy` de `san` ocupa 2,5 GB en vez de 480 MB, y eso da
+igual—, se paga en tiempo de GPU y en ventana de contexto. Con el presupuesto fijo que gasta M2
+(20 000 pasos × 51 200 tokens = 1 024 millones de tokens) el esquema UCI hace algo más de **cuatro
+épocas** sobre enero; el mismo presupuesto sobre SAN **no llega a completar una sola**: 0,81
+épocas. Con la misma GPU y el mismo reloj, un esquema ve el corpus cuatro veces y el otro se queda
+sin terminar de leerlo. Y como el coste de la atención crece con el cuadrado de la longitud,
+igualar las épocas no costaría 5,2 veces más, sino unas 27.
+
+Esta es la razón de que la tokenización sea un módulo entero y no un apartado de media página: no
+es una preferencia de formato, es un factor 5,2 sobre la factura, medido sobre seis millones de
+partidas reales y no estimado.
 
 Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
 
@@ -844,9 +866,11 @@ Lo que salió medido, y por qué zanja la decisión:
 
 - **UCI fijo**: media **80,64** tokens por partida, p50 76, p95 139 y **99,8 %** por debajo de 200.
   La decisión de `max_len = 200` no truncaría ni dos partidas de cada mil.
-- **SAN por carácter**: media **422,44**, p50 393, p95 754 y solo el **7,77 %** cabe en 200. Cinco
-  veces más largo que UCI, exactamente la proporción que anunciaba la teoría, y con la ventana de
-  200 tokens del curso sería inservible: más de nueve de cada diez partidas se cortarían.
+- **SAN por carácter**: media **422,44**, p50 393, p95 754 y solo el **7,77 %** cabe en 200. Es
+  **5,24 veces** más largo que UCI, que es exactamente la misma proporción que acabas de ver sobre
+  el corpus entero (1 258 749 609 tokens frente a 240 068 954): la muestra de 20 000 partidas y los
+  seis millones dicen el mismo número. Con la ventana de 200 tokens del curso sería inservible: más
+  de nueve de cada diez partidas se cortarían.
 - **BPE de 4 096**: media **68,05**, p50 62, p95 129 y **99,84 %** por debajo de 200. Es el más
   corto de los tres —las fusiones de apertura se comen diez plies de un bocado— a cambio del
   vocabulario más grande y de que la longitud de una partida dependa de lo previsible que sea.
