@@ -11,6 +11,7 @@ leen detectan ese estado y muestran "pendiente" en vez de dibujar cifras inventa
 | `tokenizer-stats.json` | `rukh data tokenize --stats`  | `<TokenizerStats>`               |
 | `attention.json`       | `labs/m2/attention_export.py` | `src/islands/AttentionMap.tsx`   |
 | `training-replay.json` | `labs/m2/replay_export.py`    | `src/islands/TrainingReplay.tsx` |
+| `value-bar.json`       | `labs/m3/value_bar_export.py` | `src/islands/ValueBar.tsx`       |
 
 ## `attention.json` · esquema `rukh-attention/1`
 
@@ -87,3 +88,49 @@ ninguno. La isla escribe un guion en los que falten y deja un hueco en la línea
 
 `legality` es la tasa **por argmax** (el token más probable, sin temperatura, sin top-k y sin
 máscara), que es la definición del listón del ≥ 99 % de `GOAL.md` (D-026), no la muestreada.
+
+## `value-bar.json` · esquema `rukh-value-bar/1`
+
+```jsonc
+{
+  "schema": "rukh-value-bar/1",
+  "game": {
+    // Las dos notaciones de la **misma** partida y en el mismo orden: `moves` es lo que come el
+    // modelo (UCI) y `san` es lo que lee una persona. `san[i]` y `moves[i]` son la jugada del ply
+    // `i + 1`; la isla dibuja SAN y deja UCI en el DOM para que se pueda copiar.
+    "moves": ["e2e4", "e7e5", "g1f3"],
+    "san": ["e4", "e5", "Cf3"],
+  },
+  // Un elemento por **ply jugado**, ordenados por `ply` ascendente y empezando en 1. No hay
+  // elemento para la posición inicial: las dos curvas valoran la posición *después* de la jugada,
+  // que es la única sobre la que el encoder puede decir si esa jugada fue un error.
+  "series": [
+    {
+      "ply": 1, // media jugada, 1 = la primera de las blancas; `series[i].ply === i + 1`
+      "encoder": 0.08, // valor del encoder, tanh(cp/400) desde el punto de vista de las BLANCAS
+      "stockfish": 0.06, // el mismo número calculado desde el `cp` de Stockfish, misma escala
+      "blunder": false, // true si la cabeza `blunder` marca como error la jugada de este ply
+    },
+  ],
+  "meta": {
+    "model": "rukh-encoder", // preset o repo del Hub
+    "checkpoint": "checkpoints/encoder-heads/best.pt",
+    "white": "Byrne, D.", // nombres tal como vienen del PGN; null si la partida es anónima
+    "black": "Fischer, R.",
+    "event": "New York, 1956",
+    "result": "0-1", // resultado de la partida, en notación PGN
+    "value_scale": 400.0, // el 400 de tanh(cp/400): sin él las dos curvas no son comparables
+    "threshold": 0.5, // probabilidad de la cabeza `blunder` a partir de la cual se marca el ply
+    "generated": "2026-09-21T10:02:11Z", // null en el marcador de posición
+  },
+}
+```
+
+`encoder` y `stockfish` viven **en la misma escala acotada**, `tanh(cp / value_scale)` en `[-1, 1]`
+y siempre desde el punto de vista de las blancas: positivo, ventaja blanca; negativo, ventaja negra.
+Es lo que hace que las dos curvas se puedan dibujar sobre el mismo eje y que la distancia vertical
+entre ellas signifique algo. Los dos campos son **opcionales** (`null` cuando esa fuente no valoró
+ese ply): la isla deja un hueco en la línea en vez de bajarla a cero, igual que `TrainingReplay`.
+
+Una partida de 40-60 plies es el tamaño cómodo. Por encima de 80 las etiquetas del eje dejan de
+leerse en un móvil, y el deslizador pasa a necesitar demasiados pasos para llegar a un ply concreto.

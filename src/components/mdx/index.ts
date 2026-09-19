@@ -16,6 +16,7 @@ import DemoEmbed from './DemoEmbed.astro';
 import TokenizerStats from './TokenizerStats.astro';
 import AttentionMap from '../../islands/AttentionMap';
 import TrainingReplay from '../../islands/TrainingReplay';
+import ValueBar from '../../islands/ValueBar';
 
 export {
   Callout,
@@ -31,6 +32,7 @@ export {
   TokenizerStats,
   AttentionMap,
   TrainingReplay,
+  ValueBar,
 };
 
 export const components = {
@@ -56,4 +58,5 @@ export const components = {
 export const islands = {
   AttentionMap,
   TrainingReplay,
+  ValueBar,
 };

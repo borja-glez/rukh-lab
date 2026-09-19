@@ -105,6 +105,7 @@ comprueba.
 | `TokenizerPlayground` | M1  | ninguno (corre en el navegador) |
 | `TrainingReplay`  | M2      | `src/data/training-replay.json` |
 | `AttentionMap`    | M2      | `src/data/attention.json`    |
+| `ValueBar`        | M3      | `src/data/value-bar.json`    |
 
 Convenciones de una isla nueva:
 
@@ -115,7 +116,7 @@ Convenciones de una isla nueva:
    genera. Nunca se dibujan cifras inventadas, ni siquiera de ejemplo.
 3. El esquema del JSON se documenta en `src/data/README.md` antes de escribir la isla, y el fichero
    se versiona vacío para que el build y los tests no dependan del repo de ML.
-4. **CSS en `src/styles/global.css`**, con un prefijo propio (`.tp*`, `.am*`, `.tr*`) y la altura
+4. **CSS en `src/styles/global.css`**, con un prefijo propio (`.tp*`, `.am*`, `.tr*`, `.vb*`) y la altura
    reservada (`min-height`, también en la consulta de 720 px) para no provocar CLS. Nada de
    `<style>` en la isla: la CSP solo admite estilos por atributo.
 5. Colores desde los tokens de diseño. Para escalas continuas, buckets en un atributo `data-*` que
@@ -124,8 +125,16 @@ Convenciones de una isla nueva:
    pueda comprobar las dos ramas sin depender de los datos.
 7. Accesibilidad: cada control con su `<label>`, objetivo táctil de 44 px, nada que dependa del
    hover (el valor numérico de un tooltip tiene que estar también en el DOM), y `aria-valuetext` en
-   los deslizadores.
-8. En la lección, un párrafo antes de la isla diciendo **exactamente qué hay que mirar**.
+   los deslizadores. **Nada que dependa solo del color**: si una isla dibuja un signo, una alerta o
+   dos series comparadas, el DOM tiene que decirlo también con palabras (`ValueBar` escribe "ventaja
+   de las blancas" y enumera en texto los plies marcados) y las series se distinguen además por
+   trazo (continuo frente a discontinuo), no solo por tono.
+8. **Geometría continua, por atributos de presentación de SVG** (`x`, `width`, `points`), no por
+   `style` inline ni por buckets: la CSP solo admite estilos por atributo y una barra con veinte
+   reglas de CSS es peor que un rectángulo con su `width` calculado. Los buckets de la regla 5 son
+   para el **color**; la posición y el tamaño van en el SVG. Y el eje de una serie ya acotada se
+   fija (`ValueBar` usa `[-1, 1]` siempre): ajustar una escala acotada solo sirve para exagerar.
+9. En la lección, un párrafo antes de la isla diciendo **exactamente qué hay que mirar**.
 
 El popover de `Term` existe solo en dispositivos con `(hover: hover)` (ratón o trackpad, al pasar por
 encima o al enfocar con teclado); en pantallas táctiles el término es un enlace normal al glosario,

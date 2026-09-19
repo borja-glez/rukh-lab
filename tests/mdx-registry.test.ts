@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 import * as registry from '../src/components/mdx/index';
 
 /** Preact islands a lesson may embed (registered, but hydrated from the MDX itself). */
-const ISLANDS = ['AttentionMap', 'TrainingReplay'] as const;
+const ISLANDS = ['AttentionMap', 'TrainingReplay', 'ValueBar'] as const;
 
 /** The lesson components listed in docs/04-web-curso.md. */
 const REQUIRED = [

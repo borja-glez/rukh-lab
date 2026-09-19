@@ -1,0 +1,45 @@
+{
+  "module": "m3",
+  "items": [
+    {
+      "q": "¿En qué se diferencia un encoder bidireccional de un decoder causal?",
+      "a": "En una línea: la máscara. El decoder pasa `is_causal=True` a la atención y cada posición solo ve hacia atrás, que es lo que hace posible generar de izquierda a derecha sin hacer trampa; el encoder pasa `causal=False` y cada posición ve toda la secuencia, incluidas las jugadas posteriores. Todo lo demás —embeddings, multi-cabeza, bloques pre-norm, LayerNorm final— es el mismo código: en Rukh, `PositionEncoder` y `MoveDecoder` construyen sus bloques desde el mismo `rukh.models.layers`. Lo que se gana es un contexto completo para representar; lo que se pierde es la capacidad de generar, porque la tarea de predecir el siguiente token con el siguiente token a la vista es trivial."
+    },
+    {
+      "q": "¿Qué es el MLM y por qué 80/10/10?",
+      "a": "Masked language modeling: se esconde el 15 % de los tokens y el modelo los reconstruye desde los dos lados. De los tokens elegidos, el 80 % se sustituye por `<mask>`, el 10 % por otro token al azar y el 10 % se deja como está. Si todos fueran `<mask>`, el modelo solo vería ese símbolo durante el preentrenamiento y nunca durante el afinado, así que aprendería una representación que únicamente funciona cuando falta algo. El 10 % aleatorio le obliga a desconfiar de lo que lee (un token que *está* puede ser falso) y el 10 % intacto le obliga a representar todas las posiciones, no solo las marcadas. En Rukh se aplica a jugadas y los tokens de control (`<bos>`, Elo, resultado, `<eos>`) nunca se tapan: son la condición, no la señal."
+    },
+    {
+      "q": "¿Qué es el pooling y cuándo usar CLS o media?",
+      "a": "Reducir los T vectores que devuelve el encoder a uno solo que represente la secuencia. `cls` toma la posición 0, un token que no aporta contenido y cuya única función es acumular el resumen que la atención le traiga; `mean` promedia los vectores de los tokens reales. La media es más robusta y es el defecto de Rukh, pero tiene una condición: hay que ignorar el relleno, porque promediar los vectores de los `<pad>` diluye la representación en una cantidad que depende de cuánto se rellenó ese lote, es decir, el vector de una misma posición cambiaría según con quién le toque viajar. `PositionEncoder.pool` lee la máscara de `idx` cuando no se le pasa una."
+    },
+    {
+      "q": "¿Qué diferencia hay entre un probe lineal y un fine-tuning completo, y qué mide cada uno?",
+      "a": "El probe congela el encoder y entrena solo una capa lineal encima del vector agrupado: mide si la información ya estaba en la representación, porque una capa lineal no puede aprenderla por su cuenta. El fine-tuning completo mueve todos los pesos: mide lo mejor que puede hacer esa arquitectura con esas etiquetas, y suele ganar, pero necesita más etiquetas, se sobreajusta antes y ya no dice nada sobre el preentrenamiento. Entre los dos está `last-n`, que descongela las últimas capas y la norma final. En Rukh son los tres modos de `rukh train heads --mode probe|last-n|full`, y un test comprueba que en `probe` los pesos del encoder salen idénticos bit a bit."
+    },
+    {
+      "q": "¿Qué mide el F1 y cuándo no sirve la exactitud?",
+      "a": "F1 es la media armónica de precisión (de lo que marqué, cuánto era de verdad) y exhaustividad (de lo que había, cuánto marqué). La exactitud deja de servir en cuanto una clase es rara: si solo el 10 % de las jugadas son errores, un detector que diga siempre «no es error» tiene un 90 % de exactitud y cero utilidad, mientras que su F1 es cero. La media armónica castiga el desequilibrio, así que solo sube si suben las dos. Y las dos se mueven en contra: bajar el umbral captura más errores reales y también más falsas alarmas."
+    },
+    {
+      "q": "¿Qué es una fuga de datos y por qué aquí el split va por partida?",
+      "a": "Cualquier camino por el que información de validación llega al entrenamiento. Nunca falla con un error: los números salen mejores y el problema se descubre en producción. En M3 el peligro concreto es partir por posición: dos posiciones consecutivas de la misma partida se diferencian en una jugada, así que la del ply 30 en entrenamiento y la del 31 en validación es casi la misma posición y un modelo que memoriza puntúa como uno que entiende. Rukh parte por `game_id` con una función pura de CRC-32 sobre el id y la semilla, y un test comprueba que ningún `game_id` está en los dos lados."
+    },
+    {
+      "q": "¿Por qué se correlaciona el valor con el `cp` de Stockfish y por qué dos correlaciones?",
+      "a": "Porque `cp` es la única referencia objetiva de «cuánto vale esta posición» que hay a escala, y porque una regresión necesita una medida de calidad que no dependa de un umbral. Se publican Pearson y Spearman: Pearson mide si los valores se alinean en una recta, Spearman solo si el orden coincide. Discrepan exactamente cuando el modelo tiene bien el orden y mal la escala, que es lo que le hace un `tanh` acotado a una puntuación en centipeones, así que dar solo una de las dos oculta la mitad del diagnóstico. `GOAL.md` pide ≥ 0,8."
+    },
+    {
+      "q": "¿Qué es una línea base y por qué la de M3 es deliberadamente tonta?",
+      "a": "El rival contra el que se mide el modelo para saber si su número significa algo. La de M3 cuenta material (peón 1, caballo y alfil 3, torre 5, dama 9), le suma movilidad y llama error a toda jugada que pierda un punto neto tras la captura más rentable del rival a un ply. Es tonta a propósito: una línea base que ya entendiera los sacrificios no sería un suelo, sería un competidor, y el margen dejaría de decir «el modelo aprendió algo más que contar piezas». Lo esencial es medirla exactamente igual que al modelo: mismas filas, mismas etiquetas, misma definición de acierto."
+    },
+    {
+      "q": "¿Qué aporta la curva por número de etiquetas?",
+      "a": "Dice cuántas etiquetas hacen falta de verdad. Se entrena la misma receta con el 10, 25, 50 y 100 % de las etiquetas de entrenamiento y se dibuja la métrica contra el número de filas. Si la curva se aplana pronto, etiquetar más es tirar dinero y el cuello de botella está en el modelo o en la tarea; si sigue subiendo al 100 %, etiquetar más es la inversión más rentable que queda. Los subconjuntos son **anidados** (el 10 % está dentro del 25 %, y este dentro del 50 %) porque con muestras independientes un bache a mitad de la curva podría ser mala suerte del sorteo y estaríamos midiendo ruido de muestreo en vez del valor de los datos."
+    },
+    {
+      "q": "¿En qué se diferencia este modelo del de M2?",
+      "a": "En la máscara, en la tarea y en para qué sirve. El de M2 es causal, se entrena a predecir la siguiente jugada y genera: es lo que juega en la demo. El de M3 es bidireccional, se entrena tapando jugadas en medio de la partida y no genera nada: produce un vector por posición del que salen el valor, la detección de errores y el resultado. También es más pequeño (8 capas, d=384, 15 052 800 parámetros frente a 12 capas, d=512 y 38 971 392) y usa `ignore_index=-100` en vez del `0` del decoder, porque en la entrada por casillas el `0` es un token que sí se puede pedir que prediga. En la demo conviven: el decoder elige jugada, el encoder pinta la barra, y cada uno en su propio worker."
+    }
+  ]
+}
