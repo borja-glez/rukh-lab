@@ -1511,21 +1511,47 @@ ficheros está documentado en `rukh-lab/src/data/README.md`; los dos llegan a es
 `pnpm sync:data`.
 
 ```bash title="Terminal"
+# Lo barato: solo las series que MLflow ya registró durante el entrenamiento.
 uv run python labs/m2/replay_export.py
+
+# Lo que se exportó de verdad: además, la legalidad sin máscara de cada checkpoint.
+uv run python labs/m2/replay_export.py --with-legality --positions 400
 ```
 
-Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
+Salida real de la segunda ejecución, la de referencia (RTX 5090, 2026-09-19):
 
 ```text
+  step   1000  legality 0.880
+  step   2000  legality 0.940
+  step   3000  legality 0.950
+  step   4000  legality 0.978
+  step   5000  legality 0.970
+  step   6000  legality 0.970
+  step   7000  legality 0.985
+  step   8000  legality 0.990
+  step   9000  legality 0.988
+  step  10000  legality 0.993
+  step  11000  legality 0.995
+  step  12000  legality 0.993
+  step  13000  legality 0.990
+  step  14000  legality 0.993
+  step  15000  legality 0.998
+  step  16000  legality 0.993
+  step  17000  legality 0.995
+  step  18000  legality 0.993
+  step  19000  legality 0.993
+  step  20000  legality 0.993
 20 checkpoints -> E:\work\ai\chess-lm\rukh\artifacts\web\training-replay.json
 ```
 
-Veinte checkpoints, uno cada mil pasos, y **ninguna de las dos banderas caras**: la tirada de
-referencia se exportó sin `--with-legality` y sin `--with-elo`, así que esos dos campos salen como
-un guion en los veinte pasos de la isla. No es un descuido que haya que disimular: `--with-elo`
-juega partidas contra Stockfish en cada checkpoint y convierte un script de dos segundos en una
-noche de cómputo. Lo que la isla dibuja son las tres series que MLflow registró gratis durante el
-entrenamiento, y dan de sobra para lo que hay que aprender a leer.
+Veinte checkpoints, uno cada mil pasos, y **una sola de las dos banderas caras**. `--with-legality`
+cuesta una pasada hacia delante por checkpoint sobre las posiciones que pida `--positions` —400
+aquí, unos segundos por checkpoint— y es lo que llena la fila de legalidad de la isla en los veinte
+pasos. `--with-elo` no se usó: juega partidas contra Stockfish en cada checkpoint y convierte un
+script de un par de minutos en una noche de cómputo, así que el Elo sí sale como un guion en los
+veinte. Y ojo con la resolución de lo que acabas de imprimir: con 400 posiciones, **una posición
+vale un cuarto de punto** y el ruido de muestreo ronda el ±1 punto, así que `0.993` y `0.998` son
+397 y 399 aciertos de 400 y no dos niveles distintos de competencia.
 
 <Exercise n="05" title="¿Por qué int8 cambia los logits y no la jugada?">
   Mira la salida de la exportación: la diferencia máxima de logits del fichero int8 es más de cien
@@ -1564,10 +1590,11 @@ La isla de abajo recorre los checkpoints de la tirada real: un paso del deslizad
 `step-*.pt`. El deslizador elige uno; el gráfico dibuja la pérdida de entrenamiento y la de
 validación contra el eje izquierdo y el top-1 de siguiente jugada contra el derecho, con una línea
 vertical en el checkpoint seleccionado, y debajo están sus números exactos, incluidas la legalidad
-sin máscara por argmax y el Elo estimado de los checkpoints que se evaluaron. Los campos que no se
-midieron salen como un guion, y su línea deja un hueco en vez de bajar a cero.
+sin máscara por argmax —medida en los veinte checkpoints— y el Elo estimado, que en esta tirada no
+se midió en ninguno. Los campos que no se midieron salen como un guion, y su línea deja un hueco en
+vez de bajar a cero.
 
-Dos cosas concretas que mirar, en este orden:
+Tres cosas concretas que mirar, en este orden:
 
 1. **Dónde se separan las dos pérdidas.** Mientras van juntas, el modelo generaliza: lo que aprende
    del entrenamiento le sirve para partidas que no ha visto. El punto donde la de validación se
@@ -1578,15 +1605,11 @@ Dos cosas concretas que mirar, en este orden:
    compara con el 20 000. La diferencia entre esas dos cifras de top-1 es, literalmente, lo que
    valieron veinte minutos de GPU, y es el número con el que se decide si la tirada siguiente dura
    más pasos o cambia otra cosa.
+3. **Cuándo despega la legalidad.** Mira solo esa fila mientras llevas el deslizador del paso 1 000
+   al 8 000: **88,0 % → 99,0 %**. Y luego sigue hasta el final y comprueba que ya no pasa nada. Es
+   la lectura que da título al módulo y la que se desarrolla debajo de las curvas.
 
-Y una tercera que en esta tirada **no** vas a poder mirar, aunque la isla tenga sitio para ella: la
-legalidad y el Elo salen como un guion en los veinte checkpoints, porque el export se lanzó sin
-`--with-legality` ni `--with-elo`. La pregunta que dejan sin responder es buena —si el despegue de
-la legalidad coincide con un codo de la pérdida o si ocurre mientras la pérdida bajaba
-plácidamente, que es lo que la convertiría en una capacidad **emergente** en vez de en un reflejo
-de la pérdida— y queda abierta, anotada como tal, no resuelta de memoria.
-
-Lo que sí dibuja la isla, leído de los números y no de la forma de la curva. Los 20 checkpoints van
+Lo que dibuja la isla, leído de los números y no de la forma de la curva. Los 20 checkpoints van
 de **2,6531** de pérdida de entrenamiento y **2,6279** de validación en el paso 1 000 a **1,4594** y
 **1,5197** en el 20 000, con el top-1 de validación subiendo de **0,3341** a **0,5120**. Casi todo
 el descenso ocurre pronto: del paso 1 000 al 5 000 la validación cae 0,85 (2,6279 → 1,7822) y en los
@@ -1608,6 +1631,38 @@ checkpoint y no uno intermedio rescatado antes del desastre, y por eso la conclu
 módulo es que a `small` no lo limita el sobreajuste sino el presupuesto: **entrenar más pasos era la
 mejora barata que este módulo no llegó a probar**, y esos +2,4 puntos de la segunda mitad son la
 cifra que habría que batir.
+
+Y ahora la fila que hace de este módulo el de **ver emerger el juego**. El modelo no tiene tablero,
+no tiene reglas y no sabe qué es un alfil: solo ve secuencias de cuatro caracteres. En el paso
+1 000 propone una jugada imposible en el **12 %** de las posiciones —legalidad **88,0 %**, 352
+aciertos de 400—; en el paso 8 000 ya respeta las reglas en el **99,0 %**, 396 de 400. Once puntos
+en siete mil pasos. Y ahí se para: del paso 8 000 al 20 000 la legalidad pasa de **99,0 %** a
+**99,25 %**, tres décimas de punto en los 12 000 pasos restantes, mientras la pérdida de validación
+todavía baja de **1,6727** a **1,5197** y el top-1 sube de **47,78 %** a **51,20 %**. **La
+legalidad satura mucho antes que la pérdida.**
+
+Antes de sacarle punta a la curva, el ruido. Cada punto se midió sobre **400 posiciones** de
+validación, así que un acierto o un fallo valen un cuarto de punto y el error de muestreo ronda
+**±1 punto**. Por eso a partir del paso 10 000 la serie no sube en línea recta sino que vibra entre
+99,0 % y 99,75 %: el 99,75 % del paso 15 000 y el 99,25 % del 20 000 son **399 y 397 posiciones
+legales de 400**, una diferencia de dos posiciones. Quien concluya de ahí que el checkpoint 15 000
+sabe más reglas que el final está leyendo ruido como si fuera señal. Lo único que esa parte de la
+curva dice es "ya está"; lo que significa algo es el tramo de subida, del paso 1 000 al 8 000.
+
+Y de ahí sale el argumento más importante de la lección: **legalidad y fuerza son cosas distintas**.
+En el paso 8 000 el modelo ya cumple las reglas casi perfectamente y juega bastante peor que en el
+20 000: misma legalidad dentro del ruido, pero una pérdida de validación un **10 %** más alta y
+**3,4 puntos** menos de top-1, medidos sobre las mismas partidas de validación. Saber que un alfil
+va en diagonal no es saber adónde conviene moverlo. Por eso el listón del ≥ 99 % de `GOAL.md` es un
+requisito de entrada y no una medida de calidad, y por eso la fila de la tabla única no se queda en
+la legalidad y trae además top-1, puzles, Δcp y Elo.
+
+Lo que sigue abierto es la otra pregunta, la cara: **el Elo por checkpoint**. La isla tiene sitio
+para él y en esta tirada sale como un guion en los veinte, porque `--with-elo` juega partidas
+contra Stockfish en cada uno y cuesta una noche de cómputo. Sin ese dato se puede decir cuánta
+imitación compró cada tramo de pasos, pero no cuánta fuerza; y con la legalidad ya saturada desde
+el paso 8 000, la fuerza es justo lo que falta por ver. Queda anotada como tal, no resuelta de
+memoria.
 
 <TrainingReplay client:visible />
 
