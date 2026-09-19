@@ -1,6 +1,6 @@
 ---
 title: 'El encoder: entender la posición'
-description: 'El mismo bloque del decoder sin la máscara causal: un encoder bidireccional de quince millones de parámetros preentrenado tapando jugadas, con tres cabezas que dicen cuánto vale la posición, si la última jugada fue un error y quién va a ganar, medido contra una heurística de material deliberadamente tonta y con la curva que dice cuántas etiquetas hacen falta de verdad.'
+description: 'El mismo bloque del decoder sin la máscara causal: un encoder bidireccional de quince millones de parámetros que acierta el 75,2 % de las jugadas que se le tapan, con tres cabezas que dicen cuánto vale la posición, si la última jugada fue un error y quién va a ganar. Bate a la heurística de material por nueve puntos de F1 y se queda a la mitad del listón de correlación, y por el camino enseña por qué un 96,78 % de exactitud sobre una clase del 3,7 % no significa absolutamente nada.'
 module: m3
 order: 1
 duration: 360
@@ -23,6 +23,10 @@ keywords:
   - línea base
   - fuga de datos
   - curva de etiquetas
+  - clase rara
+  - punto de operación
+  - ROC AUC
+  - tasa base
 artifacts:
   - kind: model
     label: chorcat/rukh-encoder
@@ -65,9 +69,9 @@ Al terminar tendrás:
 - Un encoder preentrenado con masked move modeling sobre el mismo flujo de tokens del decoder, para
   que los dos modelos hayan visto exactamente las mismas partidas.
 - Tres cabezas afinadas en tres modos —<Term id="probe-lineal">probe</Term> con el tronco congelado,
-  últimas capas, y completo— y una **curva por número de etiquetas** al 10, 25, 50 y 100 %, que es
-  la lección del módulo: cuántas etiquetas hacen falta de verdad antes de que etiquetar más deje de
-  pagar.
+  últimas capas, y completo— sobre **438 093 posiciones etiquetadas**, y una **curva por número de
+  etiquetas** al 10, 25, 50 y 100 %, que responde a cuántas etiquetas hacen falta de verdad antes de
+  que etiquetar más deje de pagar.
 - Una fila de la tabla única con <Term id="precision">precisión</Term>,
   <Term id="exhaustividad">exhaustividad</Term> y <Term id="f1">F1</Term> de detección de errores,
   del encoder **y** de una <Term id="linea-base">línea base</Term> de material medida sobre las
@@ -81,10 +85,14 @@ Al terminar tendrás:
 
 <ModelBadge repo="chorcat/rukh-encoder" />
 
-Las cifras medidas de esta lección se pegan cuando los entrenamientos reales terminen; mientras el
-`status` sea `borrador`, donde va una salida hay un hueco marcado y la isla dice "pendiente". Las
-cifras que sí están —parámetros, dimensiones, tamaños de vocabulario— son aritmética que puedes
-rehacer con una calculadora.
+Todas las salidas de esta lección son de la tirada real del 19 de septiembre de 2026 en una RTX
+5090, y la figura del final dibuja un JSON generado con un checkpoint de verdad. Quedan **tres
+huecos**, cada uno con un aviso que dice qué falta y por qué: el afinado en modo `last-n`, la curva
+por número de etiquetas y la exportación de embeddings, ninguno de los tres ejecutado en el
+presupuesto del hito. Mientras queden huecos el `status` de la lección sigue siendo `borrador`,
+aunque los dos criterios de `GOAL.md` ya estén medidos. Y adelantamos el titular, porque un curso
+que esconde su resultado hasta el final está vendiendo, no enseñando: **uno de los dos criterios se
+cumple con holgura y el otro no se cumple en absoluto**.
 
 ## Teoría justa
 
@@ -437,41 +445,179 @@ por completo.
   moraleja es la misma: el número que manda es el que está en el spec y el que compila.
 </Callout>
 
-Cuál gana es una pregunta empírica, y ahí hay un obstáculo real que conviene decir en voz alta,
-porque es el tipo de cosa que un curso honesto no esconde.
+Cuál gana es una pregunta empírica, es la que `docs/spec/02` pone como Componente 2 del hito, y
+ahora tiene respuesta. Las hipótesis razonables antes de medir eran que las casillas ganaran en
+valor y en resultado, donde lo que importa es el material y la estructura actual, y que las jugadas
+ganaran en detección de errores, donde la referencia es la posición anterior y la entrada por
+casillas literalmente no la tiene. Escríbelas antes de mirar los números; es la diferencia entre un
+experimento y una justificación a posteriori.
 
-<Callout kind="roto" title="Hoy las dos entradas no se encadenan, y es un límite de los datos">
-  `rukh train encoder` solo acepta el esquema de **jugadas**: el preentrenamiento necesita un flujo
-  de tokens empaquetado, y el que P1 dejó preparado es el de partidas. `rukh train heads` solo
-  acepta el esquema de **casillas**: la tabla supervisada de P1 tiene un FEN por fila y el `game_id`
-  del que salió, pero no la partida completa que llevó hasta él, así que no hay manera de alimentar
-  un encoder de jugadas desde ella sin volver a cruzar con la tabla de partidas —que es trabajo de
-  P1, no de este hito—. Consecuencia: hoy, apuntar `encoder_ckpt` al checkpoint de masked move
-  modeling desde `configs/train/encoder-heads.yaml` da un error explícito, porque el afinado
+#### El resultado medido
+
+Las dos líneas se entrenaron con las **mismas 438 093 posiciones etiquetadas**, el mismo reparto por
+partida, los mismos 4 000 pasos de afinado y la misma evaluación sobre las mismas 10 000 posiciones
+retenidas. La única diferencia es la entrada —y, con ella, que la línea de jugadas pudo partir del
+preentrenamiento con masked move modeling y la de casillas no.
+
+<div class="table-wrap">
+
+| Esquema                        | F1 de error (umbral ajustado) | Margen sobre la heurística |   ROC AUC | Spearman valor | Pearson valor |
+| ------------------------------ | ----------------------------: | -------------------------: | --------: | -------------: | ------------: |
+| `moves` (preentrenado con MMM) |                     **0,179** |                   **+9,0** | **0,738** |          0,407 |         0,442 |
+| `squares` (desde cero)         |                         0,146 |                       +5,7 |     0,696 |      **0,422** |     **0,688** |
+
+</div>
+
+Las dos hipótesis se cumplen a medias, y la mitad que falla es la interesante.
+
+**Las jugadas ganan en detectar errores**, como se esperaba: 0,179 de F1 contra 0,146, y 0,738 de
+ROC AUC contra 0,696. Tiene todo el sentido, porque un error es una propiedad de la **transición**,
+no de la posición: para saber que algo se acaba de tirar hay que saber qué había antes, y la línea
+de jugadas lleva dentro la partida entera. El preentrenamiento ayuda exactamente ahí: un modelo que
+ha pasado dieciséis minutos adivinando jugadas tapadas ha aprendido, sin que nadie se lo pida, qué
+jugadas son plausibles en una posición, y una jugada implausible es el primer indicio de un error.
+
+**Las casillas ganan en la escala del valor, y ganan mucho**: Pearson 0,688 contra 0,442, más de
+veinticuatro puntos. Ver las piezas en su sitio es lo que hace falta para contestar "cuánto vale
+esto", porque el material y la estructura están en la entrada sin tener que reconstruirlos jugada a
+jugada. Y aquí aparece la distinción que la sección de métricas explica con cuidado: en **Spearman**
+los dos empatan (0,422 contra 0,407, dentro del ruido de una sola semilla). Las dos entradas ordenan
+las posiciones igual de bien; lo que la entrada por jugadas no consigue es **la escala**. Ordena
+bien y calibra mal, que es exactamente el caso en el que Pearson y Spearman se separan.
+
+En una frase: **ver el tablero es mejor para "cuánto vale esto"; ver la línea es mejor para "qué se
+acaba de tirar"**. Que la respuesta sea "cada una gana en una cosa" y no "esta es mejor" es el
+resultado más útil de los dos, porque dice que las dos representaciones llevan información distinta
+y no una más que la otra. La continuación obvia —darle al mismo modelo las dos entradas— es trabajo
+de otro hito, y esta tabla es la razón para hacerlo.
+
+<Callout kind="roto" title="Lo que costó encadenar las dos entradas, y por qué importa">
+  Durante casi todo el hito las dos mitades no se podían encadenar. `rukh train encoder` necesita un
+  flujo de tokens empaquetado, y el que P1 dejó preparado es el de partidas; `rukh train heads` come
+  de la tabla supervisada, que tiene un FEN por fila y el `game_id` del que salió, pero **no la
+  partida completa** que llevó hasta él. Apuntar `encoder_ckpt` al checkpoint de masked move
+  modeling desde una configuración de casillas daba —y sigue dando— un error explícito: el afinado
   comprueba que el esquema del checkpoint coincide con el suyo y se niega a mezclar dos
-  vocabularios. Las cabezas se entrenan, de momento, sobre un encoder de casillas inicializado desde
-  cero, que es justamente la **línea base honesta que el preentrenamiento tiene que batir**. Cerrar
-  el círculo exige o bien un empaquetado de casillas para el MLM, o bien el cruce de posiciones con
-  sus partidas. Está anotado como lo que es: una limitación del hito, no un detalle de
-  implementación.
-</Callout>
+  vocabularios. La fila `moves` de la tabla existe porque `encoder-heads-moves.yaml` añade un
+  `labels.games_dir` y reconstruye el prefijo de cada posición a partir de las partidas de P1; la
+  fila `squares` arranca de pesos aleatorios (`encoder_ckpt: null`, y apuntarlo a un checkpoint de
+  MMM se rechaza en vez de reinterpretarlo en silencio), así que es justamente la **línea base
+  honesta que el preentrenamiento tenía que batir**. La batió en errores (+3,3 puntos de F1) y
+  perdió en la escala del valor.
 
-Con eso dicho, las hipótesis razonables antes de medir —y son hipótesis, no resultados— son que las
-casillas ganen en valor y en resultado, donde lo que importa es el material y la estructura actual,
-y que las jugadas ganen en detección de errores, donde la referencia es la posición anterior y la
-entrada por casillas literalmente no la tiene. Escríbelas antes de mirar los números; es la
-diferencia entre un experimento y una justificación a posteriori.
+Y un asterisco que el propio fichero de configuración lleva escrito, porque leer la tabla sin él
+sería leerla mal: la tabla supervisada está **deduplicada por `fen4`**, así que el prefijo que
+recibe el esquema de jugadas es _una_ línea que llega a esa posición, no necesariamente la de la
+partida que puso la etiqueta. Para una posición común —una apertura de libro— eso es casi
+irrelevante; para una posición que solo aparece en una partida, es la línea correcta. Pero es una
+aproximación, y el margen de +3,3 puntos se lee sabiéndola.
+
+</Callout>
 
 ## Cómo se mide y contra qué
 
-Al terminar esta sección sabrás leer las cinco cifras que produce `rukh eval encoder`, explicar por
-qué la línea base es deliberadamente mala y decir qué significa cada métrica en un problema donde
-una clase es rara.
+Al terminar esta sección sabrás leer las cifras que produce `rukh eval encoder`, explicar por qué la
+línea base es deliberadamente mala, elegir un punto de operación sin hacer trampa y decir qué
+significa cada métrica en un problema donde una clase es rara.
 
 Un encoder no juega partidas, así que no se puede medir como al decoder. Se mide por lo que sabe de
 posiciones que no ha visto: la partición de validación del reparto por partidas, que es el **10 %**
 de las partidas (`val_fraction: 0.1`, nunca el 10 % de las posiciones sueltas), y **con la línea
 base medida sobre exactamente las mismas filas**.
+
+Estos son los números reales del hito, para que leas el resto de la sección sabiendo adónde va:
+
+<div class="table-wrap">
+
+| Criterio de `GOAL.md`               | Listón            | Medido                    | ¿Se cumple? |
+| ----------------------------------- | ----------------- | ------------------------- | ----------- |
+| F1 de error sobre la heurística     | +5 puntos         | **+9,0** (0,179 vs 0,089) | **sí**      |
+| Correlación del valor con Stockfish | ≥ 0,80 (Spearman) | **0,407**                 | **no**      |
+
+</div>
+
+Un criterio cumplido y otro no, y las dos cosas se publican con el mismo tamaño de letra. Hay además
+una tercera cifra, `val/blunder_acc = 96,78 %`, que no es ningún criterio y que si se leyera como si
+lo fuera sería la mentira más cómoda del módulo. Empezamos por ella.
+
+### El 96,78 % que no significa nada
+
+Esta es la subsección más transferible del módulo, y no tiene nada que ver con el ajedrez: vale para
+cualquier detector de algo raro que vayas a construir en tu vida —fraude, fallos de máquina,
+diagnósticos, moderación—, que es decir, para casi todos.
+
+**Los errores son el 3,72 % de las filas etiquetadas.** De ahí salen tres consecuencias, en orden de
+gravedad.
+
+**Uno: la exactitud no mide nada.** Un detector que conteste siempre "no hay error" acierta el
+**96,3 %** de las veces sin mirar el tablero. Nuestra cabeza saca 96,78 %. Los cuatro decimales de
+diferencia son todo lo que la exactitud es capaz de decir de un modelo que, como vas a ver, sí ha
+aprendido algo. Cuando una clase es rara, la exactitud mide la tasa base y disfraza de resultado una
+propiedad del conjunto de datos.
+
+**Dos: el F1 en un umbral arbitrario tampoco mide lo que crees.** Esta es la que engaña a gente con
+experiencia. El F1 de esta cabeza en el umbral fijo de 0,5 es **exactamente 0,0000**. Precisión
+cero, exhaustividad cero, cero posiciones marcadas de 3 660. La razón está en una sola línea del
+informe:
+
+```text
+encoder    probability span: 0.0040 to 0.2568 (mean 0.0446)
+```
+
+**La probabilidad más alta que esta cabeza le da a una posición en todo el conjunto es 0,2568.** En
+0,5 no se dispara nunca, así que ese F1 era cero por construcción antes de entrenar nada. Y no es
+que el modelo esté roto: es que un sigmoide entrenado con entropía cruzada sobre una clase del 3,7 %
+aprende, correctamente, que la respuesta esperada casi siempre es "no", y coloca toda su masa de
+probabilidad abajo. Ordena bien las posiciones y las ordena todas por debajo de 0,5. **Un F1 en un
+umbral fijo mide la calibración de un sigmoide que nadie calibró, no la calidad de la
+representación.**
+
+**Tres: elegir el umbral es legítimo, y hay una única forma honesta de hacerlo.** El umbral es un
+hiperparámetro como cualquier otro, y nadie te obliga a dejarlo en el 0,5 que viene de fábrica. Lo
+que no vale es elegirlo mirando las filas que después vas a puntuar, porque entonces el número que
+publicas es el máximo de una búsqueda sobre el propio conjunto de evaluación y no una estimación de
+nada. El procedimiento correcto es:
+
+1. Parte las filas etiquetadas del conjunto retenido en dos mitades, **por `game_id`** y nunca por
+   posición, por la misma razón que el reparto principal (la sección siguiente). Aquí salen 3 793
+   filas / 2 455 partidas en la mitad `tune` y 3 660 filas / 2 368 partidas en la mitad `score`.
+2. En la mitad `tune`, barre el umbral y quédate con el que maximiza F1. Aquí sale **0,128**.
+3. **Publica el F1 medido en la mitad `score`**, que no ha visto ningún umbral. Aquí sale **0,179**.
+
+Y publica también lo que cuesta ese paso, porque es la parte que casi nadie enseña: el mismo umbral
+0,128 da **0,184** en la mitad `tune` donde se eligió y **0,179** en la mitad `score`. Esos cinco
+milésimos son el optimismo que introduce elegir un punto de operación, y son la razón entera de que
+las dos mitades no sean las mismas filas.
+
+<Callout kind="teoria" title="Y las métricas que ningún umbral puede halagar">
+  Junto al F1 ajustado, el informe publica dos cifras que no dependen de ningún umbral, porque son
+  las que de verdad dicen si la representación sabe algo.
+
+**ROC AUC** es la probabilidad de que, cogidos al azar un error y una jugada tranquila, el modelo
+puntúe más alto el error. 0,5 es una moneda. Aquí sale **0,738**: en tres de cada cuatro parejas,
+el orden es el correcto. Ese es el número que dice que la cabeza no está vacía, y es el mismo
+modelo cuyo F1 en 0,5 era cero.
+
+**La precisión media** es el área bajo la curva de precisión-exhaustividad, y su referencia no es
+0,5 sino **la tasa base**: un orden aleatorio saca 0,037. Aquí sale **0,109**, casi el triple.
+Es una cifra fea comparada con el ROC AUC, y no es un error de cálculo: con una clase tan rara,
+el ROC AUC se deja impresionar por lo bien que el modelo ordena los negativos entre sí, mientras
+que la precisión media solo mira si los positivos suben. Cuando las dos discrepan así, la
+pesimista es la que se parece a lo que verá el usuario.
+
+Las dos están implementadas a mano sobre rangos en `src/rukh/eval/`, sin `scipy` ni
+`scikit-learn`: son cuarenta líneas y no merecen una dependencia.
+
+</Callout>
+
+<Callout kind="mundo-real" title="El mismo error, fuera del ajedrez">
+  Un clasificador de fraude con un 0,2 % de transacciones fraudulentas que presume de 99,8 % de
+  exactitud. Un modelo de diagnóstico con una prevalencia del 1 % cuyo F1 se publica en el umbral
+  por defecto de la librería. Un filtro de moderación evaluado en el mismo conjunto en el que se
+  eligió el umbral. Los tres fallos son este mismo, y los tres se detectan con la misma pregunta:
+  **¿cuál es la tasa base, y dónde se eligió el umbral?** Si la respuesta a la segunda es "en las
+  filas que estoy puntuando", el número no es una estimación, es un récord personal.
+</Callout>
 
 ### La heurística de material y movilidad
 
@@ -492,10 +638,23 @@ medido sobre dos conjuntos distintos no es un margen, es una comparación de an�
 Y hay una asimetría que conviene decir antes de leer el margen, porque no juega a favor del modelo:
 la heurística recibe **la posición anterior y la jugada** —vuelve a jugarla en un tablero para saber
 qué cambió—, mientras que el encoder de casillas solo ve el FEN resultante. Detectar un error sin
-ver de dónde vienes es más difícil que detectarlo viéndolo, así que el margen que salga está medido
-en contra: si aun así gana, ha aprendido algo que no es contar piezas. Es también la razón concreta
-por la que el esquema de jugadas debería ir mejor en esta cabeza, y la razón por la que la
-comparación entre las dos entradas es la pregunta abierta del módulo.
+ver de dónde vienes es más difícil que detectarlo viéndolo, así que el margen está medido en contra
+del modelo: si aun así gana, ha aprendido algo que no es contar piezas. Ganó por 5,7 puntos.
+
+Hay una segunda asimetría, y esta va a favor del modelo, así que también se dice: la heurística es
+una regla de sí/no **sin umbral que ajustar**, de modo que no se le dio ninguna mitad `tune` ni se
+barrió nada en su lado. La comparación enfrenta a un modelo en su mejor punto de operación contra
+una regla en el único que tiene. Es una cortesía que recibe el modelo y no la línea base, está
+escrita en el informe para que no sea injusta en silencio, y conviene tenerla en la cabeza al leer
+los +9,0 puntos del esquema de jugadas.
+
+Por cierto, mira las dos filas de la heurística en la tabla de puntos de operación de más arriba:
+precisión 4,7 %, exhaustividad **77,1 %**, 2 359 posiciones marcadas de 3 660. La regla grita
+"error" en dos de cada tres jugadas de la partida. Encuentra casi todos los errores **porque marca
+casi todo**, y de ahí su exhaustividad envidiable y su precisión ridícula. El encoder gana el margen
+por el otro lado: marca 191 posiciones en vez de 2 359 y acierta en el 15,7 % de ellas contra el
+4,7 % de la regla. Dos detectores con F1 de 8,9 % y 17,9 % y con perfiles opuestos, que es
+exactamente por qué el titular lleva la precisión y la exhaustividad al lado y no solo el F1.
 
 ### Qué no puede ver
 
@@ -524,28 +683,31 @@ Arreglarlas convertiría la línea base en un pequeño motor, y entonces ya no s
 
 ### Precisión, exhaustividad y F1 cuando una clase es rara
 
-Los errores de 100 centipeones o más son minoría en las partidas de club, y
-ese <Term id="desbalanceo">desbalanceo</Term> lo cambia todo.
-
-Si el 10 % de las jugadas son errores, un detector que diga siempre "no es error" acierta el 90 % de
-las veces. Su **exactitud** es 0,9 y su utilidad es cero. Por eso la exactitud no se publica como
-titular aquí.
+Con el <Term id="desbalanceo">desbalanceo</Term> ya desmontado, las tres cifras que sí se publican.
 
 La **precisión** responde a "de lo que marqué, cuánto era de verdad": verdaderos positivos entre
 todo lo marcado. Es la que le importa a la demo, porque una barra que grita "error" en jugadas
-correctas se apaga a los cinco minutos.
+correctas se apaga a los cinco minutos. Aquí, **15,7 %**.
 
 La **exhaustividad** responde a "de lo que había, cuánto marqué": verdaderos positivos entre todos
 los errores reales. Es la que le importa a alguien que quiera usar esto para analizar sus partidas,
-porque un error que no se detecta no se aprende.
+porque un error que no se detecta no se aprende. Aquí, **20,8 %**.
 
 Las dos se mueven en contra. Bajar el umbral de decisión captura más errores reales y también más
 falsas alarmas; subirlo hace lo contrario. Elegir el punto de esa curva es una decisión de producto
-—en Rukh está en `configs/eval/encoder.yaml` como `threshold: 0.5`— y no tiene una respuesta
+—en Rukh el valor de fábrica está en `configs/eval/encoder.yaml` como `threshold: 0.5`, y ya has
+visto lo que ese valor de fábrica le hace a una clase del 3,7 %— y no tiene una respuesta
 matemática. **F1** es la media armónica de las dos, `2·P·R/(P+R)`, y se usa porque castiga el
 desequilibrio: con precisión 1,0 y exhaustividad 0,01, la media aritmética daría un respetable 0,5 y
-la armónica da 0,02, que es la cifra honesta. El listón de `GOAL.md` es superar el F1 de la
-heurística en **cinco puntos**.
+la armónica da 0,02, que es la cifra honesta. Aquí, **17,9 %**.
+
+Conviene mirar esos tres números sin adornos: de cada seis posiciones que el modelo marca como
+error, cinco no lo son, y de cada cinco errores reales se le escapan cuatro. Como producto,
+todavía no sirve para nada. Como medida, es **el doble** que una heurística que sí entiende de
+material, sobre las mismas filas y con la posición anterior escondida, y eso es lo que el módulo
+pretendía demostrar. El listón de `GOAL.md` es superar el F1 de la heurística en **cinco puntos** y
+salen **+9,0**: criterio cumplido, con el nivel absoluto dicho en voz alta para que nadie confunda
+"bate a la línea base" con "está listo".
 
 ### Pearson y Spearman, y por qué las dos
 
@@ -563,9 +725,61 @@ puntuación en centipeones que no lo está: las posiciones extremas se aplastan 
 relación deja de ser lineal aunque el ranking sea perfecto. Publicar solo Pearson haría parecer peor
 un modelo que ordena bien; publicar solo Spearman escondería un modelo que ordena bien pero cuya
 barra de evaluación marca 0,3 donde debería marcar 0,8, que en la demo es un fallo visible. Por eso
-van las dos, y por eso `GOAL.md` pide ≥ 0,8. En el código, Spearman está escrito a mano —Pearson
-sobre rangos medios— porque `scipy` no es una dependencia del proyecto y no merece serlo por
-catorce líneas.
+van las dos, y por eso `GOAL.md` pide ≥ 0,8, leído sobre Spearman. En el código, Spearman está
+escrito a mano —Pearson sobre rangos medios— porque `scipy` no es una dependencia del proyecto y no
+merece serlo por catorce líneas.
+
+Un detalle de medida antes de los números: las dos correlaciones se calculan contra
+`tanh(cp / 400)`, la escala acotada con la que se entrena la cabeza, y **nunca contra el `cp` en
+bruto**. Un mate forzado vale ±9 999 centipeones, y media docena de filas así decidirían el Pearson
+del conjunto entero. Correlacionar contra la escala en la que se entrena no es hacerlo fácil: es
+correlacionar contra la etiqueta.
+
+#### El criterio de valor no se cumple, y esta es la cifra
+
+<div class="table-wrap">
+
+| Esquema   |  Spearman |   Pearson | Listón de `GOAL.md` |
+| --------- | --------: | --------: | ------------------- |
+| `moves`   |     0,407 |     0,442 | ≥ 0,80 → **no**     |
+| `squares` | **0,422** | **0,688** | ≥ 0,80 → **no**     |
+
+</div>
+
+**El mejor Spearman del hito es 0,42 y el listón es 0,80.** No está cerca, no es un decimal, no hay
+manera de contarlo como un aprobado raspado: el criterio de valor de `GOAL.md` **no se cumple** y se
+publica sin cumplir, que es lo que el propio `GOAL.md` manda hacer cuando pasa esto.
+
+El diagnóstico, con lo que se sabe hoy, tiene tres piezas y ninguna es "hace falta un modelo más
+grande":
+
+1. **Cuatro mil pasos de afinado.** Es el presupuesto del módulo, no un punto de convergencia, y ya
+   viste que el preentrenamiento seguía bajando cuando se cortó.
+2. **Cobertura de etiquetas del 9,8 %.** De los cinco millones de posiciones muestreadas, solo
+   488 159 recibieron una evaluación de Stockfish al cruzarlas con el conjunto público de
+   evaluaciones: hay veinte ficheros en ese conjunto y el cruce recuperó menos de una de cada diez.
+   La cabeza de valor aprende de las 438 093 que sobreviven al reparto, y son pocas.
+3. **`tanh(cp/400)` comprime justo donde hay densidad.** La inmensa mayoría de las posiciones de
+   club están entre −100 y +100 centipeones, y ahí el `tanh` las aplasta contra el cero: la señal
+   que la cabeza tiene que aprender a distinguir es minúscula precisamente donde están casi todos
+   los datos. Una escala menos comprimida repartiría mejor el rango útil.
+
+Es el mismo diagnóstico que el curso ya se encontró en M2 con el tamaño del modelo: **el cuello son
+los datos, no la capacidad**. Y fíjate en la señal que lo confirma dentro de esta misma tabla: la
+entrada por casillas, que es un modelo **más pequeño y sin preentrenar**, correlaciona mejor en
+Pearson (0,688 frente a 0,442). Si el límite fuera la capacidad, el modelo con más información
+dentro ganaría; lo que decide es cuánta señal hay en la etiqueta y cómo de explícita está la
+respuesta en la entrada.
+
+<Callout kind="mundo-real" title="Publicar el número que no sale">
+  La tentación cuando un criterio falla es reescribir el criterio: leer Pearson en vez de Spearman
+  (0,688 suena mucho mejor que 0,422), correlacionar solo sobre las posiciones equilibradas, o
+  cambiar el listón a 0,40 y declarar victoria. Las tres producen un informe verdadero y un
+  resultado falso. El listón se fija **antes** de medir precisamente para que no se pueda mover
+  después, y un criterio que se mueve deja de ser un criterio y pasa a ser una descripción de lo que
+  salió. El coste de publicar un 0,42 contra un 0,80 es una tarde incómoda; el coste de haberlo
+  maquillado es que ninguna cifra del proyecto vuelve a significar nada.
+</Callout>
 
 ## Fuga de datos: por qué el reparto va por partida
 
@@ -672,9 +886,23 @@ print(f"  <mask> {masked / total:.1%}  kept {kept / total:.1%}  random {1 - (mas
 uv run python labs/m3/bidirectional.py
 ```
 
-Salida en la máquina de referencia (RTX 5090):
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
 
-{/* OUTPUT: uv run python labs/m3/bidirectional.py */}
+```text
+preset parameters: 15,052,800
+max |delta| on the FIRST token after changing the LAST one: 0.239878
+bidirectional: the future reaches the past
+max |delta| between padded and tight: 0.000001
+selected 14.910% of the tokens (target 15 %)
+  <mask> 80.6%  kept 9.9%  random 9.5%
+```
+
+Las tres comprobaciones salen como tienen que salir. La primera es la del módulo entero: cambiar el
+**último** token mueve el estado oculto del **primero** en 0,24, un número que en el decoder de M2
+sería exactamente 0,000000. La segunda dice que el relleno no contamina: la diferencia entre pasar
+la secuencia rellena y pasarla justa es 1e-6, o sea ruido de `bf16` y no información filtrada. La
+tercera cuenta el sorteo en lugar de creérselo: 14,91 % de tokens seleccionados sobre un objetivo
+del 15 %, repartidos 80,6 / 9,9 / 9,5.
 
 El `kept` que imprime la tercera parte es una cota superior del 10 % real, porque una sustitución
 aleatoria puede caer por casualidad en el mismo token; con un vocabulario de 1 968 jugadas la
@@ -688,9 +916,37 @@ que come el decoder:
 uv run rukh train encoder --config configs/train/encoder-mmm.yaml
 ```
 
-Salida en la máquina de referencia (RTX 5090):
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19). Son las últimas seis evaluaciones
+de validación de las doce mil de la tirada, que tardó **dieciséis minutos**:
 
-{/* OUTPUT: uv run rukh train encoder --config configs/train/encoder-mmm.yaml */}
+```text
+step  9500  val/loss 1.0621  val/top1 0.7396
+step 10000  val/loss 1.0456  val/top1 0.7430
+step 10500  val/loss 1.0291  val/top1 0.7467
+step 11000  val/loss 1.0195  val/top1 0.7483
+step 11500  val/loss 1.0106  val/top1 0.7507
+step 12000  val/loss 1.0032  val/top1 0.7518
+
+input:      moves
+masking:    15% at 80%/10%/10%
+steps:      12000
+checkpoint: checkpoints/encoder-mmm-20260919-093554/step-12000.pt
+```
+
+**75,2 % de acierto en las jugadas tapadas.** Tres de cada cuatro huecos se rellenan bien, y merece
+la pena pararse a entender por qué esa cifra no es comparable con el 51,1 % de top-1 del decoder de
+M2 aunque las dos se llamen "acierto sobre jugadas". El decoder adivina el futuro: ve la partida
+hasta el ply _n_ y tiene que elegir el ply _n+1_ entre treinta jugadas legales, muchas de ellas
+razonables, en una situación donde **no hay una respuesta correcta**. El encoder rellena un hueco
+con la partida entera alrededor: ve lo que vino después, y lo que vino después restringe
+brutalmente lo que pudo haber pasado. Si en el ply _n+2_ hay una torre en d1, la jugada tapada era
+seguramente la que la puso ahí. Es la misma asimetría que hay entre escribir la siguiente palabra de
+una frase y rellenar un hueco en una frase que ya está escrita entera.
+
+Que la curva siga bajando en el paso 12 000 —de 1,0621 a 1,0032 en los últimos 2 500 pasos, sin
+aplanarse— dice además que el preentrenamiento no ha terminado de exprimirse. No se alargó porque
+dieciséis minutos es el presupuesto del módulo, y eso se escribe aquí en vez de fingir que el número
+es un techo.
 
 Fíjate en la métrica que el bucle registra aparte de la pérdida: `masked_tokens_per_s`. Es la que de
 verdad manda, porque los otros `tokens_per_s` cuentan también los tokens que no puntúa nadie. Y
@@ -727,22 +983,46 @@ alta que la del preentrenamiento, porque solo se están moviendo tres capas line
 congelado y en modo `eval`:
 
 ```bash title="Terminal"
-uv run rukh train heads --config configs/train/encoder-heads.yaml --mode probe
+uv run rukh train heads --config configs/train/encoder-heads-moves.yaml --mode probe
 ```
 
-Salida en la máquina de referencia (RTX 5090):
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19), sobre las **438 093 posiciones
+etiquetadas** de la tabla supervisada, con el 10 % de validación repartido por partida:
 
-{/* OUTPUT: uv run rukh train heads --config configs/train/encoder-heads.yaml --mode probe */}
+```text
+mode:       probe
+   100% of the labels (438093 rows)
+    val/value_loss       0.0603
+    val/blunder_loss     0.1285
+    val/result_loss      0.8844
+    val/loss             0.6310
+    val/value_mae        0.1429
+    val/blunder_acc      0.9678
+    val/result_acc       0.4586
+```
 
 La salida imprime, por cabeza, la pérdida de validación y una métrica legible: `val/value_mae` (el
 error absoluto medio del valor, en la escala acotada, así que 0,1 son unos 40 centipeones en la zona
 central), `val/blunder_acc` —que es exactitud, útil para ver que algo se mueve, pero **no** la cifra
 que se publica, por lo que ya sabes del desbalanceo— y `val/result_acc`.
 
-Antes de mirar los números, escribe en algún sitio qué esperas. Una expectativa razonable: el
-resultado de la partida debería ser la más difícil de las tres, porque su etiqueta es una propiedad
-de la partida y no de la posición; el valor debería ser la más fácil, porque el material está
-explícito en la entrada por casillas.
+Antes de ejecutarlo conviene escribir en algún sitio qué esperas, porque la mitad del valor de un
+experimento está en haberse comprometido antes. Una expectativa razonable: el resultado de la
+partida debería ser la más difícil de las tres, porque su etiqueta es una propiedad de la partida y
+no de la posición; el valor debería ser la más fácil, porque el material está casi explícito en la
+entrada.
+
+La primera parte se cumple: 45,9 % de acierto en el resultado sobre tres clases, apenas trece puntos
+por encima de tirar una moneda de tres caras, que para una tarea cuyo techo teórico es bajísimo está
+donde tiene que estar. La segunda también: 0,1429 de error absoluto medio del valor, unos 57
+centipeones en la zona central de la escala.
+
+Y **el 96,78 % de `val/blunder_acc` es la cifra más peligrosa de todo el módulo**. Parece que la
+cabeza de errores es la que mejor va de las tres; es exactamente al revés. Los errores son el
+**3,72 %** de las filas, así que un detector que conteste siempre "no hay error" —sin mirar el
+tablero, sin saber qué es un alfil— saca **96,3 %**. La cabeza está batiendo a esa constante por
+cuatro décimas. Guarda esa cifra: en `Cómo se mide y contra qué` se desmonta del todo, y es la
+lección más transferible del módulo.
 
 <Exercise n="02" title="El probe no mueve el encoder: demuéstralo tú">
   Escribe un test que cargue un checkpoint del encoder, entrene tres pasos en modo `probe` y
@@ -775,34 +1055,82 @@ Repite el afinado subiendo la temperatura: primero las dos últimas capas y la n
 después el modelo entero.
 
 ```bash title="Terminal"
-uv run rukh train heads --config configs/train/encoder-heads.yaml --mode last-n
+uv run rukh train heads --config configs/train/encoder-heads-moves.yaml --mode last-n
 ```
-
-Salida en la máquina de referencia (RTX 5090):
 
 {/* OUTPUT: uv run rukh train heads --config configs/train/encoder-heads.yaml --mode last-n */}
 
+<Callout kind="roto" title="Este número falta, y falta por una razón concreta">
+  La tirada de referencia del hito encadenó `probe` y `full` y **no ejecutó `last-n`**: con el
+  presupuesto del módulo se eligieron los dos extremos, que son los que responden a la pregunta
+  ("¿basta con leer la representación, o hay que moverla?"), y el punto intermedio se quedó fuera.
+  El hueco se rellena con la primera tirada que lo ejecute; hasta entonces aquí no hay una salida
+  inventada, que es la única alternativa.
+</Callout>
+
 ```bash title="Terminal"
-uv run rukh train heads --config configs/train/encoder-heads.yaml --mode full
+uv run rukh train heads --config configs/train/encoder-heads-moves.yaml --mode full
 ```
 
-Salida en la máquina de referencia (RTX 5090):
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19), sobre las mismas 438 093 filas:
 
-{/* OUTPUT: uv run rukh train heads --config configs/train/encoder-heads.yaml --mode full */}
+```text
+mode:       full
+   100% of the labels (438093 rows)
+    val/value_loss       0.0578
+    val/blunder_loss     0.1310
+    val/result_loss      0.8991
+    val/loss             0.6384
+    val/value_mae        0.1354
+    val/blunder_acc      0.9678
+    val/result_acc       0.5142
+```
+
+Compara las dos columnas, que es todo el punto del lab:
+
+<div class="table-wrap">
+
+| Métrica            | `probe` (tronco congelado) | `full` (todo el modelo) |
+| ------------------ | -------------------------: | ----------------------: |
+| `val/value_mae`    |                     0,1429 |              **0,1354** |
+| `val/blunder_acc`  |                     0,9678 |                  0,9678 |
+| `val/result_acc`   |                     0,4586 |              **0,5142** |
+| `val/blunder_loss` |                 **0,1285** |                  0,1310 |
+
+</div>
+
+Descongelar quince millones de parámetros compra **0,0075 de error absoluto en el valor** (un 5 %
+relativo) y **5,6 puntos de acierto en el resultado**. Eso es mucho en el resultado y poco en el
+valor, y la lectura es la que anticipaba la teoría: el valor ya estaba **legible** en la
+representación preentrenada —una capa lineal lo saca—, mientras que el resultado de la partida no lo
+estaba y hubo que ir a buscarlo moviendo el tronco.
+
+Y fíjate en la fila que empeora: la pérdida de la cabeza de errores **sube** de 0,1285 a 0,1310 al
+descongelar, con la exactitud clavada en el mismo 96,78 %. Es el aviso de siempre: cuando tres
+cabezas comparten tronco, una suma ponderada de pérdidas puede mejorar dos tareas a costa de la
+tercera, y el titular agregado (`val/loss`, que también sube, de 0,6310 a 0,6384) no te dice cuál.
+Por eso el bucle registra las tres por separado.
 
 Y ahora la curva. `--curve` ejecuta la misma receta cuatro veces, con el 10, 25, 50 y 100 % de las
 etiquetas de entrenamiento, sobre subconjuntos anidados, y nombra cada tirada con su porcentaje:
 
 ```bash title="Terminal"
-uv run rukh train heads --config configs/train/encoder-heads.yaml --mode probe --curve
+uv run rukh train heads --config configs/train/encoder-heads-moves.yaml --mode probe --curve
 ```
-
-Salida en la máquina de referencia (RTX 5090):
 
 {/* OUTPUT: uv run rukh train heads --config configs/train/encoder-heads.yaml --mode probe --curve */}
 
-Son cuatro entrenamientos completos, así que tarda cuatro veces lo que uno. Merece la pena hacerla
-con `probe`, que es el modo barato, antes de gastarla con `full`.
+<Callout kind="roto" title="La curva por etiquetas tampoco está medida todavía">
+  Son cuatro entrenamientos completos, así que cuesta cuatro veces lo que uno, y en el presupuesto
+  del hito no cupo. Los dos informes de evaluación lo dicen con todas las letras —_"the checkpoint
+  carries no label-count curve: run `rukh train heads --curve` and evaluate one of its
+  checkpoints"_—, la tabla de la curva sale vacía en los dos, y por eso este marcador sigue abierto.
+  Duele más que el de `last-n`, porque la curva es justamente la que decide el diagnóstico del
+  criterio de valor que no se cumple: sin ella, "faltan etiquetas" es una hipótesis razonada y no
+  una medida.
+</Callout>
+
+Merece la pena hacerla con `probe`, que es el modo barato, antes de gastarla con `full`.
 
 <Exercise n="03" title="Lee tu propia curva antes de verla">
   Dibuja en un papel las tres formas que puede tener la curva de F1 contra número de etiquetas: (a)
@@ -856,17 +1184,50 @@ ls -td checkpoints/encoder-heads-*/ | head -1
 La suite del encoder se ejecuta sobre un checkpoint de las cabezas, no del preentrenamiento:
 
 ```bash title="Terminal"
-uv run rukh eval encoder --model checkpoints/encoder-heads/best.pt --stage encoder
+uv run rukh eval encoder --model checkpoints/encoder-heads-moves-20260919-095307/best.pt --stage encoder
 ```
 
-Salida en la máquina de referencia (RTX 5090):
+Titular real de `artifacts/eval/encoder/report.md` en la ejecución de referencia (RTX 5090,
+2026-09-19), sobre **10 000 posiciones** del conjunto retenido:
 
-{/* OUTPUT: uv run rukh eval encoder --model checkpoints/encoder-heads/best.pt --stage encoder */}
+```text
+Blunder F1, encoder (tuned, p >= 0.128)      17.9 %
+Blunder F1, encoder (fixed, p >= 0.5)         0.0 %
+Blunder F1, material baseline                 8.9 %
+Margin over the baseline                     +9.0 points
+Margin >= 5 points                            yes
+Blunder ROC AUC                               0.738
+Blunder average precision                     0.109
+Blunder base rate                             3.7 %
+Value vs tanh(cp / 400), Spearman             0.407
+Value vs tanh(cp / 400), Pearson              0.442
+Value correlation >= 0.80                     no
+Result accuracy                              49.9 %
+Positions       10,000 (7,453 with a blunder label, 3,660 of them scored)
+```
+
+Y el desglose por punto de operación, que es donde está la historia:
+
+```text
+detector   operating point                items  blunders  flagged   P       R       F1
+encoder    tuned, p >= 0.128               3660       144      191   15.7 %  20.8 %  17.9 %
+encoder    fixed, p >= 0.5                 3660       144        0    0.0 %   0.0 %   0.0 %
+heuristic  rule, no threshold to tune      3660       144     2359    4.7 %  77.1 %   8.9 %
+
+encoder    probability span: 0.0040 to 0.2568 (mean 0.0446)
+```
+
+Los dos criterios de `GOAL.md` salen en direcciones opuestas y los dos se publican tal cual: el de
+detección de errores **se cumple** con +9,0 puntos sobre la heurística; el de correlación de valor
+**no se cumple**, con 0,407 de Spearman frente a un listón de 0,80. La sección `Cómo se mide y
+contra qué` explica de dónde sale cada número, por qué el 0,0 % de la fila del umbral fijo no es un
+modelo roto y qué falló en el valor.
 
 La salida trae, en este orden: cuántas posiciones se evaluaron y cuántas de ellas tenían etiqueta de
-error; precisión, exhaustividad y F1 del encoder y de la heurística; el margen en puntos de F1 y si
-llega al listón de cinco; Pearson y Spearman del valor contra `cp`; la exactitud del resultado; y la
-curva por etiquetas si el checkpoint la lleva. Escribe además
+error; precisión, exhaustividad y F1 del encoder y de la heurística, en el umbral ajustado y en el
+fijo; el margen en puntos de F1 y si llega al listón de cinco; ROC AUC y precisión media, que no
+dependen de ningún umbral; Pearson y Spearman del valor contra `tanh(cp/400)`; la exactitud del
+resultado; y la curva por etiquetas si el checkpoint la lleva. Escribe además
 `artifacts/eval/<stage>/report.md` y una fila en `artifacts/web/results.json`, que es la que llega a
 la tabla única de esta web con `pnpm sync:data`. `<stage>` es lo que pases en `--stage`; sin esa
 opción es el **nombre del directorio del checkpoint**, o sea `encoder-heads-<marca de tiempo>`, y
@@ -915,13 +1276,40 @@ alerta de error, y no tiene ningún uso para los logits del MLM ni para el resul
 uv run rukh export --ckpt checkpoints/encoder-heads/best.pt --out artifacts/onnx/encoder --kind encoder --fp16 --int8 --check-parity
 ```
 
-Salida en la máquina de referencia (RTX 5090):
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
 
-{/* OUTPUT: uv run rukh export --ckpt checkpoints/encoder-heads/best.pt --out artifacts/onnx/encoder --kind encoder --fp16 --int8 --check-parity */}
+```text
+exporter: dynamo (opset 18)
+kind:     encoder -> value, blunder
+shapes:   batch dynamic=True, sequence dynamic=True (verified), block=200
+fp32:     artifacts/onnx/encoder/model.onnx (60735659 bytes)
+fp16:     artifacts/onnx/encoder/model-fp16.onnx (30648768 bytes, 0.50 of fp32)
+int8:     artifacts/onnx/encoder/model-int8.onnx (18254207 bytes, 0.30 of fp32)
+parity fp32: 1.0000 of the blunder decisions on 1000 positions (max |delta value| 1.073e-06)
+parity fp16: 1.0000 of the blunder decisions on 1000 positions (max |delta value| 0.0009496)
+parity int8: 1.0000 of the blunder decisions on 1000 positions (max |delta value| 0.0241)
+```
 
-Tres diferencias con la exportación del decoder que hiciste en M2. La primera: el esquema de
-casillas **no tiene eje dinámico de secuencia**, porque siempre son 69 tokens; no hace falta y no se
-anuncia, y por eso `--seq-len` no pinta nada aquí. La segunda: la paridad no se mide sobre la jugada
+**60,7 MB en fp32, 30,6 en fp16, 18,3 en int8**, y lo importante: **el 100 % de las decisiones de
+error coinciden con PyTorch en las tres precisiones**. El valor se mueve 0,024 como mucho en int8,
+que en la escala acotada son unos diez centipeones y en la barra de la demo no se ve.
+
+Compáralo con lo que te salió en M2: allí el int8 del decoder **cambiaba el 4,6 % de sus jugadas**.
+Es la misma técnica de cuantización sobre dos modelos del mismo proyecto, con resultados opuestos, y
+la diferencia no es suerte. El decoder termina en un `argmax` sobre 2 030 logits: dos jugadas
+razonables están a menudo a milésimas, y un error de redondeo que no cambia la evaluación de nada sí
+cambia cuál gana. El encoder termina en dos escalares —un `tanh` y un sigmoide— y la decisión de
+error es un umbral sobre uno de ellos: para que cambie, el ruido tiene que cruzar la frontera, y
+0,024 solo la cruza si la probabilidad ya estaba pegada al umbral. **La sensibilidad a la
+cuantización es una propiedad de la cabeza, no del cuerpo**, y esa frase vale para cualquier modelo
+que vayas a cuantizar: pregúntate siempre cuántos candidatos compiten en la última operación.
+
+Tres diferencias con la exportación del decoder que hiciste en M2. La primera: el eje de secuencia
+depende del esquema, y la salida lo dice. El checkpoint exportado aquí es el de **jugadas**, cuya
+secuencia crece con la partida, y por eso anuncia `sequence dynamic=True (verified)`; el de
+**casillas** siempre tiene 69 tokens, así que ese eje se fija y `--seq-len` no pinta nada. No es un
+detalle cosmético: un eje que se declara dinámico y no lo es se convierte en un error en el
+navegador la primera vez que llega una secuencia de otro tamaño. La segunda: la paridad no se mide sobre la jugada
 elegida sino sobre las dos salidas —la coincidencia de la **decisión** de error y la diferencia
 máxima absoluta del **valor**—, que es lo que de verdad ve el usuario. La tercera: los metadatos
 `rukh_*` que viajan dentro del fichero llevan además `rukh_kind=encoder` y `rukh_heads`, de forma
@@ -934,9 +1322,14 @@ La salida secundaria del encoder son los embeddings de posición, que no usa la 
 uv run rukh encoder embed --positions data/evals/positions-eval.parquet --out artifacts/embeddings/positions.npy --ckpt checkpoints/encoder-heads/best.pt
 ```
 
-Salida en la máquina de referencia (RTX 5090):
-
 {/* OUTPUT: uv run rukh encoder embed --positions data/evals/positions-eval.parquet --out artifacts/embeddings/positions.npy --ckpt checkpoints/encoder-heads/best.pt */}
+
+<Callout kind="roto" title="Los embeddings no se exportaron en este hito">
+  El consumidor de esta matriz es la recuperación de posiciones parecidas, que es de la **fase 2**
+  del curso, y la tirada de referencia de M3 no la ejecutó: ni la demo ni ninguna métrica de
+  `GOAL.md` la necesitan hoy. El comando funciona y el lab se puede hacer; lo que falta aquí es la
+  salida medida, y se rellenará cuando la fase 2 la produzca de verdad.
+</Callout>
 
 Fíjate en que escribe **dos** ficheros: la matriz `.npy` y un `.parquet` de acompañamiento con `row`
 y `fen4` en el mismo orden. Una matriz de flotantes sin saber qué fila es qué posición no sirve para
@@ -1045,11 +1438,24 @@ print(f"wrote {OUT} ({len(MOVES)} plies, depth {DEPTH})")
 uv run python labs/m3/value_bar_export.py
 ```
 
-Salida en la máquina de referencia (RTX 5090):
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
 
-{/* OUTPUT: uv run python labs/m3/value_bar_export.py */}
+```text
+wrote artifacts/web/value-bar.json (34 plies, depth 12)
+```
 
-El fichero llega a esta web con `pnpm sync:data`, igual que los dos de M2.
+El fichero llega a esta web con `pnpm sync:data`, igual que los dos de M2. La figura que hay más
+abajo es exactamente ese JSON, generado con el checkpoint de **casillas**
+(`checkpoints/encoder-heads-20260919-100532/best.pt`): el script tokeniza un FEN con
+`fen_to_tokens`, así que el esquema de jugadas no le sirve tal cual.
+
+Y hay una cosa que mirar en el fichero antes de mirar el gráfico: **ningún ply sale marcado como
+error**. No es un fallo del script ni del modelo. El `THRESHOLD = 0.5` que tiene escrito es el de
+`configs/eval/encoder.yaml`, y ya sabes por la evaluación que las probabilidades de esta cabeza no
+pasan de 0,19: en 0,5 no se dispara nunca. La figura enseña, sin querer, la misma lección que la
+tabla de puntos de operación, y por eso se publica así en vez de bajarle el umbral a mano hasta que
+salgan verticales bonitas. Cambiar `THRESHOLD` al 0,04459 que eligió la mitad `tune` es el lab que
+te llevas a casa.
 
 <Exercise n="05" title="¿Por qué la partida del script termina en 17…Ae6 y no sigue?">
   El script se para justo en la jugada del sacrificio. Explica qué se vería si continuara hasta el
@@ -1099,15 +1505,21 @@ Cuatro cosas concretas que mirar, en este orden:
    cuadrático tiende a la media, así que las ventajas grandes se quedan cortas. Si lo ves, mira
    Pearson y Spearman de la evaluación: es exactamente el caso en el que Spearman es alto y Pearson
    más bajo, y verlo en una partida concreta es la mejor manera de entender esas dos cifras.
-3. **Qué plies marca como error.** Compáralos con los saltos de la curva de Stockfish. Un error de
-   verdad es un escalón: la evaluación cambia de golpe entre un ply y el siguiente. Si el encoder
-   marca plies donde la curva del motor no se mueve, son falsas alarmas; si hay escalones sin marca,
-   son errores que se le escapan. Eso es precisión y exhaustividad, vistas en una sola figura en vez
-   de como dos números.
-4. **El sacrificio.** Esta partida termina en 17…Ae6, la jugada que la heurística de material llama
-   error garrafal. Mira qué dice el encoder ahí y si coincide con Stockfish. Sea cual sea la
-   respuesta, es informativa: si acierta, ha aprendido algo que no se puede contar con una tabla de
-   valores de pieza; si falla, ya sabes dónde está su frontera.
+3. **Qué plies marca como error: ninguno.** No hay una sola vertical punteada en toda la partida, y
+   ya sabes por qué: el script escribe la marca con el umbral de fábrica de 0,5 y las
+   probabilidades de esta cabeza no llegan a 0,20. La figura acaba siendo la mejor ilustración
+   posible de la sección de métricas, porque aquí no hay tabla que te consuele: el punto de
+   operación equivocado convierte a un detector con 0,696 de ROC AUC en un detector que no detecta
+   nada. Si quieres ver las verticales, cambia `THRESHOLD` a 0,04459 —el que eligió la mitad
+   `tune`— y vuelve a ejecutar el script.
+4. **El sacrificio, y el escalón que sí está.** La partida termina en 17…Ae6, la jugada que la
+   heurística de material llama error garrafal. Mira la curva de trazos en el ply 22: Stockfish
+   pasa de −0,015 a **−0,52** y se queda ahí el resto de la partida, porque ahí es donde la partida
+   se decide a favor de las negras. Y ahora mira la línea continua: el encoder se mueve entre 0,00
+   y 0,16 de principio a fin, **siempre del lado de las blancas**, y no registra el escalón. Ese
+   dibujo es 0,42 de Spearman con los ojos, y es mucho más elocuente que el número: el modelo no
+   está mintiendo, está aplastado contra el cero, que es exactamente lo que predice el diagnóstico
+   de `tanh(cp/400)` sobre pocas etiquetas.
 
 <ValueBar client:visible />
 
@@ -1134,25 +1546,45 @@ por qué la máscara es una consecuencia del objetivo y no al revés. Lo has pre
 move modeling sabiendo defender cada número de la receta —el 15 %, las tres ramas del 80/10/10, los
 tokens de control intocables y el `-100` que no es un 0—, has reducido sus salidas a un vector con
 un pooling que ignora el relleno por un motivo que puedes explicar en una frase, y has montado
-encima tres cabezas lineales precisamente porque son demasiado tontas para hacer trampa.
+encima tres cabezas lineales precisamente porque son demasiado tontas para hacer trampa. Ese
+preentrenamiento acertó el **75,2 %** de las jugadas tapadas en dieciséis minutos, y la comparación
+entre las dos entradas —la pregunta abierta con la que empezó el módulo— tiene ya una respuesta que
+no es la que nadie habría apostado entera: ver el tablero es mejor para _cuánto vale esto_, ver la
+línea es mejor para _qué se acaba de tirar_.
+
+Y te llevas el resultado incómodo, que es el que más enseña: de los dos criterios de `GOAL.md`, el
+de detección de errores **se cumple** con +9,0 puntos sobre la heurística y el de correlación de
+valor **no se cumple**, con 0,42 de Spearman frente a un listón de 0,80. Los dos se publican igual.
 
 Y has aprendido a medir. Contra una línea base deliberadamente mala, sobre las mismas filas, con
-métricas que no se dejan engañar por una clase rara, con un reparto por partida que cierra la fuga
-que este módulo tenía servida en bandeja, y con una curva que responde a la pregunta que de verdad
-decide presupuestos: cuántas etiquetas hacen falta.
+métricas que no se dejan engañar por una clase rara y con un reparto por partida que cierra la fuga
+que este módulo tenía servida en bandeja. Si de todo el módulo solo te quedas con una cosa, que sea
+esta: **con una tasa base del 3,7 %, la exactitud del 96,78 % no dice nada y el F1 de 0,0000 en el
+umbral de 0,5 tampoco; el mismo modelo tiene 0,738 de ROC AUC, y el número publicable sale de elegir
+el umbral en unas filas y puntuar en otras.** No es una particularidad del ajedrez: es lo que hay
+que hacer con cualquier detector de algo raro.
 
 **Cómo se mide el módulo 3.** Todo lo que sigue es un número o un test:
 
 - **F1 de detección de errores**, del encoder y de la heurística de material sobre las mismas filas
-  de validación, con su precisión y su exhaustividad al lado. Objetivo de `GOAL.md`: al menos cinco
-  puntos de margen. Si no se llega, se publica la cifra real y se documenta por qué.
-- **Correlación del valor con `cp`**, Pearson y Spearman. Objetivo: ≥ 0,8.
+  de validación, con su precisión y su exhaustividad al lado, en el umbral ajustado y en el fijo, y
+  con ROC AUC y precisión media, que no dependen de ningún umbral. El umbral se elige en una mitad
+  `tune` y el F1 se mide en la mitad `score`, partidas por `game_id`. Objetivo de `GOAL.md`: al
+  menos cinco puntos de margen. **Medido: 0,179 contra 0,089, +9,0 puntos. Se cumple.**
+- **Correlación del valor con `tanh(cp/400)`**, Pearson y Spearman, esta última como titular.
+  Objetivo: ≥ 0,80. **Medido: 0,407 con la entrada por jugadas y 0,422 con la de casillas. No se
+  cumple**, y el diagnóstico —pocos pasos de afinado, 9,8 % de cobertura de etiquetas y una escala
+  comprimida— queda documentado en vez de disimulado.
 - **Exactitud del resultado** sobre las tres clases, con la advertencia de que su techo es bajo por
-  construcción.
+  construcción. Medido: 51,4 % en validación con el modelo entero descongelado, 49,9 % en la
+  evaluación sobre las 10 000 posiciones retenidas.
 - **Curva por número de etiquetas** al 10, 25, 50 y 100 %, sobre subconjuntos anidados, en los tres
-  modos de afinado.
+  modos de afinado. **Pendiente**: no cupo en el presupuesto del hito, y por eso "faltan etiquetas"
+  sigue siendo un diagnóstico razonado y no una medida.
 - **Paridad ONNX** de las dos salidas que usa la demo: coincidencia de la decisión de error y
-  diferencia máxima del valor, para fp32, fp16 e int8.
+  diferencia máxima del valor, para fp32, fp16 e int8. **Medido: 100 % en las tres**, con 60,7 /
+  30,6 / 18,3 MB y un desvío máximo del valor de 0,024 en int8. El contraste con el decoder de M2,
+  cuyo int8 cambiaba el 4,6 % de las jugadas, es una de las cosas que conviene recordar del módulo.
 - **Tests unitarios** que se quedan para siempre: que el modelo **no** es causal, que el relleno no
   influye en los tokens reales, que `pool("mean")` lo ignora, que un FEN va y vuelve casilla a
   casilla, que las proporciones 80/10/10 se cumplen sobre diez mil tokens, que los tokens de control

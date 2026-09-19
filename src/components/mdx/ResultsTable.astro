@@ -14,6 +14,12 @@ import results from '../../data/results.json';
  *   puzzles: {"1000-1500": 0.347, …}, elo, elo_ci: [lo, hi], delta_cp, … }] }` — raw numbers as
  *   fractions, nested puzzle bands, no columns and no labels.
  *
+ * Since M3 the file also carries rows with `kind: "encoder"`, which share not one measurement with
+ * a decoder: no legality, no top-1, no Elo, and instead blunder F1 against the material baseline
+ * (at a threshold chosen on a held-out `tune` half, plus the fixed 0.5 one), ROC AUC, average
+ * precision, the base rate of the positive class, and the two value correlations. Squeezing them
+ * into the decoder's columns would print a row of em dashes, so they get their own table below.
+ *
  * The columns live here and not in the data: the ML repo publishes measurements, the site decides
  * how to name and order them, in each language.
  */
@@ -56,10 +62,48 @@ const LABELS: Record<'es' | 'en', { key: string; label: string }[]> = {
   ],
 };
 
+/** The encoder's own columns: nothing here is comparable with a decoder's row. */
+const ENCODER_LABELS: Record<'es' | 'en', { key: string; label: string }[]> = {
+  es: [
+    { key: 'stage', label: 'Etapa' },
+    { key: 'params', label: 'Parámetros' },
+    { key: 'f1', label: 'F1 de error, umbral ajustado (%)' },
+    { key: 'threshold', label: 'Umbral (elegido en «tune»)' },
+    { key: 'f1_fixed', label: 'F1 de error, umbral 0,5 (%)' },
+    { key: 'f1_heuristic', label: 'F1 de la heurística (%)' },
+    { key: 'margin', label: 'Margen (puntos de F1)' },
+    { key: 'roc_auc', label: 'ROC AUC' },
+    { key: 'ap', label: 'Precisión media' },
+    { key: 'base_rate', label: 'Tasa base de error (%)' },
+    { key: 'spearman', label: 'Valor: Spearman' },
+    { key: 'pearson', label: 'Valor: Pearson' },
+    { key: 'result_acc', label: 'Resultado (%)' },
+  ],
+  en: [
+    { key: 'stage', label: 'Stage' },
+    { key: 'params', label: 'Params' },
+    { key: 'f1', label: 'Blunder F1, tuned threshold (%)' },
+    { key: 'threshold', label: 'Threshold (chosen on “tune”)' },
+    { key: 'f1_fixed', label: 'Blunder F1, threshold 0.5 (%)' },
+    { key: 'f1_heuristic', label: 'Baseline F1 (%)' },
+    { key: 'margin', label: 'Margin (F1 points)' },
+    { key: 'roc_auc', label: 'Blunder ROC AUC' },
+    { key: 'ap', label: 'Average precision' },
+    { key: 'base_rate', label: 'Blunder base rate (%)' },
+    { key: 'spearman', label: 'Value: Spearman' },
+    { key: 'pearson', label: 'Value: Pearson' },
+    { key: 'result_acc', label: 'Result (%)' },
+  ],
+};
+
 const raw = results as Json;
 const locale = lang === 'en' ? 'en-GB' : 'es-ES';
 const columns = LABELS[lang];
-const rawRows = Array.isArray(raw.rows) ? (raw.rows as Json[]) : [];
+const encoderColumns = ENCODER_LABELS[lang];
+const allRows = Array.isArray(raw.rows) ? (raw.rows as Json[]) : [];
+const isEncoder = (row: Json) => row.kind === 'encoder';
+const rawRows = allRows.filter((row) => !isEncoder(row));
+const rawEncoderRows = allRows.filter(isEncoder);
 
 const decimal = lang === 'en' ? '.' : ',';
 
@@ -76,6 +120,17 @@ function number(value: unknown, digits = 1): Cell {
 
 /** A fraction in [0, 1] as a percentage; `rukh eval` never writes these as percentages. */
 const percent = (value: unknown, digits = 1): Cell => number(toNumber(value) * 100, digits);
+
+/**
+ * Three significant figures, for a number whose magnitude is not known in advance: the tuned
+ * blunder threshold is 0.128 for one input scheme and 0.0446 for the other, and rounding both to
+ * three decimals would print the second as 0.045, which is not the operating point that was used.
+ */
+function significant(value: unknown, digits = 3): Cell {
+  const n = toNumber(value);
+  if (!Number.isFinite(n)) return null;
+  return Number(n.toPrecision(digits)).toString().replace('.', decimal);
+}
 
 function toNumber(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : NaN;
@@ -131,6 +186,31 @@ const rows: Record<string, Cell>[] = rawRows.map((row) => {
   };
 });
 
+const encoderRows: Record<string, Cell>[] = rawEncoderRows.map((row) => ({
+  stage: typeof row.stage === 'string' ? row.stage : null,
+  params: params(row.params),
+  f1: percent(row.blunder_f1),
+  threshold: significant(row.blunder_threshold),
+  f1_fixed: percent(row.blunder_f1_fixed),
+  f1_heuristic: percent(row.blunder_f1_heuristic),
+  /* `blunder_f1_margin` already comes in F1 points, not as a fraction. */
+  margin: (() => {
+    const cell = number(row.blunder_f1_margin);
+    return cell === null || cell.startsWith('−') || cell.startsWith('-') ? cell : `+${cell}`;
+  })(),
+  roc_auc: number(row.blunder_roc_auc, 3),
+  ap: number(row.blunder_average_precision, 3),
+  base_rate: percent(row.blunder_base_rate),
+  spearman: number(row.value_spearman, 3),
+  pearson: number(row.value_pearson, 3),
+  result_acc: percent(row.result_accuracy),
+}));
+
+const encoderCaption =
+  lang === 'en'
+    ? 'Encoder: a blunder detector and a value head are not measured like a player. The threshold is chosen on a held-out “tune” half and the F1 is reported on a “score” half; the fixed-0.5 column is there because a 3.7 % positive class makes that default meaningless.'
+    : 'Encoder: un detector de errores y una cabeza de valor no se miden como un jugador. El umbral se elige en una mitad «tune» y el F1 se publica sobre la mitad «score»; la columna del umbral fijo 0,5 está ahí porque con una clase positiva del 3,7 % ese valor de fábrica no significa nada.';
+
 const empty =
   emptyText ??
   (lang === 'en'
@@ -178,6 +258,29 @@ const updated =
       </tbody>
     </table>
   </div>
+  {encoderRows.length > 0 && (
+    <div class="table-wrap results__encoder">
+      <table class="results__table">
+        <caption class="caption results__caption">{encoderCaption}</caption>
+        <thead>
+          <tr>
+            {encoderColumns.map((c) => (
+              <th scope="col">{c.label}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {encoderRows.map((row) => (
+            <tr>
+              {encoderColumns.map((c) => (
+                <td>{row[c.key] ?? '—'}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )}
   <p class="caption results__meta">
     {lang === 'en' ? 'Source' : 'Fuente'}: <code>rukh eval nightly</code>
     {updated && ` · ${lang === 'en' ? 'updated' : 'actualizado'} ${updated}`}
@@ -222,6 +325,17 @@ const updated =
   .results__empty {
     color: var(--muted);
     white-space: normal;
+  }
+
+  .results__encoder {
+    margin-top: 12px;
+  }
+
+  .results__caption {
+    padding: 10px 12px;
+    text-align: left;
+    white-space: normal;
+    border-bottom: 1px solid var(--line-soft);
   }
 
   .results__meta {
