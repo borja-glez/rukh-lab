@@ -113,7 +113,7 @@ const round = (value: number | null | undefined) =>
 
 function Pending() {
   return (
-    <div class="ed ed--pending">
+    <div class="ed ed--pending" data-elo-dial data-state="pending">
       <p class="ed__pending-main">
         <strong>Pendiente:</strong> el barrido por condición todavía no se ha ejecutado.
       </p>
@@ -140,11 +140,9 @@ export default function EloDial() {
   const y = (index: number) => VIEW.top + rowHeight * (index + 0.5);
 
   return (
-    <div class="ed">
+    <div class="ed" data-elo-dial data-state="ready">
       <div class="ed__head">
-        <p class="ed__title">
-          Elo medido pidiéndole al modelo que juegue a cada nivel
-        </p>
+        <p class="ed__title">Elo medido pidiéndole al modelo que juegue a cada nivel</p>
         <p class="ed__sub caption">
           Una fila por condición. La barra es el intervalo de confianza del 95 %; la marca, la
           estimación. Todo lo demás de la medición es idéntico entre filas: mismos rivales, mismas
@@ -273,7 +271,9 @@ export default function EloDial() {
       </p>
       <p class="ed__meta caption">
         {sweep.stage}
-        {typeof sweep.params === 'number' ? ` · ${sweep.params.toLocaleString('es-ES')} parámetros` : ''}
+        {typeof sweep.params === 'number'
+          ? ` · ${sweep.params.toLocaleString('es-ES')} parámetros`
+          : ''}
         {sweep.date ? ` · ${sweep.date}` : ''}
       </p>
     </div>
