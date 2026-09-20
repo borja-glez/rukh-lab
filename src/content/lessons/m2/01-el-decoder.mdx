@@ -116,6 +116,12 @@ desarrollan un caballo en la apertura) tendrán un producto escalar alto, y el v
 apuntará hacia una zona del espacio que el modelo asocia con "apertura abierta". Nadie le dice eso;
 sale de la única presión que hay, que es predecir bien la siguiente jugada.
 
+Nadie decidió que el comino y la cúrcuma fueran juntos en el supermercado. Acabaron en el mismo
+lineal porque quien compra uno suele comprar el otro, y el que ordena la tienda solo mira qué se
+lleva junto. El modelo hace eso con 2 030 jugadas y 512 estanterías. Donde se acaba el parecido: el
+supermercado tiene un pasillo por categoría y aquí ninguna dimensión significa nada por sí sola —lo
+único que existe es la cercanía—.
+
 ¿Por qué 512 y no 128 o 2 048? Porque `d_model` es el presupuesto de información que fluye por el
 modelo, y todo escala con él: las matrices de atención son `d × 3d` y `d × d`, las del MLP `d × 4d`
 y `4d × d`, así que el número de parámetros por bloque crece con `d²`. Con 512 y 12 capas salen
@@ -211,9 +217,15 @@ tres):
 - **K, la clave** (_key_): qué ofrezco yo a quien me busque.
 - **V, el valor** (_value_): qué información entrego si me eligen.
 
-La metáfora útil es un archivo. Cada jugada anterior deja una ficha con una etiqueta (K) y un
-contenido (V). La jugada actual escribe una búsqueda (Q). El parecido entre la búsqueda y cada
-etiqueta decide cuánto pesa cada contenido en el resultado.
+Piensa en un tablón de anuncios. Cada jugada anterior deja clavada una nota con dos caras: una
+**etiqueta** de qué clase de cosa es —«aquí se clavó un alfil»— y un **contenido**, lo que eso
+implica. Cuando le toca elegir la jugada 40, el modelo escribe primero qué está buscando —«¿alguien
+dejó una pieza sin defender?»—, lo compara con todas las etiquetas del tablón y se lleva **una
+mezcla de los contenidos**, pesada por lo bien que encajaba cada etiqueta.
+
+Y ahí está lo que casi todas las explicaciones de la atención se dejan: **no elige una nota, se
+lleva un promedio de todas**. Por eso la pregunta y la respuesta son objetos distintos, y por eso la
+misma nota se lee diferente según quién pregunte.
 
 Hagámoslo con números, en un modelo de juguete de dos dimensiones por cabeza. Tres jugadas:
 
@@ -308,6 +320,9 @@ out = F.scaled_dot_product_attention(q, k, v, dropout_p=..., is_causal=True)
 En el ejemplo anterior, la consulta de la posición 3 miró a las claves 1, 2 y 3. ¿Y la consulta de
 la posición 1? Si mirase a las claves 2 y 3, estaría mirando el futuro.
 
+En el tablón, la regla es que **solo puedes leer las notas clavadas antes que la tuya**. Sin ella,
+el modelo ve clavada la nota que tiene que adivinar.
+
 Eso, en un modelo entrenado para predecir la siguiente jugada, no es una imprecisión: **es hacer
 trampa, y el modelo la encuentra inmediatamente**. El entrenamiento es _teacher forcing_: se le da
 la partida entera y se le pide que en cada posición prediga el token siguiente. Si la posición `t`
@@ -356,6 +371,10 @@ como si hay ocho; lo único que cambia es cómo se reinterpretan sus columnas. M
 parámetros, prácticamente los mismos FLOPs, y a cambio ocho patrones de atención distintos por
 capa en vez de uno. Con 12 capas, el modelo tiene 96 cabezas y por tanto 96 formas simultáneas de
 relacionar jugadas.
+
+Vuelve al tablón: son ocho lectores mirándolo a la vez, cada uno buscando otra cosa. Uno va a las
+piezas sin defender, otro a de quién es el turno, otro a qué se jugó justo antes. Ninguno lee notas
+distintas; cada uno hace una pregunta distinta a las mismas.
 
 ¿Qué aprende cada una? En los Transformers de texto se han encontrado cabezas muy especializadas:
 una que mira siempre al token anterior, otra que busca la aparición previa del mismo token, otra
@@ -529,6 +548,15 @@ si revienta, avisa y entrena en modo _eager_ en vez de morirse.
 ### Muestrear una jugada: temperatura, top-k y la máscara de legalidad
 
 El modelo da 2 030 logits. Convertirlos en una jugada es una decisión de diseño con tres perillas.
+
+Antes de las perillas, una advertencia sobre la palabra que todo el mundo usa para la temperatura:
+**creatividad**. Es falsa, y entenderlo ahorra disgustos. Le preguntas a alguien que se conoce el
+restaurante qué pedir. A temperatura cero te dice siempre su plato favorito, el mismo cada vez;
+subiéndola empieza a nombrarte el segundo y el tercero de su lista; muy arriba te acaba proponiendo
+la ensalada que no le gusta a nadie. **No ha aprendido platos nuevos.** Solo está dispuesto a bajar
+más por la lista que ya tenía. La temperatura no añade opciones, redistribuye confianza entre las
+que el modelo ya había ordenado —y por eso bajar por la lista cuesta, en este proyecto, unos 180
+puntos de Elo—.
 
 **<Term id="temperatura">Temperatura</Term>.** Se dividen los logits por `T` antes del softmax. Con
 `T = 1` la distribución es la que el modelo aprendió; con `T` pequeña las diferencias se amplifican
@@ -1303,9 +1331,15 @@ conoces de antemano, y se comprueba cada vez que se toca.**
 - Un umbral de latencia medido con un reloj que deriva.
 
 Y la asimetría que hay que llevarse, porque es lo que decide qué hay que rehacer: un sesgo
-sistemático **mata lo absoluto y respeta lo relativo**. Los cuatro modelos subieron por igual, así
-que todas las comparaciones entre ellos siguieron siendo válidas y solo hubo que corregir las
-cifras publicadas. Si el sesgo hubiera dependido del modelo, no se habría salvado nada.
+sistemático **mata lo absoluto y respeta lo relativo**.
+
+Imagina una cinta métrica en la que el dueño anterior repasó a boli cuatro de las marcas, y las
+puso mal. Todo lo que has medido con ella está equivocado en centímetros. Pero si con esa misma
+cinta mediste tres estanterías y anotaste cuál era la más alta, ese orden sigue siendo correcto:
+el error se fue en la misma dirección en las tres. Aquí pasó eso: los cuatro modelos subieron por
+igual, las comparaciones entre ellos aguantaron y solo hubo que corregir las cifras publicadas. Si
+el sesgo hubiera dependido del modelo —una cinta que se estira más cuanto más larga es la
+estantería— no se habría salvado nada.
 
 </Transfer>
 
@@ -1722,6 +1756,11 @@ misma receta da esto:
 Léela dos veces. **El modelo de 39 M con datos suficientes bate al de 115 M mal alimentado**, con
 un tercio de los parámetros. Y el hueco cae a la mitad, que es justo lo que predice el diagnóstico:
 menos pasadas sobre el mismo material, menos memorización.
+
+Dos estudiantes tienen el mismo mes para preparar un examen. Uno se relee cuatro veces el mismo
+libro; el otro lee dos libros distintos una vez cada uno. El primero se sabrá ese libro mejor —te
+recita párrafos— y el segundo sabrá más del tema. Subir de talla es **ampliarle la capacidad al
+primero**: recitará más literal. Lo que le hacía falta era el segundo libro.
 
 <Transfer concept="Presupuesto cómputo-óptimo, y el hueco train/val como diagnóstico" where="Tu RAG tiene el recall plano y cambias el modelo de embeddings, cuando el chunker emite doscientos casi-duplicados.">
   Subir de talla es el reflejo más caro y el peor informado de los que tienes. La comprobación que
