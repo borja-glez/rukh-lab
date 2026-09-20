@@ -4,7 +4,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 const LESSON = '/curso/m4/01-fine-tuning/';
 
 /** The three figures this lesson adds, all of them animated. */
-const FIGURES = ['fig--axis', 'fig--lora', 'fig--swap'] as const;
+const FIGURES = ['fig--axis', 'fig--lora', 'fig--swap', 'fig--shrink'] as const;
 
 /** Scrolls an island into view and waits until Astro has hydrated it (`ssr` attribute gone). */
 async function hydrated(page: Page, marker: string): Promise<Locator> {
