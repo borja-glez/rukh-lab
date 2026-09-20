@@ -935,6 +935,25 @@ tramo que el corpus cubre.
   honesta de un afinado necesita medir en el recorte **original** y no solo en el nuevo.
 </Callout>
 
+¿Y la primera mitad de la predicción, la de que sube el Elo? Sube, y no lo suficiente como para
+poder decirlo:
+
+|                    |      Elo |     IC 95 % |  top-1 | puzles |
+| ------------------ | -------: | ----------: | -----: | -----: |
+| `medium-v4` (base) |     1504 | 1446 – 1558 | 54,4 % | 37,5 % |
+| `medium-masters`   | **1583** | 1525 – 1641 | 54,9 % | 38,0 % |
+| `medium-elo`       |     1558 | 1500 – 1609 | 54,9 % | 37,8 % |
+
+Setenta y nueve puntos de diferencia entre el base y el de maestros, con los intervalos solapados —y
+con un suelo de reproducibilidad de unos 40 puntos, son dos sigmas: sugerente, no establecido. Los
+tres modelos del hito caben dentro del intervalo de los otros dos.
+
+Que es el resultado del módulo dicho con los tres modelos delante: **ninguno de los dos afinados
+mueve la fuerza de forma demostrable**, y los dos mueven cosas que sí se ven. El de maestros ensancha
+el repertorio y estrecha el eje; el condicionado ordena el repertorio a lo largo del eje y arregla
+la mitad que era ruido. Lo que ninguno hace es enseñar táctica, porque la táctica no estaba en el
+objetivo de entrenamiento de ninguno de los dos.
+
 ### Los adaptadores: 1,6 MB que fijan una decisión y no cuestan nada
 
 Cada adaptador de estilo son **1 578 824 bytes** —393 216 números de `float32` más la cabecera de
@@ -996,6 +1015,69 @@ movimiento y no tocó ninguno de los once siguientes.
 </Callout>
 
 <EloDial client:visible />
+
+### Qwen3 contra el decoder: la pregunta que el curso llevaba tres módulos sin contestar
+
+La pregunta es «¿merecía la pena escribir un modelo propio en vez de afinar uno general?», y para
+que la respuesta valga, las dos mitades tienen que diferenciarse en **una sola** cosa. Mismas
+partidas, mismo mes, misma validación reservada, mismo harness, mismos rivales. Lo único distinto
+es la **representación**: el decoder lee un token por jugada legal; Qwen lee `1. e4 e5 2. Nf3`
+partido en los trozos que decida su BPE.
+
+Y el presupuesto se eligió **generoso con Qwen**: `r = 16` sobre las cuatro proyecciones de atención
+—el doble del rango de nuestros adaptadores—, 1 500 pasos, unos 24 M de tokens de ajedrez, sobre un
+modelo de **600 millones** de parámetros que ya sabe hablar, contra los 115 M del decoder entrenados
+desde cero. Si aun así pierde por mucho, nadie puede decir que se le dejó sin comer.
+
+Pierde por mucho.
+
+| Métrica                     | `medium-v4` (decoder) | `qwen3-pgn-qlora` |
+| --------------------------- | --------------------: | ----------------: |
+| Parámetros                  |           115 120 128 |   **600 637 440** |
+| Jugadas legales sin máscara |            **99,8 %** |           62,50 % |
+| Top-1 contra jugada humana  |            **54,4 %** |            12,5 % |
+| Puzles resueltos            |            **37,5 %** |             0,9 % |
+| Elo estimado                |  **1504** (1446–1558) |         **< 807** |
+
+Ese último número no es una estimación con intervalo: es una **cota**. Qwen jugó 160 partidas contra
+los ocho peldaños de la escalera —incluido el más flojo, `uci-1320`— y perdió **todas**. Veinte de
+veinte en cada peldaño, un 0,000 limpio en las ocho filas. Cuando no se gana ni una, no hay curva
+que ajustar: solo se puede decir «por debajo de», con un límite de una cola.
+
+Y la columna que el decoder no puede ni tener:
+
+| Cómo falló la respuesta |       Cuota |
+| ----------------------- | ----------: |
+| legal                   |     62,50 % |
+| ilegal aquí             | **33,70 %** |
+| no es una jugada        |      2,90 % |
+| SAN ambigua             |      0,90 % |
+| no escribió nada        |      0,00 % |
+
+Una de cada tres respuestas es una jugada bien escrita que esa posición no permite, y casi cuatro de
+cada cien ni siquiera son una jugada: `Nf9`, una desambiguación que falta, una frase. El decoder no
+puede cometer ninguno de esos dos errores, porque su vocabulario **es** el conjunto de jugadas: un
+token, una jugada legal en alguna posición. La representación no es un detalle de implementación; es
+la mitad del resultado.
+
+<Callout kind="teoria" title="Qué demuestra y qué no demuestra esta tabla">
+  **No** demuestra que Qwen3-0.6B sea un mal modelo, ni que afinar un LLM general sea mala idea en
+  general. Demuestra algo más estrecho y más útil: para una tarea con un **espacio de salida
+  cerrado, pequeño y verificable** —1 970 jugadas posibles, y en cada posición se sabe cuáles son
+  legales—, gastar el vocabulario en describir ese espacio vale más que quinientos millones de
+  parámetros extra entrenados para otra cosa. La lección que se lleva fuera del ajedrez: cuando tu
+  salida tiene estructura conocida, métela en la representación en vez de esperar que el modelo la
+  reaprenda desde texto.
+</Callout>
+
+<Callout kind="roto" title="Y lo que QLoRA no ahorró">
+  El nombre promete memoria y a esta escala no la da. Cuatro bits sobre Qwen3-0.6B ahorraron **341
+  MB de pesos** (un 29 %) y **7 MB del pico** (un 0,4 %), porque la tabla de embeddings —el 25,9 %
+  del modelo— no se cuantiza y el pico lo marcan las activaciones y el optimizador, no los pesos
+  congelados. La ventaja de QLoRA es real cuando el modelo no cabe; a 0,6 B en una tarjeta de 32 GB
+  no hay nada que no quepa. Se intentó, se midió y se dice: 4 587 520 parámetros entrenables de 600
+  637 440, el **0,76 %**, y una pérdida final de 0,878.
+</Callout>
 
 ## Labs
 
