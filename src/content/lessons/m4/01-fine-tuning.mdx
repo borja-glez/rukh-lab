@@ -1320,3 +1320,66 @@ vuelve **el mismo número**, no uno parecido; y que en toda la prueba se ha pedi
   pueda escribir como una aserción, escríbela: es la diferencia entre documentar una intención y
   defenderla.
 </Callout>
+
+## Qué has aprendido, cómo se mide
+
+- **El corpus antes que el modelo.** Los doce tokens de Elo por debajo de 1800 nunca habían
+  recibido un gradiente porque `min_elo: 1800` filtraba a **los dos** jugadores, y eso explicaba
+  tres hitos de resultados raros. **Medido** con un `Counter` sobre el segundo token de cada
+  partida empaquetada: 18 942 740 partidas, 1 681 069 636 tokens, **0 de 12** cabeceras por debajo
+  de 1800 vistas alguna vez. No hacía falta ni cargar el modelo.
+- **El eje dejó de ser ruido, y se ve sin jugar una partida.** La entropía analítica de la primera
+  jugada —la softmax tal cual, sin muestreo, sin semilla— pasa a ser **monótona en las seis
+  condiciones**: 1,596 → 1,647 → 1,741 → 1,841 → 1,881 → 1,992 bits. En el modelo viejo había un
+  escalón de **1,17 bits** justo entre `<w1500>` y `<w1800>`, exactamente donde cortaban los datos,
+  y con el signo del ruido: por debajo del suelo estaba _menos_ decidido que en cualquier cabecera
+  que conocía.
+- **El criterio 1 de `GOAL.md` no se cumple, y está medido por qué.** Ni monotonía ni intervalos
+  separados con 160 partidas por condición. Entre `<w1500>` y `<w2000>` la diferencia de tasa de
+  puntos es **−0,013** y harían falta **24 420 partidas por condición** para separarla: no faltan
+  partidas, no hay diferencia. Entre `<w2000>` y `<w2400>` harían falta 284, que sí es un problema
+  de medición.
+- **Y el control dice que la columna de Elo no distingue las dos causas.** El mismo barrido sobre
+  el modelo **sin** afinar recorre 161 puntos —con los intervalos separados— usando una cabecera
+  que nunca entrenó: un prefijo desconocido le estorba, y estorbarle cuesta eso. Si una métrica
+  sube con el tratamiento, mídela también sin él.
+- **Dónde sí se ve el afinado:** a `<w1200>`, con el mismo Elo que el modelo base, el condicionado
+  escribe **cero** jugadas ilegales contra cuatro de mil, gana 1,6 puntos de top-1, seis décimas de
+  puzles y baja **1,26 bits** de entropía. A `<w2100>` los dos coinciden en las cinco columnas, que
+  es cómo se comprueba que no hubo olvido catastrófico.
+- **LoRA escrita a mano es LoRA.** La misma configuración entrenada con `apply_lora` y con
+  `peft.get_peft_model`, mismos pesos base, misma `A` copiada, mismo optimizador: **`|delta| =
+0,00e+00` durante seis pasos**. Y fundir el adaptador es exacto, así que un fichero de 1,6 MB se
+  puede exportar, cuantizar y servir como un modelo cualquiera.
+- **Un adaptador de 393 216 números —el 0,34 % del modelo— cambia una decisión por completo y no
+  cuesta nada.** `lora-e4` sube `1. e4` del 59,64 % al **99,85 %** y deja legalidad (99,8 %),
+  top-1 (54,4 → 54,7 %) y puzles (37,5 → 37,8 %) donde estaban. Y con la primera jugada clavada,
+  doscientas auto-partidas de doce plies siguen dando **199 líneas distintas**: el adaptador fijó
+  el primer movimiento y no tocó ninguno de los once siguientes.
+- **Dos métricas con el mismo nombre pueden contradecirse y tener razón las dos.** La entropía de
+  la primera jugada dice «este modelo no varía» (0,021 bits) y la de líneas dice «no repite una
+  partida» (7,634 de 7,644). Miden decisiones distintas; publicar una sola habría dado un titular
+  falso en cualquiera de las dos direcciones.
+- **Un adaptador no tiene por qué costar un modelo entero al desplegarlo.** Exportando el decoder
+  con `A` y `B` como **entradas del grafo**, el navegador cambia de estilo subiendo 1,6 MB en vez
+  de descargar otros 221 MB. Con los factores a cero el fichero es el modelo base exactamente, así
+  que sustituye a la exportación normal en lugar de sumarse a ella, y el E2E lo comprueba pidiendo
+  **un solo** `.onnx` en toda la prueba.
+- **Un parámetro implícito es una dependencia.** El `ConstantOfShape` que el exportador escribe sin
+  atributo `value` se apoya en el valor por defecto de la especificación, y el conversor a fp16
+  retipa el grafo a su alrededor: resultado, el fp32 carga y el fp16 no. Lo encontró un test de
+  catorce segundos sobre un modelo de juguete.
+- **Tests que se quedan:** que un adaptador sin entrenar es la identidad (`B` empieza en cero); que
+  el recuento de parámetros es la fórmula y no una constante; que fundir es exacto; que la
+  equivalencia con `peft` se sostiene paso a paso; que los factores se crean en el dispositivo de
+  los pesos que corrigen —un fallo que catorce pruebas en CPU no podían ver—; que la entropía de
+  una sola línea es `0,0` y no `-0,0`; y que un adaptador cuyos rangos no midan lo mismo se rechaza
+  diciéndolo en vez de apilar algo que no cuadra.
+
+Lo siguiente es M5, donde el modelo deja de imitar y empieza a **preferir**: un modelo de
+recompensa, pares de jugadas puntuadas por el motor, DPO y GRPO. Es también donde se ataca lo que
+este módulo no pudo: la fuerza táctica no sale de la cabecera, y la pregunta de M5 es de dónde sí.
+La envoltura `PreTrainedModel` que has construido aquí es lo que hace que `DPOTrainer` y
+`GRPOTrainer` funcionen sobre tu decoder sin escribir ninguno de los dos.
+
+La cheatsheet del módulo, con su pregunta y su respuesta corta, está justo debajo.
