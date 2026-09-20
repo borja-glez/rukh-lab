@@ -549,12 +549,17 @@ Estos son los números reales del hito, para que leas el resto de la sección sa
 
 <div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
 
-| Criterio de `GOAL.md`               | Listón            | Medido                    | ¿Se cumple? |
-| ----------------------------------- | ----------------- | ------------------------- | ----------- |
-| F1 de error sobre la heurística     | +5 puntos         | **+9,0** (0,179 vs 0,089) | **sí**      |
-| Correlación del valor con Stockfish | ≥ 0,80 (Spearman) | **0,407**                 | **no**      |
+| Criterio de `GOAL.md`               | Listón            | Al cerrar el hito         | Hoy        | ¿Se cumple? |
+| ----------------------------------- | ----------------- | ------------------------- | ---------- | ----------- |
+| F1 de error sobre la heurística     | +5 puntos         | **+9,0** (0,179 vs 0,089) | **+9,7**   | **sí**      |
+| Correlación del valor con Stockfish | ≥ 0,80 (Spearman) | 0,407                     | **0,6665** | **no**      |
 
 </div>
+
+La columna «hoy» existe porque el módulo siguió midiendo después de publicarse, y lo que se
+encontró —que la pérdida optimizaba una cosa distinta de la que puntúa el criterio— está más abajo,
+en «La pérdida no medía lo que el criterio mide». La cifra sube de 0,407 a 0,6665 y **sigue sin
+cumplir**, que es exactamente por lo que la tabla tiene dos columnas y no una reescrita.
 
 Un criterio cumplido y otro no, y las dos cosas se publican con el mismo tamaño de letra. Hay además
 una tercera cifra, `val/blunder_acc = 96,78 %`, que no es ningún criterio y que si se leyera como si
@@ -770,8 +775,13 @@ correlacionar contra la etiqueta.
 manera de contarlo como un aprobado raspado: el criterio de valor de `GOAL.md` **no se cumple** y se
 publica sin cumplir, que es lo que el propio `GOAL.md` manda hacer cuando pasa esto.
 
-El diagnóstico, con lo que se sabe hoy, tiene tres piezas y ninguna es "hace falta un modelo más
-grande":
+Antes de seguir, mira otra vez esa tabla y busca lo raro. `squares` tiene **mejor Pearson y peor
+Spearman** que `moves`. Acabas de leer que esas dos medidas se separan exactamente cuando el orden
+está bien y la escala mal; aquí una entrada gana en escala y pierde en orden. Eso no es ruido: es
+una huella dactilar, estuvo publicada en esta página desde el primer día y tardó dos hitos en
+leerse. Guárdala; volvemos a ella en cuanto acabe el diagnóstico.
+
+El diagnóstico **del momento** tenía tres piezas y ninguna era "hace falta un modelo más grande":
 
 1. **Cuatro mil pasos de afinado.** Es el presupuesto del módulo, no un punto de convergencia, y ya
    viste que el preentrenamiento seguía bajando cuando se cortó.
@@ -786,12 +796,109 @@ grande":
    que la cabeza tiene que aprender a distinguir es minúscula precisamente donde están casi todos
    los datos. Una escala menos comprimida repartiría mejor el rango útil.
 
-Es el mismo diagnóstico que el curso ya se encontró en M2 con el tamaño del modelo: **el cuello son
-los datos, no la capacidad**. Y fíjate en la señal que lo confirma dentro de esta misma tabla: la
-entrada por casillas, que es un modelo **más pequeño y sin preentrenar**, correlaciona mejor en
-Pearson (0,688 frente a 0,442). Si el límite fuera la capacidad, el modelo con más información
-dentro ganaría; lo que decide es cuánta señal hay en la etiqueta y cómo de explícita está la
-respuesta en la entrada.
+Ese razonamiento está bien hecho y se equivocó. Las tres piezas apuntaban a los datos y a la
+etiqueta; ninguna miró la pérdida. Vale la pena dejarlo escrito tal cual, porque un diagnóstico
+competente y fallido enseña criterio, y una conclusión sola solo enseña conclusiones.
+
+#### La pérdida no medía lo que el criterio mide
+
+Vuelve a la huella dactilar. Si una entrada gana en escala y pierde en orden, la pregunta que nadie
+hizo es **qué está minimizando la pérdida**. Y la respuesta estaba en una línea:
+
+```python
+"value": F.mse_loss(outputs["value"], targets["value"])
+```
+
+`F.mse_loss` minimiza la **distancia** entre cada predicción y su etiqueta. `GOAL.md` puntúa con
+Spearman, que solo mira el **orden** y al que la distancia le da exactamente igual. Son dos
+funciones distintas, con mínimos distintos, y en lenguaje corriente se dicen igual —«acertar el
+valor»—, que es por lo que el fallo es invisible.
+
+Una predicción que está lejísimos de todas las etiquetas pero las ordena perfectamente saca un
+Spearman de 1 y un MSE malísimo. Otra que está cerquísima de todas y confunde dos saca un MSE
+excelente y pierde orden. Entrenábamos la segunda y puntuábamos la primera.
+
+El arreglo es una pérdida que mire pares: por cada dos posiciones del lote, si la etiqueta dice que
+`i` vale más que `j`, la predicción debería ponerlas en ese orden, y el voto pesa según lo lejos que
+estén las etiquetas —distinguir una ganada de una perdida cuenta más que separar dos iguales, que
+es justo donde un evaluador sin búsqueda no tiene nada que hacer—.
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Qué cambia                                 | Pearson    | Spearman   | F1 de error |
+| ------------------------------------------ | ---------- | ---------- | ----------- |
+| nada (`F.mse_loss` sola)                   | 0,6476     | 0,5205     | 0,1804      |
+| **+ término de ordenación**                | 0,6621     | **0,6395** | 0,1774      |
+| + término de ordenación y el triple de red | **0,7261** | **0,6665** | **0,1855**  |
+
+</div>
+
+Dos cosas que leer aquí, y la segunda es la importante.
+
+La primera: **no hubo intercambio**. Se esperaba ceder Pearson para ganar Spearman y subieron los
+dos, así que la pérdida anterior no estaba «optimizando otra cosa legítima», estaba peor alineada
+con la tarea en los dos ejes.
+
+La segunda es una **atribución**: cambiar la pérdida valió **+0,119** de Spearman y triplicar el
+modelo **+0,027**. Cuatro veces más barato mirar qué optimizas que comprar más red. El reflejo de
+subir de talla es el más caro de los disponibles y casi siempre el peor informado.
+
+<Transfer concept="Desalineamiento entre la pérdida sustituta y la métrica de evaluación" where="Un reranker entrenado con entropía cruzada binaria cuando la métrica de producto es nDCG@5.">
+  La regla se puede aplicar el lunes y es de una sola frase: **escribe el criterio de evaluación
+  primero, y después di en voz alta qué función minimiza tu pérdida y si su mínimo es el mismo. Si
+  el criterio es un orden, la pérdida lleva pares.**
+
+Dónde aparece este bug fuera de aquí, literalmente el mismo:
+
+- Un **reranker** entrenado para predecir «relevante sí/no» cuando lo que se despliega es un top-5
+  ordenado.
+- Un **LLM como juez** afinado con MSE para dar una nota de 1 a 5, cuando en producción se le pide
+  «elige la mejor de estas dos».
+- **Embeddings** ajustados contra puntuaciones de similitud cuando la recuperación solo mira qué
+  entra en el top-k y en qué orden.
+
+En los tres casos el número de entrenamiento sube, el del producto no se mueve, y nadie encuentra
+por qué porque los dos se describen con las mismas palabras.
+
+</Transfer>
+
+#### 0,6665 no significa «regular en todas partes»
+
+Con la pérdida arreglada el criterio sigue sin cumplirse: 0,6665 frente a 0,80. La pregunta útil no
+es cuánto falta, es **dónde falla**, y eso se responde cortando la métrica en vez de mirándola
+entera.
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Cómo de decidida está la posición | Posiciones       | Spearman   |
+| --------------------------------- | ---------------- | ---------- |
+| menos de 50 cp (casi igualadas)   | 6 099 (**61 %**) | 0,4625     |
+| 50 a 150 cp                       | 2 775 (28 %)     | 0,5844     |
+| 150 a 400 cp                      | 496 (5 %)        | 0,5196     |
+| más de 400 cp (decididas)         | 626 (6 %)        | **0,8797** |
+
+</div>
+
+**Donde la ventaja está clara el encoder ya pasa el listón.** Lo que hunde la media es el 61 % de
+posiciones casi igualadas, y ordenar dos posiciones que el motor separa por menos de medio peón
+exige ver táctica: una secuencia concreta de capturas que cambia el signo. Una pasada hacia delante
+sin búsqueda no la tiene y no la va a tener por entrenar más.
+
+Las dos lecturas del mismo 0,6665 llevan a acciones opuestas. «Regular en todo» dice _entrena más_.
+«Excelente en lo evidente, casi azar en lo que decide» dice _este enfoque tiene techo: cambia el
+enfoque o cambia el listón_. La segunda es la verdadera, y solo aparece al cortar.
+
+<Transfer concept="Evaluación desagregada por rebanadas" where="Un RAG al 68 % que es 95 % en consultas de un salto y 30 % en comparativas de varios.">
+  Una métrica global es un promedio sobre subpoblaciones que pueden comportarse al revés la una de
+  la otra. Antes de gastar un euro en arreglar un número que no llega, **córtalo por dificultad**:
+  es la medida más informativa y la más barata de repetir de todas las que hay.
+
+Y el diagnóstico cambia la factura. Un RAG al 68 % que acierta el 95 % de las preguntas de un
+salto y el 30 % de las comparativas no se arregla subiendo de modelo; se arregla con un
+planificador que parta la consulta. Un agente con 70 % de éxito que falla toda tarea de más de
+tres llamadas no tiene un problema de prompt, tiene un problema de arquitectura.
+
+</Transfer>
 
 <Callout kind="mundo-real" title="Publicar el número que no sale">
   La tentación cuando un criterio falla es reescribir el criterio: leer Pearson en vez de Spearman

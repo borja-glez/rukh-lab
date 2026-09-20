@@ -310,6 +310,25 @@ _workers_, los prepara en paralelo mientras la GPU calcula el lote anterior. Con
 worker abre el mismo fichero y el sistema operativo comparte las páginas; nadie copia un GB en
 memoria.
 
+<Callout kind="roto" title="Los tokens no se copian; el índice sí">
+  Esa frase es cierta y es exactamente donde uno da la auditoría por cerrada. Los tokens están en
+  memmap y no se copian. El **índice** —dónde empieza cada partida, un entero de 64 bits por
+  partida— estaba cargado en memoria como un array normal.
+
+En Windows los workers se lanzan con `spawn`, así que el objeto del dataset se serializa entero
+una vez por worker. Con 12,5 M partidas eso son 95 MB por worker y funcionaba; con 18,9 M son 145
+MB y la tubería se corta antes del primer paso, con un `UnpicklingError: pickle data was
+  truncated` que no menciona los datos por ningún lado.
+
+Lo transferible no es el arreglo (`__getstate__` que no manda los arrays y cada worker los
+reabre: 145 MB → 0,5 KB). Es el modo de fallo: **lo que optimizaste no es lo que creció**.
+Memmapear el array grande dio por resuelto el problema mientras la estructura pequeña de al lado
+escalaba igual de linealmente. Pasa idéntico con un índice vectorial memmapeado y un diccionario
+de identificadores por worker, o con un agente cuyo esquema de herramientas es minúsculo y cuyo
+historial de resultados se reserializa en cada paso.
+
+</Callout>
+
 ### Fugas entre splits
 
 Una <Term id="fuga-de-datos">fuga</Term> es cualquier camino por el que información del conjunto de
@@ -324,11 +343,33 @@ entrenamiento; las otras 40, en validación. Cuando el modelo "acierta" la sigui
 jugador en validación, ¿ha aprendido ajedrez o ha aprendido a ese jugador? No lo sabes, y la
 exactitud top-1 que publicas está inflada por una cantidad que no puedes medir.
 
-La solución es partir por algo que **separe el mundo, no las filas**: por tiempo. Entrenamos con
-enero de 2025 y validamos con febrero. Los jugadores se repiten entre meses, claro, pero febrero
-está en el futuro de enero, que es exactamente la situación en la que va a estar el modelo cuando
-juegue: partidas que todavía no existían. Si el modelo memoriza a un jugador de enero, en febrero
-esa memoria vale menos, y la métrica lo refleja.
+La solución es partir por algo que **separe el mundo, no las filas**. Este módulo partió por
+tiempo: entrenar con enero de 2025 y validar con febrero. Los jugadores se repiten entre meses,
+claro, pero febrero está en el futuro de enero, que es exactamente la situación en la que va a
+estar el modelo cuando juegue: partidas que todavía no existían.
+
+Conviene decir cómo acabó esa decisión, porque enseña más que el principio. Reservar un mes entero
+significa apartar **238 657 571 tokens** para un bucle de validación que lee 50 lotes —640 000
+tokens— cada vez que evalúa. El 44 % del corpus estaba parado sosteniendo una medida que se
+saturaba en unos cientos de lotes. Al recortarlo a 100 000 partidas congeladas, el material de
+entrenamiento pasó de 240 M tokens a 470 M sin descargar un byte.
+
+Lo que hace legítimo ese cambio no es el argumento, es la comprobación: los mismos pesos miden
+**1,5197 de pérdida y 51,20 % de top-1 en la validación vieja y en la nueva**, hasta el cuarto
+decimal. Si hubieran discrepado, el listón se habría movido bajo los pies y todas las
+comparaciones anteriores habrían dejado de valer.
+
+<Transfer concept="Dimensionar un conjunto retenido por la varianza que tiene que resolver" where="En un RAG: apartar el 30 % del corpus documental cuando tu suite ejecuta 200 preguntas y nunca más.">
+  «Más datos retenidos = más rigor» es falso, y cuesta caro porque suena a prudencia. Un conjunto
+  de validación no se dimensiona por un porcentaje sino por **el error típico de la decisión que
+  sostiene**: si con dos mil ejemplos ya distingues los modelos que te importa distinguir, el resto
+  es material de entrenamiento inmovilizado.
+
+La regla operativa es escribir ese número en la configuración, no heredar un 10 % de un tutorial.
+Y cuando cambies la partición —porque lo vas a hacer— mide el mismo modelo con las dos y
+comprueba que dicen lo mismo antes de tirar la vieja.
+
+</Transfer>
 
 Con los puzles pasa algo parecido, con otra clave. Un puzle tiene un `PuzzleId` único, pero varios
 puzles vienen de la misma partida (`GameId`) y muchos comparten la posición inicial con pequeñas
