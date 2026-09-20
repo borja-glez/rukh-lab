@@ -270,7 +270,7 @@ export default function EloDial() {
         {typeof sweep.span === 'number' ? ` · ${Math.round(sweep.span)} Elo entre extremos` : ''}
       </p>
       <p class="ed__meta caption">
-        {sweep.stage}
+        <code>{sweep.stage}</code>
         {typeof sweep.params === 'number'
           ? ` · ${sweep.params.toLocaleString('es-ES')} parámetros`
           : ''}
