@@ -832,3 +832,95 @@ adaptador cambió la apertura» y «el adaptador lo empeoró» serían la misma 
   ya no dicen dónde acababa el adaptador. El bucle lo rechaza diciéndolo.
 
 <AdapterSwap />
+
+### Lab 7 · Qwen3 con QLoRA, por el mismo harness
+
+**Objetivo:** que el modelo general y el propio se midan con el mismo metro, y que lo único
+distinto entre ellos sea la representación.
+
+Primero las mismas partidas, escritas como las leería un humano. `rukh.data.pgn_text` reconstruye
+el SAN con python-chess desde el mismo corpus UCI:
+
+```
+[WhiteElo "2015"] [BlackElo "2028"]
+1. e4 c6 2. d4 d5 3. exd5 cxd5 4. Bd3 Nf6 5. h3 Nc6 6. c3 e5 ... 1-0
+```
+
+Dos detalles del formato que parecen menores y no lo son:
+
+- El movetext se **vuelve a jugar** desde la raíz en vez de leerse de la pila de jugadas, porque
+  SAN depende de la posición en la que se escribe: la misma jugada es `Nf3` o `Ngf3` según dónde
+  esté el otro caballo, y solo la posición de ese momento lo sabe.
+- El prompt **nunca termina en espacio**. Un BPE escribe una jugada como `" Nc6"`, con el espacio
+  pegado; un prompt que ya lo lleva empuja al modelo hacia la grafía que casi nunca vio en
+  entrenamiento, y eso saldría en la tabla como un modelo peor en vez de como un prompt peor.
+
+Después el afinado, que es deliberadamente **código de otros**: `transformers` para el modelo,
+`peft` para el adaptador, `trl` para el bucle. El proyecto tiene su propia LoRA y su propio bucle y
+no los necesita aquí; lo que necesita es la experiencia del camino del ecosistema, que es el que un
+lector va a usar de verdad.
+
+- El presupuesto se elige **generoso con Qwen**, no justo con nosotros: `r = 16` sobre las cuatro
+  proyecciones de atención (el doble del rango que usan nuestros adaptadores) y 1 500 pasos de
+  hasta 24 M de tokens de ajedrez, para un modelo que ya sabe hablar. Si aun así pierde por mucho,
+  nadie puede decir que se le dejó sin comer.
+- Cuatro bits se **intenta** y no se exige. Si `bitsandbytes` no carga, la corrida cae a bf16 y lo
+  escribe en su informe, con la razón. Fingir que se demostró QLoRA cuando la cuantización no se
+  usó sería peor que no intentarlo.
+- Y hay un detalle de contabilidad que cambia el titular: `bitsandbytes` guarda dos valores de 4
+  bits por byte, así que `numel()` sobre un peso cuantizado devuelve **la mitad** de los parámetros
+  que representa. Contarlo sin corregir haría que la línea de «solo el 0,1 % es entrenable» saliera
+  el doble de favorable de lo que es.
+
+Y por último la evaluación, que es la parte que hace válida la comparación. `play_game` se partió
+en dos para esto: un protocolo `Player` y un `DecoderPlayer` que es el camino original palabra por
+palabra. El Qwen afinado entra como otro `Player` y juega contra la misma escalera, con los mismos
+rivales, el mismo tiempo por jugada, los mismos colores y la misma adjudicación.
+
+- El protocolo obliga a decir dos cosas a la vez: qué jugada se hace **y** si la propuesta sin
+  máscara era legal. La partida tiene que terminar, así que una propuesta ilegal se rescata con la
+  primera jugada legal, pero el rescate no puede esconder que ocurrió — es la misma regla que
+  `illegal_proposals` en el decoder.
+- El rescate **no vuelve a preguntarle al modelo**. Insistir hasta que conteste algo legal mediría
+  un modelo distinto del que describe la tasa de legalidad.
+
+### Lab 8 · Publicar y encender el selector
+
+**Objetivo:** que lo medido salga del disco, y que la demo no prometa más de lo que se midió.
+
+Un adaptador no es un modelo y su repositorio no debe parecerlo. Sin pesos, sin ONNX, sin
+vocabulario: tres ficheros, y una card que empieza por el modelo base y por el comando que lo
+carga, porque sin el checkpoint base exacto el adaptador es un montón de números sin modelo que
+corregir.
+
+```bash
+rukh publish adapter --run checkpoints/lora-e4-... \
+  --repo chorcat/rukh-lora-e4 --base chorcat/rukh-medium-elo \
+  --effect artifacts/eval/lora-e4-effect.json
+```
+
+- La card publica lo que el adaptador **cambió** —el reparto de primeras jugadas que movió— y lo
+  que costó. Publicar un adaptador con el Elo del modelo base sería publicar el número de otro, así
+  que cuando una medición no existe la card dice «no medido» en vez de tomarla prestada. Hay un
+  test de eso.
+- El recuento de parámetros de la card es la **fórmula** sobre el modelo base real, no el tamaño
+  del fichero del test.
+
+Y en la demo, el selector «Elo objetivo» lleva desde P2 en pantalla y desactivado. Encenderlo es
+una línea; lo que hay que decidir es qué ofrece.
+
+```ts title="rukh-web/src/lib/registry.ts"
+export const ELO_TARGETS = [1200, 1500, 1800, 2100, 2400] as const;
+```
+
+Cinco, no veintisiete. El vocabulario tiene veintisiete cabeceras y el modelo contesta a todas,
+pero **un control que el jugador puede mover es la afirmación de que moverlo hace algo**, y esa
+afirmación es tan ancha como el barrido que la respalda. Ofrecer las veintisiete sería prometer
+veintisiete mediciones y tener cinco.
+
+- E2E: con una etapa condicionada el selector está activo, sin pista, con exactamente esas cinco
+  opciones y empezando en 1800; con las demás, desactivado y con la pista visible.
+- La etapa de prueba condicionada es el mismo grafo de juguete con la bandera puesta, para que el
+  E2E recorra el camino activado sin descargar 221 MB. Lo que se prueba es el cableado que lee la
+  bandera; si los pesos detrás están de verdad condicionados es una pregunta para `rukh eval sweep`
+  y ninguna prueba de navegador podría contestarla.
