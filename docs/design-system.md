@@ -89,7 +89,7 @@ Las fuentes las sirve la API de fuentes de Astro (`fontProviders.fontsource()`),
 | Etiquetas (`.label`) | Monoespaciada, 11 px, mayúsculas, `--muted`; variantes `--ink`, `--accent`, `--plain`                                         | `.caption` es la misma familia sin mayúsculas                                                |
 | Chips (`.chip`)      | Estado de módulo o lección: `--live` (verde), `--draft` (ámbar)                                                               | Monoespaciada                                                                                |
 | `.section__title`    | Título de sección grande, peso 500, interletrado −0.035em                                                                     | `--narrow` limita a 22ch                                                                     |
-| `.prose`             | Prosa de lección a 72ch, `h2` con regla superior, tablas con cabecera en mono                                                 | Los componentes MDX viven dentro                                                             |
+| `.prose`             | Prosa de lección al ancho de lectura (`--measure`), `h2` con regla superior, tablas con cabecera en mono                      | Los componentes MDX viven dentro                                                             |
 
 ## Componentes MDX (lecciones)
 
@@ -106,7 +106,10 @@ Las fuentes las sirve la API de fuentes de Astro (`fontProviders.fontsource()`),
   las dos del portfolio más `1800px` y `2400px`, que ensanchan `--container` para que una pantalla
   de 4K no deje dos tercios en blanco. `--measure` va aparte de `--container` a propósito: el
   ancho extra se reparte entre la guía, las figuras y el código, no en líneas de texto más largas,
-  que se leen peor y no mejor.
+  que se leen peor y no mejor. `--measure` está en `rem` y no en `ch` porque `ch` se resuelve
+  contra la fuente del elemento que lo usa: el mismo token daba un ancho a la prosa (18 px), otro
+  al artículo que la envuelve (16 px) y otro a una pista de rejilla, y por eso el pie y la
+  cheatsheet acababan hasta 294 px más allá del texto al que pertenecen.
 - Los botones miden 44 px de alto como mínimo (el portfolio usa 14 px de padding sin mínimo) y todos
   los controles de cabecera también.
 - `Rail` es `position: sticky` dentro del layout de lección y sus ticks son secciones de la lección,
@@ -123,4 +126,4 @@ Las fuentes las sirve la API de fuentes de Astro (`fontProviders.fontsource()`),
   `style`, solo `style-src-attr` admite `'unsafe-inline'`; `style-src` y `script-src` siguen siendo
   solo por hash.
 
-tokens.css sha256: 29136a91eccf7b1e1672c00e8051b6598c8c8ae5960d049bb611bc21cdf28143
+tokens.css sha256: bc26633a4bda0a43e3075102156adea9b5050c05b20ec7fb53f40fdd58f9cbd3

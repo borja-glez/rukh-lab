@@ -112,6 +112,22 @@ test.describe('lesson layout', () => {
     expect(after.y).toBeGreaterThan(before.y - 400);
   });
 
+  test('the footer and the cheatsheet end where the text ends', async ({ page }) => {
+    // Only `.prose` honoured the reading measure, so the rule above the footer, the prev/next
+    // pair and the cheatsheet box ran past the paragraphs above them: 94 px at 1920, 294 px at
+    // 2560. Blocks of a lesson share one column width.
+    await page.setViewportSize({ width: 2560, height: 1200 });
+    await page.goto(LESSON);
+    const widthOf = async (selector: string) => {
+      const box = (await page.locator(selector).first().boundingBox())!;
+      return { x: Math.round(box.x), width: Math.round(box.width) };
+    };
+    const prose = await widthOf('.prose');
+    for (const selector of ['.lesson__head', '.lesson__foot', '.lesson__nav', '.cheat']) {
+      expect(await widthOf(selector), selector).toEqual(prose);
+    }
+  });
+
   test('a wide screen buys width without stretching the line length', async ({ page }) => {
     // A 4K monitor left two thirds of the page empty. The fix widens the canvas, but the
     // reading measure only grows a little: long lines are harder to read, not easier.
