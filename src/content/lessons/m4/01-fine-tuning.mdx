@@ -1,0 +1,564 @@
+---
+title: 'Fine-tuning e instrucción: enseñarle a jugar peor'
+description: 'El módulo donde el modelo deja de ser uno y pasa a ser una familia. Afinado completo sobre un corpus rebalanceado, condicionamiento por Elo como instrucción, LoRA escrita a mano y comprobada contra peft, la envoltura del decoder como PreTrainedModel, y QLoRA de Qwen3 sobre PGN para medir de una vez si merecía la pena escribir un modelo propio. Y por el camino, el fallo que llevaba tres hitos escondido en los datos: media escala de Elo que nunca había recibido un gradiente.'
+module: m4
+order: 1
+duration: 420
+level: medio
+status: borrador
+updated: 2026-09-20
+keywords:
+  - fine-tuning
+  - SFT
+  - instruction tuning
+  - condicionamiento
+  - Elo
+  - LoRA
+  - rango
+  - adaptador
+  - peft
+  - PreTrainedModel
+  - QLoRA
+  - cuantización de 4 bits
+  - olvido catastrófico
+  - entropía de aperturas
+  - diversidad
+  - SAN
+  - monotonía
+  - intervalo de confianza
+artifacts:
+  - kind: model
+    label: chorcat/rukh-medium-elo
+  - kind: model
+    label: chorcat/rukh-medium-masters
+  - kind: adapter
+    label: chorcat/rukh-lora-e4
+  - kind: adapter
+    label: chorcat/rukh-lora-d4
+  - kind: adapter
+    label: chorcat/rukh-qwen3-pgn-qlora
+demo: '?stage=medium-elo-fp16'
+---
+
+import EloAxis from '../../../components/figures/EloAxis.astro';
+import LoraDecomposition from '../../../components/figures/LoraDecomposition.astro';
+import AdapterSwap from '../../../components/figures/AdapterSwap.astro';
+
+import EloDial from '../../../islands/EloDial.tsx';
+
+## Qué vas a construir
+
+Al terminar esta sección sabrás qué deja de ser el modelo y en qué se convierte, qué cinco
+artefactos salen de aquí y por qué el módulo empieza arreglando un fichero de configuración de P1.
+
+Hasta ahora el proyecto tenía **un** modelo. Al terminar este módulo tiene una **familia**: el mismo
+decoder de M2, con los mismos 115 120 128 parámetros, en cinco versiones que se diferencian en lo
+que se les enseñó después de aprender a jugar. Una obedece una instrucción que viaja en la propia
+entrada —«juega como alguien de 1500»—, otra ha pasado una última mano de partidas de maestros, dos
+son ficheros de un megabyte y medio que se enganchan encima y le cambian el repertorio, y la quinta
+no es nuestra: es un Qwen3 de 600 millones de parámetros afinado con las mismas partidas, que está
+aquí para responder a la pregunta que este curso lleva tres módulos sin contestar.
+
+Vas a construir:
+
+- Un **corpus rebalanceado**. No es un detalle de intendencia: es el hito entero. La mitad baja de
+  la escala de Elo nunca se había entrenado, y hasta arreglar eso ninguna otra cosa de este módulo
+  podía funcionar.
+- `rukh eval sweep`, que corre la suite **una vez por condición** cambiando un solo número, y que
+  responde a la pregunta con dos veredictos separados en vez de uno: si las estimaciones suben, y si
+  los intervalos se separan. No son lo mismo y la diferencia ya nos costó una conclusión que hubo
+  que retirar.
+- `src/rukh/models/lora.py`, <Term id="lora">LoRA</Term> escrita a mano, con la prueba que hace
+  honesto escribirla: la misma configuración entrenada con nuestra implementación y con `peft`
+  optimiza el mismo número, paso a paso.
+- `src/rukh/models/hf.py`, el decoder vestido de `PreTrainedModel`, que es lo que permite hacer esa
+  comparación —y lo que abre la puerta a `SFTTrainer`, `DPOTrainer` y `GRPOTrainer` en M5 sin
+  escribir ninguno.
+- Dos **adaptadores de estilo** de 393 216 parámetros cada uno —el 0,34 % del modelo— entrenados
+  sobre 200 000 partidas que empiezan `1. e4` y 200 000 que empiezan `1. d4`.
+- Un **QLoRA de Qwen3-0.6B** sobre las mismas partidas escritas como PGN, evaluado con el mismo
+  harness, incluida una columna que el decoder no puede ni tener: cuántas de sus respuestas no eran
+  jugadas.
+- Y en la demo, el selector «juega como…» encendido, con las condiciones que están medidas y
+  ninguna más.
+
+<Callout kind="roto" title="Este módulo está en borrador">
+  Las mediciones se están ejecutando. Cuando estén, esta lección pasa a `vigente` con todas las
+  tablas rellenas y con los criterios de `GOAL.md` declarados cumplidos o incumplidos, uno por uno.
+  Mientras tanto no hay ningún número inventado aquí: lo que está medido lleva su cifra y lo que no,
+  no está.
+</Callout>
+
+## El agujero: media escala que nunca se entrenó
+
+Al terminar esta sección sabrás por qué el condicionamiento por Elo no funcionaba, cómo se
+encontró, y por qué la respuesta estaba en un fichero YAML de P1 y no en el modelo.
+
+El vocabulario de Rukh tiene, desde M1, veintisiete tokens de Elo por bando: `<w0600>`, `<w0700>`,
+…, `<w3200>`, y sus gemelos `<b….>`. Cada partida de entrenamiento empieza con tres tokens —
+`<bos> <wXXXX> <bXXXX>`— y a partir de ahí las jugadas. La idea es <Term
+id="instruction-tuning">instruction tuning</Term> en su forma más pequeña que se pueda: la orden no
+es una capa ni una cabeza, es un token; el modelo aprende qué sigue a ese token porque lo ha visto
+seguido de partidas de gente con esa fuerza.
+
+En M2 medimos que el eje existía. En el hito de la barrera de 1200 volvimos a medirlo y salió una
+conclusión rara: pedirle al modelo que jugara a 2600 no lo hacía mejor. Se archivó como «imitar a un
+fuerte no compra táctica», que es verdad y no era toda la verdad.
+
+Lo que faltaba estaba aquí:
+
+```yaml title="configs/data/lichess-2025-01-02.yaml"
+min_elo: 1800
+```
+
+Ese filtro se aplica a **los dos** jugadores, y es el filtro con el que se descargó todo. Los 5,9
+millones de partidas del corpus base, los 13,1 millones de la Elite Database, los 19 millones de
+`tokens-v4` sobre los que se entrenó el modelo que juega en la demo: todo, de 1800 para arriba. El
+manifiesto del conjunto balanceado de P1 lo dice sin ambigüedad ninguna: su bin más bajo es el 1800.
+
+Así que los doce tokens por debajo de 1800 —`<w0600>` a `<w1700>`— **nunca recibieron un
+gradiente**. Su embedding sigue exactamente donde lo dejó la inicialización: un vector normal de
+media cero y desviación 0,02, sin relación con nada. Pedirle al modelo «juega como 1500» no era
+pedirle que jugara peor. Era ponerle delante ruido.
+
+<EloAxis />
+
+Vale la pena detenerse en cómo se ve un fallo así, porque no se ve. No hay excepción, no hay aviso,
+no hay test que falle: el token existe en el vocabulario, el tokenizador lo emite sin quejarse, el
+modelo lo lee y produce una distribución perfectamente normal sobre jugadas legales. Lo único que
+pasa es que la distribución no cambia de la manera que uno esperaría, y eso se confunde con
+facilidad con «el condicionamiento no funciona». Lo que lo destapó no fue leer el modelo: fue mirar
+el histograma del corpus antes de volver a entrenarlo.
+
+<Callout kind="mundo-real" title="La regla que deja">
+  Antes de concluir que un mecanismo no funciona, comprueba que ha recibido datos. Un token que no
+  aparece nunca en el entrenamiento no es un token que no funciona: es un token que no existe, con
+  una entrada en una tabla que dice lo contrario.
+</Callout>
+
+### El corpus que faltaba
+
+La reparación es la mitad baja del eje, descargada con **el mismo filtro salvo el rango**: mismos
+180 segundos de base, mismas terminaciones, sin variantes, mínimo 20 plies. Solo cambia que
+`min_elo` es 1000 y aparece un `max_elo` de 1799, y que va a su propio directorio, porque `data/uci`
+es lo que entrenó todo lo publicado y mezclarle una banda más débil cambiaría en silencio lo que
+significa.
+
+Y aquí hay una lección de infraestructura que no estaba en el plan. La descarga original de P1 leía
+los parquet remotos directamente con DuckDB sobre `hf://`, que es el diseño elegante: solo las filas
+que pasan el filtro llegan a tocar el disco. Dejó de funcionar. Un mes son 72 ficheros de un
+gigabyte, leerlos en remoto son miles de peticiones de rango contra un mismo anfitrión, y el
+anfitrión contesta `HTTP 429` a mitad de camino. El segundo intento, ya autenticado y con ocho
+reintentos, se quedó **cincuenta minutos a 0,02 MB/s** con 8,6 GB de buffer en memoria y **cero
+bytes escritos**. Descargar el mismo shard entero, de una pieza, va a **14,8 MB/s**.
+
+Así que ahora cada shard se descarga una vez, se filtra en local y se borra. El pico de disco es un
+fichero, el mes se reanuda donde se quedó, y `limit` **para la descarga** en vez de solo recortar el
+resultado: con 505 547 partidas de la banda 1000-1799 en el primer shard, 1,2 millones salen de
+tres. La descarga entera pasó de cincuenta minutos atascada a **noventa segundos**.
+
+|                                             |               |
+| ------------------------------------------- | ------------- |
+| Partidas descargadas (1000-1799, dos meses) | 2 400 000     |
+| Convertidas a UCI                           | **2 292 475** |
+| Ilegales encontradas                        | **0**         |
+| Descartadas por cortas (< 20 plies)         | 107 513       |
+| Descartadas por largas (> 300 plies)        | 12            |
+
+### Por qué el corpus de afinado es plano y el mundo no
+
+Con las dos mitades en disco, el corpus del afinado se construye **plano**: el mismo número de
+partidas por banda de 200 Elo, de 1000 a 2600.
+
+Eso no es lo que hay en Lichess ni de lejos, y es a propósito. Un corpus con la forma real le enseña
+al modelo que `<w1500>` es **raro**, que no es lo mismo que enseñarle qué **significa**. La
+frecuencia de una condición y su contenido son dos cosas distintas, y aquí solo interesa la segunda:
+el modelo tiene que saber qué viene después de cada token de Elo, no con qué probabilidad aparece.
+
+| Banda |   Partidas |
+| ----- | ---------: |
+| 1000  |    150 000 |
+| 1200  |    150 000 |
+| 1400  |    150 000 |
+| 1600  |    150 000 |
+| 1800  |    150 000 |
+| 2000  |    150 000 |
+| 2200  |    150 000 |
+| 2400  |    146 232 |
+| 2600  | **23 191** |
+
+Las dos últimas filas son el límite de los datos y se publican tal cual. No hay 150 000 partidas de
+2600+ en dos meses de Lichess; hay 23 191, y ninguna manera honesta de fabricar las que faltan. El
+corpus queda plano donde puede y se estrecha donde el mundo se estrecha, y como el criterio de
+`GOAL.md` vive entero dentro de la parte plana (1500, 2000 y 2400), eso no lo compromete. Total:
+**1 219 423 partidas, 95 722 318 tokens**.
+
+Contado sobre el flujo empaquetado, token a token, así queda la cabecera que el modelo lee:
+
+| Token     | Partidas |     | Token      | Partidas |
+| --------- | -------: | --- | ---------- | -------: |
+| `<w1000>` |   59 335 |     | `<w1900>`  |   79 730 |
+| `<w1100>` |   87 662 |     | `<w2000>`  |   85 267 |
+| `<w1200>` |   71 956 |     | `<w2100>`  |   68 393 |
+| `<w1300>` |   78 537 |     | `<w2200>`  |   85 367 |
+| `<w1400>` |   71 209 |     | `<w2300>`  |   68 169 |
+| `<w1500>` |   79 820 |     | `<w2400>`  |   81 258 |
+| `<w1600>` |   81 664 |     | `<w2500>`  |   47 622 |
+| `<w1700>` |   69 817 |     | `<w2600>`  |   19 073 |
+| `<w1800>` |   76 633 |     | `<w2700>`+ |    7 911 |
+
+<Callout kind="teoria" title="Un detalle del empaquetado que casi estropea el experimento">
+  El empaquetador tenía una regla razonable: el mes de validación se parte en dos, sus primeras 100
+  000 partidas validan y **el resto se suma al entrenamiento** (es lo que recuperó 238 M de tokens
+  en el hito anterior). Sobre un corpus cuya forma es el experimento, esa regla añade 2,85 millones
+  de partidas de 1800+ encima del reparto plano y lo deshace sin decir nada. Por eso
+  `val_remainder_trains` existe ahora, y por eso está en `false` aquí: el conjunto de validación
+  sigue siendo exactamente el mismo con el que se miden todas las demás corridas —para que las
+  pérdidas sean comparables— y el de entrenamiento es el corpus balanceado y nada más.
+</Callout>
+
+### Qué costó el afinado
+
+`medium-v4` afinado 3 800 pasos sobre ese corpus, a la tasa de afinado del spec (1e-4, dieciséis
+veces por debajo del preentrenamiento), son 194,56 M de tokens: unas dos pasadas.
+
+La validación mide imitación de juego 1800+, que es justo lo que este afinado **deja de optimizar**,
+así que se espera que empeore. Empeoró, y poco:
+
+|                           | pérdida de validación | top-1 de validación |
+| ------------------------- | --------------------: | ------------------: |
+| `medium-v4` (paso 48 000) |                1,3733 |             54,73 % |
+| `medium-elo` (paso 3 800) |                1,3987 |         **54,66 %** |
+
+Veinticinco milésimas de nat y siete centésimas de punto de top-1. Es el precio del eje, medido
+sobre el mismo conjunto y con el mismo medidor. Lo que queda por saber —y es lo que decide el
+hito— es qué compró.
+
+<Callout kind="roto" title="`best.pt` no es el resultado de un afinado">
+  Un detalle que esta corrida destapó y que ahora avisa por escrito. El bucle guarda `best.pt`
+  cuando la pérdida de validación baja, y en un preentrenamiento eso *es* el objetivo. En un afinado
+  que cambia de corpus a propósito, la pérdida de validación sube desde el principio, así que
+  `best.pt` se queda congelado en el paso 200 —un modelo casi sin tocar— y cualquiera que lo
+  evaluara después estaría midiendo los pesos equivocados con números perfectamente plausibles. El
+  resultado de un afinado es su **último** checkpoint, y el bucle ahora lo dice en el log.
+</Callout>
+
+## Teoría justa
+
+Al terminar esta sección podrás explicar qué distingue un afinado de un preentrenamiento, por qué
+una matriz de rango 8 puede mover un modelo de 115 millones de parámetros, qué gana el proyecto
+vistiendo su decoder de `PreTrainedModel` y qué demuestra —y qué no— hacer QLoRA a esta escala.
+
+### Afinar no es cambiar de objetivo, es cambiar de distribución
+
+Lo primero que hay que quitarse de encima es la idea de que el fine-tuning supervisado es una
+técnica. No lo es. Es el mismo bucle, la misma pérdida, el mismo optimizador; lo único que cambia es
+de dónde salen los lotes. `medium-elo` se entrena con entropía cruzada sobre el siguiente token,
+exactamente igual que `medium-v4`; con otros datos y con la tasa de aprendizaje dividida por
+dieciséis.
+
+Eso tiene dos consecuencias prácticas que conviene tener claras antes de tocar nada.
+
+La primera es que **el afinado hereda todo lo que el preentrenamiento aprendió, incluido lo que uno
+preferiría que olvidara**, y al revés: puede deshacer cosas que nadie le pidió deshacer. Eso es el
+
+<Term id="olvido-catastrofico">olvido catastrófico</Term>, y no se evita con un truco sino con una
+medida. La defensa de este módulo es aburrida y es la correcta: tasa baja, pocos pasos, y volver a
+medir el listón anterior. Si el Elo del modelo condicionado en su mejor condición se hundiera
+respecto a los 1504 de `medium-v4`, el eje habría salido caro y habría que decirlo.
+
+La segunda es que **la pérdida de validación deja de ser el objetivo**. Validamos sobre 100 000
+partidas de 1800+; el afinado entrena sobre un corpus que es dos tercios juego de club. Que la
+pérdida suba no es un problema, es la definición de lo que se está haciendo. El error sería leer esa
+subida como «va mal» y parar antes de tiempo, o —peor— guardar el checkpoint de menor pérdida y
+publicarlo.
+
+<Callout
+  kind="entrevista"
+  title="¿Cuándo un aumento de la pérdida de validación es una buena señal?"
+>
+  Cuando la validación mide la distribución **de la que te estás yendo**. Es el caso de cualquier
+  afinado de dominio: el conjunto de validación del preentrenamiento sigue siendo útil como
+  termómetro del olvido, pero deja de ser el criterio. La respuesta completa nombra las dos cosas
+  que sí hay que mirar en su lugar: una métrica de la tarea nueva y una métrica de la capacidad
+  vieja que no quieres perder. Aquí son, respectivamente, el Elo por condición y el Elo en la
+  condición fuerte.
+</Callout>
+
+### Instruction tuning con un token: qué puede y qué no
+
+`<w1500>` es una instrucción. No hay parser, ni plantilla, ni «System:». La instrucción es el
+contexto, y el contexto es lo único que un decoder causal tiene.
+
+Lo que esto puede hacer es exactamente lo que hace un modelo de lenguaje: cambiar la distribución de
+lo que viene después. Si el corpus contiene partidas de 1500 precedidas de `<w1500>` y partidas de
+2400 precedidas de `<w2400>`, el modelo aprende dos distribuciones distintas sobre jugadas y elige
+según el prefijo. Es imitación condicionada, y es lo mismo que hace Maia salvo que Maia entrena un
+modelo por nivel y aquí es uno solo con un interruptor.
+
+Lo que **no** puede hacer es inventar fuerza que no está en los datos. Pedir `<w2600>` no convierte
+al modelo en un 2600: le pide que imite las elecciones de un 2600, y esas elecciones sin la búsqueda
+táctica que las produjo son un 2600 perdiendo partidas por táctica. Esa parte de la conclusión del
+hito anterior sigue en pie y es importante que siga: el eje es una herramienta para **bajar**, y la
+pregunta de este módulo es si baja de forma medible y ordenada.
+
+<Callout kind="hoy" title="Así se hace hoy">
+  La forma actual de esto en un LLM general es el chat template: unos tokens especiales delimitan
+  turnos y roles, y el modelo se afina con ejemplos que llevan esa estructura. Cambia el envoltorio,
+  no el mecanismo: sigue siendo condicionar la distribución con tokens que el modelo ha visto
+  seguidos de la clase de continuación que se le quiere pedir. Rukh usa la versión mínima —dos
+  tokens de cabecera— y por eso se ve entero.
+</Callout>
+
+### LoRA: la corrección tiene que caber por un cuello de ocho
+
+Afinar los 115 millones de parámetros deja un checkpoint de 1,4 GB, y un proyecto que quiera cinco
+estilos necesita cinco copias del mismo modelo con diferencias minúsculas. <Term
+id="lora">LoRA</Term> plantea otra pregunta: en vez de mover `W`, aprender una corrección `B·A` cuyo
+
+<Term id="rango">rango</Term> sea lo bastante pequeño como para que los dos factores juntos no pesen
+nada al lado de `W`.
+
+<LoraDecomposition />
+
+La aritmética es la mitad del argumento. Una proyección de consulta de `medium` es una matriz de
+768 × 768 = **589 824** números. Su adaptador con `r = 8` son dos matrices, 8 × 768 y 768 × 8:
+**12 288** números, el **2,08 %**. Sobre las proyecciones de consulta y valor de las dieciséis
+capas, **393 216** parámetros entrenables de 115 120 128, el **0,34 %**, que en `float32` son
+**1,5 MB**.
+
+La otra mitad del argumento es el cuello. Todo lo que el adaptador pueda aprender tiene que pasar
+por ocho dimensiones por matriz; esa es la razón por la que es barato y también el techo de lo que
+puede hacer. Sirve para inclinar un modelo hacia un estilo, un dominio o un formato. No sirve para
+enseñarle algo que no sabe.
+
+Dos detalles de la implementación que no son cosméticos:
+
+**`B` empieza exactamente en cero.** Así el modelo adaptado **es** el modelo base en el paso 0.
+Cualquier otra inicialización movería los pesos antes de que llegara un solo gradiente, y toda
+comparación contra la base empezaría desde un modelo que ya es distinto.
+
+**Cada matriz adaptada tiene su propio subespacio.** Esto importa aquí más que en la mayoría de
+implementaciones, porque la atención de Rukh usa una proyección `qkv` **fusionada**: no hay un
+módulo `q_proj` que envolver, hay una sola `nn.Linear` de 768 × 2304 que produce consulta, clave y
+valor pegadas. Adaptar «consulta y valor» significa adaptar dos rangos contiguos de salida de esa
+matriz, y cada uno recibe su propia `A` y su propia `B`. Compartir una `A` entre los dos sería más
+barato y no sería LoRA: el punto del método es que cada matriz adaptada tiene su propio subespacio
+de rango `r`.
+
+```python title="src/rukh/models/lora.py"
+TARGETS = {
+    "q": ("attn.qkv", 0, 1),   # el primer tercio de la salida fusionada
+    "k": ("attn.qkv", 1, 2),
+    "v": ("attn.qkv", 2, 3),
+    "attn_out": ("attn.proj", 0, 1),
+    "mlp_in": ("mlp.fc", 0, 1),
+    "mlp_out": ("mlp.proj", 0, 1),
+}
+```
+
+### Cómo se comprueba que lo que escribiste es LoRA
+
+Escribir a mano una técnica publicada tiene un riesgo evidente: que lo escrito se parezca a la
+técnica y no lo sea. Un `alpha` aplicado en el sitio equivocado, `A` y `B` intercambiadas, una
+inicialización distinta —cualquiera de las tres da un modelo que entrena, converge y produce números
+creíbles, y ninguna da LoRA.
+
+La prueba está en `tests/unit/test_hf_wrapper.py` y es la razón por la que existe la envoltura HF de
+la sección siguiente. Se montan dos modelos sobre **los mismos pesos base**: uno con `apply_lora`,
+otro con `peft.get_peft_model`. Se copia nuestra `A` en la suya, para que la comparación sea de las
+matemáticas y no de dos sorteos aleatorios (`B` es cero en los dos lados por construcción). Y
+entonces los dos dan pasos de SGD sobre el mismo lote, con la misma tasa, y se comparan las pérdidas
+**paso a paso**:
+
+```python
+for step, (a, b) in enumerate(zip(my_curve, their_curve, strict=True)):
+    assert a == pytest.approx(b, abs=1e-5), f"step {step}: {a} vs {b}"
+```
+
+Si la regla de actualización difiriera en cualquier detalle —el escalado, de qué lado multiplica
+`A`, si `B` arranca en cero— las curvas se separarían en el primer paso. No se separan. Esa línea es
+lo que convierte «implementamos LoRA» en una afirmación comprobable en vez de en la palabra del
+autor.
+
+<Callout kind="teoria" title="Por qué la comparación se hace sobre attn.proj y no sobre q y v">
+  Porque `peft` no puede expresar lo mismo que nosotros sobre una matriz fusionada. Si le pides
+  `target_modules=["qkv"]` adapta las tres proyecciones con **una** pareja `A`/`B` de 2304 filas;
+  nuestra implementación da una pareja por rango. Son parametrizaciones distintas y compararlas
+  mediría esa diferencia en vez de medir la corrección de la implementación. Sobre `attn.proj` —una
+  `nn.Linear` normal, un solo rango que cubre toda la salida— las dos hacen literalmente lo mismo, y
+  por eso es ahí donde la igualdad significa algo.
+</Callout>
+
+### Vestir el decoder de `PreTrainedModel`
+
+El decoder de este curso es PyTorch a secas, a propósito: leerlo no debería exigir conocer el
+framework de nadie. Pero el resto del ecosistema habla `PreTrainedModel`, y una envoltura son cien
+líneas mientras que reimplementar LoRA, DPO y GRPO no lo es.
+
+La envoltura **contiene** un `MoveDecoder`, no reimplementa uno. Hay una sola definición del paso
+hacia delante en todo el repositorio, y el test de que las dos dan los mismos logits comprueba que el
+envoltorio es fiel, no que una segunda implementación no se ha desviado. Los tensores son los mismos
+objetos, que es también por qué `from_decoder` no cuesta nada.
+
+Tres cosas que aprendimos montándola y que no están en ningún tutorial:
+
+- **`labels` aquí no se desplaza.** Casi todos los modelos causales de `transformers` desplazan las
+  etiquetas dentro de `forward`. El flujo empaquetado de este proyecto ya guarda `y` un paso por
+  delante de `x`, así que volver a desplazarlas entrenaría al modelo a predecir la jugada **de
+  después de la siguiente** —y la pérdida seguiría teniendo buena pinta.
+- **El método de la config no se puede llamar `decoder`.** `transformers` lee un atributo de la
+  config con ese nombre como la mitad decodificadora de un par encoder-decoder e intenta llamarle
+  `to_dict()`, lo que convierte un método enlazado en una excepción la primera vez que algo pide una
+  config de generación.
+- **Hay que declarar los pesos atados.** `lm_head.weight` comparte almacenamiento con la tabla de
+  embeddings; `safetensors` guarda tensores, no alias, y rechaza un state dict con dos nombres para
+  un tensor salvo que se le diga cuál es la copia. Es el mismo hecho que
+  `rukh.train.checkpoint.TIED_SOURCES` registra para el formato propio del proyecto.
+
+### QLoRA a 0,6 B: qué demuestra y qué no
+
+QLoRA es LoRA sobre un modelo base <Term id="cuantizacion">cuantizado</Term> a 4 bits. La razón de
+existir de la cuantización ahí es la memoria: permite afinar un modelo de 70 B en una GPU de
+consumo, que sin ella no cabría.
+
+A 0,6 B parámetros en una tarjeta de 32 GB no hay nada que ahorrar. El modelo en bf16 son 1,2 GB.
+Así que lo honesto es intentarlo, medir el pico de memoria con y sin, y decir cuál de las dos cosas
+pasó —y no fingir que se ha demostrado una técnica cuya única ventaja no aplica a la escala en la
+que se ejecutó. El código lo hace explícito: si `bitsandbytes` no carga, la corrida cae a bf16 y lo
+escribe en su informe.
+
+Lo que sí se demuestra con Qwen, y es el motivo de que esté en el módulo, es otra cosa: **si merecía
+la pena escribir un modelo propio**. Y para que esa respuesta valga, las dos mitades tienen que
+diferenciarse en una sola cosa.
+
+- Las **partidas** son las mismas, del mismo mes, con la misma validación reservada.
+- Las **métricas** son las mismas, porque el Qwen afinado entra en el harness de M2 como un jugador
+  más y juega contra la misma escalera de Stockfish.
+- La **representación** es lo que cambia, y es justo el punto. El decoder lee un token por jugada
+  legal. Qwen lee `1. e4 e5 2. Nf3` partido en los trozos que su BPE decida, y nada en él le impide
+  escribir una jugada que no existe.
+
+Esa última frase es una columna de la tabla. Un decoder cuyo vocabulario **es** el conjunto de
+jugadas solo puede fallar de una manera: una jugada legal en la posición equivocada. Un modelo que
+escribe <Term id="san">SAN</Term> tiene tres maneras más, y separarlas es la mitad de lo que enseña
+la comparación:
+
+| Fallo                | Qué significa                                                       | ¿Puede el decoder? |
+| -------------------- | ------------------------------------------------------------------- | ------------------ |
+| **ilegal aquí**      | jugada bien formada que esta posición no permite                    | sí                 |
+| **no es una jugada** | `Nf9`, `O-O-O-O`, una frase                                         | no                 |
+| **SAN ambigua**      | dos piezas podrían hacerla y no desambiguó (`Nd2` en vez de `Nbd2`) | no                 |
+| **nada**             | no escribió ningún token                                            | no                 |
+
+## Cómo se mide y contra qué
+
+Al terminar esta sección sabrás por qué el criterio de este hito son dos afirmaciones y no una, qué
+mide cada columna del barrido, y qué métrica del spec llevaba tres hitos saliendo `n/a` y por qué
+hacía falta ahora.
+
+### «Monótono» y «separado» no son lo mismo
+
+`GOAL.md` pide para P4: _Elo por condición monótono (1500 < 2000 < 2400 con IC)_. Esa frase esconde
+dos afirmaciones distintas y hay que medirlas por separado, porque una es barata y la otra es la
+que vale.
+
+**Monótono** quiere decir que las estimaciones puntuales suben con la condición. Es fácil de
+conseguir por casualidad: con tres números y ruido, la probabilidad de que salgan ordenados por azar
+es una de seis.
+
+**Separado** quiere decir que los intervalos de confianza consecutivos no se solapan. Eso ya no pasa
+por casualidad: es la afirmación de que la diferencia sobrevive al ruido de la medición.
+
+El proyecto ya se quemó con esto. En el hito anterior, una prueba de 32 partidas dio 0,703 contra
+0,609 a favor de `<2600>` frente a `<1800>` y pareció una victoria del condicionamiento. Con 160
+partidas se cayó: 1058 frente a 1095, con los intervalos casi superpuestos. La conclusión hubo que
+retirarla. Por eso `rukh eval sweep` imprime **los dos veredictos** y el hito se juzga con el
+segundo:
+
+```python title="src/rukh/eval/sweep.py"
+def is_separated(rows: list[SweepRow]) -> bool:
+    """Whether every consecutive pair of intervals is disjoint, in the right order."""
+    usable = [row for row in rows if row.elo is not None]
+    for low, high in zip(usable, usable[1:], strict=False):
+        top_of_low = low.elo_ci[1] if low.elo_ci else low.elo_upper
+        bottom_of_high = high.elo_ci[0] if high.elo_ci else high.elo_lower
+        if top_of_low is None or bottom_of_high is None or top_of_low >= bottom_of_high:
+            return False
+    return True
+```
+
+<Callout kind="entrevista" title="Tu métrica sube en las tres condiciones. ¿Ya está?">
+  No. La pregunta siguiente es siempre cuál es el ruido de la medición, y la respuesta honesta
+  empieza midiéndolo: intervalos por bootstrap, o dos tiradas con semillas distintas y la diferencia
+  entre ellas. Una ordenación de tres números sin barras de error es una anécdota con formato de
+  tabla. La versión avanzada de la respuesta añade que el ruido tiene estructura —aquí, los mismos
+  rivales y las mismas aperturas en todas las filas— y que por eso conviene cambiar **una** cosa
+  entre condiciones y no dos.
+</Callout>
+
+### Un solo número cambia entre filas
+
+El barrido corre la misma suite una vez por condición: mismos rivales de Stockfish, mismas
+posiciones de validación, mismos puzles, misma semilla, misma temperatura. Lo único que cambia son
+los dos tokens de cabecera. Cualquier cosa que difiera entre filas es la condición, y eso es lo que
+hace que la tabla se pueda leer.
+
+Hay un detalle que casi arruina esa propiedad y que conviene contar porque es el tipo de error que
+se publica sin que nadie lo note. Los puzles del conjunto llevan **el Elo real** de los jugadores de
+la partida de la que salieron, y `start_history` los usa cuando están. Correcto para medir puzles;
+desastroso para un barrido: la columna de puzles habría salido **idéntica en las cinco filas**, que
+es indistinguible de la evidencia de que la condición no hace nada. Por eso existe
+`puzzles_use_header`, activado solo aquí, que fuerza la cabecera de la condición en todos los
+puzles. La consecuencia es que el barrido tiene su propia caché, porque estas tentativas responden a
+otra pregunta y no deben confundirse con las anteriores.
+
+### ¿Juega peor o juega ilegal?
+
+La legalidad sin máscara vuelve al barrido como columna propia, y no es decorativa. Si el modelo
+condicionado a 1200 empeora, hay dos maneras muy distintas de empeorar: elegir jugadas legales
+peores —que es lo que hace un humano débil— o proponer jugadas que no existen —que es lo que hace un
+modelo que ha dejado de entender el tablero.
+
+La primera sería un dial que funciona. La segunda sería un dial roto con aspecto de funcionar,
+porque la máscara de legalidad de la demo esconde las jugadas ilegales y el jugador solo vería que
+el rival es más flojo. Medir las dos cosas por separado es lo que distingue «aprendió a imitar a un
+1200» de «se le deshizo el modelo al leer un token que apenas ha visto».
+
+### Entropía de aperturas: la métrica que llevaba tres hitos vacía
+
+`docs/spec/02` lista, desde el primer día, una columna de diversidad: _entropía de las aperturas
+jugadas en 200 partidas propias_. Ha salido `n/a` en todos los informes del proyecto, porque hasta
+ahora ninguna afirmación la necesitaba.
+
+Este módulo la necesita. El spec predice del afinado con maestros que _sube el Elo y baja la
+diversidad_, y esa frase tiene dos mitades: una tabla que solo mide la primera no puede comprobarla.
+
+Se mide con dos números, porque fallan de maneras distintas:
+
+**La entropía de líneas** juega N aperturas del modelo contra sí mismo y mide la entropía de
+Shannon de la distribución de líneas distintas. Es la métrica que pide el spec y **depende del
+muestreo**: leída al ajuste casi determinista con el que se comparan todas las etapas (T = 0,05,
+top-k 1), cualquier decoder juega una sola partida y saca exactamente 0. Eso es verdad y dice más
+del muestreador que de los pesos, así que se lee a su propia temperatura y **siempre se publica con
+ella al lado**.
+
+**La entropía de la primera jugada** es analítica: la distribución del propio modelo sobre las
+veinte primeras jugadas legales, renormalizada, sin muestreo de ninguna clase. No tiene varianza
+entre tiradas, es una propiedad de los pesos, y es la que se puede comparar entre etapas tal cual.
+Su techo es log₂(20) = 4,32 bits para un modelo sin ninguna opinión; un modelo afinado sobre un
+repertorio estrecho la hunde.
+
+Las auto-partidas van en lote: las N avanzan un ply a la vez, todas en la misma pasada, así que 200
+aperturas de 12 plies son 12 pasadas de lote 200 en vez de 2 400 pasadas de lote 1. Y el lote es
+rectangular por construcción, lo que en este modelo no es un detalle: las posiciones son
+**aprendidas**, así que rellenar por la izquierda desplazaría cada token real a una posición en la
+que nunca se entrenó, y rellenar por la derecha dejaría un `<pad>` en la columna que predice. El
+código prefiere fallar a rellenar.
+
+<Callout kind="roto" title="Lo que una métrica de diversidad no mide">
+  La entropía de aperturas dice si el modelo varía, no si varía **bien**. Un modelo que juegue
+  veinte primeras jugadas distintas al azar saca una entropía magnífica y es peor que uno que juega
+  siempre `1. e4`. Por eso viaja siempre junto al Elo y nunca sola: la pareja «más fuerte y menos
+  variado» es un resultado, y «más variado» a secas no es ninguno.
+</Callout>
