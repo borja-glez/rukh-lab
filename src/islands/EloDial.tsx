@@ -269,6 +269,16 @@ export default function EloDial() {
         {sweep.separated ? 'separados' : 'no separados'}
         {typeof sweep.span === 'number' ? ` · ${Math.round(sweep.span)} Elo entre extremos` : ''}
       </p>
+      {/* The dial would otherwise read as "the axis is worth this many Elo", and the control run
+          says it is not: the model *before* the fine-tune covers 161 of those points with a
+          header it never trained on, simply because an unknown prefix gets in its way. The
+          caption is here and not in the lesson's prose because this island is the thing a reader
+          screenshots. */}
+      <p class="ed__caveat caption">
+        El recorrido no es mérito del condicionamiento por sí solo: el modelo <em>sin</em> afinar
+        cubre 161 de esos puntos con una cabecera que nunca entrenó. La diferencia entre los dos
+        está en las otras columnas, no en el Elo.
+      </p>
       <p class="ed__meta caption">
         <code>{sweep.stage}</code>
         {typeof sweep.params === 'number'
