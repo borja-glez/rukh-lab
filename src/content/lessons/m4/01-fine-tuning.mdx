@@ -80,8 +80,10 @@ Vas a construir:
 - Un **QLoRA de Qwen3-0.6B** sobre las mismas partidas escritas como PGN, evaluado con el mismo
   harness, incluida una columna que el decoder no puede ni tener: cuántas de sus respuestas no eran
   jugadas.
-- Y en la demo, el selector «juega como…» encendido, con las condiciones que están medidas y
-  ninguna más.
+- Y en la demo, dos controles nuevos: el selector «juega como…», con las condiciones que están
+  medidas y ninguna más, y el de **estilo**, que carga un adaptador de 1,6 MB sobre el modelo ya
+  descargado. Ese segundo obliga a exportar el ONNX de otra manera —con los factores de LoRA como
+  entradas del grafo— y es la diferencia entre 1,6 MB por estilo y 221 MB por estilo.
 
 <Callout kind="roto" title="Este módulo está en borrador">
   Las mediciones se están ejecutando. Cuando estén, esta lección pasa a `vigente` con todas las
@@ -487,6 +489,11 @@ es una de seis.
 **Separado** quiere decir que los intervalos de confianza consecutivos no se solapan. Eso ya no pasa
 por casualidad: es la afirmación de que la diferencia sobrevive al ruido de la medición.
 
+Y hay una tercera pregunta que solo aparece cuando la segunda sale que no, que es lo que le pasó a
+este hito: **si no están separados, ¿es porque faltan partidas o porque no hay diferencia?** Las dos
+se escriben igual en el informe y no se parecen en nada. Se contesta con aritmética, no con más
+máquina, y la sección de resultados la contesta con los números delante.
+
 El proyecto ya se quemó con esto. En el hito anterior, una prueba de 32 partidas dio 0,703 contra
 0,609 a favor de `<2600>` frente a `<1800>` y pareció una victoria del condicionamiento. Con 160
 partidas se cayó: 1058 frente a 1095, con los intervalos casi superpuestos. La conclusión hubo que
@@ -524,11 +531,12 @@ hace que la tabla se pueda leer.
 Hay un detalle que casi arruina esa propiedad y que conviene contar porque es el tipo de error que
 se publica sin que nadie lo note. Los puzles del conjunto llevan **el Elo real** de los jugadores de
 la partida de la que salieron, y `start_history` los usa cuando están. Correcto para medir puzles;
-desastroso para un barrido: la columna de puzles habría salido **idéntica en las cinco filas**, que
-es indistinguible de la evidencia de que la condición no hace nada. Por eso existe
-`puzzles_use_header`, activado solo aquí, que fuerza la cabecera de la condición en todos los
-puzles. La consecuencia es que el barrido tiene su propia caché, porque estas tentativas responden a
-otra pregunta y no deben confundirse con las anteriores.
+desastroso para un barrido: la columna de puzles habría salido **idéntica en las seis filas**, que
+es indistinguible de la evidencia de que la condición no hace nada. Por eso existe `force_header`,
+activado solo aquí, que fuerza la cabecera de la condición en los puzles **y en las posiciones de
+validación**, que tenían exactamente el mismo problema por exactamente la misma razón: cada partida
+lleva el Elo real de quien la jugó. La consecuencia es que el barrido tiene su propia caché, porque
+estas tentativas responden a otra pregunta y no deben confundirse con las anteriores.
 
 ### ¿Juega peor o juega ilegal?
 
@@ -541,6 +549,10 @@ La primera sería un dial que funciona. La segunda sería un dial roto con aspec
 porque la máscara de legalidad de la demo esconde las jugadas ilegales y el jugador solo vería que
 el rival es más flojo. Medir las dos cosas por separado es lo que distingue «aprendió a imitar a un
 1200» de «se le deshizo el modelo al leer un token que apenas ha visto».
+
+Adelanto del resultado, porque cambia cómo se lee el resto: la legalidad salió **100,00 %** a 1200 y
+**99,70 %** a 2400. Es decir, lo contrario de romperse — el modelo condicionado a 1200 es el que
+menos jugadas imposibles escribe de los seis.
 
 ### Entropía de aperturas: la métrica que llevaba tres hitos vacía
 
@@ -1088,6 +1100,48 @@ adaptador cambió la apertura» y «el adaptador lo empeoró» serían la misma 
 
 <AdapterSwap />
 
+Y aquí está la parte del laboratorio que no es entrenar. Un adaptador de 1,6 MB que para llegar al
+navegador necesita 221 MB de ONNX no ha ahorrado nada: el método es barato y el formato se lo come.
+La salida es sacar la corrección de los pesos y meterla en el **grafo**.
+
+```python title="src/rukh/export/adapter.py"
+class AdaptableDecoder(nn.Module):
+    """`forward(idx, lora_a, lora_b)` -> the last step's logits, with the adapter applied."""
+
+    def forward(self, idx: Tensor, lora_a: Tensor, lora_b: Tensor) -> Tensor:
+        for layer, slot in enumerate(self.slots):
+            slot.a = lora_a[layer]
+            slot.b = lora_b[layer]
+        logits, _ = self.model(idx)
+        return logits[:, -1, :]
+```
+
+Los factores viajan apilados por capas —`A` de forma `(capas, rangos, r, d)` y `B` de
+`(capas, rangos, d, r)`— y se exportan con `rukh export --adapter-inputs`. El navegador cambia de
+estilo **subiendo** 1,6 MB, no descargando otro modelo.
+
+- Comprueba lo primero que hay que comprobar: con los factores a **cero**, el grafo da exactamente
+  los mismos logits que la exportación normal. Si no lo diera, el fichero adaptable no podría
+  sustituir al ordinario y habría que publicar los dos.
+- Comprueba lo segundo: con dos adaptadores distintos, las respuestas difieren, y el fichero no se
+  ha tocado entre las dos.
+- Y lo tercero, que es la paridad de siempre: el mismo adaptador cargado en PyTorch y alimentado
+  al grafo tiene que elegir la misma jugada en mil posiciones de validación.
+- Un detalle de implementación que no es cosmético: la corrección se arma con `cat` sobre todo el
+  ancho de salida en vez de escribirse en una rodaja de un tensor de ceros. La asignación por
+  índice exporta como `ScatterND`, que onnxruntime web ejecuta en CPU aunque el resto del grafo vaya
+  por WebGPU.
+
+<Callout kind="teoria" title="Dónde vive el factor `alpha / r`">
+  La corrección es `(alpha / r) · B · A`, y ese factor tiene que estar en un sitio y solo en uno. Si
+  vive en el grafo, cualquier adaptador que se le dé tiene que haberse entrenado con el mismo
+  `alpha` y el mismo `r`, y en un búfer plano de `float32` no hay nada contra lo que comprobarlo.
+  Así que vive en el **fichero**: el adaptador que descarga la página lleva `B` ya multiplicado y el
+  grafo multiplica por uno. Un adaptador de cualquier rango es correcto en ese grafo sin que nadie
+  tenga que cuadrar dos números a mano. La regla general: cuando un dato y su interpretación pueden
+  separarse, júntalos en el mismo fichero.
+</Callout>
+
 ### Lab 8 · Qwen3 con QLoRA, por el mismo harness
 
 **Objetivo:** que el modelo general y el propio se midan con el mismo metro, y que lo único
@@ -1165,15 +1219,15 @@ Y en la demo, el selector «Elo objetivo» lleva desde P2 en pantalla y desactiv
 una línea; lo que hay que decidir es qué ofrece.
 
 ```ts title="rukh-web/src/lib/registry.ts"
-export const ELO_TARGETS = [1200, 1500, 1800, 2100, 2400] as const;
+export const ELO_TARGETS = [1200, 1500, 1800, 2000, 2100, 2400] as const;
 ```
 
-Cinco, no veintisiete. El vocabulario tiene veintisiete cabeceras y el modelo contesta a todas,
+Seis, no veintisiete. El vocabulario tiene veintisiete cabeceras y el modelo contesta a todas,
 pero **un control que el jugador puede mover es la afirmación de que moverlo hace algo**, y esa
 afirmación es tan ancha como el barrido que la respalda. Ofrecer las veintisiete sería prometer
-veintisiete mediciones y tener cinco.
+veintisiete mediciones y tener seis.
 
-- E2E: con una etapa condicionada el selector está activo, sin pista, con exactamente esas cinco
+- E2E: con una etapa condicionada el selector está activo, sin pista, con exactamente esas seis
   opciones y empezando en 1800; con las demás, desactivado y con la pista visible.
 - La etapa de prueba condicionada es el mismo grafo de juguete con la bandera puesta, para que el
   E2E recorra el camino activado sin descargar 221 MB. Lo que se prueba es el cableado que lee la
