@@ -71,3 +71,38 @@ test.describe('course navigation', () => {
     await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
   });
 });
+
+test.describe('lesson layout', () => {
+  test('the guide stays on screen while the article scrolls', async ({ page }) => {
+    // It used to scroll away. `.lesson__sticky` had `position: sticky` and looked correct, but
+    // the grid's `align-items: start` shrank its column to 462 px against a 15 528 px article,
+    // and a sticky box can only travel inside its containing block. Scrolling is the only way
+    // to see the difference, so the test scrolls.
+    await page.goto(LESSON);
+    const guide = page.locator('.lesson__sticky');
+    await expect(guide).toBeVisible();
+
+    await page.evaluate(() => window.scrollBy(0, 2000));
+    await page.waitForTimeout(200);
+
+    const box = await guide.boundingBox();
+    expect(box).not.toBeNull();
+    // Still on screen, pinned near the top rather than pushed off it.
+    expect(box!.y).toBeGreaterThan(0);
+    expect(box!.y).toBeLessThan(200);
+  });
+
+  test('a wide screen buys width without stretching the line length', async ({ page }) => {
+    // A 4K monitor left two thirds of the page empty. The fix widens the canvas, but the
+    // reading measure only grows a little: long lines are harder to read, not easier.
+    await page.setViewportSize({ width: 2560, height: 1200 });
+    await page.goto(LESSON);
+    const grid = (await page.locator('.lesson__grid').boundingBox())!;
+    const prose = (await page.locator('.prose').first().boundingBox())!;
+
+    expect(grid.width).toBeGreaterThan(1400);
+    // Roughly 70-90 characters: wide enough to use the screen, short enough to read.
+    expect(prose.width).toBeGreaterThan(820);
+    expect(prose.width).toBeLessThan(1100);
+  });
+});

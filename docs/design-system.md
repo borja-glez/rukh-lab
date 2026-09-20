@@ -101,8 +101,12 @@ Las fuentes las sirve la API de fuentes de Astro (`fontProviders.fontsource()`),
 
 - Sin i18n por diccionarios: cada página fija su `lang` (`es` por defecto, `en` en `/proyecto/` y
   `/en/`). No hay redirección por idioma guardado.
-- `tokens.css` solo contiene el bloque `:root`, `color-scheme` y las dos media queries que cambian
-  tokens; la base y los patrones (`.label`, `.btn`, `.section`…) están en `global.css`.
+- `tokens.css` solo contiene el bloque `:root`, `color-scheme` y las media queries que cambian
+  tokens; la base y los patrones (`.label`, `.btn`, `.section`…) están en `global.css`. Son cuatro:
+  las dos del portfolio más `1800px` y `2400px`, que ensanchan `--container` para que una pantalla
+  de 4K no deje dos tercios en blanco. `--measure` va aparte de `--container` a propósito: el
+  ancho extra se reparte entre la guía, las figuras y el código, no en líneas de texto más largas,
+  que se leen peor y no mejor.
 - Los botones miden 44 px de alto como mínimo (el portfolio usa 14 px de padding sin mínimo) y todos
   los controles de cabecera también.
 - `Rail` es `position: sticky` dentro del layout de lección y sus ticks son secciones de la lección,
@@ -119,4 +123,4 @@ Las fuentes las sirve la API de fuentes de Astro (`fontProviders.fontsource()`),
   `style`, solo `style-src-attr` admite `'unsafe-inline'`; `style-src` y `script-src` siguen siendo
   solo por hash.
 
-tokens.css sha256: d4d3d58f692847ea7f29127f0ee5763217656eff911785dc43d4b9b25e6fb38b
+tokens.css sha256: 29136a91eccf7b1e1672c00e8051b6598c8c8ae5960d049bb611bc21cdf28143
