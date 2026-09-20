@@ -7,6 +7,7 @@ import Callout from './Callout.astro';
 import Exercise from './Exercise.astro';
 import Solution from './Solution.astro';
 import Term from './Term.astro';
+import Transfer from './Transfer.astro';
 import Figure from './Figure.astro';
 import Tabs from './Tabs.astro';
 import NotebookLink from './NotebookLink.astro';
@@ -23,6 +24,7 @@ export {
   Exercise,
   Solution,
   Term,
+  Transfer,
   Figure,
   Tabs,
   NotebookLink,
@@ -40,6 +42,7 @@ export const components = {
   Exercise,
   Solution,
   Term,
+  Transfer,
   Figure,
   Tabs,
   NotebookLink,
