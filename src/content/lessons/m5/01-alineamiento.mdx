@@ -1,0 +1,1276 @@
+---
+title: 'Alineamiento: cambiar lo que el modelo prefiere, no lo que sabe'
+description: 'El módulo donde el modelo deja de imitar y empieza a preferir. Un instrumento que mide diferencias en vez de restar dos absolutos, un reward model con Bradley-Terry que falla exactamente donde tiene que fallar, DPO sobre pares que vienen de fuera y sobre pares que salen del propio modelo, GRPO contra una recompensa que un motor puede verificar, y una galería de reward hacking cuya primera versión se equivocó de pregunta y lo dijo.'
+module: m5
+order: 1
+duration: 480
+level: medio
+status: vigente
+updated: 2026-09-20
+keywords:
+  - alineamiento
+  - par de preferencia
+  - Bradley-Terry
+  - reward model
+  - DPO
+  - beta
+  - on-policy
+  - off-policy
+  - GRPO
+  - ventaja relativa
+  - línea base
+  - recompensa verificable
+  - RLVR
+  - reward hacking
+  - KL
+  - k3
+  - enfrentamiento directo
+  - potencia estadística
+  - reproducibilidad
+artifacts:
+  - kind: model
+    label: chorcat/rukh-rm
+  - kind: model
+    label: chorcat/rukh-medium-dpo
+  - kind: model
+    label: chorcat/rukh-medium-grpo
+demo: '?stage=medium-dpo-fp16'
+---
+
+import SubtractingNoise from '../../../components/figures/SubtractingNoise.astro';
+import RewardBands from '../../../components/figures/RewardBands.astro';
+import GroupBaseline from '../../../components/figures/GroupBaseline.astro';
+import HackedShape from '../../../components/figures/HackedShape.astro';
+import Intransitive from '../../../components/figures/Intransitive.astro';
+import OverOptimised from '../../../components/figures/OverOptimised.astro';
+
+## Qué vas a construir
+
+Al terminar esta sección sabrás qué deja de hacer el modelo, qué empieza a hacer, y por qué el
+primer trabajo del módulo no es entrenar nada sino cambiar de instrumento.
+
+El <Term id="alineamiento">alineamiento</Term> empieza donde termina la imitación, y los cuatro módulos anteriores enseñaron al modelo a **imitar**. El preentrenamiento le puso delante
+cinco millones de partidas y le pidió la siguiente jugada; el afinado de M4 le puso delante otras
+partidas y le pidió lo mismo. Toda la señal salía de gente que jugó. M4 terminó midiendo el techo
+de eso con cinco instrumentos distintos: afinar **cambia el comportamiento de forma total y barata,
+y no cambia la competencia**. Un adaptador de 1,6 MB sube `1. e4` del 59,64 % al 99,85 %; ningún
+afinado mueve el Elo de forma demostrable.
+
+Este módulo cambia de dónde sale la señal. En vez de «esto es lo que jugó un humano de 2000», la
+señal pasa a ser «**de estas dos jugadas, esta es mejor**» —que es un par de preferencia— o «esta
+jugada vale 0,84 y esta otra 0,31» —que es una recompensa—. Ninguna de las dos frases aparece en
+una partida. Las dos se pueden construir, y el ajedrez es uno de los poquísimos sitios donde la
+segunda se puede **verificar**: una jugada es legal o no lo es, un mate es un mate, y un motor
+pone un número a cualquier posición.
+
+La pregunta del módulo es: **¿se puede mover la competencia cambiando el objetivo?** Y la primera
+respuesta del hito no fue un modelo, fue un instrumento — porque con el que había, la pregunta no
+se podía contestar.
+
+Vas a construir:
+
+- `rukh eval match`, un <Term id="enfrentamiento-directo">enfrentamiento directo</Term> entre dos modelos, con libro de aperturas
+  sembrado y colores espejados. Sale 8,1 veces más barato en partidas que restar dos Elo de la
+  escalera, y se ahorra el ruido de un tercero. Es lo primero del hito y lo que más se reutiliza.
+- `src/rukh/models/reward.py` y `src/rukh/train/reward.py`: un <Term id="reward-model">reward
+  model</Term> entrenado con la pérdida de <Term id="bradley-terry">Bradley-Terry</Term>, que
+  acierta cerca de tres de cada cuatro pares no vistos y **falla justo donde tiene que fallar**.
+- `src/rukh/data/onpolicy.py`, que construye pares con las jugadas que propone **el propio
+  modelo**, para poder comparar dos DPO cuya única diferencia sea de dónde salen las dos jugadas.
+- `src/rukh/train/rewards.py`: la <Term id="recompensa-verificable">recompensa verificable</Term>, con su puerta de legalidad, sus topes y
+  un test que comprueba sobre miles de entradas aleatorias que nada se sale del intervalo.
+- `src/rukh/train/grpo.py`: <Term id="grpo">GRPO</Term> con grupos de ocho, ventaja relativa al
+  propio grupo y una <Term id="kl">penalización KL</Term> contra los pesos de partida.
+- Y `labs/m5/reward_hacking.py`, la **galería** de <Term id="reward-hacking">reward hacking</Term>: la misma recompensa rota de cinco maneras, medida.
+  Su primera versión preguntaba qué jugada corona cada una, las seis coronaron la misma, y esa
+  respuesta —que parecía un fracaso— es el hallazgo que ordena la última parte del módulo.
+
+## El instrumento: para medir una diferencia, mide la diferencia
+
+Al terminar esta sección sabrás por qué restar dos números medidos es peor que medir la
+diferencia, cuánto peor exactamente, y por qué el primer día del hito no se entrenó nada.
+
+`GOAL.md` pide para este módulo **+50 Elo con intervalo de confianza** sobre el modelo de partida.
+Con el instrumento que había al empezar, esa frase no se podía comprobar, y conviene ver por qué
+antes de aceptar ningún número del resto de la lección.
+
+El instrumento que había es la **escalera**: el modelo juega contra ocho Stockfish de fuerza
+limitada, se mira dónde saca el 50 % y eso da un Elo. Funcionó bien durante tres módulos. Pero P4
+midió algo sobre ella que aquí cambia todo: la **misma** configuración, con la misma semilla, medida
+dos veces por dos caminos distintos, dio **1498 y 1558** (D-107). Sesenta puntos de diferencia sin
+que nada cambiara.
+
+No es un fallo. La semilla fija *nuestro* muestreo, no el del rival: Stockfish juega con un límite
+de **tiempo** y `UCI_LimitStrength` aleatoriza a propósito para acertar el Elo pedido. Así que «las
+mismas 160 partidas» son 160 partidas nuevas contra alguien que no se repite. El suelo de
+reproducibilidad de la escalera es de unos **40 Elo de una sigma**.
+
+Y ahora la aritmética que decide el hito. Si mides el Elo de la base y el del modelo alineado por
+separado y los restas, la diferencia hereda **los dos** ruidos:
+
+<SubtractingNoise />
+
+Los números son los del propio proyecto. La escalera lee `medium-v4` en **1504 (1446-1558)** y el
+mismo modelo tras DPO en **1529 (1470-1583)**. Resta: **+25**, con un semiancho de
+`√(56² + 56,5²) = 80`. O sea, de **−55 a +105**: atraviesa el cero de lado a lado.
+
+Cada absoluto trae su ruido entero a la resta, y la diferencia acaba **más ancha que cualquiera de
+las dos medidas que entraron**. Buscar una diferencia de 50 con un instrumento que devuelve ±80 no
+es cuestión de más partidas: es el instrumento equivocado.
+
+Los mismos dos checkpoints enfrentados entre sí dan **+40 Elo con intervalo 11 a 69**, separado del
+cero, en cuatro minutos.
+
+### La cuenta, y los dos números que salen
+
+El precio de cada camino se calcula antes de pagarlo, y eso es el primer lab del módulo:
+
+```bash
+uv run python labs/m5/games_needed_match.py
+```
+
+Para distinguir dos **proporciones** que difieren en Δp hacen falta, en cada lado,
+
+```
+n > 3,84 / (Δp)²
+```
+
+partidas —es la aproximación normal al 95 % con dos colas—. Para detectar una ventaja en un
+**enfrentamiento** directo, donde lo que se mide es una sola proporción contra 0,5, hacen falta
+
+```
+n > z² · p(1-p) / (p - 0,5)²
+```
+
+partidas **en total**. Para +50 Elo, la primera pide 8,1 veces más partidas que la segunda. Y la
+tabla que imprime el lab es la que se usa al revés, que es como se usa de verdad: con 200 partidas,
+la diferencia más pequeña que se puede ver es de **48 Elo**; con 400, de **34**; con 50, de **95**.
+Antes de jugar una sola partida ya sabes si tu presupuesto puede contestar tu pregunta.
+
+### El control que costó un minuto y valió el hito
+
+Un instrumento nuevo se estrena midiendo algo cuya respuesta ya se sabe. Un modelo contra una copia
+exacta de sí mismo tiene que dar **0,5000 clavado**:
+
+```bash
+uv run rukh eval match --a <base> --b <base> --games 100
+```
+
+Salió **0,975 a favor de uno de los dos lados, con 999 jugadas ilegales**.
+
+Los dos errores estaban en `infer/game.py` y ninguno era sutil de encontrar una vez que había un
+número imposible señalándolos (D-111):
+
+1. `play_game_with` empezaba la partida desde un tablero con las jugadas del libro de aperturas ya
+   puestas, pero **nunca se las reproducía al jugador**. El modelo veía un prompt vacío y un tablero
+   con seis jugadas hechas, así que proponía jugadas de la posición inicial.
+2. Al rival, si guardaba estado, **no se le contaba ninguna jugada**. `Opponent` no tiene `observe`
+   en su protocolo, así que nadie preguntaba si lo tenía.
+
+El arreglo del segundo cabe en tres líneas y dice exactamente lo que hace:
+
+```python
+def _tell(opponent: Opponent, move: chess.Move) -> None:
+    """Show a move to an opponent that keeps state; a no-op for one that does not."""
+    observe = getattr(opponent, "observe", None)
+    if callable(observe):
+        observe(move)
+```
+
+Después del arreglo: **0,5000 exacto, 11 ilegales por bando**. El control pasa.
+
+<Callout kind="mundo-real" title="La regla que deja">
+Un instrumento nuevo se estrena midiendo algo cuya respuesta ya sabes. Aquí costó un minuto de
+máquina y evitó publicar un +40 que habría sido un artefacto de dos errores de fontanería.
+</Callout>
+
+### Lo que mide, cuando ya mide
+
+`rukh eval match` juega un número **par** de partidas —se niega a jugar un número impar, para que
+el reparto de colores no pueda salir torcido— desde posiciones de un libro de aperturas sembrado,
+cada una jugada dos veces con los colores cambiados. Devuelve la puntuación, su intervalo por
+bootstrap, y la conversión a Elo:
+
+```python
+def elo_difference(score: float, cap: float = 1200.0) -> float:
+    if score <= 0.0:
+        return -cap
+    if score >= 1.0:
+        return cap
+    return max(-cap, min(cap, 400.0 * math.log10(score / (1.0 - score))))
+```
+
+El tope no es cosmético: una puntuación de 1,0 es un logaritmo infinito, y un instrumento que puede
+devolver infinito acaba metiéndolo en una tabla.
+
+Con este instrumento, `medium-v4-dpo` contra `medium-v4` da **+40 Elo con intervalo 11 a 69**, en
+cuatro minutos — que es el número de la figura de arriba, y el mismo par de modelos que la escalera
+dejaba en +25 con el intervalo atravesando el cero. Misma conclusión cualitativa, y un instrumento
+que la puede afirmar mientras el otro no.
+
+<Callout kind="mundo-real" title="La regla que deja">
+Si lo que quieres saber es una diferencia, no midas dos absolutos y restes. Cada absoluto trae su
+ruido entero a la resta, y el ruido de la resta es la suma de los dos.
+</Callout>
+
+## Teoría justa
+
+Al terminar esta sección sabrás qué es un par de preferencia, qué promete y qué no promete
+Bradley-Terry, por qué DPO no necesita reward model, y qué hace GRPO que PPO hace más caro.
+
+### Un par de preferencia no dice cuánto vale nada
+
+Un <Term id="par-de-preferencia">par de preferencia</Term> son dos respuestas a la misma entrada,
+una marcada mejor y otra peor. En Rukh son dos jugadas legales en la misma posición, con la
+distancia en centipeones que el motor les puso. Lo que el par **no** dice es cuánto vale ninguna de
+las dos: solo dice cuál gana.
+
+Eso basta, y el modelo que lo convierte en números es <Term id="bradley-terry">Bradley-Terry</Term>:
+la probabilidad de que `a` gane a `b` es `σ(r(a) − r(b))`, así que la pérdida es
+
+```
+L = −log σ(r(chosen) − r(rejected))
+```
+
+La consecuencia que más se olvida está a la vista en la fórmula: **solo aparecen diferencias**.
+Sumarle cien a todas las puntuaciones no cambia la pérdida ni un decimal. La escala de un reward
+model no significa nada por sí sola, y comparar el «0,8» de un entrenamiento con el «1,4» de otro
+es comparar dos reglas sin origen. Hay un test que lo fija, porque un modelo que se rompa con un
+desplazamiento constante no lo notaría nadie aguas abajo:
+
+```python
+def test_the_loss_only_sees_the_difference():
+    """Shift every score by a constant and nothing changes: that *is* Bradley-Terry."""
+    chosen = torch.tensor([1.0, -0.5, 3.0])
+    rejected = torch.tensor([0.0, -2.0, 1.0])
+    base = preference_loss(chosen, rejected)
+    for shift in (-100.0, 0.25, 7.0):
+        assert preference_loss(chosen + shift, rejected + shift) == pytest.approx(float(base))
+```
+
+### DPO: la referencia que no hay que entrenar
+
+El camino clásico es entrenar un reward model, y luego usarlo para hacer refuerzo sobre la política
+con PPO. Son dos entrenamientos y una red de valor. <Term id="dpo">DPO</Term> demuestra que, para
+el caso de las preferencias, se puede saltar el intermediario: se puede escribir el óptimo de ese
+refuerzo en función de la política y de una **referencia**, y entrenar la política directamente
+sobre los pares.
+
+La referencia es **implícita**: una copia congelada de los pesos de partida. No se entrena, no se
+publica, y `β` mide cuánto se le deja a la política alejarse de ella.
+
+En Rukh la completación es **una sola jugada**, así que toda la maquinaria de secuencia se colapsa
+a dos log-probabilidades en una posición, y el fichero es corto:
+
+```python
+def dpo_loss(policy, reference, batch, beta):
+    index = torch.arange(policy.shape[0], device=policy.device)
+    chosen = policy[index, batch.chosen] - reference[index, batch.chosen]
+    rejected = policy[index, batch.rejected] - reference[index, batch.rejected]
+    margin = chosen - rejected
+    loss = -F.logsigmoid(beta * margin).mean()
+    accuracy = (policy[index, batch.chosen] > policy[index, batch.rejected]).float().mean()
+    return loss, margin.mean(), accuracy
+```
+
+Dos cosas de ahí merecen quedarse. La primera: se devuelve el **margen** y el **acierto** por
+separado, porque un margen puede crecer con la ordenación todavía mal, y el que hay que mirar es el
+segundo. La segunda: `nll_weight`, que es opcional y suele hacer falta. DPO puro sube el margen sin
+mirar si la política sigue sabiendo jugar —el margen dice «`chosen` gana a `rejected`», no dice
+«`chosen` es buena»—, y un poco de pérdida de siguiente token sobre la jugada preferida la ancla.
+
+### On-policy y off-policy: de dónde salen las dos jugadas
+
+Los 13 838 pares que el proyecto trae de P1 son **fuera de política**: salen de las evaluaciones
+multi-PV de Lichess. Dicen «en esta posición `e4` es mejor que `h4`» tanto si el modelo iba a
+considerar alguna de las dos como si no.
+
+Un par **<Term id="on-policy">dentro de política</Term>** hace una pregunta más estrecha y, en
+principio, más útil: *de las jugadas que ibas a considerar aquí, ¿cuál era la mejor y cuál la
+peor?* Se construye muestreando cuatro jugadas del propio modelo, puntuándolas con el motor y
+quedándose con los extremos si están lo bastante lejos.
+
+El argumento a favor es de una línea: **un modelo solo pierde partidas con las jugadas que juega**.
+El argumento en contra también: los pares on-policy son más caros, y su calidad depende de que el
+modelo proponga cosas distintas. Este módulo no elige entre los dos con un argumento, los entrena y
+los mide.
+
+### GRPO: el grupo es la línea base
+
+<Term id="grpo">GRPO</Term> no necesita ni los pares ni el reward model. Para cada posición, la
+política propone `group_size` jugadas; una **función** las puntúa; y cada una se empuja arriba o
+abajo según cómo le fue **frente a la media de su propio grupo**:
+
+```
+A_i = (r_i − media(r)) / (desviación(r) + ε)
+```
+
+Esa media es la <Term id="linea-base-grpo">línea base</Term>. PPO entrena una red de valor entera
+para estimarla; GRPO la saca del grupo, que ya estaba pagado. El precio está en la misma fórmula y
+es el detalle que casi nunca se menciona:
+
+<GroupBaseline />
+
+Si el grupo no tiene dispersión —un <Term id="grupo-plano">grupo plano</Term>— la línea base cae
+encima de todos y **todas las ventajas son cero**. El motor ya se ha pagado y el paso es un no-op. Por eso `GrpoResult` cuenta los grupos
+planos aparte: el número dice qué parte del presupuesto se lleva la propia confianza del modelo, y
+no hay manera de saberlo por adelantado.
+
+### La KL es un término, no un adorno
+
+Una recompensa verificable es exactamente especificable, y por tanto exactamente **hackeable**. Lo
+único que impide que la política se vaya a la esquina del espacio de jugadas que mejor puntúa es la
+<Term id="kl">penalización KL</Term> contra los pesos de partida. Rukh usa el estimador k3:
+
+```python
+difference = reference_logprob - policy_logprob
+kl = (torch.exp(difference) - difference - 1.0).mean()
+```
+
+`exp(d) − d − 1` es **no negativo por construcción**, y eso importa para algo que quiere ser un
+castigo. La diferencia de log-probabilidades a secas es negativa la mitad de las veces: como
+término de penalización, le pagaría al modelo precisamente en las muestras en las que se alejó.
+Hay un test que lo dispara en las dos direcciones a propósito.
+
+## Cómo se mide y contra qué
+
+Al terminar esta sección sabrás qué número mira cada parte del hito, y los tres sitios donde una
+medición de alineamiento miente sin avisar.
+
+### El acierto de un reward model depende de cómo se parten los datos
+
+El criterio de `GOAL.md` para el reward model es **75 % de acierto en pares no vistos**. Cuatro
+corridas del mismo modelo con cuatro semillas dan 72,91 %, 74,76 %, 75,19 % y 74,71 %.
+
+La primera explicación fue buena y no era toda. `split_examples` reparte **por partida** usando la
+misma semilla que el entrenamiento, así que cambiar la semilla cambia qué partidas caen en
+validación, y con ellas cuántos pares de mate hay en el conjunto que se mide: **484** con la semilla
+42, **356** con la 1. Y los pares de mate son donde el modelo peor va, así que el titular sube
+cuando el sorteo reparte menos mates.
+
+<Callout kind="roto" title="Y después se repitió la corrida sin cambiar nada">
+Hizo falta volver a entrenar con **la misma configuración y la misma semilla 42** para que el
+`run.json` llevara unos campos nuevos. Salió **74,21 %** donde la primera vez había salido
+**72,91 %**.
+
+Mismo reparto —484 pares de mate las dos veces—, mismos hiperparámetros, mismo modelo de 12×512.
+**1,30 puntos sin que cambiara nada que se pueda escribir en un fichero**: kernels de GPU que no son
+deterministas.
+
+Así que el suelo de esta medición, con todo fijado, es de más de un punto. El 75,19 % de la semilla
+2 y el 74,21 % de la 42 **no se distinguen**, y perseguir el 75 % con más semillas sería pescar
+(D-113).
+</Callout>
+
+Es la misma lección que el instrumento del principio del módulo, en otro sitio: allí la escalera
+daba 1498 y 1558 con la misma configuración, aquí el reward model da 72,91 y 74,21.
+
+<Callout kind="mundo-real" title="La regla que deja">
+Antes de explicar una diferencia pequeña, mide cuánto se mueve tu montaje cuando **no** cambias
+nada. Y cuando una semilla mueve el resultado, mira si mueve el modelo, la regla de medir, o las
+dos: aquí eran las dos.
+</Callout>
+
+Por eso se publican siempre cuatro cosas juntas: el acierto global, el acierto sobre los pares que
+una evaluación puede decidir, el recuento por banda, y cuánto se separan dos corridas idénticas.
+
+### Una correlación sobre dos poblaciones no describe ninguna
+
+Las cuatro corridas reportan una correlación de Pearson **negativa** entre el margen del modelo y la
+distancia en centipeones: de −0,034 a −0,156. Leído tal cual, dice que el modelo está más seguro
+cuanto más parecidas son las dos jugadas, que es lo contrario de lo que debería.
+
+Lo que pasa es que los pares de mate tienen, por construcción, la distancia más grande (≥ 2 000) y
+son donde el modelo peor va: su margen medio es **+0,744** frente a **+1,272** en el resto. Un
+tercio de los puntos, pegados al extremo derecho del eje y abajo del todo, bastan para torcer la
+recta entera. Sobre el mismo modelo y el mismo conjunto:
+
+| conjunto | pares | Pearson | Spearman | acierto |
+|---|---|---|---|---|
+| todos | 1 268 | **−0,1276** | −0,0674 | 74,76 % |
+| sin mates | 912 | **+0,0576** | +0,0747 | 77,30 % |
+
+El signo lo cambia el subconjunto, no el modelo (D-119).
+
+<Callout kind="mundo-real" title="La regla que deja">
+Una correlación sobre una población con dos regímenes distintos no describe ninguno de los dos.
+Antes de interpretar el signo, mira si hay un grupo que lo esté poniendo.
+</Callout>
+
+### Un `head()` no es una muestra
+
+`build_on_policy` recortaba con `frame.head(n)` cuando se le pedía un subconjunto. Los pares están
+equilibrados por fase **en bloques**, así que las primeras 40 filas son **65 % aperturas** frente al
+33 % del fichero entero (D-114).
+
+Importa porque el hito compara pares de dos fuentes. Si el recorte de una es casi todo aperturas y
+el de la otra no, lo que se compara no son las fuentes: es la mezcla de fases, que desde M2 se sabe
+que mueve todo. El arreglo es `frame.sample(shuffle=True, seed=...)`.
+
+### En GRPO, que suba la recompensa no es la noticia
+
+Una recompensa verificable **siempre** puede subir: está escrita, y lo que está escrito se puede
+optimizar. Lo que dice si subió jugando mejor o cultivando el número es que suba **y** la KL se
+quede pequeña **y** la proporción de ilegales no empeore. Los tres a la vez, o no es una mejora, es
+un síntoma.
+
+## Lo que salió
+
+Al terminar esta sección sabrás qué midió cada pieza del hito, incluida la que midió lo contrario
+de lo que se esperaba.
+
+### El reward model: tres de cada cuatro, y el cuarto siempre es el mismo
+
+El criterio de `GOAL.md` pedía **75 %** de acierto en pares no vistos. Cinco corridas dan 72,91 %,
+74,21 %, 74,71 %, 74,76 % y 75,19 %: la frontera se toca y no se cruza de forma estable. Y dos de
+esas cinco son **la misma semilla**, así que el instrumento repite con un margen de 1,3 puntos: el
+criterio está por debajo del ruido de la medición que lo comprueba. Lo interesante no es el
+titular, es dónde está el error.
+
+<RewardBands />
+
+La banda de mate es la peor en las cuatro corridas —68,3 % a 71,7 %— y es **un tercio de los
+pares**. La mejor es la de 400-800 cp, entre 80,2 % y 85,4 %. Un mate es un hecho táctico y lo que
+el modelo lee es una evaluación estática de la posición que queda: no lo puede ver. Quitando esa
+banda, el acierto sube a 77,30 % y el criterio se cumple con holgura — pero quitarla es cambiar la
+pregunta, así que se publican las dos cifras y el recuento de cada banda.
+
+Lo que **no** se puede decir es que el acierto suba monótonamente con la distancia. Las bandas
+100-200 y 200-400 se cruzan según la semilla, y la de 800-2000 tiene entre diez y veintidós pares:
+en cuatro corridas dio 90 %, 68 %, 90 % y 50 %, que es la misma ausencia de dato con cuatro caras.
+Está dibujada hueca en la figura por eso.
+
+Tres cosas más salieron de la bandeja de experimentos, y una de ellas fue la que más sorprendió:
+
+- **El encoder preentrenado de M3 resta.** Partir de él da unos 6,5 puntos **menos** que inicializar
+  al azar. El encoder aprendió a rellenar jugadas enmascaradas; aquí se le pide ordenar posiciones
+  por lo buenas que son. «Preentrenado» no es una propiedad, es una relación entre lo que aprendió
+  y lo que le vas a pedir, y cuando no hay relación la inicialización al azar gana.
+- **La capacidad sí manda.** 12 capas × 512 sube donde ninguna otra palanca subía: el techo estaba
+  en el modelo, no en los datos.
+- **El punto de vista no era la causa.** Se sospechaba que pedirle «cómo de buena es esta posición
+  para quien acaba de mover» le obligaba a leer el turno del FEN e invertir el signo cada ply. Se
+  midió la alternativa —«cómo de buena es para las blancas», con el signo puesto en la pérdida— y
+  sale lo mismo. Queda como `point_of_view` en la config, documentado como *medido y sin efecto*.
+
+Y un error que hizo falta cometer: la primera corrida daba 72,98 % alimentando un encoder entrenado
+con el esquema `moves` con los 69 tokens de casilla del esquema `squares`. No falla nada — los
+identificadores caben en el vocabulario de 2 030 y significan otra cosa —, no avisa nada, y sale un
+número plausible de una representación revuelta. Ahora `load_squares_encoder` se niega, con el
+mensaje que dice por qué.
+
+### Los pares que salen del propio modelo son otra cosa
+
+`rukh data onpolicy` recorre las 13 838 posiciones de los pares off-policy, muestrea cuatro jugadas
+del modelo en cada una a temperatura 1,0, las puntúa con el motor a profundidad 10, y se queda con
+la mejor y la peor si están a más de 100 cp. Salieron **6 386 pares**, y el reparto de lo que no
+salió es tan informativo como lo que sí:
+
+| resultado | posiciones | reparto |
+|---|---|---|
+| pares construidos | 6 386 | 46,1 % |
+| el modelo propuso **una sola** jugada distinta | 3 743 | 27,1 % |
+| las dos extremas estaban a menos de 100 cp | 3 709 | 26,8 % |
+
+Ese 27,1 % es el mismo fenómeno que en GRPO cuenta `flat_groups`, visto desde la generación de
+datos: **la confianza del propio modelo se lleva un cuarto del presupuesto de motor**, y no hay
+forma de saber cuál cuarto antes de pagarlo. De los pares que sí salieron, solo 2 632 llegaron a
+tener las cuatro candidatas distintas; 1 835 se quedaron en dos.
+
+Y la diferencia que decide cómo hay que leer todo lo que viene después:
+
+| conjunto | pares | mediana Δcp | media Δcp | pares de mate |
+|---|---|---|---|---|
+| off-policy | 13 838 | 251 | 2 996 | ~33 % |
+| on-policy | 6 386 | 385 | 672 | **2,9 %** |
+
+Los dos conjuntos no son dos fuentes de lo mismo: son **dos distribuciones de dificultad**. Los
+pares off-policy están dominados por mates —de ahí la media de casi 3 000 con una mediana de 251—,
+porque una evaluación multi-PV encuentra mates que el modelo nunca iba a proponer. Los on-policy
+casi no los tienen: si hay un mate en la posición, o el modelo lo ve y sus cuatro candidatas son
+razonables, o no lo ve y ninguna lo es.
+
+Eso obliga a una decisión de diseño antes de comparar nada: el conjunto off-policy se **submuestrea
+a 6 386** con semilla fija, para que los dos brazos vean la misma cantidad de datos. Si uno ve 2,2
+veces más, lo que se mide es la cantidad y no la fuente.
+
+### DPO: el margen sube, la ordenación no siempre
+
+Los dos entrenamientos son idénticos línea por línea salvo el fichero de pares: mismo checkpoint de
+partida, `beta` 0,1, `lr` 5e-6, `nll_weight` 0,1, una época, misma semilla.
+
+| brazo | pares | acierto antes | acierto después | margen después |
+|---|---|---|---|---|
+| off-policy (igualado) | 6 386 | 94,05 % | **92,96 %** | +3,00 |
+| on-policy | 6 386 | 89,51 % | **91,86 %** | +1,71 |
+
+Dos cosas que leer aquí, y la primera es la advertencia de la teoría cumpliéndose delante.
+
+**El brazo off-policy triplicó el margen y empeoró la ordenación.** De 94,05 % a 92,96 %. El margen
+dice «`chosen` gana a `rejected`» y no dice «la ordenación de todos los pares mejoró»: se puede
+separar mucho a unos cuantos y cruzar a otros por el camino. Es exactamente por lo que `dpo_loss`
+devuelve las dos cosas por separado, y por lo que el número que se mira es el segundo.
+
+**El punto de partida ya era distinto.** El modelo base ordena bien el 94,05 % de los pares
+off-policy y solo el 89,51 % de los on-policy. No es casualidad ni ruido: los pares on-policy están
+construidos **a partir de las jugadas que el modelo dudaba**, así que por construcción son los que
+peor ordena. Un conjunto de entrenamiento hecho de tus propios errores es más difícil que uno hecho
+de los errores de otro, y eso es lo que se supone que lo hace útil.
+
+Pero ninguna de estas dos columnas es la medición que decide. El acierto sobre pares es una métrica
+*de proxy*: mide si el modelo ordena pares, no si juega mejor. Para eso está el instrumento del
+principio del módulo.
+
+### La medición que decide: seis enfrentamientos y un triángulo que no cierra
+
+Tres modelos y tres aristas: base, DPO fuera de política y DPO dentro de política. Cada arista se
+jugó **dos veces**, 400 partidas con un modelo pasado como A y 400 con los lados intercambiados,
+sobre el mismo libro de aperturas y con los colores espejados dentro de cada corrida.
+
+Las dos direcciones no eran por rigor ceremonial. Las tres primeras corridas las ganó **quien iba
+como A**, y eso hay que descartarlo antes de creerse nada. Se descartó: al intercambiar los lados,
+el signo aguanta las tres veces —`off` gana a `base` por +61 siendo A y por +74 siendo B—. El
+instrumento no tiene preferencia por un lado.
+
+Pero intercambiarlos enseñó otra cosa, y es la que más se va a repetir en el resto del curso.
+
+<Callout kind="roto" title="El veredicto se dio la vuelta y la estimación no">
+Para el par `on-policy` contra `off-policy`, la misma comparación con las mismas 400 partidas y las
+mismas aperturas:
+
+| dirección | Elo | IC 95 % | veredicto |
+|---|---|---|---|
+| `on` como A | **+48** | 19 a 80 | separado del cero |
+| `on` como B | **+26** | −3 a 57 | **incluye el cero** |
+
+La estimación se mueve 22 puntos, que es ruido perfectamente normal con 400 partidas. El
+**veredicto** pasa de «esto es una medición» a «esto no concluye». Un binario leído del borde de un
+intervalo es mucho menos estable que el número del que se lee, y publicar solo el binario habría
+sido publicar una moneda al aire (D-120).
+
+Por eso existe `labs/m5/pooled_match.py`: lee todos los informes, agrupa las dos direcciones de
+cada par y da un solo número con el intervalo sobre las 800 partidas.
+</Callout>
+
+Agrupadas las dos direcciones, las aristas medidas —incluida la de GRPO, que llega en la última
+sección pero se mide con el mismo instrumento:
+
+| arista | partidas | Elo | IC 95 % |
+|---|---:|---:|---|
+| DPO off-policy − base | 1 600 | **+65** | 50 a 81 |
+| DPO on-policy − base | 800 | **+57** | 36 a 79 |
+| **GRPO − base** | 800 | **+44** | 23 a 66 |
+| DPO on-policy − off-policy | 800 | **+37** | 15 a 59 |
+
+(La primera lleva 1 600 porque se le añadieron 800 partidas más para intentar cruzar el criterio, lo
+cual tiene su propia historia en la última sección. Con las 800 originales daba +67.)
+
+Los tres métodos baten a la base con el intervalo separado del cero. Es la primera vez en el
+proyecto que este criterio se mide así, y lo que cambió no fue el modelo: fue cómo se mira.
+
+Léelas en orden y las dos primeras contradicen a la tercera. Si `off` está 67 por encima de la base
+y `on` está 57, entonces `on` debería estar unos **diez por debajo** de `off`. Medido de frente, con
+800 partidas, está **37 por encima**.
+
+<Intransitive />
+
+El residuo de esta <Term id="no-transitividad">no transitividad</Term> —lo que las tres aristas no
+consiguen sumar— es de **47 Elo con un error típico de 19**,
+o sea **2,4 σ**. No es que los intervalos sean generosos: es que un solo número de fuerza por modelo
+supone que la fuerza es un orden total, y un emparejamiento no está obligado a respetarlo. El modelo
+fuera de política juega más afilado —lo dice su tasa de ilegales, que veremos ahora— y eso le va
+bien contra la base y mal contra un modelo más limpio.
+
+<Callout kind="mundo-real" title="La regla que deja">
+Mide las dos direcciones y agrúpalas, siempre. Y no ordenes modelos por un número: si te importa
+cuál de dos gana, enfréntalos. Restar dos enfrentamientos contra un tercero es el mismo error que
+restar dos escaleras, un piso más arriba.
+</Callout>
+
+### El <Term id="peaje-de-alineamiento">peaje</Term>: alinear dobló la tasa de jugadas ilegales
+
+`rukh eval match` cuenta las propuestas ilegales de cada bando porque el control del instrumento lo
+necesitaba. Salió una métrica que nadie estaba buscando y que es el coste del hito:
+
+| modelo | ilegales sobre sus propias jugadas |
+|---|---|
+| `medium-v4` (base) | 1,30 % – 1,47 % |
+| `medium-v4-dpo-onpolicy` | 2,42 % – 2,58 % |
+| `medium-v4-dpo-offpolicy` | 2,90 % – 3,80 % |
+| `medium-v4-grpo` | 1,92 % (base 1,16 % en la misma corrida) |
+
+Los dos DPO se entrenaron con `nll_weight: 0.1`, que existe exactamente para anclar la política
+mientras el margen crece, y aun así la tasa se dobla. No rompe las partidas —el bucle rescata la
+propuesta ilegal con un sorteo enmascarado— pero es distribución que se ha ido a otro sitio.
+
+Y la diferencia entre los dos brazos tiene mecanismo, no solo signo. Los pares fuera de política
+contienen mates que el modelo **nunca iba a proponer**, así que DPO empuja probabilidad hacia tokens
+donde la política tenía masa casi nula, y eso deforma más. Los pares dentro de política solo mueven
+probabilidad **entre jugadas que el modelo ya consideraba**. El brazo que más deforma es el que más
+ilegales propone, y son el mismo (D-121).
+
+GRPO paga **menos** peaje: 1,66 veces la tasa de su base frente a las 2,0-2,6 de los DPO. Cabía
+esperarlo y no estaba garantizado, y la explicación no es la que parece. Su recompensa tiene una
+puerta de legalidad, sí, pero en esta configuración **no llega a dispararse**: las candidatas se
+muestrean entre jugadas legales. Lo que protege la legalidad no es la puerta — es que el gradiente
+de GRPO solo mueve masa **entre jugadas que ya eran legales**, mientras el de DPO la empuja hacia
+tokens donde la política casi no tenía.
+
+Hay un detalle del instrumento escondido aquí que conviene decir en voz alta. Una propuesta ilegal
+se rescata con un sorteo **enmascarado**, que es un segundo sorteo restringido a jugadas legales —o
+sea, un sorteo mejor—. Un modelo que propone más ilegales recibe más de esos segundos sorteos. Así
+que la tasa no es solo un coste: es un posible sesgo a favor del modelo peor educado. Por eso
+`rukh eval match` tiene `--mask`, que enmascara desde el primer sorteo para los dos lados y quita
+el camino de rescate. No es un ajuste: es un control, y está ahí para que la ventaja se pueda leer
+otra vez sin ese confundido.
+
+<Callout kind="mundo-real" title="La regla que deja">
+Mide el coste de alinear en la misma corrida en la que mides el beneficio. Aquí salió gratis porque
+el instrumento ya contaba las ilegales; si no las hubiera contado, el peaje habría pasado
+desapercibido y el modelo se habría publicado diciendo la mitad de lo que se sabe de él.
+</Callout>
+
+### La suite completa: lo que se gana y lo que se paga, en las mismas filas
+
+El enfrentamiento directo dice que los modelos alineados juegan mejor. La suite canónica —la misma
+con la que se mide cada etapa del proyecto desde M2— dice en qué.
+
+| etapa | legalidad | top-1 | top-3 | puzles 1000-1500 | 1500-2000 | 2000+ | Elo escalera |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `medium-v4` (base) | **99,8 %** | **54,4 %** | **82,2 %** | 57,9 % | 38,0 % | 16,6 % | 1504 (1446-1558) |
+| `+ DPO on-policy` | 99,2 % | 52,3 % | 79,9 % | **59,0 %** | **40,3 %** | 17,8 % | 1560 (1500-1617) |
+| `+ GRPO` | 99,3 % | 53,3 % | 80,3 % | 58,9 % | 39,1 % | 17,8 % | 1572 (1512-1640) |
+
+Tres lecturas, y las tres son la misma historia contada desde ángulos distintos.
+
+**La legalidad y el top-1 bajan.** De 99,8 % a 99,2-99,3 % y de 54,4 % a 52,3-53,3 %. El top-1 mide
+cuántas veces el modelo elige **la jugada que eligió el humano**, y a estos dos modelos se les ha
+pedido explícitamente que dejen de hacer eso: que prefieran la jugada que el motor puntúa mejor. Que
+la métrica de imitación baje al alinear no es un defecto, es la definición de haberlo hecho. Es el
+mismo peaje de las jugadas ilegales, visto en la suite en vez de en las partidas.
+
+**Los puzles suben en las seis comparaciones**, entre un punto y dos y medio. Los puzles son lo más
+parecido a fuerza táctica pura que mide el proyecto, y es exactamente lo que M4 no consiguió mover.
+Pero conviene el decimal: ninguna banda por separado lo establece —las seis diferencias están entre
+0,6 y 1,5 sigmas—, y los dos modelos no son independientes entre sí, así que el «seis de seis» vale
+menos de lo que parece. Los afinados de M4 también subían, entre 0,2 y 0,7 puntos. Lo que se puede
+decir es que los alineados suben **más** y en la misma dirección siempre; lo que no se puede decir es
+que la suite de puzles lo demuestre sola.
+
+**Y el Elo de la escalera sube**, de 1504 a 1560 y 1572. Con los intervalos solapándose, como
+siempre: 1446-1558 contra 1500-1617 y 1512-1640. La escalera **coincide en dirección** con el
+enfrentamiento directo y sigue sin poder afirmarlo. Es el mismo instrumento del principio del
+módulo, dando otra vez la misma media respuesta, y la razón de que el hito empezara cambiándolo.
+
+<Callout kind="mundo-real" title="La regla que deja">
+Una mejora que se ve en tres instrumentos débiles y en uno fuerte se afirma con el fuerte y se
+apoya con los otros tres. Al revés —afirmarla con la coincidencia de tres débiles— es contar el
+mismo ruido tres veces.
+</Callout>
+
+### La recompensa verificable, y las cuatro reglas que la hacen auditable
+
+`src/rukh/train/rewards.py` es el módulo más corto del hito y el que más decisiones tiene por
+línea. Cuatro reglas lo gobiernan, y cada una existe porque su contraria produce un fallo concreto.
+
+**La legalidad es una puerta, no un término.** Una jugada ilegal puntúa el suelo y se salta todo lo
+demás. Sumar un *bonus* por ser legal a una suma ponderada permite cambiar legalidad por otra cosa,
+y el sentido de una recompensa verificable es que hay cosas que no se cambian por nada.
+
+**Todo tiene tope.** Una recompensa sin techo es una invitación: el optimizador encuentra la
+dirección que crece sin límite y se va por ahí. Todas las funciones devuelven un valor en un
+intervalo cerrado, y hay un test que lo comprueba sobre cientos de entradas aleatorias con
+puntuaciones muy fuera de lo que un motor devolvería.
+
+**El signo y la escala se fijan a mano, no con los datos.** `delta_cp` se normaliza por una
+constante que pasa quien llama, no por la dispersión del lote, porque una recompensa que se
+reescala sola hace incomparables dos corridas y esconde el momento en que el modelo deja de
+mejorar.
+
+**Todas las funciones son puras.** Tablero y números entran, número sale, sin llamar al motor
+dentro. Las puntuaciones vienen de fuera, que es lo que permite que los tests corran en
+milisegundos en CPU y lo que impide que la recompensa se convierta en un segundo sitio donde se
+decide el presupuesto de análisis.
+
+<Callout kind="roto" title="La puerta que se podía saltar">
+La regla de la puerta estaba escrita en el docstring y **el código no la cumplía**. `ILLEGAL` era
+un `0,0` plano, y el intervalo de una jugada legal, con los pesos por defecto, es `[−0,25, 1,25]`:
+el cero cae **dentro**. Así que una jugada que no se puede jugar puntuaba `0,0` y una jugada legal
+que se mete en repetición puntuaba `−0,25`. A la política se le estaba diciendo, con todas las
+letras, que proponer algo imposible es mejor que jugar algo que repite.
+
+Lo encontró la galería de `labs/m5`, escribiendo los fallos ajenos. El arreglo es derivar el valor
+en vez de escribirlo:
+
+```python
+def illegal_value(weights: RewardWeights | None = None) -> float:
+    """What an illegal move scores: strictly below anything a legal move can reach."""
+    return legal_bounds(weights)[0] - ILLEGAL_MARGIN
+```
+
+Y un test que lo comprueba con tres juegos de pesos distintos, porque una constante es una promesa
+que deja de ser verdad la primera vez que alguien sube `repetition` (D-115).
+</Callout>
+
+El término de repetición es el único negativo y el único que existe por una observación en vez de
+por un principio: un modelo premiado por no empeorar descubre que barajar nunca empeora. Salta con
+`board.is_repetition(2)` y no con la reclamación de tablas por triple repetición, porque cuando las
+tablas ya son reclamables el baile ya ha ocurrido y la penalización llega tarde.
+
+### La galería: la primera versión preguntó lo que no era
+
+`labs/m5/reward_hacking.py` coge la recompensa que el proyecto usa, la rompe de cinco maneras que
+cada una parece razonable sobre el papel, y mide las seis sobre el mismo grupo de candidatas.
+
+La primera versión preguntaba: **¿qué jugada corona cada una?** La hipótesis era que las rotas
+coronarían otra, y ese desacuerdo sería el hackeo. La corrida contestó que **las seis coronan la
+misma jugada** en las tres posiciones.
+
+En retrospectiva es evidente y por eso merece quedarse escrito: todas son monótonas en la
+evaluación del motor, así que el máximo no se puede mover. **La cima de la ordenación no es donde
+vive el hackeo de recompensa.**
+
+Lo que hay que mirar es lo que el optimizador consume de verdad, que no es la recompensa sino
+`(r − media) / desviación` sobre el grupo:
+
+<HackedShape />
+
+Con la recompensa sana, las dos candidatas ilegales quedan abajo del todo en −1,28, que es donde
+una puerta las tiene que poner, y la peor se lleva el 25 % de la masa de ventaja. Quitándole el
+suelo al término de calidad —**una sola línea, un solo término**— las dos ilegales salen en
+**+0,18**, por encima de una jugada legal que está a 355 cp del óptimo y saca −0,15.
+
+La puerta no se ha tocado: sigue devolviendo el mismo número. Lo que ha cambiado es el **rango de
+lo que hay debajo**, y un suelo solo es un suelo en relación con lo que tiene que estar por debajo.
+Es D-115 otra vez, llegando por el otro lado.
+
+Y de paso la figura enseña el precio honesto del tope, que también está medido: en la columna sana,
+`b2b4` y `f3g4` sacan las dos +0,14, porque un error de 355 cp y otro de 943 cp se recortan los dos
+a calidad cero. Un intervalo cerrado se paga con resolución abajo. Es el cambio que el proyecto
+eligió hacer, y conviene decir que es un cambio y no una mejora gratis.
+
+<Callout kind="mundo-real" title="La regla que deja">
+Cuando un experimento contesta «no hay efecto», la primera sospecha es la pregunta. Aquí la
+pregunta miraba al máximo y el daño estaba en la forma de la distribución.
+</Callout>
+
+Y hubo un segundo error que arreglar antes de poder leer nada: las cinco recompensas rotas estaban
+escritas cada una por su cuenta, y cuatro se habían dejado el término de repetición por el camino
+sin querer. Resultado: todas reportaban la **misma** inversión y ninguna era atribuible a su propio
+fallo. Reescritas como «la sana con exactamente un término sustituido», cada inversión señala a lo
+suyo: la que no penaliza repetir invierte exactamente un par, y es el de la jugada que repite
+(D-117). Vale para una galería didáctica y vale para cualquier ablación: si dos condiciones
+difieren en dos cosas, no has medido ninguna de las dos.
+
+### La misma jugada a cuatro profundidades
+
+El último bloque de la galería es el que no se ve mirando ordenaciones. La misma jugada —`Kf6` en
+un rey y torre contra rey—, el mismo tablero, cuatro profundidades de búsqueda:
+
+| recompensa | prof. 4 | prof. 6 | prof. 10 | prof. 14 | rango |
+|---|---:|---:|---:|---:|---:|
+| (el motor dice) | 597 | 9 996 | 9 998 | 9 998 | — |
+| sana | 0,000 | 0,980 | 0,990 | 0,990 | **0,990** |
+| sin suelo | −47,015 | −0,020 | −0,010 | −0,010 | **47,005** |
+| legalidad como bonus | 2,000 | 2,980 | 2,990 | 2,990 | 0,990 |
+| mate por marcador | 0,000 | 3,479 | 3,489 | 3,489 | 3,489 |
+| sin penalizar repetir | 0,000 | 0,980 | 0,990 | 0,990 | 0,990 |
+| reescalada sola | 0,009 | 1,000 | 1,000 | **0,667** | 0,991 |
+
+La jugada no cambia. Lo que cambia es que a profundidad 6 el motor encuentra el mate. Y entonces:
+
+- **Ninguna es estable**, incluida la sana, que se mueve 0,990 — todo su intervalo legal.
+- **La que no tiene suelo se mueve 47,0**: cuarenta y siete veces ese intervalo.
+- Lo único que no se mueve es el **bono de mate plano**, porque le pregunta al tablero («¿esta
+  jugada es mate?») y no al motor.
+- Y hay una fila que se mueve **sin que el motor se mueva**: la reescalada sola pasa de 1,000 a
+  0,667 entre profundidad 10 y 14 con el mismo 9 998 delante. No cambió la jugada, ni la posición,
+  ni la evaluación: cambió el **grupo**, que es lo único que esa recompensa mira.
+
+<Callout kind="mundo-real" title="La regla que deja">
+Fija la profundidad, escríbela en el run, y no compares dos corridas con profundidades distintas.
+Es la misma conclusión que P4 sacó del reloj (D-107) llegando por otro lado: todo lo que el motor
+te dé depende de cuánto le dejaste pensar.
+</Callout>
+
+### GRPO: tres decisiones que se midieron antes de entrenar nada
+
+El bucle está en `src/rukh/train/grpo.py` y es corto, porque una completación aquí es **una sola
+jugada**: la política gradiente se reduce a `ventaja · log π(jugada | prompt)` en una posición, y
+una sola pasada hacia delante da la distribución entera. Por eso ocho candidatas cuestan **una**
+pasada y no ocho.
+
+Tres knobs se fijaron midiendo, no eligiendo.
+
+**La temperatura no es una palanca gratis.** El grupo tiene que tener dispersión o no enseña nada,
+y la temperatura es lo que la compra. Veinticinco pasos a tres temperaturas:
+
+| temperatura | grupos planos | recompensa media del grupo | análisis de motor | grupos útiles por análisis |
+|---|---:|---:|---:|---:|
+| 1,0 | 38 % | 0,865 | 667 | **0,184** |
+| 1,3 | 26 % | 0,831 | 795 | **0,186** |
+| 1,6 | 19 % | 0,781 | 932 | **0,174** |
+
+Subirla reduce los grupos planos a la mitad, y cuesta exactamente lo que da: la última columna
+—grupos útiles por análisis de motor, que es el precio real— **no se mueve**. Con el coste plano,
+el desempate es cuál se parece más a cómo se lee el modelo, y esa es 1,0.
+
+**La legalidad no se puede enseñar si no se propone nunca.** Por defecto el grupo se muestrea solo
+entre jugadas legales, así que la puerta de legalidad de la recompensa **nunca se dispara**: la
+proporción de ilegales sale 0,0000 exacta. No es un fallo —la demo enmascara las ilegales antes de
+que lleguen al tablero, así que la legalidad es una propiedad que la recompensa *garantiza* en vez
+de enseñar—, pero significa que en esa configuración GRPO no puede devolver el peaje que DPO se
+gastó. `restrict_to_legal: false` muestrea del vocabulario entero, así que una propuesta imposible
+puede caer en el grupo y sacar el suelo. Es la única configuración en la que la puerta enseña algo.
+
+**Y la tercera no era un knob: era un fallo.**
+
+<Callout kind="roto" title="La recompensa que se maximiza colapsando">
+`score_candidates` toma `cp_best` **dentro del grupo**. Es una decisión defendible y está
+defendida en el código: mantiene enseñable un grupo entero de jugadas malas, porque la ordenación
+interna sobrevive aunque las ocho sean flojas.
+
+El precio se ve al hacerse la única pregunta que hay que hacerle a una métrica: **¿qué política
+maximizaría exactamente este número?** Una que proponga la misma jugada ocho de ocho veces. Entonces
+«la mejor del grupo» es cada una de ellas, las ocho sacan calidad 1,0, y la recompensa media llega
+a su máximo.
+
+O sea: `reward_before → reward_after` **sube cuando el modelo colapsa**. Era el número que iba a
+publicarse como «la recompensa mejoró» y mide, en parte, lo contrario.
+
+No se arregla en el entrenamiento. Usar el mejor movimiento *disponible* haría que un grupo entero
+de jugadas malas se recortara a calidad cero, quedara plano y no aportara gradiente — justo los
+grupos donde más hay que aprender. Y como la ventaja de grupo es invariante a sumar una constante,
+para el gradiente las dos referencias son casi la misma cosa.
+
+Así que se separan. El entrenamiento sigue con la referencia del grupo; la **métrica** usa
+`best_available`, una llamada al motor **por posición** —no por candidata— que da la evaluación con
+mejor juego. Y se publica `flat_share`: la proporción de grupos de validación donde las ocho
+candidatas eran la misma jugada, que es el detector de colapso directo (D-123).
+
+La galería de `labs/m5` rompe cinco recompensas a propósito. La sexta estaba en casa.
+</Callout>
+
+Y no es una preocupación teórica. Tres corridas de 400 pasos desde el mismo checkpoint, con la
+misma semilla, cambiando solo la tasa de aprendizaje:
+
+| tasa de aprendizaje | recompensa (grupo) | KL contra el inicio | grupos planos |
+|---|---:|---:|---:|
+| 1e-6 | +0,0020 | 0,0005 | 1 276 / 3 200 · **40 %** |
+| 5e-6 | +0,0206 | 0,0309 | 1 483 / 3 200 · **46 %** |
+| 2e-5 | +0,0268 | 0,1076 | 1 696 / 3 200 · **53 %** |
+
+La recompensa sube, y **la proporción de grupos planos sube con ella**, monótona en las tres. Es
+el mismo hackeo de la galería, ocurriendo de verdad, con curva dosis-respuesta. Y la recompensa era
+la sana y el bucle era el correcto: lo único que hizo falta fue preguntarse qué política maximizaría
+el número (D-124).
+
+<Callout kind="mundo-real" title="La regla que deja">
+Antes de publicar una métrica, describe la política que la maximizaría. Si esa política no es la
+que quieres, la métrica no es la que quieres. Y cuando una métrica sube, busca la variable que la
+política podría estar moviendo en su lugar y ponla en la misma tabla: aquí era la entropía de la
+propia política, y cabía en una columna.
+</Callout>
+
+### GRPO: sí mejora, y la mejora tiene forma de U invertida
+
+Con las dos recompensas separadas, la pregunta se puede contestar. Tres corridas de 400 pasos desde
+el mismo checkpoint, con la misma semilla, y solo la tasa de aprendizaje cambiando, medidas sobre
+300 posiciones que no se entrenaron:
+
+| lr | recompensa (referencia del grupo) | recompensa (referencia del motor) | grupos planos en validación |
+|---|---:|---:|---:|
+| 1e-6 | **−0,0032** | **+0,0088** | 0,387 → **0,370** |
+| 5e-6 | +0,0154 | **+0,0267** | 0,387 → 0,453 |
+| 2e-5 | +0,0155 | **+0,0078** | 0,387 → **0,490** |
+
+<OverOptimised />
+
+Tres cosas que leer, y las tres importan.
+
+**GRPO funciona.** La recompensa medida contra el mejor movimiento *disponible* —la que no se puede
+subir haciendo la política más determinista— sube en las tres tasas. Las jugadas mejoran de verdad,
+no solo respecto a sí mismas.
+
+**Las dos recompensas discrepan en el signo** a 1e-6: la del grupo **baja** y la del motor **sube**.
+Es exactamente lo que el fallo de arriba predecía, y es la prueba de que separarlas no era
+pedantería: con la métrica original, esa corrida se habría archivado como fracasada, y es la mejor
+de las tres.
+
+**Y la ganancia es no monótona.** Sube hasta 5e-6 y vuelve a caer a 2e-5, mientras el indicador de
+colapso sube **monótono en las tres**. Esa es la U invertida de la sobreoptimización, con el
+mecanismo a la vista en la columna de al lado: la política compra recompensa con determinismo, y
+pasado un punto la compra deja de salir a cuenta.
+
+La corrida de 1e-6 es además la única donde los grupos planos **bajan** respecto al punto de
+partida —de 0,387 a 0,370—: la única en la que la política se hace *más* diversa mientras mejora.
+
+Y entonces se alargaron las corridas a 1 500 pasos, y esa última frase dejó de ser verdad:
+
+| lr | recompensa (motor) | grupos planos | KL |
+|---|---:|---:|---:|
+| 1e-6 | **+0,0279** | 0,385 → 0,472 | 0,122 |
+| 5e-6 | **+0,0467** | 0,385 → 0,560 | 0,555 |
+
+Las dos mejoran, y bastante más que a 400 pasos. Pero **el colapso sube en las dos**: a 1 500 pasos
+ni siquiera la tasa pequeña mantiene la diversidad. Lo que a 400 pasos parecía «una tasa que mejora
+sin peaje» era en realidad «una tasa que aún no había llegado al peaje».
+
+Así que no hay una corrida limpia y otra sucia: hay una curva, y el punto donde se para es una
+decisión. Y la decisión se toma con el instrumento del principio del módulo, no con la recompensa.
+
+<Callout kind="roto" title="Y la primera vez se tomó mal">
+Con **una** dirección de cada corrida, la tabla decía +44 contra +54, y la conclusión escrita fue
+«diez puntos dentro del ruido, se publica la barata». Al completar la segunda dirección —que este
+mismo módulo declara obligatoria tres secciones más arriba— la corrida rápida pasó de +54 a **+68**,
+porque en el otro sentido dio +82.
+
+Veinticuatro puntos, no diez. La regla que uno escribe y la regla que uno aplica son dos cosas
+distintas, y esta se saltó a los veinte minutos de escribirla.
+</Callout>
+
+| corrida | Elo sobre la base (800 partidas) | ilegales propios | grupos planos | KL |
+|---|---|---|---|---|
+| lr 1e-6 | **+44** (IC 23 a 66) | 1,92 % · **1,66×** la base | 0,472 | 0,122 |
+| lr 5e-6 | **+68** (IC 46 a 90) | 3,12 % · **2,08×** la base | 0,560 | 0,555 |
+
+Y aun con la tabla completa, **esta tabla no decide**. Elegir entre las dos restando lo que cada una
+hizo contra un tercero es exactamente el error que el módulo lleva describiendo desde la primera
+sección. Se enfrentaron entre sí:
+
+```
+medium-v4-grpo-fast vs medium-v4-grpo   400 partidas   +7 Elo   incluye el cero
+medium-v4-grpo vs medium-v4-grpo-fast   400 partidas   +9 Elo   incluye el cero
+                                 agrupado, 800 partidas
+                                 score 0,49875   elo -0,87   IC -22,2 a +20,4
+```
+
+Las dos direcciones dan el mismo veredicto, y las dos lo dan a favor de quien va como A: la firma
+del ruido simétrico. Agrupadas, **empate**, con el intervalo centrado en cero.
+
+Y con esta arista, el proyecto tiene **dos** triángulos completos, que no dicen lo mismo:
+
+| triángulo | residuo | veredicto |
+|---|---:|---|
+| base / DPO-off / DPO-on | **−45 Elo** | 2,6 σ · **no cierra** |
+| base / GRPO / GRPO-rápido | +25 Elo | 1,3 σ · consistente |
+
+Los dos residuos son grandes y solo uno está establecido. Lo honesto es decirlo así —«medido en un
+triángulo, sugerido en el otro»— y no convertirlo en una ley general sobre el Elo con una muestra de
+dos.
+
+**Los veinticuatro puntos no están ahí.** Restando contra la base parecían una diferencia; medida de
+frente, no hay ninguna. Es la tesis de este módulo por tercera vez dentro del propio módulo, y la
+tercera es la que decidió.
+
+Se publica la de **1e-6**: mismo Elo que la rápida —indistinguibles— y estrictamente menos de todo lo
+demás, menos colapso (0,472 contra 0,560), menos KL (0,122 contra 0,555) y menos propuestas ilegales
+(1,66× la base contra 2,08×). Cuando dos modelos empatan en lo que se busca, gana el que cuesta menos
+en lo que no (D-126).
+
+<Callout kind="mundo-real" title="La regla que deja">
+La conclusión correcta a partir de datos insuficientes sigue siendo suerte. La primera lectura de
+esta sección acertó qué modelo se publica y se equivocó en el número, en el instrumento y en el
+razonamiento: tres cuartas partes de una decisión pueden estar mal y el resultado salir bien, y eso
+no la convierte en una buena decisión.
+</Callout>
+
+<Callout kind="mundo-real" title="La regla que deja">
+Una curva con tres puntos vale más que un punto con tres decimales. La forma —sube, se dobla, baja—
+es lo que distingue «mejora» de «sobreoptimización», y con un solo ajuste no se ve ninguna de las
+dos.
+</Callout>
+
+Un arreglo de medición apareció por el camino y merece el mismo trato que los demás: `kl_after`
+reportaba la KL del **último grupo**, no un nivel. Dos corridas con la misma tasa dieron 0,00048 y
+0,126 sin que nada relevante cambiara entre ellas. Ahora promedia sobre la última décima parte de
+los pasos, porque una sola muestra no es un nivel.
+
+## Los criterios, uno por uno
+
+Al terminar esta sección sabrás qué pedía el hito, qué se cumplió, qué no, y en qué sentido exacto
+de la palabra «cumplir».
+
+`GOAL.md` escribió los criterios de este módulo **antes** de medir nada, que es cuando hay que
+escribirlos y también la razón de que a veces no encajen con lo que se descubre. La norma del
+proyecto desde M4 es que el valor está en que el módulo enseñe algo cierto, no en aprobar el
+criterio; así que aquí van los tres, con las dos lecturas donde hay dos.
+
+### Criterio 1 · «DPO o GRPO ≥ +50 Elo con intervalo sobre su base»
+
+**Cumplido en la estimación puntual, no en el extremo del intervalo.**
+
+| comparación | partidas | Elo | IC 95 % | ¿separado del cero? |
+|---|---:|---:|---|---|
+| DPO off-policy − base | **1 600** | **+65,25** | **49,74** a 80,76 | sí |
+| DPO on-policy − base | 800 | +57 | 36 a 79 | sí |
+| GRPO − base | 800 | +44 | 23 a 66 | sí |
+
+Los **tres** métodos dan un intervalo separado del cero, así que hay una mejora medida y no una
+sospecha. Pero el criterio, leído estrictamente —«al menos +50» con el intervalo respaldándolo—
+pide que el **extremo inferior** pase de 50.
+
+El brazo off-policy se llevó 800 partidas más, con otra semilla de libro y en las dos direcciones,
+precisamente para cruzarlo. El extremo inferior quedó en **49,74**.
+
+<Callout kind="roto" title="Se queda a 0,26 Elo, y ahí se para">
+La cuenta dice que harían falta unas **56 partidas más**. Media hora de nada.
+
+Y no se juegan. Jugar hasta que el número cruce el umbral es ajustar el experimento al criterio, que
+es lo que este módulo lleva ocho secciones desaconsejando. El presupuesto se fijó en 1 600 partidas
+antes de jugarlas, y el resultado es el que hay (D-127).
+
+Un criterio que se cumple añadiendo partidas hasta que se cumple no era un criterio.
+</Callout>
+
+Es la primera vez en el proyecto que este criterio se mide separado del cero. M4 lo dejó incumplido
+con cuatro mediciones explicando por qué (D-108); lo que cambió no fue el modelo, fue el
+instrumento.
+
+### Criterio 2 · «Reward model ≥ 75 % en pares no vistos»
+
+**Rozado, no cruzado de forma estable.**
+
+Cinco corridas: 72,91 %, **74,21 %**, 74,71 %, 74,76 %, **75,19 %**. Una lo cruza. Pero las dos
+primeras son **la misma semilla**, así que 1,3 de esos dos puntos y medio de dispersión no son la
+partición: son lo que esta medición repite (D-113). Con ese suelo, el 75,19 % y el 74,21 % no se
+distinguen, y el criterio está por debajo del ruido del instrumento que lo mide.
+
+Sobre los pares que una evaluación estática **puede** decidir, el acierto es **77,30 %**. Es una
+cifra honesta y es otra pregunta: quita un tercio de los datos, justo el tercio difícil.
+
+Lo que este criterio enseñó no fue si se cruza el 75 %, sino tres cosas que no estaban previstas:
+que el encoder preentrenado de M3 **resta** 6,5 puntos, que la capacidad es lo que manda, y que la
+correlación publicada **cambia de signo** al quitar la banda de mate (D-119).
+
+### Criterio 3 · «`rukh-rm`, `-dpo` y `-grpo` en el Hub con card»
+
+Cumplido, con una desviación de nombre registrada: `GOAL.md` escribió `rukh-small-dpo` y
+`-small-grpo`, y se publican sobre `medium-v4` por lo mismo que en M4 (D-105) — `small` es el modelo
+de M2 y ya no es la base de nada que la demo sirva. Anotado en D-122.
+
+## Labs
+
+Siete laboratorios, en el orden en que se hicieron. Los tres primeros no entrenan nada: el hito
+empezó cambiando de instrumento y comprobándolo, que es lo que permitió creerse el resto.
+
+### Lab 1 · ¿Cuántas partidas cuesta la pregunta?
+
+Antes de jugar nada, el precio. Dos maneras de contestar «¿este modelo es 50 Elo mejor?», y la
+cuenta que dice cuál cuesta ocho veces menos.
+
+```bash
+uv run python labs/m5/games_needed_match.py
+```
+
+<Exercise>
+Cambia la diferencia buscada de 50 a 20 Elo y vuelve a correrlo. ¿Cuántas partidas pide el
+enfrentamiento directo? ¿Y la resta de dos escaleras? ¿Es el mismo factor 8,1 o cambia con la
+diferencia?
+</Exercise>
+
+<Solution>
+El factor se mantiene cerca de 8 porque las dos fórmulas escalan igual, con el cuadrado de la
+diferencia: al bajar de 50 a 20 Elo las dos multiplican sus partidas por unas 6,3 veces
+—`(50/20)² = 6,25`— y la razón entre ellas apenas se mueve. Lo que sí cambia, y mucho, es el valor
+absoluto: 20 Elo son unas 1 900 partidas en un enfrentamiento, casi cinco veces las 400 que el
+hito jugó. Por eso la tabla al revés es la útil: con el presupuesto que tienes, ¿cuál es la
+diferencia más pequeña que podrías ver?
+</Solution>
+
+### Lab 2 · El control que tiene que dar 0,5000
+
+El instrumento se estrena midiendo algo cuya respuesta ya se sabe.
+
+```bash
+uv run rukh eval match --a checkpoints/medium-v4-*/best.pt --b checkpoints/medium-v4-*/best.pt --games 100
+```
+
+<Exercise>
+Corre el control. Luego corre el mismo comando con `--games 101`. ¿Qué pasa, y por qué está puesto
+así a propósito?
+</Exercise>
+
+<Solution>
+Falla con un `ValueError`: «a mirrored match needs an even number of games». Cada apertura se juega
+dos veces con los colores cambiados, así que un número impar significa que alguien jugó una partida
+de más con un color. Podría redondearse hacia abajo en silencio y nadie se enteraría — y esa es
+exactamente la razón de no hacerlo. Un reparto de colores torcido es un sesgo que no aparece en
+ninguna métrica, así que el sitio donde tiene que doler es al escribir el comando.
+</Solution>
+
+### Lab 3 · Agrupar las dos direcciones de un enfrentamiento
+
+```bash
+uv run rukh eval match --a <A> --b <B> --games 400 --seed 7
+uv run rukh eval match --a <B> --b <A> --games 400 --seed 7
+uv run python labs/m5/pooled_match.py
+```
+
+<Exercise>
+Corre las dos direcciones de un par cualquiera y luego el agrupador. ¿Cuánto se estrecha el
+intervalo al pasar de 400 a 800 partidas? ¿Y por qué no se estrecha a la mitad?
+</Exercise>
+
+<Solution>
+Se estrecha por `√2`, no por dos: el error típico de una media va con la raíz del número de
+muestras. Doblar las partidas divide el intervalo por 1,41. Para dividirlo por dos hacen falta
+**cuatro** veces las partidas, y por eso la tabla del lab 1 se lee al revés antes de pagar nada.
+
+Lo que sí puede pasar al agrupar es que el veredicto cambie, y no siempre a mejor: en M5, `on`
+contra `off` daba «separado» en una dirección e «incluye el cero» en la otra, y agrupado vuelve a
+«separado» con la mitad de incertidumbre. El agrupado es el número honesto de las dos corridas, no
+el mejor de los dos.
+</Solution>
+
+### Lab 4 · Mirar cuánto se mueve la recompensa con la profundidad
+
+La comprobación que no se ve mirando ordenaciones.
+
+```bash
+uv run python labs/m5/reward_hacking.py --depth 10
+```
+
+<Exercise>
+Fíjate en la fila «reescalada sola» del último bloque. Entre profundidad 10 y 14 el motor da el
+mismo 9 998 y la recompensa pasa de 1,000 a 0,667. Si el motor dijo lo mismo, ¿qué cambió?
+</Exercise>
+
+<Solution>
+El grupo. Esa recompensa normaliza por la dispersión de las candidatas que tiene delante, y a
+profundidad 14 el motor encuentra el mate en otra candidata más: el mínimo del grupo sube, la
+dispersión se encoge, y la misma jugada con la misma evaluación vale otra cosa. Es la única
+recompensa de la galería cuyo valor depende de con quién la compares, y por eso dos corridas suyas
+no se pueden comparar ni entre sí.
+</Solution>
+
+### Lab 5 · Construir pares con las jugadas del propio modelo
+
+```bash
+uv run rukh data onpolicy --config configs/data/onpolicy.yaml --max-positions 500
+```
+
+<Exercise>
+Mira el `manifest.json` que escribe. ¿Qué fracción de posiciones no produjo par, y por qué dos
+razones distintas? Luego baja `temperature` a 0,3 —la temperatura a la que se leen todos los
+números publicados del proyecto— y vuelve a correrlo. ¿Qué pasa con `skipped_all_same`?
+</Exercise>
+
+<Solution>
+Sobre las 13 838 posiciones completas, el 27,1 % no dio par porque el modelo propuso una sola
+jugada distinta, y el 26,8 % porque las dos extremas estaban a menos de 100 cp. Son dos fallos
+distintos: el primero es falta de diversidad, el segundo es falta de desacuerdo.
+
+Con `temperature: 0.3` el primero se dispara: a esa temperatura el modelo propone su moda cuatro
+veces de cada cuatro en la gran mayoría de las posiciones, y no hay nada que comparar. Es la misma
+lección con la que terminó M4 desde el otro lado: el muestreo casi determinista es lo que hace que
+los números publicados sean estables, y es exactamente lo que impide construir un par.
+</Solution>
+
+### Lab 6 · DPO con dos fuentes de pares, y la trampa de no igualarlas
+
+```bash
+uv run rukh train dpo --config configs/train/dpo-onpolicy.yaml
+uv run rukh train dpo --config configs/train/dpo-offpolicy.yaml
+```
+
+<Exercise>
+Antes de correr nada: el conjunto off-policy tiene 13 838 pares y el on-policy 6 386. Si entrenas
+los dos tal cual y el off-policy sale mejor, ¿qué has medido?
+</Exercise>
+
+<Solution>
+La cantidad de datos, no la fuente. Por eso `configs/train/dpo-offpolicy.yaml` apunta a
+`data/pairs-offpolicy-matched/`, que es el conjunto original submuestreado a 6 386 con semilla
+fija. Es la misma disciplina que la galería del lab 3 necesitó para que sus inversiones fueran
+atribuibles: si dos condiciones difieren en dos cosas, no has medido ninguna de las dos.
+
+Hay una segunda diferencia que **no** se puede igualar y hay que decir: los pares off-policy tienen
+un 29 % de mates y los on-policy un 2,9 %. Eso no es un defecto de la construcción, es lo que
+significa «on-policy» — el modelo casi nunca propone a la vez un mate y una pifia —, y hay que
+declararlo en vez de esconderlo.
+</Solution>
+
+### Lab 7 · Ventajas de grupo a mano
+
+Sin GPU y sin motor, para ver el paso que todo el mundo reconstruye mal.
+
+```python
+import torch
+from rukh.train.grpo import group_advantages, grpo_loss
+
+# Un grupo con dispersión y uno sin ella.
+print(group_advantages([0.98, 0.74, 1.21, 0.31, 0.62, 0.05, 0.88, 0.45]))
+print(group_advantages([0.74] * 8))
+
+# La KL, en las dos direcciones.
+policy = torch.log_softmax(torch.randn(4, 8), dim=-1)
+reference = torch.log_softmax(torch.randn(4, 8), dim=-1)
+_, kl = grpo_loss(policy, reference, torch.tensor([0, 1, 2, 3]), torch.zeros(4), beta_kl=1.0)
+print(float(kl))
+```
+
+<Exercise>
+Multiplica por diez todas las recompensas del primer grupo. ¿Cambian las ventajas? ¿Y si les sumas
+diez a todas?
+</Exercise>
+
+<Solution>
+No cambian en ninguno de los dos casos, y por razones distintas. Sumar una constante no cambia nada
+porque la media se mueve con ella: es la misma invariancia que tiene Bradley-Terry, vista en otro
+sitio. Multiplicar por diez no cambia nada porque la desviación se multiplica por diez también. La
+ventaja de grupo es invariante a traslaciones **y** a escala, lo cual es justo lo que la hace
+utilizable sin calibrar la recompensa — y justo lo que hace que un grupo de ocho pifias y un grupo
+de ocho jugadas excelentes produzcan ventajas del mismo tamaño.
+</Solution>
+
+### Lab 8 · Romper la recompensa a propósito
+
+```bash
+uv run python labs/m5/reward_hacking.py --depth 12
+```
+
+<Exercise>
+Añade una sexta recompensa rota a `REWARDS`: la sana, pero con `WEIGHTS.mate` subido de 0,25 a
+2,0. ¿Invierte algún par? ¿Qué le pasa a la columna «cabeza» en la posición «hay mate»?
+</Exercise>
+
+<Solution>
+No invierte nada —el mate ya era la mejor jugada por evaluación, así que pagarlo más no cambia el
+orden— y la cabeza se dispara, porque toda la masa de ventaja del grupo se va a la candidata que
+mata y las demás se aplastan. Es el mismo daño que hace «sin suelo» por el otro extremo: una
+recompensa puede romper un grupo tirando de arriba o empujando desde abajo, y en las dos el
+síntoma es el mismo — deja de haber señal para ordenar lo que queda en medio.
+</Solution>
+
+## Lo que te llevas
+
+Tres cosas, y las tres son sobre cómo medir, no sobre alineamiento. Eso no es un accidente del
+módulo: es lo que pasa cuando el instrumento y el experimento se construyen a la vez.
+
+**Para medir una diferencia, mide la diferencia.** Cada absoluto trae su ruido entero a la resta, y
+la resta acaba más ancha que las medidas que entraron. En este módulo la regla falló tres veces por
+tres caminos distintos —restando dos escaleras, restando dos enfrentamientos contra la base en un
+triángulo que no cierra, y eligiendo entre dos GRPO por lo que cada uno hizo contra un tercero— y
+las tres veces el enfrentamiento directo dio otra respuesta. Dos de las tres las cometí yo **después**
+de escribir la regla.
+
+**Antes de explicar una diferencia pequeña, mide cuánto se mueve tu montaje cuando no cambias nada.**
+La escalera repite 1498 y 1558. El reward model repite 72,91 % y 74,21 % con la misma semilla y la
+misma partición. Un veredicto de «separado del cero» se dio la vuelta al intercambiar los lados
+mientras la estimación apenas se movía. Ninguna de las tres se descubre mirando el modelo.
+
+**Y antes de publicar una métrica, describe la política que la maximizaría.** Si esa política no es
+la que quieres, la métrica no es la que quieres. Esa pregunta encontró en nuestro propio bucle un
+fallo que ninguna de las cinco recompensas rotas a propósito habría enseñado: la recompensa que GRPO
+optimiza se maximiza **dejando de ser diverso**, y la curva de tres puntos que lo demuestra tiene el
+mecanismo en la columna de al lado.
+
+El modelo, mientras tanto, mejoró: los tres métodos baten a su base con el intervalo separado del
+cero, que es la primera vez en el proyecto. Lo que cambió no fue el modelo, fue cómo se mira.
+
+Lo siguiente es M6, el cierre de la primera fase: la tabla única con todas las etapas, las model
+cards desde MLflow, y la demo final. Después empieza la fase agéntica, donde el modelo deja de ser
+lo único que hay y pasa a ser una herramienta que algo más usa.
+
+La cheatsheet del módulo, con su pregunta y su respuesta corta, está justo debajo.
