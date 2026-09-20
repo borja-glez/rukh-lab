@@ -92,6 +92,26 @@ test.describe('lesson layout', () => {
     expect(box!.y).toBeLessThan(200);
   });
 
+  test('the section rail travels with the article instead of sitting at the top', async ({
+    page,
+  }) => {
+    // The same containing-block trap as the guide, one column over: `.rail` is sticky, but its
+    // grid item was only as tall as the ticks, so it scrolled off after one screen.
+    await page.goto(LESSON);
+    const rail = page.locator('.rail');
+    await expect(rail).toBeVisible();
+    const before = (await rail.boundingBox())!;
+
+    await page.evaluate(() => window.scrollBy(0, 2000));
+    await page.waitForTimeout(200);
+
+    const after = (await rail.boundingBox())!;
+    // Still near the top of the viewport, not carried 2000 px above the fold.
+    expect(after.y).toBeGreaterThan(0);
+    expect(after.y).toBeLessThan(200);
+    expect(after.y).toBeGreaterThan(before.y - 400);
+  });
+
   test('a wide screen buys width without stretching the line length', async ({ page }) => {
     // A 4K monitor left two thirds of the page empty. The fix widens the canvas, but the
     // reading measure only grows a little: long lines are harder to read, not easier.
