@@ -48,13 +48,16 @@ import MaskCompare from '../../../components/figures/MaskCompare.astro';
 
 <RepoTag tag="p2" at="inicio" module="M2" next="m3" />
 
+Parte 1 de 3 del módulo «El encoder». Sigue en «El encoder: medir sin engañarse» y termina en «El encoder: los labs».
+
 ## Qué vas a construir
 
 Al terminar esta sección sabrás qué objeto vas a escribir, cuánto ocupa, en qué se parece y en qué
 se diferencia del modelo de M2, y qué se ve en pantalla cuando funciona.
 
 Vas a construir un <Term id="encoder">encoder</Term> bidireccional de **15 052 800 parámetros**
-—quince millones, poco más de un tercio del decoder de M2— que no juega. Mira una posición y dice
+—quince millones, poco más de un tercio del `small` de M2, que tiene treinta y nueve— que no juega.
+Mira una posición y dice
 tres cosas: cuánto vale, si la jugada que llevó hasta ella fue un error, y cómo acabó la partida de
 la que salió. Es el mismo bloque que escribiste en el módulo anterior, con la misma atención, el
 mismo MLP y la misma normalización previa; lo único que cambia es la máscara, y ese cambio de una
@@ -91,6 +94,13 @@ Al terminar tendrás:
   otro worker.
 - Y en la parte de labs, una visualización de una partida entera con las dos curvas de evaluación,
   la del encoder y la de Stockfish, para ver de un vistazo dónde acierta y dónde se inventa cosas.
+
+Una aclaración antes de la tarjeta de abajo, porque sus cifras no cuadran con las de arriba y no es
+un error: lo que hoy vive en `chorcat/rukh-encoder` es el **hermano mayor**, de 39 millones de
+parámetros —12 capas y 512 dimensiones, el tamaño del `small`—, que se entrenó con la misma receta
+después de cerrar el módulo y que la parte 3 cuenta al final. Los labs se hacen con el de 15
+millones, que se entrena en quince minutos, y la comparación entre los dos es parte de lo que se
+aprende.
 
 <ModelBadge repo="chorcat/rukh-encoder" />
 
@@ -141,6 +151,12 @@ Mira la mitad vacía de la izquierda. Ahí está la razón de que un decoder no 
 juzga la posición 20 no puede leer la 21, y a menudo la 21 es la que lo explica todo.
 No hay un "modelo encoder" y un
 "modelo decoder" en el sentido de dos arquitecturas distintas: hay un Transformer y una máscara.
+
+Fuera del ajedrez, la diferencia es la que hay entre un mecanógrafo al dictado y un corrector con
+la página delante. El mecanógrafo escribe cada palabra sabiendo solo lo que ya se ha dicho, y por
+eso puede escribir mientras le hablan; el corrector tiene la página entera y por eso puede decir si
+una palabra está mal, porque lee la frase que la sigue. El primero produce; el segundo juzga. Pedirle
+al mecanógrafo que corrija es pedirle que juzgue una palabra sin leer la siguiente.
 
 Vale la pena detenerse aquí porque es el punto donde mucha gente se confunde al leer sobre BERT y
 GPT como si fueran mundos separados. Lo que los separa es **la tarea**, y la máscara es la
@@ -231,7 +247,22 @@ el token `<mask>`, el 10 % se sustituye por otra jugada cualquiera del vocabular
 restante se deja exactamente como estaba. La pérdida es entropía cruzada sobre esas posiciones
 elegidas, y solo sobre esas.
 
-Cada número tiene una razón, y las tres ramas del 80/10/10 responden a problemas distintos.
+Cada número tiene una razón, y las tres ramas del 80/10/10 responden a problemas distintos. La
+imagen que lo resume es un examen de corrección de textos con erratas deliberadas: en el texto hay
+huecos que rellenar, hay palabras cambiadas a propósito sin marcar, y hay palabras correctas que
+también hay que dar por buenas. Si solo hubiera huecos, bastaría con leer los huecos; con las
+erratas sin marcar, hay que leerlo **todo**.
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Rama                                    | Qué se hace con la posición elegida                                | Qué evita                                                                                                                                                                                                        |
+| --------------------------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 80 % `<mask>`                           | Se sustituye la jugada por el símbolo `<mask>`.                    | Es la tarea en sí: reconstruir mirando a los dos lados del hueco.                                                                                                                                                |
+| 10 % aleatoria                          | Se sustituye por otra jugada cualquiera del vocabulario.           | Que la política óptima sea «copia lo que ves salvo donde ponga `<mask>`». Con ruido, cualquier token puede ser mentira y cada posición necesita su propia opinión; en ajedrez, la jugada falsa suele ser ilegal. |
+| 10 % intacta                            | Se deja tal cual, pero se puntúa igual.                            | Que un token que no es `<mask>` ni está corrupto no necesite representación propia. Es la rama que convierte «rellena huecos» en «representa la partida entera».                                                 |
+| Nunca: `<bos>`, Elo, resultado, `<eos>` | No se eligen jamás, y el ruido se sortea por encima de sus 62 ids. | Regalarle una tarea trivial —predecir el resultado con el mate a la vista— que no enseña ajedrez y contamina la pérdida, o inventar un Elo falso.                                                                |
+
+</div>
 
 **Por qué 15 %.** Es un equilibrio entre dos fuerzas opuestas. Si tapas poco, casi todas las pasadas
 se gastan en procesar contexto que no puntúa nadie y el entrenamiento se vuelve carísimo por señal
@@ -244,38 +275,20 @@ experimento honesto para quien quiera hacerlo con esta base.
 **Por qué no todo `<mask>`.** Si el 100 % de las posiciones elegidas se sustituyera por `<mask>`,
 el modelo solo vería ese símbolo durante el preentrenamiento y nunca durante el afinado, donde las
 secuencias vienen completas. Aprendería una representación que funciona cuando falta algo y se
-degrada cuando no falta nada: el clásico desajuste entre preentrenamiento y uso. Ese es el problema
-que las otras dos ramas resuelven.
-
-**Qué hace el 10 % aleatorio.** Sustituir una jugada por otra distinta, sin avisar, obliga al modelo
-a desconfiar de lo que lee. Si solo hubiera `<mask>` y tokens intactos, la política óptima sería
-"copia lo que ves salvo donde ponga `<mask>`": el modelo solo construiría una representación real de
-las posiciones marcadas. Con ruido, cualquier token puede ser mentira, así que a cada posición le
-conviene tener su propia opinión sobre qué debería haber ahí. En ajedrez esto es especialmente
-sabroso: una jugada aleatoria en medio de una partida suele ser ilegal, y detectar eso exige
-mantener el tablero en la cabeza.
-
-**Qué hace el 10 % intacto.** Es la rama que la gente olvida. Sin ella, el modelo podría aprender que
-un token que no es `<mask>` y no está corrupto no necesita representación propia. Dejando un 10 % de
-posiciones elegidas exactamente como estaban —pero puntuándolas igual— se le pide que prediga lo que
-ya tiene delante, lo que fuerza a que la representación de **toda** posición contenga qué jugada es.
-Es la rama que convierte el objetivo en "representa la partida entera" en lugar de "rellena huecos".
-
-**Qué nunca se tapa.** Los tokens de control: `<bos>`, los dos tokens de <Term id="elo">Elo</Term>,
-el de resultado y `<eos>`. Son la condición de la partida, no su contenido. Pedirle a un modelo
-bidireccional que prediga el resultado teniendo delante la partida completa es regalarle una tarea
-trivial —el mate está a la vista— que no enseña nada de ajedrez y contamina la pérdida. En el código
-son los 62 primeros ids del vocabulario, que por construcción forman un prefijo: por eso el ruido
-aleatorio se sortea _por encima_ de ese bloque y nunca inventa un Elo o un resultado falso.
+degrada cuando no falta nada: el clásico desajuste entre preentrenamiento y uso. Las dos ramas del
+10 % existen para eso, y la intacta es la que la gente olvida: sin ella, la representación de una
+jugada normal, sin tapar, no tendría por qué contener qué jugada es.
 
 **Y por qué `ignore_index` es −100 y no 0.** En M2, las posiciones que no había que puntuar eran el
 relleno, y el relleno es el token 0; poner `ignore_index=0` funcionaba porque "predecir el id 0" y
 "no predecir nada" querían decir lo mismo. Aquí no. El id 0 es `<pad>` en los dos esquemas, pero el
 esquema de casillas es un vocabulario pequeño y cerrado en el que un 0 puede aparecer como etiqueta
 legítima, así que confundir las dos cosas sería un error silencioso: unas etiquetas dejarían de
-puntuar sin que nadie se entere y la pérdida bajaría por el motivo equivocado. La solución es un
-valor que no es un id de nada, `-100`, que es además la convención de PyTorch y de Hugging Face. En
-`rukh.models.encoder` está como `MMM_IGNORE_INDEX`, con el porqué escrito al lado.
+puntuar sin que nadie se entere y la pérdida bajaría por el motivo equivocado. Es la diferencia
+entre un `0` y un `N/A` en una hoja de cálculo: el cero es un valor y entra en la media; el `N/A`
+se salta. Apuntar «no hay dato» como cero baja la media sin que nadie se dé cuenta. La solución es
+un valor que no es un id de nada, `-100`, que es además la convención de PyTorch y de Hugging Face.
+En `rukh.models.encoder` está como `MMM_IGNORE_INDEX`, con el porqué escrito al lado.
 
 <Callout kind="roto" title="El fallo que no da error">
   Un `ignore_index` mal elegido no lanza ninguna excepción. Simplemente deja de puntuar un puñado de
@@ -309,7 +322,9 @@ completan con `<pad>` hasta la longitud de la más larga. Si promedias los `T` v
 estás metiendo en el resumen los vectores de posiciones que no existen, y —esto es lo que duele— en
 una cantidad que depende de **con quién le haya tocado viajar a esa secuencia en el lote**. La misma
 partida da una representación distinta según el lote. Eso no es ruido: es una dependencia de algo
-que no debería existir, y envenena tanto el entrenamiento como la evaluación.
+que no debería existir, y envenena tanto el entrenamiento como la evaluación. Es la nota media de
+una clase calculada por pupitres en vez de por alumnos: los pupitres vacíos cuentan como un cero, y
+la media de los mismos veinte alumnos cambia según el aula que les toque.
 
 En el código, `pool` lee la máscara del propio `idx` cuando no se la pasan:
 
@@ -343,7 +358,10 @@ Si una capa lineal sobre el vector agrupado basta para decir cuánto vale una po
 información **ya estaba** en el vector, porque una capa lineal no tiene capacidad para inventarla. Si
 pusiéramos dos capas ocultas y una no linealidad, la cabeza podría aprender la tarea por su cuenta y
 el resultado no diría absolutamente nada sobre el encoder. La regla es general y vale para cualquier
-proyecto: **cuando quieras medir una representación, usa la sonda más tonta que funcione.**
+proyecto: **cuando quieras medir una representación, usa la sonda más tonta que funcione.** Piensa
+en un mozo de almacén sin permiso para mover cajas: si encuentra lo que le piden solo leyendo las
+etiquetas, es que el almacén estaba bien ordenado. Si le dejas reordenar el almacén antes de buscar,
+que lo encuentre ya no dice nada del orden que había.
 
 La **cabeza de valor** es una regresión con `tanh`, contra la etiqueta `tanh(cp / 400)`. Dos
 decisiones ahí. La primera, por qué acotar: los centipeones no están acotados y un mate vale ±10 000
@@ -395,7 +413,8 @@ aprender a compensar y que el encoder no puede absorber, porque no está aprendi
 **`last-n`.** Se descongelan las últimas `n` capas (dos por defecto) y la normalización final.
 Pregunta: _¿cuánto se gana dejando que las capas altas se especialicen?_ Es el punto intermedio
 habitual en producción: las capas bajas conservan lo general, las altas se adaptan a la tarea, y el
-coste de cómputo y de memoria es una fracción del afinado completo.
+coste de cómputo y de memoria es una fracción del afinado completo. Es reformar la cocina sin tocar
+los cimientos: cambias la parte que usas de otra manera y dejas quieta la que sostiene el edificio.
 
 **`full`.** Se mueve todo. Pregunta: _¿qué es lo mejor que esta arquitectura puede hacer con estas
 etiquetas?_ Se suele dar por hecho que da los mejores números, y es el que más etiquetas necesita,
@@ -429,6 +448,13 @@ te queda es etiquetar más, y ninguna idea arquitectónica va a competir con eso
 leas el resto de la sección sabiendo adónde va: en este módulo se aplana en el 25 %, y el lab 3 trae
 las cuatro filas.
 
+Es la misma curva que la de una encuesta electoral. Con mil encuestados el margen de error ronda los
+tres puntos; con cuatro mil baja a punto y medio; con dieciséis mil, a menos de uno. Cada vez que
+cuadruplicas el gasto, la precisión solo mejora a la mitad, y a partir de un tamaño la encuesta
+está limitada por otra cosa —quién contesta, cómo se pregunta— que ningún encuestado más arregla.
+Saber en qué punto de esa curva estás es la diferencia entre gastar en etiquetas y gastar en
+etiquetas mejores.
+
 Y un detalle metodológico que separa una curva útil de una anécdota: los subconjuntos son
 **anidados**. El 10 % está dentro del 25 %, que está dentro del 50 %, que está dentro del 100 %. En
 el código es un orden estable por fila —un CRC-32 de `(semilla, partida, ply)`— y un `head(n)` sobre
@@ -460,6 +486,11 @@ el FEN completo. Aquí la posición está **explícita**: la capa
 1 ya sabe que hay un caballo en f3 sin tener que deducirlo de nada. A cambio, la historia desaparece
 por completo.
 
+Piensa en un accidente de tráfico. La foto del coche después del golpe dice cuánto daño hay, y para
+tasarlo es lo que necesitas: eso son las casillas. El vídeo de la cámara del salpicadero dice de
+quién fue la culpa, porque la culpa está en lo que pasó justo antes: eso son las jugadas. Ninguna
+de las dos sustituye a la otra, y esa es exactamente la comparación que viene a continuación.
+
 <Callout kind="teoria" title="Los 69 tokens, y por qué no son 71">
   La enumeración obvia —64 casillas, turno, cuatro derechos de enroque, al paso y reloj— suma 71, y
   el número duro del spec es 69. La solución del código es empaquetar los cuatro derechos de enroque
@@ -487,20 +518,27 @@ preentrenamiento con masked move modeling y la de casillas no.
 
 | Esquema                        | F1 de error (umbral ajustado) | Margen sobre la heurística |   ROC AUC | Spearman valor | Pearson valor |
 | ------------------------------ | ----------------------------: | -------------------------: | --------: | -------------: | ------------: |
-| `moves` · afinado `full`       |                         0,179 |                       +9,0 |     0,735 |          0,407 |         0,442 |
-| **`moves` · afinado `last-n`** |                     **0,180** |                   **+9,2** | **0,738** |      **0,520** |         0,648 |
+| `moves` · afinado `full`       |                         0,179 |                       +9,0 |     0,738 |          0,407 |         0,442 |
+| **`moves` · afinado `last-n`** |                     **0,180** |                   **+9,2** | **0,740** |      **0,520** |         0,648 |
 | `squares` (desde cero)         |                         0,146 |                       +5,7 |     0,696 |          0,422 |     **0,688** |
 
 </div>
 
-La fila que cuenta es la del medio: **`last-n` es lo que hay publicado** en
-`chorcat/rukh-encoder`, y afinar menos red gana en todo. La de `full` se queda porque es la
+Dos columnas de esta tabla todavía no se han explicado, y basta con esto para leerla: **ROC AUC**
+es la probabilidad de que, cogidos al azar un error y una jugada tranquila, el modelo puntúe más
+alto el error (0,5 sería una moneda), y **Spearman** mide si el orden de los valores predichos
+coincide con el del motor, sin mirar la escala; Pearson sí la mira. Las tres tienen su sección en
+la parte 2, y el umbral «ajustado» del F1 también.
+
+La fila que cuenta es la del medio: **`last-n` es el checkpoint que se publicó al cerrar el
+módulo** (`checkpoints/encoder-heads-moves-20260919-101904/best.pt`), el que usan todas las cifras
+de estas tres partes, y afinar menos red gana en todo. La de `full` se queda porque es la
 comparación que lo demuestra, y porque publicar el checkpoint de una y las métricas de otra es un
-error que este proyecto estuvo a punto de cometer.
+error que este proyecto estuvo a punto de cometer: la decisión D-061 del registro existe por eso.
 
 Las dos hipótesis se cumplen a medias, y la mitad que falla es la interesante.
 
-**Las jugadas ganan en detectar errores**, como se esperaba: 0,179 de F1 contra 0,146, y 0,738 de
+**Las jugadas ganan en detectar errores**, como se esperaba: 0,180 de F1 contra 0,146, y 0,740 de
 ROC AUC contra 0,696. Tiene todo el sentido, porque un error es una propiedad de la **transición**,
 no de la posición: para saber que algo se acaba de tirar hay que saber qué había antes, y la línea
 de jugadas lleva dentro la partida entera. El preentrenamiento ayuda exactamente ahí: un modelo que
@@ -534,14 +572,14 @@ de otro hito, y esta tabla es la razón para hacerlo.
   `labels.games_dir` y reconstruye el prefijo de cada posición a partir de las partidas de P1; la
   fila `squares` arranca de pesos aleatorios (`encoder_ckpt: null`, y apuntarlo a un checkpoint de
   MMM se rechaza en vez de reinterpretarlo en silencio), así que es justamente la **línea base
-  honesta que el preentrenamiento tenía que batir**. La batió en errores (+3,3 puntos de F1) y
-  perdió en la escala del valor.
+  honesta que el preentrenamiento tenía que batir**. La batió en errores (+3,5 puntos de F1: 0,180
+  frente a 0,146) y perdió en la escala del valor.
 
 Y un asterisco que el propio fichero de configuración lleva escrito, porque leer la tabla sin él
 sería leerla mal: la tabla supervisada está **deduplicada por `fen4`**, así que el prefijo que
 recibe el esquema de jugadas es _una_ línea que llega a esa posición, no necesariamente la de la
 partida que puso la etiqueta. Para una posición común —una apertura de libro— eso es casi
 irrelevante; para una posición que solo aparece en una partida, es la línea correcta. Pero es una
-aproximación, y el margen de +3,3 puntos se lee sabiéndola.
+aproximación, y el margen de +3,5 puntos se lee sabiéndola.
 
 </Callout>

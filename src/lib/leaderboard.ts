@@ -27,6 +27,7 @@ export interface ResultRow {
   elo_lower?: number | null;
   elo_upper?: number | null;
   delta_cp?: number | null;
+  first_move_entropy?: number | null;
   date?: string | null;
   /** Already-formatted Hub link of the committed placeholder shape. */
   hub?: string | null;
@@ -178,13 +179,13 @@ export const COLUMNS: readonly Column[] = [
     numeric: true,
   },
   {
-    key: 'delta_cp',
-    label: 'Δ medio (cp)',
-    short: 'Δ cp',
-    value: (row) => number(row.delta_cp),
+    key: 'first_move_entropy',
+    label: 'Entropía de la 1.ª jugada (bits)',
+    short: 'Entropía',
+    value: (row) => number(row.first_move_entropy),
     text: (row) => {
-      const n = number(row.delta_cp);
-      return n === null ? null : formatDecimal(n, 1);
+      const n = number(row.first_move_entropy);
+      return n === null ? null : formatDecimal(n, 2);
     },
     numeric: true,
   },

@@ -102,9 +102,10 @@ Las consecuencias se miden en tres sitios:
    imposible (los modelos públicos de referencia de 25-50M parámetros se entrenaron por carácter y
    llegaron a jugar), pero es capacidad que se paga.
 3. **Coste de atención.** La atención compara cada token con todos los anteriores: su coste crece
-   con el cuadrado de la longitud, O(n²). Pasar de 200 a 800 tokens no es cuatro veces más caro,
-   son dieciséis. Con una sola GPU, esa diferencia es la que separa "entrena en dos horas" de "no
-   entrena esta noche".
+   con el cuadrado de la longitud, O(n²). Es una reunión donde cada asistente que entra saluda a
+   todos los que ya estaban: con el doble de gente no hay el doble de saludos, hay cuatro veces
+   más. Pasar de 200 a 800 tokens no es cuatro veces más caro, son dieciséis. Con una sola GPU,
+   esa diferencia es la que separa "entrena en dos horas" de "no entrena esta noche".
 
 <Callout kind="teoria" title="El vocabulario es la primera hipótesis sobre los datos">
   Elegir "una jugada es un token" es afirmar que la jugada es la unidad natural del ajedrez, igual
@@ -150,7 +151,9 @@ pequeño posible y el que menos sabe de ajedrez. Su virtud es que no hay nada fu
 que reproduce exactamente el formato en que la gente escribe partidas; su precio es la longitud.
 
 **BPE (byte-pair encoding).** Es la familia que usan casi todos los LLM de texto, y conviene
-saber construirla a mano una vez. Se parte de los caracteres como tokens iniciales. Se cuenta, en un
+saber construirla a mano una vez. Es un taquígrafo que inventa abreviaturas: lo que más veces tiene
+que escribir se gana un signo propio, y lo raro lo sigue escribiendo letra a letra. Se parte de los
+caracteres como tokens iniciales. Se cuenta, en un
 corpus de entrenamiento, qué par de tokens adyacentes aparece más veces; ese par se fusiona en un
 token nuevo y se añade al vocabulario; se vuelve a contar; se repite hasta llegar al tamaño de
 vocabulario que se ha pedido (4 096 en nuestro caso). Cada fusión queda registrada con su orden, y
@@ -251,7 +254,7 @@ Un modelo de chat no tiene roles. No sabe qué es un "sistema" ni un "usuario". 
 secuencia de tokens, y alguien decidió que ciertos tokens marcan dónde empieza y acaba cada turno.
 
 <Figure
-  n="02"
+  n="01"
   caption="Las tres cosas son lo mismo: una secuencia plana de tokens donde unos pocos símbolos acordados marcan el papel de lo que viene después. El modelo no distingue entre «instrucción» y «dato»; solo ve tokens y predice el siguiente."
 >
   <PromptStrips />
@@ -293,17 +296,20 @@ partidas no son rectangulares: unas duran 25 jugadas y otras 90. Hay dos formas 
 círculo, y elegimos la segunda.
 
 **Una partida por fila, con padding.** Cada partida se rellena con `<pad>` hasta 200 (o se corta
-si es más larga). Es lo más fácil de entender y lo más caro: en una partida de 60 tokens, 140 son
-relleno, y la GPU calcula atención sobre relleno. Además hay que decirle a la pérdida que no cuente
+si es más larga). Es una hoja de cálculo con una fila por partida y 200 columnas: las partidas
+cortas dejan la mayoría de sus celdas vacías, y la hoja las guarda y las recorre igual. Es lo más
+fácil de entender y lo más caro: en una partida de 60 tokens, 140 son relleno, y la GPU calcula
+atención sobre relleno. Además hay que decirle a la pérdida que no cuente
 los `<pad>`: eso es `ignore_index`. En PyTorch, `CrossEntropyLoss(ignore_index=0)` hace que
 cualquier posición cuyo objetivo sea el id 0 no contribuya a la pérdida ni al gradiente. Si se te
 olvida, el modelo aprende que después de cualquier cosa viene `<pad>` y lo predice con confianza.
 
 **Empaquetado en flujo.** Concatenamos todas las partidas codificadas, una detrás de otra, en un
 único vector de enteros: `<bos> … <eos> <bos> … <eos> <bos> …`. Guardamos aparte la lista de
-posiciones donde empieza cada partida. Un ejemplo de entrenamiento es una ventana de 200 tokens
-que empieza en un `<bos>`: incluye una partida entera y, si sobra sitio, el principio de la
-siguiente. Solo la última ventana del fichero necesita padding. Casi no hay relleno, la GPU calcula
+posiciones donde empieza cada partida. Es un disco con las canciones grabadas seguidas, sin
+silencios entre ellas, y un índice aparte que dice en qué segundo empieza cada una. Un ejemplo de
+entrenamiento es una ventana de 200 tokens que empieza en un `<bos>`: incluye una partida entera
+y, si sobra sitio, el principio de la siguiente. Solo la última ventana del fichero necesita padding. Casi no hay relleno, la GPU calcula
 sobre jugadas reales y el fichero es un solo array `uint16` que se lee con memmap.
 
 La alternativa que descartamos es el empaquetado "a bloques puros", el de nanoGPT: trocear el flujo
@@ -333,7 +339,8 @@ El dataloader completa el cuadro. Un `Dataset` de PyTorch responde a dos pregunt
 ejemplos hay y cuál es el ejemplo `i`. Un `DataLoader` los junta en lotes, los baraja y, con varios
 _workers_, los prepara en paralelo mientras la GPU calcula el lote anterior. Con memmap, cada
 worker abre el mismo fichero y el sistema operativo comparte las páginas; nadie copia un GB en
-memoria.
+memoria. Es el libro de consulta de la biblioteca: nadie se lo lleva a casa fotocopiado entero,
+cada lector abre la página que necesita y varios pueden leer el mismo ejemplar a la vez.
 
 <Callout kind="roto" title="Los tokens no se copian; el índice sí">
   Esa frase es cierta y es exactamente donde uno da la auditoría por cerrada. Los tokens están en
@@ -368,26 +375,31 @@ entrenamiento; las otras 40, en validación. Cuando el modelo "acierta" la sigui
 jugador en validación, ¿ha aprendido ajedrez o ha aprendido a ese jugador? No lo sabes, y la
 exactitud top-1 que publicas está inflada por una cantidad que no puedes medir.
 
-La solución es partir por algo que **separe el mundo, no las filas**. Este módulo partió por
-tiempo: entrenar con enero de 2025 y validar con febrero. Los jugadores se repiten entre meses,
-claro, pero febrero está en el futuro de enero, que es exactamente la situación en la que va a
-estar el modelo cuando juegue: partidas que todavía no existían.
+La solución es partir por algo que **separe el mundo, no las filas**. Este módulo parte por
+tiempo: **enero de 2025 entrena y febrero valida**. Los jugadores se repiten entre meses, claro,
+pero febrero está en el futuro de enero, que es exactamente la situación en la que va a estar el
+modelo cuando juegue: partidas que todavía no existían. Es la partición con la que corren los labs
+de la parte siguiente y con la que se entrena el primer decoder de M2.
 
-Conviene decir cómo acabó esa decisión, porque enseña más que el principio. Reservar un mes entero
-significa apartar **238 657 571 tokens** para un bucle de validación que lee 50 lotes —640 000
-tokens— cada vez que evalúa. El 44 % del corpus estaba parado sosteniendo una medida que se
-saturaba en unos cientos de lotes. Al recortarlo a 100 000 partidas congeladas, el material de
-entrenamiento pasó de 240 M tokens a 470 M sin descargar un byte.
+Cuánto apartar es otra pregunta, y conviene dejarla planteada ya. Piensa en un restaurante. El
+inspector de sanidad necesita **una mesa reservada** para juzgar, y esa mesa no se vende nunca, ni
+el día que hay lista de espera. Lo que no necesita es medio comedor vacío. La pregunta no es qué
+porcentaje apartas, sino cuántas mesas le hacen falta para formarse su juicio; y si lo que vas a
+medir ocurre una vez de cada treinta, la mesa tiene que ser bastante más grande.
 
-El inspector de sanidad necesita **una mesa reservada**, y esa mesa no se vende nunca, ni el día que
-hay lista de espera. Lo que no necesita es medio comedor. La pregunta no es qué porcentaje apartas,
-sino cuántas mesas le hacen falta para formarse su juicio —y si lo que vas a medir ocurre una vez de
-cada treinta, la mesa tiene que ser bastante más grande—.
-
-Lo que hace legítimo ese cambio no es el argumento, es la comprobación: los mismos pesos miden
-**1,5197 de pérdida y 51,20 % de top-1 en la validación vieja y en la nueva**, hasta el cuarto
-decimal. Si hubieran discrepado, el listón se habría movido bajo los pies y todas las
-comparaciones anteriores habrían dejado de valer.
+<Callout kind="roto" title="Lo que M2 cambió de este split (D-062, 19 de septiembre de 2026)">
+  Reservar febrero entero resultó ser medio comedor. Son **238 657 571 tokens** apartados para un
+  bucle de validación que lee 50 lotes —640 000 tokens— cada vez que evalúa: el 44 % del corpus
+  parado sosteniendo una medida que se satura en unos cientos de lotes. En la parte 4 de M2 la
+  validación se recorta a las **primeras 100 000 partidas de febrero**, congeladas, y el resto del
+  mes pasa a entrenar: el material de entrenamiento sube de 240 M a 470 M tokens sin descargar un
+  byte. Lo que hace legítimo el cambio no es el argumento, es la comprobación: los mismos pesos dan
+  el mismo top-1 (51,20 %) y la misma pérdida —el número que M2 define y que allí aprenderás a leer—
+  en la validación vieja y en la nueva, hasta el cuarto decimal. Si hubieran discrepado, el listón
+  se habría movido bajo los pies y todas las comparaciones anteriores habrían dejado de valer. Las
+  salidas de los labs de la parte siguiente son anteriores a ese cambio: cuando leas `val: 2,946,874
+  games`, es febrero entero.
+</Callout>
 
 <Transfer concept="Dimensionar un conjunto retenido por la varianza que tiene que resolver" where="En un RAG: apartar el 30 % del corpus documental cuando tu suite ejecuta 200 preguntas y nunca más.">
   «Más datos retenidos = más rigor» es falso, y cuesta caro porque suena a prudencia. Un conjunto
@@ -426,8 +438,32 @@ pydantic (`extra="forbid"`, como en M0: una clave mal escrita falla, no se ignor
 rukh data fetch → uci → tokenize → positions → evals → puzzles → pairs → elite → elo-bins → publish
 ```
 
-Merece la pena saber qué escribe cada paso y por qué existe, porque son los datasets que van a
-aparecer en la tabla única con nombre propio.
+Merece la pena saber qué lee y qué escribe cada paso y por qué existe, porque son los datasets que
+van a aparecer en la tabla única con nombre propio. La tabla es el mapa; después van en prosa los
+tres pasos que esconden una decisión (`fetch`, `evals` y `pairs`), y los labs de la parte siguiente
+recorren `uci`, `tokenize` y el dataloader con sus salidas reales.
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Paso        | Lee                                                                                      | Escribe                                                                                     | Quién lo usa                                    | Decisión                                                                                                                               |
+| ----------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `fetch`     | Lichess en remoto (`hf://`)                                                              | `data/raw/` (parquet por mes) y manifiesto                                                  | `uci`                                           | Filtros de M0 y tope de 3 millones por mes (D-017)                                                                                     |
+| `uci`       | `data/raw/`                                                                              | `data/uci/year=…/month=…/games.parquet`: `game_id`, `uci`, `n_plies`, Elo, resultado, `eco` | `tokenize`, `positions`, `elo-bins`, `pairs`    | SAN → UCI sobre un tablero real; una jugada ilegal descarta la partida; aquí se aplica el filtro de ≥ 20 plies                         |
+| `tokenize`  | `data/uci/`                                                                              | `data/tokens/<esquema>/`: `tokens.npy` (`uint16`), `starts.npy`, `meta.json`                | El decoder de M2, el encoder de M3              | Flujo empaquetado alineado a `<bos>` (D-019); `--stats` mide los tres esquemas, `--export-fixture` escribe la fixture de paridad       |
+| `positions` | `data/uci/` (hasta 300 000 partidas de enero)                                            | `data/positions/positions.parquet`: FEN de cuatro campos, fase, conteo                      | `evals`                                         | FEN sin contadores de jugadas, para que dos posiciones iguales no parezcan distintas; fase por plies y piezas                          |
+| `evals`     | `positions.parquet` y 42 GB de evaluaciones en remoto                                    | `data/evals/positions-eval.parquet`: mejor línea y columna `pvs` con las demás              | `pairs`, las etiquetas del encoder de M3        | Semi join en remoto por FEN, resumible por partes                                                                                      |
+| `puzzles`   | Los seis millones de puzles de Lichess, en remoto                                        | `data/puzzles/puzzles.parquet` con split                                                    | La tabla única de M2 a M6                       | `RatingDeviation ≤ 100`, `NbPlays ≥ 100`; tres tramos; split por `PuzzleId` con semilla 42, 2 000 de test por tramo                    |
+| `pairs`     | `positions-eval.parquet` y `data/uci/` (los prefijos)                                    | `data/pairs/pairs.parquet` y `dpo-prompts.parquet`                                          | DPO en M5                                       | Elegida frente a rechazada por ≥ 100 centipeones (D-018), equilibrado por fase, ambas verificadas legales                              |
+| `elite`     | La base Elite de Lichess (2500+), dos zips de unos 80 MB                                 | `data/elite/games.parquet`, mismas columnas que `uci`                                       | El SFT «como los maestros» de M4                | Convierte con el mismo `uci.py`, para que un mismo modelo pueda leer los dos corpus                                                    |
+| `elo-bins`  | `data/uci/` (los dos meses)                                                              | `data/elo-bins/games.parquet`                                                               | El condicionamiento por Elo de M4               | Tramo = media de los dos Elo truncada a la centena (`// 100 * 100`: un 1899 cae en 1800); hasta 50 000 partidas por tramo, con semilla |
+| `publish`   | Los seis datasets anteriores (todo menos `fetch` y `positions`) y `artifacts/tokenizer/` | Una card por dataset (Jinja, en inglés, CC0, atribución a Lichess) y el repo en `chorcat/`  | Cualquiera: es lo que descargas con `rukh pull` | `--dry-run` escribe la card en local sin tocar la red; la publicación real necesita `HF_TOKEN` y es el punto donde intervienes tú      |
+
+</div>
+
+Sin `elo-bins`, el modelo de M4 vería diez veces más partidas de 1800 que de 2400 y el token
+`<w2400>` apenas se entrenaría (el lab 1 de la parte siguiente enseña esa distribución). Y sin
+`positions` no habría `evals`: recorre las partidas con `python-chess`, escribe cada posición y
+deduplica por FEN contando cuántas veces se ha visto.
 
 **`fetch`** (ya ejecutado en M0) filtra en remoto con <Term id="duckdb">DuckDB</Term> sobre
 `hf://datasets/Lichess/standard-chess-games/…` y materializa solo lo que pasa: ambos Elo ≥ 1800,
@@ -442,29 +478,10 @@ millones por mes, muy por encima de los 3-6 millones por dos meses que pedía el
 el tope se lleva los primeros doce ficheros, unos cinco días de enero y otros cinco de febrero. Seis
 millones de partidas en total, registrado en el manifiesto como recorte temporal. Es más que lo que
 usaron los modelos públicos de 25-50M parámetros que tomamos de referencia. De esos seis millones,
-la conversión a UCI del paso siguiente conserva **5 896 388**.
+la conversión a UCI del paso siguiente conserva **5 896 388** (el filtro de ≥ 20
 
-**`uci`** convierte el `movetext` SAN de cada partida a UCI con `python-chess`, jugada a jugada
-sobre un tablero real, verificando la legalidad. Antes limpia los comentarios `{[%clk 0:03:00]}` y
-`{[%eval 0.3]}`, los números de jugada y el resultado final. Una partida con una jugada ilegal o un
-SAN que no se puede resolver se descarta entera (no se "arregla"), y aquí se aplica por fin el
-filtro de ≥ 20 <Term id="ply">plies</Term> que M0 dejó pendiente porque necesitaba parsear las
-jugadas. Escribe `data/uci/year=YYYY/month=MM/games.parquet` con `game_id` (hash de la URL de
-Lichess), `uci`, `n_plies`, `white_elo`, `black_elo`, `result`, `time_control`, `utc_date`, `eco` y
-`month`. Está paralelizado por lotes de 20 000 partidas porque una conversión son unos 0,3 ms y seis
-millones son media hora en un solo proceso.
-
-**`tokenize`** codifica las partidas con uno de los tres esquemas y las empaqueta en un flujo
-`uint16` (`tokens.npy`) con un índice de inicios (`starts.npy`) y un `meta.json` con conteos y el
-hash del vocabulario. Con `--stats` calcula tokens por partida (media, p50, p95), el porcentaje de
-partidas que caben en 200 tokens y el tamaño de vocabulario, y lo escribe en
-`artifacts/web/tokenizer-stats.json`, que es lo que ves en la tabla del lab 3. Con
-`--export-fixture` escribe `vocab.json` y las 20 partidas de paridad.
-
-**`positions`** recorre hasta 300 000 partidas de enero con `python-chess`, escribe cada posición
-como un FEN de cuatro campos (piezas, turno, enroques, al paso; sin los contadores de jugadas, que
-harían que dos posiciones idénticas parecieran distintas), la etiqueta con su fase (apertura ≤ 10
-plies, medio juego con ≥ 14 piezas, final) y deduplica por FEN contando cuántas veces se ha visto.
+<Term id="ply">plies</Term> que M0 dejó pendiente se aplica ahí, porque necesita parsear las
+jugadas).
 
 **`evals`** es el paso caro y el más interesante. Lichess publica 395 millones de posiciones
 evaluadas por Stockfish en 20 ficheros parquet (42 GB). No los descargamos: para cada fichero
@@ -476,10 +493,6 @@ posición**: una por línea principal (multi-PV), ordenadas de mejor a peor para
 Al consolidar nos quedamos con la mejor línea (el valor de la posición) y guardamos todas las demás
 en una columna `pvs`.
 
-**`puzzles`** descarga los seis millones de puzles con DuckDB, filtra los mal calibrados
-(`RatingDeviation ≤ 100`, `NbPlays ≥ 100`), los agrupa en tres tramos (1000-1500, 1500-2000, 2000+)
-y hace el split por `PuzzleId` con semilla: 2 000 de test por tramo, hasta 50 000 de entrenamiento.
-
 **`pairs`** es donde las líneas múltiples de `evals` dan un dataset entero gratis. Para cada
 posición con al menos dos líneas, la primera jugada de la mejor línea es la jugada _elegida_ y la
 primera jugada de una línea peor en al menos 100 centipeones es la _rechazada_. Eso es exactamente
@@ -487,23 +500,9 @@ un par de preferencia para DPO (M5), **sin ejecutar Stockfish ni una vez**: la e
 hecha y publicada. Se equilibra por fase para que el dataset no sea solo aperturas, y las dos
 jugadas se verifican legales con `python-chess`. Es la decisión D-018.
 
-**`elite`** descarga la base de partidas 2500+ (dos zips mensuales de unos 80 MB) y las convierte
-con el mismo `uci.py`, mismas columnas, para el SFT "como los maestros" de M4.
-
-**`elo-bins`** toma los dos meses, calcula el tramo de cada partida como la media de los dos Elo
-truncada a la centena (`((white_elo + black_elo) // 2) // 100 * 100`, división entera, no redondeo:
-un 1899 de media cae en el tramo 1800), y muestrea hasta 50 000 partidas por tramo con semilla. Es
-el dataset equilibrado con el que se afina el condicionamiento por Elo en M4: sin él, el modelo
-vería diez veces más partidas de 1800 que de 2400 y el token `<w2400>` apenas se entrenaría.
-
-**`publish`** renderiza una card por dataset (Jinja, en inglés, con la licencia CC0 y la atribución
-a Lichess), crea el repo bajo `chorcat/` y sube parquet, manifiesto y card. `--dry-run` escribe la
-card en local sin tocar la red. La publicación real necesita `HF_TOKEN` y es el punto donde
-intervienes tú.
-
 <Figure
-  n="01"
-  caption="El pipeline de M1. Cada caja escribe en data/ y añade una entrada al manifiesto; las de la fila inferior alimentan módulos posteriores."
+  n="02"
+  caption="El pipeline de M1. Cada caja escribe en data/ y añade una entrada al manifiesto; las flechas son lo que cada paso lee (la discontinua, los prefijos que pairs toma de uci). puzzles y elite descargan de Lichess por su cuenta, y elite convierte con el mismo uci.py. Los siete pasos con borde marcado son los que publish sube a chorcat/; arriba, el orden en que se ejecutan."
 >
   <TokenPipeline />
 </Figure>

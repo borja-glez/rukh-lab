@@ -194,7 +194,9 @@ Y el afinado necesita algo que el bucle no tenía: empezar desde unos pesos **si
 del optimizador. `--resume` existe para continuar una corrida interrumpida y restaura los momentos
 de Adam, el contador de pasos, el RNG y hasta el run de MLflow; un afinado quiere exactamente lo
 contrario, porque es una corrida **nueva**, con sus datos, su tasa y su calendario, y los momentos
-de un coseno de 48 000 pasos ya decaído pelearían contra el warmup que empieza ahora.
+de un coseno de 48 000 pasos ya decaído pelearían contra el warmup que empieza ahora. `--resume` es
+volver del café: la mesa está como la dejaste, con las notas de Adam, el contador de pasos y el run
+abierto. `init_from` es empezar en otra empresa: te llevas lo que sabes y nada más.
 
 ```python title="src/rukh/train/loop.py"
 initialised_from = load_init_weights(cfg.init_from, model, where)
@@ -465,8 +467,10 @@ cargado en PyTorch frente al grafo sobre mil posiciones.
   `alpha` y el mismo `r`, y en un búfer plano de `float32` no hay nada contra lo que comprobarlo.
   Así que vive en el **fichero**: el adaptador que descarga la página lleva `B` ya multiplicado y el
   grafo multiplica por uno. Un adaptador de cualquier rango es correcto en ese grafo sin que nadie
-  tenga que cuadrar dos números a mano. La regla general: cuando un dato y su interpretación pueden
-  separarse, júntalos en el mismo fichero.
+  tenga que cuadrar dos números a mano. Un `alpha / r` guardado fuera del adaptador es una cifra sin
+  unidad: «está a 30» no dice nada hasta que sabes si son grados o metros, y entregar el 30 sin el
+  símbolo obliga a quien lo recibe a adivinarlo. La regla general: cuando un dato y su
+  interpretación pueden separarse, júntalos en el mismo fichero.
 </Callout>
 
 ### Lab 8 · Qwen3 con QLoRA, por el mismo harness
@@ -576,7 +580,9 @@ export const ELO_TARGETS = [1200, 1500, 1800, 2000, 2100, 2400] as const;
 Seis, no veintisiete. El vocabulario tiene veintisiete cabeceras y el modelo contesta a todas,
 pero **un control que el jugador puede mover es la afirmación de que moverlo hace algo**, y esa
 afirmación es tan ancha como el barrido que la respalda. Ofrecer las veintisiete sería prometer
-veintisiete mediciones y tener seis.
+veintisiete mediciones y tener seis. Una carta de restaurante solo lista los platos que la cocina ha
+probado; una con veintisiete entradas de las que se han cocinado seis no es una carta más larga, es
+una carta que miente en veintiuna líneas.
 
 - E2E: con una etapa condicionada el selector está activo, sin pista, con exactamente esas seis
   opciones y empezando en 1800; con las demás, desactivado y con la pista visible.
@@ -601,81 +607,58 @@ vuelve **el mismo número**, no uno parecido; y que en toda la prueba se ha pedi
 
 ## Qué has aprendido, cómo se mide
 
+Primero los números, una fila por etapa, tal y como los cita este módulo (la fila de `medium-elo`
+es la condición `<w1800>` del barrido, que comparte suite con las otras cinco; su Elo canónico,
+1558, sale de otra tirada y no se mezcla):
+
+<div class="table-wrap">
+
+| Etapa                     |               Elo (IC 95 %) |   legal |  top-1 | puzles | entropía 1.ª a `<w1800>` |
+| ------------------------- | --------------------------: | ------: | -----: | -----: | -----------------------: |
+| `medium-v4` (base)        |            1504 (1446–1558) |  99,8 % | 54,4 % | 37,5 % |              1,7695 bits |
+| `medium-elo` (`<w1800>`)  |            1498 (1435–1552) | 99,80 % | 54,1 % | 38,2 % |                   1,7408 |
+| `medium-masters`          |            1583 (1525–1641) |       — | 54,9 % | 38,0 % |                   1,8850 |
+| `medium-v4` + `lora-e4`   |                   no medido | 99,80 % | 54,7 % | 37,8 % |                   0,0209 |
+| `qwen3-pgn-qlora` (0,6 B) | < 807 (160 derrotas de 160) | 62,50 % | 12,5 % |  0,9 % |                        — |
+
+</div>
+
+Ninguna columna de fuerza separa su intervalo del de la base; todas las de comportamiento se
+mueven. Eso es el módulo, y estas seis frases son cómo se llegó:
+
 - **El corpus antes que el modelo.** Los doce tokens de Elo por debajo de 1800 nunca habían
-  recibido un gradiente porque `min_elo: 1800` filtraba a **los dos** jugadores, y eso explicaba
-  tres hitos de resultados raros. **Medido** con un `Counter` sobre el segundo token de cada
-  partida empaquetada: 18 942 740 partidas, 1 681 069 636 tokens, **0 de 12** cabeceras por debajo
-  de 1800 vistas alguna vez. No hacía falta ni cargar el modelo.
+  recibido un gradiente porque `min_elo: 1800` filtraba a **los dos** jugadores. **Medido** con un
+  `Counter` sobre el segundo token de cada partida empaquetada: 18 942 740 partidas, **0 de 12**
+  cabeceras vistas alguna vez. No hacía falta ni cargar el modelo, y es el primer sitio donde mirar
+  la próxima vez que una condición «no funcione».
 - **El eje dejó de ser ruido, y se ve sin jugar una partida.** La entropía analítica de la primera
-  jugada —la softmax tal cual, sin muestreo, sin semilla— pasa a ser **monótona en las seis
-  condiciones**: 1,596 → 1,647 → 1,741 → 1,841 → 1,881 → 1,992 bits. En el modelo viejo había un
-  escalón de **1,17 bits** justo entre `<w1500>` y `<w1800>`, exactamente donde cortaban los datos,
-  y con el signo del ruido: por debajo del suelo estaba _menos_ decidido que en cualquier cabecera
-  que conocía.
-- **El criterio 1 de `GOAL.md` no se cumple, y está medido por qué.** Ni monotonía ni intervalos
-  separados con 160 partidas por condición. Entre `<w1500>` y `<w2000>` la diferencia de tasa de
-  puntos es **−0,013** y harían falta **24 420 partidas por condición** para separarla: no faltan
-  partidas, no hay diferencia. Entre `<w2000>` y `<w2400>` harían falta 284, que sí es un problema
-  de medición.
-- **La explicación obvia del apartado anterior se comprobó y salió que no.** Muestrear la cola en
-  vez de jugar la moda ensancha la brecha en Elo (219 → 270) y ensancha más los intervalos
-  (123 → 195), así que la diferencia pasa de 4,40 σ a 3,85 σ: la medición **empeora**. La causa es
-  que a temperatura 1,0 el modelo pierde unos 400 puntos y cae por debajo del rango para el que la
-  escalera está calibrada. Un tratamiento que saca al sujeto del rango del instrumento no revela el
-  efecto, lo esconde.
-- **Y la escalera no se repite a sí misma.** El mismo modelo, la misma cabecera y la misma semilla,
-  medidos dos veces por caminos distintos: **1498 y 1558**. La semilla fija nuestro muestreo, no el
-  de Stockfish, que juega por tiempo y con `UCI_LimitStrength`. Son 1,18 σ de la diferencia entre
-  dos tiradas de 160 partidas, o sea nada raro — y significa que el suelo de reproducibilidad del
-  instrumento (unos 40 Elo de una sigma) es **mayor** que la distancia entre condiciones contiguas.
-- **Y el control dice que la columna de Elo no distingue las dos causas.** El mismo barrido sobre
-  el modelo **sin** afinar recorre 161 puntos —con los intervalos separados— usando una cabecera
-  que nunca entrenó: un prefijo desconocido le estorba, y estorbarle cuesta eso. Si una métrica
-  sube con el tratamiento, mídela también sin él.
-- **Dónde sí se ve el afinado:** a `<w1200>`, con el mismo Elo que el modelo base, el condicionado
-  escribe **cero** jugadas ilegales contra cuatro de mil, gana 1,6 puntos de top-1, seis décimas de
-  puzles y baja **1,26 bits** de entropía. A `<w2100>` los dos coinciden en las cinco columnas, que
-  es cómo se comprueba que no hubo olvido catastrófico.
-- **LoRA escrita a mano es LoRA.** La misma configuración entrenada con `apply_lora` y con
-  `peft.get_peft_model`, mismos pesos base, misma `A` copiada y mismo optimizador optimizan el
-  mismo número durante seis pasos, con una diferencia de **cero exacto**. Y fundir el adaptador
-  también es exacto, así que un fichero de 1,6 MB se puede exportar, cuantizar y servir como un
-  modelo cualquiera.
-- **Un adaptador de 393 216 números —el 0,34 % del modelo— cambia una decisión por completo y no
-  cuesta nada.** `lora-e4` sube `1. e4` del 59,64 % al **99,85 %** y deja legalidad (99,8 %),
-  top-1 (54,4 → 54,7 %) y puzles (37,5 → 37,8 %) donde estaban. Y con la primera jugada clavada,
-  doscientas auto-partidas de doce plies siguen dando **199 líneas distintas**: el adaptador fijó
-  el primer movimiento y no tocó ninguno de los once siguientes.
-- **Dos métricas con el mismo nombre pueden contradecirse y tener razón las dos.** La entropía de
-  la primera jugada dice «este modelo no varía» (0,021 bits) y la de líneas dice «no repite una
-  partida» (7,634 de 7,644). Miden decisiones distintas; publicar una sola habría dado un titular
-  falso en cualquiera de las dos direcciones.
-- **Un adaptador no tiene por qué costar un modelo entero al desplegarlo.** Exportando el decoder
-  con `A` y `B` como **entradas del grafo**, el navegador cambia de estilo subiendo 1,6 MB en vez
-  de descargar otros 221 MB. Con los factores a cero el fichero es el modelo base exactamente, así
-  que sustituye a la exportación normal en lugar de sumarse a ella, y el E2E lo comprueba pidiendo
-  **un solo** `.onnx` en toda la prueba.
-- **Un parámetro implícito es una dependencia.** El `ConstantOfShape` que el exportador escribe sin
-  atributo `value` se apoya en el valor por defecto de la especificación, y el conversor a fp16
-  retipa el grafo a su alrededor: resultado, el fp32 carga y el fp16 no. Lo encontró un test de
-  catorce segundos sobre un modelo de juguete.
-- **Afinar sobre maestros ensancha el repertorio y estrecha el eje.** `docs/spec/02` predecía «sube
-  el Elo, baja la diversidad»; la diversidad **sube** (1,7695 → 1,8850 bits a `<w1800>`) porque la
-  élite juega más aperturas que el jugador medio, y el Elo sube 79 puntos con los intervalos
-  solapados, que con este instrumento no da para afirmarlo. Y entre `<w2100>` y `<w2400>` el eje casi
-  desaparece: 0,010 bits contra los 0,107 del base.
-- **Un modelo general de 600 M afinado con las mismas partidas pierde 160 partidas de 160.**
-  62,50 % de jugadas legales contra el 99,8 % del decoder, 12,5 % de top-1 contra 54,4 %, 0,9 % de
-  puzles contra 37,5 %. Un tercio de sus respuestas son jugadas bien escritas que la posición no
-  permite, y tres de cada cien no son jugadas. La lección no es «Qwen es malo»: es que cuando la
-  salida tiene una estructura conocida y pequeña, conviene meterla en la **representación** en vez
-  de esperar que el modelo la reaprenda desde texto.
-- **Tests que se quedan:** que un adaptador sin entrenar es la identidad (`B` empieza en cero); que
-  el recuento de parámetros es la fórmula y no una constante; que fundir es exacto; que la
-  equivalencia con `peft` se sostiene paso a paso; que los factores se crean en el dispositivo de
-  los pesos que corrigen —un fallo que catorce pruebas en CPU no podían ver—; que la entropía de
-  una sola línea es `0,0` y no `-0,0`; y que un adaptador cuyos rangos no midan lo mismo se rechaza
-  diciéndolo en vez de apilar algo que no cuadra.
+  jugada pasa a ser **monótona en las seis condiciones** (1,596 → 1,992 bits) donde el modelo viejo
+  tenía un escalón de **1,17 bits** justo en el corte de los datos, con el signo del ruido: menos
+  decidido por debajo del suelo que en cualquier cabecera que conocía. Por encima de 1800 los dos
+  modelos coinciden: no hubo olvido catastrófico.
+- **El criterio 1 de `GOAL.md` no se cumple, y está medido por qué.** Entre `<w1500>` y `<w2000>`
+  la diferencia de tasa es **−0,013** y harían falta **24 420 partidas** por condición: no faltan
+  partidas, no hay diferencia. El control sobre el modelo **sin** afinar recorre 161 de los 219
+  puntos del eje con cabeceras que nunca entrenó, el mismo montaje medido dos veces se mueve 60
+  puntos (1498 y 1558, 1,18 σ), y con 160 partidas el instrumento no ve nada por debajo de unos
+  110 Elo. Tres herramientas —partidas necesarias, corrida de control, suelo de reproducibilidad— y
+  las tres se reutilizan.
+- **La explicación obvia se comprobó y salió que no.** Muestrear la cola a temperatura 1,0 en vez
+  de jugar la moda ensancha la brecha (219 → 270) pero ensancha más los intervalos (123 → 195):
+  el cociente baja de 1,78 a 1,38 y en tasa la diferencia pasa de 4,40 σ a 3,85 σ. El muestreo
+  cuesta unos 400 Elo y saca al modelo del rango de la escalera. La cabecera mueve el estilo, no la
+  fuerza táctica, y ya se sabe por qué: predecir el siguiente token nunca premia calcular mejor.
+- **LoRA escrita a mano es LoRA, y 393 216 números cambian una decisión sin costar nada.** La
+  misma configuración con `apply_lora` y con `peft` optimiza el mismo número seis pasos seguidos
+  con diferencia **cero**; `lora-e4` sube `1. e4` del 59,64 % al **99,85 %** y deja legalidad,
+  top-1 y puzles donde estaban, con **199 líneas distintas** en 200 auto-partidas (fijó la primera
+  jugada y no tocó las once siguientes). Con `A` y `B` como **entradas del grafo**, cambiar de
+  estilo en el navegador cuesta 1,6 MB y no 221, y el E2E lo comprueba pidiendo un solo `.onnx`.
+- **La representación es la mitad del resultado.** Un Qwen3 de 600 M afinado con las mismas
+  partidas pierde 160 de 160: un tercio de sus respuestas son jugadas bien escritas que la posición
+  no permite y tres de cada cien no son jugadas, dos errores que el decoder no puede cometer. Y el
+  afinado de maestros enseña el reverso: estrechar el corpus ensancha el repertorio arriba
+  (1,7695 → 1,8850 bits) y borra el eje entre `<w2100>` y `<w2400>` (0,010 bits contra 0,107).
 
 Lo siguiente es M5, donde el modelo deja de imitar y empieza a **preferir**: un modelo de
 recompensa, pares de jugadas puntuadas por el motor, DPO y GRPO. Es también donde se ataca lo que

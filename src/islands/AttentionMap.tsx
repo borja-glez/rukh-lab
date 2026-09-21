@@ -8,6 +8,9 @@
  * With the committed placeholder (empty `weights`) the island renders its "pendiente" state: the
  * lesson ships before the training run that produces the real numbers, and a made-up heat map
  * would teach the wrong thing.
+ *
+ * The MDX chooses the head the map opens on (`layer`, `head`), so the lesson can land the reader
+ * on the one it then discusses instead of on L0H0, which in this model shows no pattern at all.
  */
 import { useId, useMemo, useState } from 'preact/hooks';
 
@@ -88,10 +91,22 @@ function Pending() {
   );
 }
 
-function Map({ source }: { source: AttentionData }) {
+/** The head the island opens on, from the MDX; both indices are zero-based like the selects. */
+export interface AttentionMapProps {
+  layer?: number;
+  head?: number;
+}
+
+/** Clamps a requested index into `[0, count - 1]`; anything unusable falls back to 0. */
+export function clampIndex(value: number | undefined, count: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || count <= 0) return 0;
+  return Math.min(Math.max(Math.floor(value), 0), count - 1);
+}
+
+function Map({ source, initial }: { source: AttentionData; initial: AttentionMapProps }) {
   const base = useId();
-  const [layer, setLayer] = useState(0);
-  const [head, setHead] = useState(0);
+  const [layer, setLayer] = useState(() => clampIndex(initial.layer, source.layers));
+  const [head, setHead] = useState(() => clampIndex(initial.head, source.heads));
   const [query, setQuery] = useState(0);
 
   const matrix = useMemo<number[][]>(
@@ -235,8 +250,9 @@ function Map({ source }: { source: AttentionData }) {
         ))}
         <span class="am__legend-label">{pct(max)}</span>
         <span class="am__legend-note">
-          Diagonal encendida: cada jugada mira a la anterior. Columna encendida: una jugada a la que
-          mira todo el mundo.
+          Subdiagonal encendida (la celda justo a la izquierda de la diagonal): cada jugada mira a
+          la anterior. Diagonal: cada jugada se mira a sí misma. Columna encendida: una jugada a la
+          que mira todo el mundo.
         </span>
       </p>
 
@@ -249,6 +265,6 @@ function Map({ source }: { source: AttentionData }) {
   );
 }
 
-export default function AttentionMap() {
-  return isReady(data) ? <Map source={data} /> : <Pending />;
+export default function AttentionMap(props: AttentionMapProps) {
+  return isReady(data) ? <Map source={data} initial={props} /> : <Pending />;
 }

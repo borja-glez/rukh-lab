@@ -26,7 +26,7 @@ keywords:
   - Elo
 ---
 
-Parte 2 de 3 del módulo «El decoder». Viene de «El decoder: escribirlo a mano» y sigue en «El decoder: exportarlo y mirar dentro».
+Parte 2 de 4 del módulo «El decoder». Viene de «El decoder: escribirlo a mano» y sigue en «El decoder: exportarlo y mirar dentro».
 
 ## Cómo se mide
 
@@ -37,16 +37,17 @@ Un modelo sin números es una anécdota. `rukh eval --model <ckpt> --suite full`
 completa, con caché SQLite para que repetir la evaluación no vuelva a jugar las mismas partidas.
 Seis medidas, cada una respondiendo a una pregunta distinta.
 
-**Legalidad sin máscara, en sus dos versiones.** Diez mil prefijos de partidas de validación; en
-cada uno se le pide una jugada sin máscara y se comprueba si el token propuesto es legal en esa
-posición. Salen dos columnas: `legality_argmax` (el token más probable; es el titular y el listón
-de GOAL) y `legality_sampled` (temperatura 0,6 y top-k 20, como juega la demo), que es siempre
-menor porque muestrear mete cola. Es lo primero que sube durante el entrenamiento y lo que más
-impresiona: el modelo no tiene tablero, no tiene reglas, no sabe qué es un alfil, y aun así acaba
-proponiendo jugadas legales casi siempre. Ojo con el sesgo de la medida: las posiciones de apertura
-son fáciles (casi cualquier desarrollo razonable es legal) y los finales son difíciles (pocas
-jugadas legales, muchas parecidas). Una legalidad global del 95 % puede esconder un 99 % en
-apertura y un 70 % en finales.
+**Legalidad sin máscara, en sus dos versiones.** Mil prefijos de partidas de validación
+(`legality_positions: 1000` en la configuración de la suite); en cada uno se le pide una jugada
+sin máscara y se comprueba si el token propuesto es legal en esa posición. Salen dos columnas:
+`legality_argmax` (el token más probable; es el titular y el listón de GOAL) y `legality_sampled`
+(temperatura 0,6 y top-k 20, como juega la demo), que es siempre menor porque muestrear mete
+cola. Es lo primero que sube durante el entrenamiento y lo que más impresiona: el modelo no tiene
+tablero, no tiene reglas, no sabe qué es un alfil, y aun así acaba proponiendo jugadas legales
+casi siempre. Ojo con el sesgo de la medida: las posiciones de apertura son fáciles (casi
+cualquier desarrollo razonable es legal) y los finales son difíciles (pocas jugadas legales,
+muchas parecidas). Una legalidad global del 95 % puede esconder un 99 % en apertura y un 70 % en
+finales.
 
 **Top-1 y top-3 de siguiente jugada.** Porcentaje de posiciones en que la jugada más probable del
 modelo (o alguna de sus tres primeras) coincide con la que jugó el humano. Es la métrica más
@@ -80,20 +81,40 @@ de la log-verosimilitud es `c · Σ(s − p)` y la curvatura `−c² · Σ p(1�
 `Σ(s − p) / (c · Σ p(1−p))`. Las tablas entran como puntuación 0,5.
 
 **Y ahora la parte que casi nadie cuenta.** La misma curvatura que resuelve el ajuste da la
-varianza del resultado: `1 / (c² · Σ p(1−p))`. Haz el número. Si juegas 100 partidas contra un
-rival donde rindes al 50 %, `Σ p(1−p) = 25`, la varianza es `1 / (0,005756² · 25) ≈ 1 207` y la
-desviación típica **35 puntos de Elo**: el intervalo del 95 % mide unos ±68. Con los ocho escalones
-de la suite completa, 800 partidas, la desviación baja a unos 12 puntos y el intervalo a ±24. En
-la práctica el harness no usa esa fórmula sino un **bootstrap percentil**: remuestrea con
+varianza del resultado: `1 / (c² · Σ p(1−p))`. Haz el número para el caso más favorable, un
+rival contra el que rindes al 50 % en todas las partidas (`p(1−p) = 0,25` por partida, que es el
+máximo posible: cuanto más lejos del 50 %, menos informa cada partida). La suite juega **20
+partidas por escalón contra ocho escalones, 160 en total** (`elo_games: 20` en la configuración),
+y la tabla es esta:
+
+| Partidas                   | `Σ p(1−p)` a p = 0,5 | Varianza | σ (Elo) | IC 95 % |
+| -------------------------- | -------------------- | -------- | ------- | ------- |
+| 20 (un escalón)            | 5                    | 6 036    | 78      | ±152    |
+| 100                        | 25                   | 1 207    | 35      | ±68     |
+| **160 (la suite: 20 × 8)** | 40                   | 754      | **27**  | **±54** |
+| 800 (cinco suites)         | 200                  | 151      | 12      | ±24     |
+| 1 000                      | 250                  | 121      | 11      | ±22     |
+
+En la práctica el harness no usa esa fórmula sino un **bootstrap percentil**: remuestrea con
 reemplazo las partidas jugadas mil veces, reajusta el Elo en cada remuestreo y se queda con los
 percentiles 2,5 y 97,5. Da un intervalo parecido sin suponer que la verosimilitud es gaussiana, y
-las tablas —que reducen la varianza— quedan contadas tal como ocurrieron.
+las tablas —que reducen la varianza— quedan contadas tal como ocurrieron. Y ahora compara la tabla
+con lo medido en el lab 4: las 160 partidas de `small` dan **1359 con IC 1293-1429**, es decir
+**±68**, no ±54. La diferencia es que la tabla supone el 50 % en todos los escalones, y el modelo
+real puntúa 0,05 contra unos y 0,5 contra otros; `Σ p(1−p)` se queda por debajo de 40 y el
+intervalo se ensancha. La fórmula da el suelo del ruido; el bootstrap da el ruido que hay.
 
-La conclusión práctica: **con 100 partidas por escalón no puedes presumir de 10 puntos de Elo**.
-Ni de 30. La mejora que Elo-conditioning o DPO produzcan en M4 y M5 tiene que superar el ancho del
-intervalo para que signifique algo, y si no lo supera, lo honesto es escribir "no medimos una
-diferencia" en vez de "mejoró un poco". Es exactamente el mismo error que cometen los benchmarks de
-LLM que celebran medio punto en una evaluación de 200 ejemplos.
+Una encuesta electoral a 100 personas sale con un margen de ±10 puntos, y nadie serio titula
+«sube dos puntos» con ella; a 1 000 personas el margen baja a ±3, y para bajarlo a ±1 harían
+falta 10 000, porque la precisión va con la raíz del tamaño de la muestra. La escalera de
+Stockfish es esa encuesta: 160 partidas son la de 100 personas, y el ±68 es el «±10» que va
+impreso al lado de cada cifra de Elo de este curso.
+
+La conclusión práctica: **con 20 partidas por escalón no puedes presumir de 10 puntos de Elo**.
+Ni de 30, ni de 50. La mejora que Elo-conditioning o DPO produzcan en M4 y M5 tiene que superar el
+ancho del intervalo para que signifique algo, y si no lo supera, lo honesto es escribir "no
+medimos una diferencia" en vez de "mejoró un poco". Es exactamente el mismo error que cometen los
+benchmarks de LLM que celebran medio punto en una evaluación de 200 ejemplos.
 
 <Callout kind="entrevista" title="¿Por qué los rivales por debajo de 1320 no son Elo de verdad?">
   Porque `UCI_Elo` de Stockfish no baja de 1320; para escalones más bajos se usa `Skill Level`, que
@@ -738,9 +759,8 @@ mismos 0,1 s por jugada.
 | `skill-3` | 1250               | **1678** | +428  |
 
 Los cuatro se habían metido en la escalera para llegar **por debajo** del suelo de 1320 de
-`UCI_Elo`, y ninguno llega. El método se valida con su propio control: `uci-1500` midió **+179**
-Elo sobre `uci-1320` frente a los +180 nominales, así que el procedimiento no está sesgado.
-(`UCI_Elo` sí se comprime más arriba: `uci-1800` midió +215 sobre `uci-1500`, no +300.)
+`UCI_Elo`, y ninguno llega. (`UCI_Elo` sí se comprime más arriba: `uci-1800` midió +215 sobre
+`uci-1500`, no +300; es una salvedad para los escalones altos, no para el rango en el que jugamos.)
 
 Con las etiquetas medidas, el mismo checkpoint, las mismas 160 partidas y el mismo ajuste dan
 **1359 Elo (IC 1293-1429)**. El listón de 1200 nunca se falló; la regla estaba torcida y lo estuvo
@@ -841,9 +861,12 @@ otra cosa.
     Con `p = 0,5`, `Σ p(1−p) = 0,25·n`, así que `var = 1 / (0,005756² · 0,25 n) = 1 / (8,28e-6 · n)`.
     Para una desviación de 20 hace falta `var = 400`, es decir `n = 1 / (8,28e-6 · 400) ≈ 302`
     partidas. Para 10 puntos harían falta unas 1 208: la precisión va con la raíz, así que **dividir
-    el error por dos cuesta cuatro veces más partidas**. Con 800 partidas la desviación ronda los
-    12 puntos y el intervalo del 95 % mide unos 48 de ancho: una mejora de 40 puntos es detectable,
-    una de 15 no.
+    el error por dos cuesta cuatro veces más partidas**. La suite real juega 160, con una
+    desviación de unos 27 puntos en el mejor caso: para bajar a 20 habría que doblar la suite, y
+    para bajar a 10, jugar siete veces y media más partidas. Con las 160 de la suite el intervalo
+    del 95 % mide más de 100 puntos de ancho —los 1293-1429 de `small` son 136—, así que una mejora
+    de 40 no se distingue del ruido dentro de una sola escalera. Es la razón de que M5 construya
+    otro instrumento para comparar dos modelos.
 
     Y no, los intervalos que no se solapan no son el criterio correcto: es una prueba demasiado
     conservadora (dos intervalos pueden solaparse y la diferencia ser significativa). Lo correcto
@@ -855,3 +878,7 @@ otra cosa.
 
   </Solution>
 </Exercise>
+
+Sigue en «El decoder: exportarlo y mirar dentro»: el mismo `best.pt` convertido a ONNX con su
+paridad medida, la repetición del entrenamiento checkpoint a checkpoint y el mapa de atención de
+una partida.

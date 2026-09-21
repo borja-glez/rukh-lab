@@ -46,6 +46,9 @@ demo: ?stage=medium-elo-fp16
 import EloAxis from '../../../components/figures/EloAxis.astro';
 import LoraDecomposition from '../../../components/figures/LoraDecomposition.astro';
 import LoraSpectrum from '../../../components/figures/LoraSpectrum.astro';
+import PromptStrips from '../../../components/figures/PromptStrips.astro';
+
+Parte 1 de 3 del módulo «Fine-tuning e instrucción». Sigue en «Fine-tuning: cómo se mide y lo que salió».
 
 <RepoTag tag="p3" at="inicio" module="M3" next="m4" />
 
@@ -136,6 +139,9 @@ gradiente**. Su embedding sigue exactamente donde lo dejó la inicialización: u
 media cero y desviación 0,02, sin relación con nada. Pedirle al modelo «juega como 1500» no era
 pedirle que jugara peor. Era ponerle delante ruido.
 
+Es el botón de un ascensor que lleva a un piso que no existe: está en el panel, se ilumina al
+pulsarlo y el ascensor no va a ninguna parte. Nadie quitó el botón; solo faltaba el piso.
+
 <EloAxis />
 
 Vale la pena detenerse en cómo se ve un fallo así, porque no se ve. No hay excepción, no hay aviso,
@@ -172,13 +178,13 @@ fichero, el mes se reanuda donde se quedó, y `limit` **para la descarga** en ve
 resultado: con 505 547 partidas de la banda 1000-1799 en el primer shard, 1,2 millones salen de
 tres. La descarga entera pasó de cincuenta minutos atascada a **noventa segundos**.
 
-|                                             |               |
-| ------------------------------------------- | ------------- |
-| Partidas descargadas (1000-1799, dos meses) | 2 400 000     |
+| Paso                                        |      Partidas |
+| ------------------------------------------- | ------------: |
+| Partidas descargadas (1000-1799, dos meses) |     2 400 000 |
 | Convertidas a UCI                           | **2 292 475** |
-| Ilegales encontradas                        | **0**         |
-| Descartadas por cortas (< 20 plies)         | 107 513       |
-| Descartadas por largas (> 300 plies)        | 12            |
+| Ilegales encontradas                        |         **0** |
+| Descartadas por cortas (< 20 plies)         |       107 513 |
+| Descartadas por largas (> 300 plies)        |            12 |
 
 ### Por qué el corpus de afinado es plano y el mundo no
 
@@ -189,6 +195,9 @@ Eso no es lo que hay en Lichess ni de lejos, y es a propósito. Un corpus con la
 al modelo que `<w1500>` es **raro**, que no es lo mismo que enseñarle qué **significa**. La
 frecuencia de una condición y su contenido son dos cosas distintas, y aquí solo interesa la segunda:
 el modelo tiene que saber qué viene después de cada token de Elo, no con qué probabilidad aparece.
+Un diccionario le dedica la misma entrada a «casa» que a «abstruso» aunque la primera se use mil
+veces más, porque lo que se le pide al diccionario es qué significa cada palabra, no cuántas veces
+sale. El corpus plano es ese diccionario: una entrada del mismo tamaño para cada cabecera.
 
 | Banda |   Partidas |
 | ----- | ---------: |
@@ -207,6 +216,11 @@ Las dos últimas filas son el límite de los datos y se publican tal cual. No ha
 corpus queda plano donde puede y se estrecha donde el mundo se estrecha, y como el criterio de
 `GOAL.md` vive entero dentro de la parte plana (1500, 2000 y 2400), eso no lo compromete. Total:
 **1 219 423 partidas, 95 722 318 tokens**.
+
+Y por abajo el corpus también se acaba, esta vez por decisión: la descarga empieza en 1000, así que
+`<w0600>`, `<w0700>`, `<w0800>` y `<w0900>` **siguen sin un solo gradiente** después de este
+módulo. El eje que se arregla va de 1000 en adelante; esas cuatro cabeceras siguen siendo el botón
+del piso que no existe, y por eso ni el barrido de la parte 2 ni el selector de la demo las ofrecen.
 
 Contado sobre el flujo empaquetado, token a token, así queda la cabecera que el modelo lee:
 
@@ -258,6 +272,28 @@ hito— es qué compró.
   resultado de un afinado es su **último** checkpoint, y el bucle ahora lo dice en el log.
 </Callout>
 
+<Exercise n="01" title="¿Por qué best.pt es exactamente el paso 200, y no el 0 ni el 3 800?">
+  Mira `configs/train/medium-elo.yaml` (`eval_every`, `warmup`, `max_steps`) y la rama del bucle
+  que guarda `best.pt` en `src/rukh/train/loop.py`. Antes de leer la solución, escribe en qué paso
+  se quedaría `best.pt` si `eval_every` fuera 50, y qué tendría que pasar con la pérdida de
+  validación para que se quedara en el último paso.
+
+  <Solution>
+    Tres hechos y ninguno es del modelo. Primero, el bucle no evalúa en el paso 0: `best_val` empieza
+    en infinito y la primera evaluación llega cuando `done % eval_every == 0`, es decir, en el paso
+    200. Segundo, esa primera evaluación **siempre** mejora a infinito, así que `best.pt` se escribe
+    en el 200 pase lo que pase. Tercero, la validación mide imitación de partidas de 1800+ y el corpus
+    del afinado tiene el 49 % de partidas por debajo, así que la pérdida de validación sube desde la
+    primera evaluación y ninguna posterior bate a la del 200. Con `eval_every: 50` se quedaría en el
+    paso 50, un modelo todavía más intacto (y dentro del warmup de 200 pasos, con la tasa de
+    aprendizaje aún subiendo). Para que `best.pt` fuera el paso 3 800 haría falta que la pérdida de
+    validación **bajara** durante el afinado, o sea, que el corpus nuevo se pareciera más a la
+    validación que el viejo, que es justo lo contrario de lo que este afinado hace a propósito. Por
+    eso el fichero correcto es `step-3800.pt` y por eso el bucle lo avisa por escrito.
+
+  </Solution>
+</Exercise>
+
 ## Teoría justa
 
 Al terminar esta sección podrás explicar qué distingue un afinado de un preentrenamiento, por qué
@@ -271,6 +307,10 @@ técnica. No lo es. Es el mismo bucle, la misma pérdida, el mismo optimizador; 
 de dónde salen los lotes. `medium-elo` se entrena con entropía cruzada sobre el siguiente token,
 exactamente igual que `medium-v4`; con otros datos y con la tasa de aprendizaje dividida por
 dieciséis.
+
+Un cocinero formado en España que se va a trabajar a Japón no vuelve a aprender a cocinar. Corta,
+sazona y controla el fuego igual; lo que cambia es la despensa, y con la despensa cambian los platos
+que salen. Afinar es eso: el mismo oficio con otros ingredientes, no otro oficio.
 
 Eso tiene dos consecuencias prácticas que conviene tener claras antes de tocar nada.
 
@@ -286,7 +326,8 @@ partidas de 1800+, y el afinado entrena sobre un corpus donde **600 000 de 1 219
 49 %— están por debajo de 1800**. Que la pérdida suba no es un problema, es la definición de lo que
 se está haciendo. El error sería leer esa
 subida como «va mal» y parar antes de tiempo, o —peor— guardar el checkpoint de menor pérdida y
-publicarlo.
+publicarlo. Seguir mirando esa pérdida como si fuera el objetivo es leer el termómetro de la casa
+de la que te acabas de mudar: mide perfectamente, pero mide otra casa.
 
 <Callout
   kind="entrevista"
@@ -304,6 +345,10 @@ publicarlo.
 
 `<w1500>` es una instrucción. No hay parser, ni plantilla, ni «System:». La instrucción es el
 contexto, y el contexto es lo único que un decoder causal tiene.
+
+<Figure caption="La misma idea con tres disfraces. Los dos tokens de cabecera de Rukh, la plantilla de chat de un LLM y los ejemplos de un prompt few-shot son una sola secuencia plana: unos pocos tokens acordados condicionan lo que viene después. Cuando la parte 2 mida que «juega como 1200» cambia el repertorio, estará midiendo un prompt de sistema de un token.">
+  <PromptStrips />
+</Figure>
 
 Lo que esto puede hacer es exactamente lo que hace un modelo de lenguaje: cambiar la distribución de
 lo que viene después. Si el corpus contiene partidas de 1500 precedidas de `<w1500>` y partidas de
@@ -328,7 +373,17 @@ pregunta de este módulo es si baja de forma medible y ordenada.
 ### LoRA: la corrección tiene que caber por un cuello de ocho
 
 Afinar los 115 millones de parámetros deja un checkpoint de 1,4 GB, y un proyecto que quiera cinco
-estilos necesita cinco copias del mismo modelo con diferencias minúsculas.
+estilos necesita cinco copias del mismo modelo con diferencias minúsculas. Conviene tener los
+tamaños en la cabeza, porque el módulo va a manejar tres y son el mismo modelo: 115 120 128
+parámetros en `float32` son **460 MB** (el `model.onnx` de `medium-v4` mide 461 621 570 bytes); a
+la mitad de precisión, el `model-fp16.onnx` que descarga la demo mide 231 386 235 bytes, que son
+los **221 MB** que verás por todo el curso y en la demo, contados en megabytes binarios
+(MiB); y `best.pt` guarda **tres** copias del modelo —los pesos y los dos momentos de Adam—,
+1 387 921 435 bytes, **1,4 GB**. Afinar entero cuesta el tercero; publicar, el segundo.
+
+Frente a eso, un adaptador es una fe de erratas. En vez de reimprimir el libro entero con las
+veinte líneas que cambian, se imprime una hoja con las veinte líneas y el libro se comparte. Cinco
+estilos son cinco hojas y un libro.
 La <Term id="lora">LoRA</Term> plantea otra pregunta: en vez de mover `W`, aprender una corrección
 `B·A` cuyo <Term id="rango">rango</Term> sea lo bastante pequeño como para que los dos factores
 juntos no pesen nada al lado de `W`.
@@ -345,6 +400,32 @@ La otra mitad del argumento es el cuello. Todo lo que el adaptador pueda aprende
 por ocho dimensiones por matriz; esa es la razón por la que es barato y también el techo de lo que
 puede hacer. Sirve para inclinar un modelo hacia un estilo, un dominio o un formato. No sirve para
 enseñarle algo que no sabe.
+
+<Exercise n="02" title="Cuenta el adaptador que se le dio a Qwen, pero sobre nuestro decoder">
+  La parte 2 afina Qwen3 con `r = 16` sobre las cuatro proyecciones de atención. Calcula cuántos
+  parámetros tendría ese mismo adaptador —`r = 16` sobre `q`, `k`, `v` y `attn.proj`— en `medium`
+  (dieciséis capas, `d_model` 768), qué fracción del modelo es y cuánto pesa en `float32`. Después
+  di por qué la fórmula del lab 4, `n_capas × n_objetivos × 2 × r × d_model`, vale para esas cuatro
+  matrices y no valdría para `mlp.fc`.
+
+  <Solution>
+    Cada matriz adaptada recibe una `A` de `r × 768` y una `B` de `768 × r`: `2 × 16 × 768 =
+    24 576` números. Cuatro matrices por capa son `98 304`, y dieciséis capas, **1 572 864**
+    parámetros. Sobre 115 120 128 es el **1,37 %**, cuatro veces el adaptador de estilo (`r = 8`
+    sobre dos matrices: 393 216, el 0,34 %), y en `float32` son 6 291 456 bytes, **6,3 MB**. Fíjate en
+    la coincidencia: 1 572 864 es exactamente el número de **bytes** del adaptador de estilo, porque
+    duplicar el rango y duplicar las matrices multiplica por cuatro, igual que pasar de contar
+    números a contar bytes.
+
+    La fórmula vale porque las cuatro matrices tienen entrada y salida de 768: `q`, `k` y `v` son
+    tres franjas de 768 filas de la misma `qkv` de `768 × 2304`, y `attn.proj` es una `768 × 768`.
+    `mlp.fc` es `768 × 3072`: su `A` seguiría siendo `r × 768`, pero su `B` sería `3072 × r`, y el
+    término `2 × r × d_model` ya no describe las dos. Es el mismo hecho por el que el exportador de
+    la parte 3 admite `q`, `k` y `v` en el grafo y no admite el MLP: los factores viajan como un
+    tensor por rango y tienen que medir todos lo mismo.
+
+  </Solution>
+</Exercise>
 
 Y eso no es una metáfora, es una propiedad que se mide con una línea de álgebra. Los valores
 singulares de una matriz son las direcciones por las que puede empujar, y los del adaptador
@@ -387,7 +468,10 @@ TARGETS = {
 Escribir a mano una técnica publicada tiene un riesgo evidente: que lo escrito se parezca a la
 técnica y no lo sea. Un `alpha` aplicado en el sitio equivocado, `A` y `B` intercambiadas, una
 inicialización distinta —cualquiera de las tres da un modelo que entrena, converge y produce números
-creíbles, y ninguna da LoRA.
+creíbles, y ninguna da LoRA. Es la misma razón por la que nadie que implementa un algoritmo de
+cifrado se conforma con que «parece que cifra»: lo pasa por los vectores de prueba oficiales, con
+entradas y salidas publicadas, porque una implementación que se desvía en un bit también produce
+una salida perfectamente ilegible. Aquí los vectores de prueba son `peft`.
 
 La prueba está en `tests/unit/test_hf_wrapper.py` y es la razón por la que existe la envoltura HF de
 la sección siguiente. Se montan dos modelos sobre **los mismos pesos base**: uno con `apply_lora`,
@@ -435,7 +519,8 @@ son 6,8e-5 sobre logits de escala 18,9, y la jugada elegida no cambia en ninguna
 
 El decoder de este curso es PyTorch a secas, a propósito: leerlo no debería exigir conocer el
 framework de nadie. Pero el resto del ecosistema habla `PreTrainedModel`, y una envoltura son cien
-líneas mientras que reimplementar media librería no lo es.
+líneas mientras que reimplementar media librería no lo es. Es un adaptador de enchufe: no cambia el
+aparato, cambia la clavija para que entre en la pared de otro país.
 
 (Dicho lo cual: M5 acabó escribiendo DPO y GRPO a mano, por lo mismo que este módulo escribió LoRA
 a mano. Con una jugada por respuesta, la pérdida de DPO son dos log-probabilidades en una posición
@@ -460,8 +545,10 @@ Tres cosas que aprendimos montándola y que no están en ningún tutorial:
   config de generación.
 - **Hay que declarar los pesos atados.** `lm_head.weight` comparte almacenamiento con la tabla de
   embeddings; `safetensors` guarda tensores, no alias, y rechaza un state dict con dos nombres para
-  un tensor salvo que se le diga cuál es la copia. Es el mismo hecho que
-  `rukh.train.checkpoint.TIED_SOURCES` registra para el formato propio del proyecto.
+  un tensor salvo que se le diga cuál es la copia. Es un enlace simbólico: un segundo nombre para el
+  mismo fichero, y un copiador que no sepa de enlaces guarda dos ficheros o se niega a guardar
+  ninguno. Es el mismo hecho que `rukh.train.checkpoint.TIED_SOURCES` registra para el formato
+  propio del proyecto.
 
 ### QLoRA a 0,6 B: qué demuestra y qué no
 
@@ -469,7 +556,9 @@ QLoRA es LoRA sobre un modelo base <Term id="cuantizacion">cuantizado</Term> a 4
 existir de la cuantización ahí es la memoria: permite afinar un modelo de 70 B en una GPU de
 consumo, que sin ella no cabría.
 
-A 0,6 B parámetros en una tarjeta de 32 GB no hay nada que ahorrar. El modelo en bf16 son 1,2 GB.
+A 0,6 B parámetros en una tarjeta de 32 GB no hay nada que ahorrar. El modelo en bf16 son 1,2 GB:
+es comprimir una foto de 10 KB para que quepa en un disco de un terabyte. La compresión funciona,
+y no hacía falta.
 Así que lo honesto es intentarlo, medir el pico de memoria con y sin, y decir cuál de las dos cosas
 pasó —y no fingir que se ha demostrado una técnica cuya única ventaja no aplica a la escala en la
 que se ejecutó. El código lo hace explícito: si `bitsandbytes` no carga, la corrida cae a bf16 y lo
@@ -497,3 +586,13 @@ la comparación:
 | **no es una jugada** | `Nf9`, `O-O-O-O`, una frase                                         | no                 |
 | **SAN ambigua**      | dos piezas podrían hacerla y no desambiguó (`Nd2` en vez de `Nbd2`) | no                 |
 | **nada**             | no escribió ningún token                                            | no                 |
+
+Es la diferencia entre un desplegable y un campo de texto libre en un formulario. El desplegable no
+admite un país que no existe; el campo de texto admite «Espanya», «España » con un espacio al final y
+«asdf», y cada una de esas tres es un error distinto que hay que contar aparte. El decoder es el
+desplegable. Qwen es el campo de texto.
+
+Hasta aquí el agujero y la teoría: qué faltaba en los datos, qué es afinar, qué cabe por un cuello de
+ocho y qué se le va a pedir a un modelo general. La parte siguiente es la medición: por qué el
+criterio del hito son dos afirmaciones y no una, qué salió del barrido por condición y del control,
+y qué mueve de verdad un adaptador de 1,6 MB. Sigue en «Fine-tuning: cómo se mide y lo que salió».

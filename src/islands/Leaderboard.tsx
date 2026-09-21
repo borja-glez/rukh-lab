@@ -77,8 +77,9 @@ function Table({ source }: { source: ResultsFile }) {
         </p>
         <p class="lb__sub caption">
           Una fila por etapa evaluada, en el orden del curso. Pulsa una cabecera para ordenar por
-          esa columna; otra vez, para invertir. Las fracciones son porcentajes; el Elo lleva su
-          intervalo del 95 %.
+          esa columna; otra vez, para invertir. Legalidad, top-k y puzles son porcentajes; el Elo
+          lleva su intervalo del 95 %; la entropía de la primera jugada dice si el modelo abre
+          siempre igual (0) o reparte (más bits).
         </p>
       </div>
 

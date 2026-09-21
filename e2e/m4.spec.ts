@@ -97,10 +97,20 @@ test.describe('lesson M4 and its animated figures', () => {
         await page.goto(lesson);
         const prose = (await page.locator('.prose').boundingBox())!;
         for (const figure of figures) {
-          const svg = (await page.locator(`figure.${figure} svg`).boundingBox())!;
-          expect(Math.round(svg.width), `${figure} at ${width}`).toBeLessThanOrEqual(
-            Math.round(prose.width) + 1,
-          );
+          const svg = (await page.locator(`figure.${figure} svg`).first().boundingBox())!;
+          if (Math.round(prose.width) >= 560) {
+            expect(Math.round(svg.width), `${figure} at ${width}`).toBeLessThanOrEqual(
+              Math.round(prose.width) + 1,
+            );
+          } else {
+            // Below 560 px the figure keeps its size and scrolls inside its own box, so the
+            // type stays legible; what must never happen is the page scrolling sideways.
+            expect(Math.round(svg.width), `${figure} at ${width}`).toBeGreaterThanOrEqual(559);
+            const fits = await page.evaluate(
+              () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+            );
+            expect(fits, `${figure} at ${width} overflows the page`).toBe(true);
+          }
         }
         const overflow = await page.evaluate(
           () => document.documentElement.scrollWidth > document.documentElement.clientWidth,

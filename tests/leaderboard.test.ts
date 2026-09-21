@@ -203,7 +203,7 @@ describe('columns', () => {
     expect(text.top1).toBe(`51,1${THIN}%`);
     expect(text.elo).toBe('1365 (1293 … 1423)');
     expect(text.top3).toBeNull();
-    expect(text.delta_cp).toBeNull();
+    expect(text.first_move_entropy).toBeNull();
   });
 });
 

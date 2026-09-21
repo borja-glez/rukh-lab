@@ -107,7 +107,8 @@ test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
       await expect(island.locator('svg')).toHaveCount(0);
       return;
     }
-    await expect(island.locator('svg')).toHaveCount(1);
+    // The chart, plus the legality strip under it when the JSON carries legality.
+    expect(await island.locator('svg').count()).toBeGreaterThanOrEqual(1);
     await expect(island.locator('[data-numbers]')).toBeVisible();
     const before = await island.getAttribute('data-step');
     const slider = island.getByRole('slider', { name: 'Checkpoint' });

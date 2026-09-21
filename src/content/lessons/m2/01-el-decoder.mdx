@@ -42,6 +42,8 @@ import SoftmaxPush from '../../../components/figures/SoftmaxPush.astro';
 
 <RepoTag tag="p1" at="inicio" module="M1" next="m2" />
 
+Parte 1 de 4 del módulo «El decoder». Sigue en «El decoder: entrenarlo y medirlo».
+
 ## Qué vas a construir
 
 Al terminar esta sección sabrás exactamente qué objeto vas a escribir, cuánto ocupa, cuánto tarda
@@ -179,6 +181,13 @@ posición `m` y la posición `n` depende solo de la diferencia `m − n`. La ate
 distancias relativas ("la jugada de hace dos") en vez de índices absolutos ("la jugada número 7"),
 gratis y sin parámetros nuevos.
 
+Es la diferencia entre dos formas de sentar a la gente en una sala. La tabla aprendida da a cada
+silla un número y el modelo aprende qué significa «la silla 7»; si un día hay más sillas que
+números, no hay sitio. RoPE no numera sillas: lo que sabe es a cuántos asientos de distancia está
+cada persona de cada otra, y esa distancia es la misma se sienten donde se sienten. Por eso sirve
+para una fila más larga que cualquiera que haya visto, y por eso aquí, con la fila fija en 200,
+no compra nada.
+
 En el código, `head_dim` es 64, así que hay 32 pares de dimensiones, cada uno con su propia
 frecuencia:
 
@@ -270,6 +279,11 @@ con atenciones prácticamente binarias, y donde el softmax satura el gradiente e
 √d mantiene las puntuaciones en un rango donde el softmax todavía tiene pendiente. Es una línea de
 código que decide si el modelo aprende o se queda clavado.
 
+Es el mando de volumen que va **antes** del amplificador. Si la señal entra ya saturada, el
+amplificador no la arregla: recorta todo lo que pasa de un umbral y lo que sale es un ruido plano.
+El softmax es ese amplificador —exponencial, sin piedad— y el 1/√d es bajar el volumen a la entrada
+para que lo que llegue tenga todavía matices.
+
 **Paso 3, softmax.** Exponenciar y normalizar:
 
 ```text
@@ -318,6 +332,25 @@ out = F.scaled_dot_product_attention(q, k, v, dropout_p=..., is_causal=True)
   exporta el mapa de atención, tiene que recalcularlos a mano.
 </Callout>
 
+<Exercise n="01" title="La misma consulta, el doble de larga">
+  Repite los cuatro pasos con `q₃ = (2, 2)` y las mismas claves y valores. ¿Qué pesos salen y qué
+  salida? ¿Qué ha cambiado respecto a `q₃ = (1, 1)` y a qué perilla de la sección de muestreo se
+  parece?
+
+  <Solution>
+    Productos escalares 2, 4 y 2; escalados por √2, 1,4142, 2,8284 y 1,4142; exponenciales 4,1133,
+    16,919 y 4,1133, que suman 25,146. Pesos **0,1636 · 0,6728 · 0,1636** (antes 0,2483 · 0,5035 ·
+    0,2483) y salida `0,1636·(2, 0) + 0,6728·(0, 2) + 0,1636·(1, 1) = (0,4908, 1,5092)`. La consulta
+    apunta en la misma dirección que antes, así que el orden de preferencia no cambia; lo que cambia
+    es cuánto se concentra: doblar la longitud de la consulta dobla todas las diferencias entre
+    puntuaciones antes del exponencial, y el softmax pasa de repartir a casi elegir. Es exactamente
+    lo que hace bajar la temperatura a 0,5, con una diferencia importante: la temperatura la eliges
+    tú al muestrear, y la longitud de las consultas la aprende el modelo, cabeza a cabeza, durante
+    el entrenamiento. Una cabeza que quiere ser un interruptor alarga sus consultas.
+
+  </Solution>
+</Exercise>
+
 ### La máscara causal, que aquí no es opcional
 
 En el ejemplo anterior, la consulta de la posición 3 miró a las claves 1, 2 y 3. ¿Y la consulta de
@@ -337,7 +370,10 @@ no se manifiesta como un fallo sino como un resultado buenísimo.
 
 La <Term id="mascara-causal">máscara causal</Term> lo impide. Antes del softmax, toda puntuación de
 una clave posterior a la consulta se pone a menos infinito; `exp(-inf) = 0`, así que esos pesos
-salen exactamente cero:
+salen exactamente cero. Para completar la matriz hacen falta las consultas de las dos primeras
+posiciones, que el ejemplo de arriba no daba: toma `q₁ = (1, 0)` y `q₂ = (0,5, 1)`, con las mismas
+claves `k₁ = (1, 0)`, `k₂ = (1, 1)` y `k₃ = (0, 1)`, y la misma escala 1/√2. Así `q₁·k₁ = 1 →
+0,71`, `q₂·k₁ = 0,5 → 0,35` y `q₂·k₂ = 1,5 → 1,06`; la tercera fila es la de antes:
 
 ```text
              clave 1   clave 2   clave 3
@@ -421,6 +457,11 @@ capa reescala lo que pasa por ella. Pre-norm mueve el `LayerNorm` dentro de la r
 subcapa, y deja la autopista libre desde la pérdida hasta el embedding. Es un cambio de dos
 caracteres en el código que convierte "entrenable con cuidado" en "entrenable".
 
+Post-norm es poner un peaje en cada tramo de la autopista: todo lo que circula, aporte o no,
+para y paga. Pre-norm mueve el peaje a la salida que lleva a cada subcapa: quien entra a trabajar
+paga, y la autopista sigue siendo autopista. El gradiente es el tráfico que tiene que llegar de la
+última capa a la primera sin que doce peajes lo dejen en nada.
+
 Queda un detalle que parece cosmético y no lo es. La corriente residual recibe **24 aportaciones**
 (12 bloques × 2 subcapas), y si cada una tiene la varianza de una inicialización normal, la
 varianza total crece con el número de capas y el modelo arranca con activaciones enormes. Por eso
@@ -434,8 +475,11 @@ Es el truco de GPT-2 y está en `MoveDecoder.__init__`. Divide la desviación po
 en la corriente residual empiezan pequeñas y el modelo va subiendo el volumen de las que le sirven.
 
 El MLP, por cierto, es la parte aburrida y **dos tercios de los parámetros de un bloque**:
-`512 → 2048 → 512` con GELU en medio. La atención mezcla posiciones; el MLP procesa cada posición por separado. Se suele
-describir como la memoria del modelo: donde vive "después de esta configuración, esta jugada".
+`512 → 2048 → 512` con GELU en medio. La atención mezcla posiciones; el MLP procesa cada posición
+por separado. Se suele describir como la memoria del modelo: donde vive "después de esta
+configuración, esta jugada". Si la atención es la reunión —cada uno se lleva lo que le han dicho
+los demás—, el MLP es lo que hace cada asistente a solas al volver a su mesa: pensar sobre lo
+que ha oído, sin hablar con nadie, y con dos tercios del tiempo del bloque para hacerlo.
 
 ### Tied embeddings: la misma tabla para leer y para escribir
 
@@ -461,6 +505,12 @@ significa `e2e4` a la entrada" y "lo que hay que pensar para decir `e2e4`" sean 
 hipótesis fuerte, casi siempre buena, y ocasionalmente limitante: si un token quisiera significar
 cosas muy distintas leído y escrito, atarlos le quita esa libertad.
 
+Es usar el mismo diccionario para traducir en los dos sentidos. Un diccionario español-inglés y
+otro inglés-español son dos libros, y pueden contradecirse; uno solo, leído de ida y de vuelta,
+garantiza que «lo que entiendo por `e2e4`» y «lo que digo cuando quiero decir `e2e4`» coinciden. Se
+pierde la posibilidad de que una palabra se entienda de una manera y se use de otra, que en un
+idioma existe y en un vocabulario de jugadas casi no.
+
 <Callout kind="entrevista" title="¿Los tied embeddings ayudan o solo ahorran?">
   Las dos cosas, y en modelos pequeños con vocabularios grandes en proporción, ayudan más de lo que
   ahorran: la capa de salida es la que más sufre de escasez de datos (hay jugadas que aparecen
@@ -468,6 +518,22 @@ cosas muy distintas leído y escrito, atarlos le quita esa libertad.
   entrada. En modelos muy grandes la práctica se abandona a veces, porque el vocabulario pesa poco y
   la restricción ya no compensa.
 </Callout>
+
+<Exercise n="02" title="Cuánto ahorra atar la tabla en `medium`">
+  `medium` tiene `d_model = 768` y 115 120 128 parámetros. ¿Cuántos parámetros ahorra `tie_embeddings`
+  ahí y qué porcentaje del modelo son? Compáralo con el 2,7 % de `small` y explica hacia dónde va
+  esa cifra al crecer el modelo.
+
+  <Solution>
+    La tabla es `2 030 × 768 = 1 559 040` parámetros, y eso es lo que se ahorra: el **1,35 %** de
+    los 115 millones, la mitad del 2,7 % de `small`. La razón está en cómo escala cada pieza: la
+    tabla crece con `d` y los bloques con `d²` por capa (y con el número de capas). Al pasar de
+    12 × 512 a 16 × 768 los bloques se multiplican por tres y la tabla solo por 1,5. En un modelo
+    de miles de millones de parámetros el ahorro es una fracción de milésima, y por eso la
+    justificación de atar la tabla deja de ser el tamaño y pasa a ser la del callout: qué le hace
+    al gradiente de la capa de salida.
+  </Solution>
+</Exercise>
 
 ### La receta: AdamW, warmup, coseno, clipping, bf16
 
@@ -498,6 +564,12 @@ canal, no regularizarlo. Un sesgo tiene una dimensión y desplaza, no escala: no
 que haga falta contener. Son unos pocos miles de parámetros de los 39 millones, pero meterlos en el
 grupo equivocado degrada el entrenamiento de forma silenciosa, que es la peor.
 
+El decaimiento es un alquiler que se cobra por peso: cada parámetro paga cada paso una fracción de
+lo que vale, y solo se queda grande el que el gradiente sostiene porque de verdad hace falta. Lo
+que no se usa se va encogiendo hasta desaparecer. A las ganancias del `LayerNorm` no se les cobra
+porque su tamaño no es capacidad: es un ajuste de escala, y cobrarles alquiler es apagar el
+canal.
+
 **<Term id="warmup">Warmup</Term> de 1 000 pasos y después coseno.** La tasa de aprendizaje empieza
 en cero, sube en línea recta hasta 6e-4 en el paso 1 000 y desde ahí baja siguiendo medio coseno
 hasta el 10 % de ese valor en el paso 20 000, donde se queda:
@@ -510,8 +582,10 @@ return floor + 0.5 * (1.0 + math.cos(math.pi * progress)) * (cfg.lr - floor)
 ```
 
 Qué pasa sin warmup. En el paso 1, Adam tiene una estimación del segundo momento hecha con un único
-gradiente; el cociente que calcula es casi arbitrario, y como el paso de Adam está normalizado, un
-parámetro puede moverse tanto como la tasa de aprendizaje de golpe. Sobre una red recién
+gradiente; el cociente que calcula es casi arbitrario —es calcular tu velocidad media en un viaje
+cuando llevas recorrido el primer metro: el número existe, pero no significa nada todavía—, y como
+el paso de Adam está normalizado, un parámetro puede moverse tanto como la tasa de aprendizaje de
+golpe. El warmup es no fiarse de esa media hasta que hay kilómetros detrás. Sobre una red recién
 inicializada, con 24 escrituras en la corriente residual, eso basta para que las activaciones
 exploten, el softmax de la atención sature y el modelo caiga en un mínimo tonto: predecir siempre
 las jugadas más frecuentes del corpus. La curva no revienta con un `NaN` espectacular; se queda
@@ -526,7 +600,11 @@ modelo está cerca de un mínimo y pasos grandes solo lo sacan de él. El suelo 
 pasa de 1,0, se reescala el vector entero para que valga 1,0. Es un seguro contra un lote raro: sin
 él, una única secuencia patológica puede mover los pesos lo suficiente como para tirar horas de
 entrenamiento. El `grad_norm` se registra en MLflow en cada paso, y mirarlo es la mejor forma de
-saber si el entrenamiento está sano: debe bajar y estabilizarse, no dar picos.
+saber si el entrenamiento está sano: debe bajar y estabilizarse, no dar picos. Es el limitador de
+velocidad de un coche de alquiler: no cambia cómo conduces mientras vas por debajo, y el día que
+pisas de más porque la carretera te engañó, es lo que evita el accidente. Si salta en cada
+curva —el `grad_norm` pegado a 1,0 paso tras paso—, el problema no es el limitador, es que vas
+demasiado deprisa para esa carretera: la tasa de aprendizaje es alta.
 
 **<Term id="bf16">bf16</Term>, y por qué no fp16.** Los dos son formatos de 16 bits y los dos
 doblan el rendimiento en una GPU moderna. La diferencia está en cómo reparten los bits. fp16 usa 5
@@ -535,8 +613,12 @@ pequeño alrededor de 6·10⁻⁵. Los gradientes de una red profunda viven just
 fp16 se van a cero: por eso entrenar en fp16 obliga a un `GradScaler` que multiplica la pérdida por
 un factor grande, lo baja si aparecen infinitos, y de vez en cuando te regala un `NaN` a las tres
 de la mañana. bf16 usa 8 bits de exponente —**el mismo rango que fp32**— y 7 de mantisa: menos
-precisión por número, pero nada se desborda por abajo. No hace falta escalar nada. En la RTX 5090
-(sm_120) bf16 es nativo, así que la elección es gratis:
+precisión por número, pero nada se desborda por abajo. No hace falta escalar nada. Son dos reglas
+del mismo precio: fp16 es una regla fina y corta —marca las décimas de milímetro, pero solo llega
+a 20 centímetros—, bf16 es gruesa y larga —milímetros enteros, pero llega hasta donde llega una
+de metro—. Para un gradiente, que puede ser minúsculo o enorme y casi nunca necesita la tercera
+cifra, la larga es la que sirve. En la RTX 5090 (sm_120) bf16 es nativo, así que la elección es
+gratis:
 
 ```yaml
 precision: bf16
@@ -584,7 +666,7 @@ reparte entre el resto en proporción a lo que ya tenían.
 
 <Figure
   n="02"
-  caption="Empujar hacia abajo la mejor jugada no la sustituye por la segunda. Las dos columnas suman uno, así que todo lo demás sube a la vez: la cola naranja —las jugadas que no querías— pasa de sumar el 25 % al 37 % sin que nadie la haya tocado. El softmax no tiene papelera."
+  caption="Empujar hacia abajo la mejor jugada no la sustituye por la segunda. Las dos columnas suman uno, así que todo lo demás sube a la vez: la cola —las ocho jugadas que no querías— pasa de sumar el 26 % al 38 % sin que nadie la haya tocado. El softmax no tiene papelera."
 >
   <SoftmaxPush />
 </Figure>
@@ -637,3 +719,7 @@ módulo:
   tiene `mask_illegal` y por eso `rukh play` tiene `--no-mask`: no es un modo de depuración, es el
   experimento.
 </Callout>
+
+Hasta aquí el objeto. Sigue en «El decoder: entrenarlo y medirlo»: cómo se lee cada columna de la
+tabla única, con cuántas partidas se puede creer un Elo, y los cuatro labs que escriben, prueban y
+entrenan `MoveDecoder`.
