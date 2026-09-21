@@ -15,6 +15,7 @@ import ModelBadge from './ModelBadge.astro';
 import ResultsTable from './ResultsTable.astro';
 import DemoEmbed from './DemoEmbed.astro';
 import TokenizerStats from './TokenizerStats.astro';
+import RepoTag from './RepoTag.astro';
 import AttentionMap from '../../islands/AttentionMap';
 import TrainingReplay from '../../islands/TrainingReplay';
 import ValueBar from '../../islands/ValueBar';
@@ -32,6 +33,7 @@ export {
   ResultsTable,
   DemoEmbed,
   TokenizerStats,
+  RepoTag,
   AttentionMap,
   TrainingReplay,
   ValueBar,
@@ -50,6 +52,7 @@ export const components = {
   ResultsTable,
   DemoEmbed,
   TokenizerStats,
+  RepoTag,
 };
 
 /*
