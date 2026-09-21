@@ -99,8 +99,8 @@ Las fuentes las sirve la API de fuentes de Astro (`fontProviders.fontsource()`),
 
 ## Divergencias respecto al portfolio
 
-- Sin i18n por diccionarios: cada página fija su `lang` (`es` por defecto, `en` en `/proyecto/` y
-  `/en/`). No hay redirección por idioma guardado.
+- Sin i18n: el sitio es solo en español (decisión de Borja del 2026-09-21; la traducción queda
+  para más adelante). `Locale` es `'es'` y cada página declara `lang="es"`.
 - `tokens.css` solo contiene el bloque `:root`, `color-scheme` y las media queries que cambian
   tokens; la base y los patrones (`.label`, `.btn`, `.section`…) están en `global.css`. Son cuatro:
   las dos del portfolio más `1800px` y `2400px`, que ensanchan `--container` para que una pantalla

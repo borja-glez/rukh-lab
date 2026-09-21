@@ -61,9 +61,13 @@ test('landmarks, skip link and language are in place', async ({ page }) => {
   await expect(skip).toBeFocused();
 });
 
-test('English pages declare lang="en"', async ({ page }) => {
-  await page.goto('/proyecto/');
-  await expect(page.locator('html')).toHaveAttribute('lang', 'en');
-  await page.goto('/en/');
-  await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+test('the site is Spanish only: every page declares lang="es" and /en/ is gone', async ({
+  page,
+}) => {
+  for (const path of ['/proyecto/', '/curso/', '/glosario/']) {
+    await page.goto(path);
+    await expect(page.locator('html')).toHaveAttribute('lang', 'es');
+  }
+  const response = await page.goto('/en/');
+  expect(response?.status()).toBe(404);
 });

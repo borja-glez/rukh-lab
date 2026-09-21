@@ -20,13 +20,6 @@ const themeInitHash = `sha256-${createHash('sha256').update(themeInit).digest('b
 export default defineConfig({
   site: 'https://lab.rukh.borjaglez.com',
   trailingSlash: 'always',
-  i18n: {
-    defaultLocale: 'es',
-    locales: ['es', 'en'],
-    routing: {
-      prefixDefaultLocale: false,
-    },
-  },
   integrations: [
     expressiveCode({
       themes: ['github-light', 'github-dark'],
@@ -48,8 +41,6 @@ export default defineConfig({
     }),
     mdx(),
     preact(),
-    // No i18n option: it would advertise /en/curso/ etc., which do not exist. The two
-    // real English pages declare their alternates in Base.astro.
     sitemap(),
   ],
   fonts: [

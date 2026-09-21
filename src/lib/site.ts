@@ -26,9 +26,9 @@ export const themeColors: Record<Theme, string> = {
   dark: '#0e1622',
 };
 
-export type Locale = 'es' | 'en';
+/** The site is Spanish only for now; a translation would widen this and the dictionaries. */
+export type Locale = 'es';
 
 export const localeTags: Record<Locale, string> = {
   es: 'es-ES',
-  en: 'en',
 };

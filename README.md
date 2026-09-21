@@ -2,8 +2,8 @@
 
 The course site of **Rukh**, a hands-on course on generative and agentic AI that builds a chess
 language model from scratch: data, decoder, encoder, fine-tuning, alignment with verifiable rewards,
-RAG, agents and MCP. Lessons are written in Spanish; this README, the code and the project page are
-in English.
+RAG, agents and MCP. The site is in Spanish only for now (a translation may come later); this
+README and the code are in English.
 
 - Site: [lab.rukh.borjaglez.com](https://lab.rukh.borjaglez.com)
 - Demo (play against the model): [rukh.borjaglez.com](https://rukh.borjaglez.com) ·
@@ -39,7 +39,7 @@ Requirements: Node ≥ 24 and pnpm 10 (`corepack enable`).
 | `pnpm check`          | `astro check` (types in `.astro` and `.ts`).                                     |
 | `pnpm lint`           | ESLint.                                                                          |
 | `pnpm format`         | Prettier (write); `pnpm format:check` verifies.                                  |
-| `pnpm test`           | Vitest: token hash, theme script hash, MDX registry, i18n parity, progress.      |
+| `pnpm test`           | Vitest: token hash, theme script hash, MDX registry, dictionary, progress.       |
 | `pnpm e2e`            | Playwright against `pnpm preview`: navigation, progress, axe, CSP.               |
 | `pnpm lighthouse`     | Lighthouse CI on `dist/` (desktop, 3 runs, all categories ≥ 0.95).               |
 | `pnpm sync:data`      | Copies `../rukh/artifacts/web/*.json` to `src/data/` (no-op if missing).         |
@@ -64,7 +64,7 @@ src/data/results.json   the single results table (synced from the ML repo)
 ```
 
 Routes: `/` · `/curso/` · `/curso/[module]/[lesson]/` · `/glosario/` · `/cheatsheets/` (printable) ·
-`/proyecto/` (English, for recruiters) · `/en/` (English landing) · `404`.
+`/proyecto/` (the project in one page) · `404`.
 
 ## Writing lessons
 
