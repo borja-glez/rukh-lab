@@ -5,13 +5,18 @@ Cada fichero de esta carpeta lo produce un lab del repo `rukh` en `artifacts/web
 versionan como marcador de posición (colecciones vacías y `meta.generated: null`); las islas que los
 leen detectan ese estado y muestran "pendiente" en vez de dibujar cifras inventadas.
 
-| Fichero                | Lo genera                     | Lo lee                           |
-| ---------------------- | ----------------------------- | -------------------------------- |
-| `results.json`         | `rukh eval` (tabla única)     | `<ResultsTable>`                 |
-| `tokenizer-stats.json` | `rukh data tokenize --stats`  | `<TokenizerStats>`               |
-| `attention.json`       | `labs/m2/attention_export.py` | `src/islands/AttentionMap.tsx`   |
-| `training-replay.json` | `labs/m2/replay_export.py`    | `src/islands/TrainingReplay.tsx` |
-| `value-bar.json`       | `labs/m3/value_bar_export.py` | `src/islands/ValueBar.tsx`       |
+| Fichero                | Lo genera                        | Lo lee                                                 |
+| ---------------------- | -------------------------------- | ------------------------------------------------------ |
+| `results.json`         | `rukh eval` (tabla única)        | `<ResultsTable>` y `src/islands/Leaderboard.tsx`       |
+| `tokenizer-stats.json` | `rukh data tokenize --stats`     | `<TokenizerStats>`                                     |
+| `attention.json`       | `labs/m2/attention_export.py`    | `src/islands/AttentionMap.tsx`                         |
+| `training-replay.json` | `labs/m2/replay_export.py`       | `src/islands/TrainingReplay.tsx`                       |
+| `value-bar.json`       | `labs/m3/value_bar_export.py`    | `src/islands/ValueBar.tsx`                             |
+| `ladder-floor.json`    | `labs/m6/ladder_floor_export.py` | `src/components/figures/LadderFloor.astro`             |
+| `parity-cost.json`     | `labs/m6/parity_export.py`       | `src/components/figures/ParityCost.astro`              |
+
+`pnpm sync:data` copia **todos** los `*.json` de `../rukh/artifacts/web/`, sin lista: un fichero
+nuevo del repo de ML llega aquí sin tocar el script.
 
 ## `results.json` · la tabla única
 
@@ -47,6 +52,14 @@ repo de ML publica medidas y no decisiones de presentación; acepta también el 
 versionado, que sí trae `columns` y filas ya formateadas. Redondea con `toFixed`, igual que el
 `report.md` que escribe `rukh eval`, para que las dos lecturas de la misma medida no discrepen en
 una décima.
+
+La isla `<Leaderboard>` (M6) lee el mismo fichero y muestra las filas del decoder ordenables por
+columna, con los baselines marcados y cada etapa enlazada a su card y a la arena de la demo; el
+mapa etapa → repo/etapa de la demo vive en `src/lib/stages.ts`, no en los datos. Un baseline es una
+fila con `baseline: true` o cuya etapa empieza por `qwen`, `karvonen` o `maia`. El intervalo del
+Elo sale de `elo_ci` y, si no lo hay, de `elo_lower`/`elo_upper` por separado: la fila de Qwen trae
+solo `elo_upper`, porque su extremo inferior tocó el suelo de la escalera, y se imprime como
+`320 (… 807)`. Las filas con `kind: "encoder"` no entran en la clasificación.
 
 ## `attention.json` · esquema `rukh-attention/1`
 
@@ -177,3 +190,48 @@ cero— y escribe un guion en la lectura, igual que `TrainingReplay`.
 
 Una partida de 40-60 plies es el tamaño cómodo. Por encima de 80 las etiquetas del eje dejan de
 leerse en un móvil, y el deslizador pasa a necesitar demasiados pasos para llegar a un ply concreto.
+
+## `ladder-floor.json` · el suelo del instrumento (M6)
+
+```jsonc
+{
+  "meta": {
+    "generated": "2026-09-22T09:40:00Z", // null en el marcador de posición
+    "model": "medium-v4", // la etapa medida cuatro veces
+    "games": 160, // partidas por tirada
+  },
+  // Cuatro tiradas del mismo modelo contra la misma escalera: dos con Stockfish limitado por
+  // tiempo y dos limitado por nodos. Solo cambia la semilla dentro de cada par.
+  "runs": [
+    { "name": "time-a", "limit": "time", "elo": 1538, "lo": 1476, "hi": 1599 },
+    { "name": "time-b", "limit": "time", "elo": 1521, "lo": 1460, "hi": 1583 },
+    { "name": "nodes-a", "limit": "nodes", "elo": 1531, "lo": 1470, "hi": 1592 },
+    { "name": "nodes-b", "limit": "nodes", "elo": 1534, "lo": 1473, "hi": 1595 },
+  ],
+  "decision": "nodes", // "nodes" | "time": el límite que se queda para el resto del hito
+}
+```
+
+`lo` y `hi` son el intervalo del 95 % de cada tirada, en Elo. La figura agrupa por `limit`, dibuja
+las cuatro barras sobre un mismo eje e imprime la distancia entre las dos tiradas de cada grupo, que
+es lo que decidió `decision`. Con el marcador de posición (`runs` vacío) muestra "pendiente".
+
+## `parity-cost.json` · el coste de la cuantización (M6)
+
+```jsonc
+{
+  "meta": { "generated": "2026-09-22T09:40:00Z" }, // null en el marcador de posición
+  "model": "medium-v4",
+  // Una entrada por exportación del mismo checkpoint. `parity` es la fracción de posiciones en
+  // las que la exportación elige la misma jugada que el checkpoint en PyTorch, en [0, 1].
+  "variants": [
+    { "name": "fp32", "parity": 1.0, "elo": 1538, "lo": 1476, "hi": 1599 },
+    { "name": "fp16", "parity": 0.999, "elo": 1535, "lo": 1473, "hi": 1596 },
+    { "name": "int8", "parity": 0.954 }, // sin `elo` mientras el lab 2 no lo mida
+  ],
+}
+```
+
+`elo`, `lo` y `hi` son opcionales y van los tres juntos: la figura solo dibuja el panel de Elo para
+las variantes que los traen, y lo omite entero cuando ninguna los trae. Con el marcador de posición
+(`variants` vacío) muestra "pendiente".

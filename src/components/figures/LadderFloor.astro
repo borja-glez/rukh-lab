@@ -1,0 +1,220 @@
+---
+/**
+ * The floor of the instrument: the same model measured four times against the same ladder, twice
+ * with Stockfish limited by time and twice limited by nodes (A2 of the P6 plan).
+ *
+ * Every row is one full run of the Elo suite. The bar is the 95 % interval, the mark is the
+ * estimate. Nothing differs between the two rows of a group but the seed, so the distance between
+ * them is what the instrument itself adds to a measurement: an Elo difference smaller than that
+ * floor is not a difference. The two groups are the two ways of capping Stockfish, and the spread
+ * of each is the number that decided which cap the milestone keeps (`decision`).
+ *
+ * Data comes from `src/data/ladder-floor.json`, written by `labs/m6/ladder_floor_export.py` and
+ * copied here with `pnpm sync:data`; the schema is in `src/data/README.md`. With the committed
+ * placeholder (`meta.generated: null`, no runs) the figure renders its "pendiente" state, because
+ * a floor invented for the drawing would be the opposite of what it is here to show.
+ *
+ * Styles live in `src/styles/global.css` (`.fig*`): a scoped `<style>` in a figure used from MDX
+ * never reaches the page.
+ */
+import raw from '../../data/ladder-floor.json';
+import { formatInt } from '../../lib/format';
+
+type Limit = 'time' | 'nodes';
+
+interface Run {
+  name: string;
+  limit: Limit;
+  elo: number;
+  lo: number;
+  hi: number;
+}
+
+interface LadderFloor {
+  meta: { generated: string | null; model?: string; games?: number };
+  runs: Run[];
+  decision?: Limit | null;
+}
+
+const data = raw as LadderFloor;
+const runs = Array.isArray(data.runs)
+  ? data.runs.filter((run) => run && typeof run.elo === 'number')
+  : [];
+const ready = data.meta?.generated !== null && runs.length > 0;
+
+const LIMITS: { key: Limit; title: string; word: string }[] = [
+  { key: 'time', title: 'Stockfish limitado por tiempo', word: 'tiempo' },
+  { key: 'nodes', title: 'Stockfish limitado por nodos', word: 'nodos' },
+];
+
+const groups = LIMITS.map((limit) => {
+  const own = runs.filter((run) => run.limit === limit.key);
+  const spread =
+    own.length >= 2
+      ? Math.max(...own.map((run) => run.elo)) - Math.min(...own.map((run) => run.elo))
+      : null;
+  return { ...limit, runs: own, spread, chosen: data.decision === limit.key };
+}).filter((group) => group.runs.length > 0);
+
+/* Axis fitted to the data and rounded outwards to a multiple of 50, padded so no bar touches the
+   edge; a fixed axis would squash four intervals that differ by a handful of points. */
+const ends = runs.flatMap((run) => [run.lo, run.hi]);
+const pad = ready ? Math.max((Math.max(...ends) - Math.min(...ends)) * 0.1, 10) : 0;
+const LOW = ready ? Math.floor((Math.min(...ends) - pad) / 50) * 50 : 0;
+const HIGH = ready ? Math.ceil((Math.max(...ends) + pad) / 50) * 50 : 1;
+const step = HIGH - LOW > 400 ? 100 : 50;
+const ticks: number[] = [];
+for (let value = LOW; value <= HIGH; value += step) ticks.push(value);
+
+const X0 = 150;
+const X1 = 615;
+const x = (elo: number) => X0 + ((elo - LOW) / (HIGH - LOW || 1)) * (X1 - X0);
+
+/* Vertical layout: a title line per group, then one row per run. */
+const ROW = 28;
+const HEAD = 26;
+const TOP = 14;
+let cursor = TOP;
+const laid = groups.map((group) => {
+  const titleY = cursor + 12;
+  cursor += HEAD;
+  const rows = group.runs.map((run) => {
+    const y = cursor + ROW / 2;
+    cursor += ROW;
+    return { run, y };
+  });
+  cursor += 10;
+  return { ...group, titleY, rows };
+});
+const axisY = cursor + 6;
+const HEIGHT = axisY + 26;
+
+const spreadText = (spread: number | null) =>
+  spread === null ? 'una sola tirada' : `${formatInt(spread)} Elo entre tiradas`;
+
+const summary = laid
+  .map(
+    (group) =>
+      `Por ${group.word}: ${group.runs
+        .map(
+          (row) =>
+            `${row.name} en ${formatInt(row.elo)}, intervalo ${formatInt(row.lo)} a ${formatInt(row.hi)}`,
+        )
+        .join('; ')}. ${spreadText(group.spread)}.`,
+  )
+  .join(' ');
+const decisionText = data.decision
+  ? `Se decidió limitar por ${LIMITS.find((l) => l.key === data.decision)?.word ?? data.decision}.`
+  : '';
+---
+
+{ready ? (
+  <figure class="fig fig--ladder" data-ladder-floor data-state="ready">
+    <svg
+      viewBox={`0 0 640 ${HEIGHT}`}
+      role="img"
+      aria-label={`Cuatro mediciones del mismo modelo contra la misma escalera. ${summary} ${decisionText}`}
+    >
+      <g font-family="var(--font-mono)" font-size="10" fill="var(--muted)">
+        {ticks.map((tick) => (
+          <g>
+            <line
+              x1={x(tick)}
+              y1={TOP - 4}
+              x2={x(tick)}
+              y2={axisY}
+              stroke="var(--line-soft)"
+              stroke-width="1"
+            />
+            <text x={x(tick)} y={axisY + 16} text-anchor="middle" font-size="9">
+              {tick}
+            </text>
+          </g>
+        ))}
+        <line x1={X0} y1={axisY} x2={X1} y2={axisY} stroke="var(--line)" stroke-width="0.8" />
+        <text x="10" y={axisY + 16} font-size="9">
+          Elo medido
+        </text>
+
+        {laid.map((group) => (
+          <g
+            class={
+              group.chosen ? 'fig-ladder__group fig-ladder__group--chosen' : 'fig-ladder__group'
+            }
+          >
+            <text x="10" y={group.titleY} fill="var(--ink)" font-size="10">
+              {group.title}
+              {group.chosen ? ' · elegido' : ''}
+            </text>
+            {group.rows.map(({ run, y }) => (
+              <g>
+                <text x="10" y={y + 4} font-size="10">
+                  {run.name}
+                </text>
+                <rect
+                  x={x(run.lo)}
+                  y={y - 6}
+                  width={Math.max(x(run.hi) - x(run.lo), 1)}
+                  height="12"
+                  rx="2"
+                  fill={group.chosen ? 'var(--accent)' : 'var(--diagram-stroke)'}
+                  fill-opacity="0.22"
+                  stroke={group.chosen ? 'var(--accent)' : 'var(--line)'}
+                  stroke-width="0.8"
+                />
+                <line
+                  x1={x(run.elo)}
+                  y1={y - 8}
+                  x2={x(run.elo)}
+                  y2={y + 8}
+                  stroke={group.chosen ? 'var(--accent)' : 'var(--ink)'}
+                  stroke-width="1.6"
+                />
+                <text x={x(run.hi) + 6} y={y + 4} font-size="9" fill="var(--ink)">
+                  {formatInt(run.elo)}
+                </text>
+              </g>
+            ))}
+          </g>
+        ))}
+      </g>
+    </svg>
+    <dl class="fig-ladder__spreads">
+      {laid.map((group) => (
+        <div class="fig-ladder__spread">
+          <dt class="label">Por {group.word}</dt>
+          <dd>
+            {group.runs.map((run) => formatInt(run.elo)).join(' y ')}
+            {' → '}
+            <strong>{spreadText(group.spread)}</strong>
+            {group.chosen ? ' · elegido' : ''}
+          </dd>
+        </div>
+      ))}
+    </dl>
+    <figcaption class="caption">
+      Mismo modelo, misma escalera, mismas posiciones: solo cambia la semilla. La distancia entre
+      las dos tiradas de cada grupo es lo que el instrumento añade por su cuenta, y por debajo de
+      ella no hay diferencia que publicar.
+      {data.meta.model ? ` Modelo: ${data.meta.model}.` : ''}
+      {typeof data.meta.games === 'number'
+        ? ` ${formatInt(data.meta.games)} partidas por tirada.`
+        : ''}
+      {decisionText ? ` ${decisionText}` : ''}
+    </figcaption>
+  </figure>
+) : (
+  <figure class="fig fig--pending" data-ladder-floor data-state="pending">
+    <p class="fig__pending-main">
+      <strong>Pendiente:</strong> el suelo del instrumento se dibuja con{' '}
+      <code>src/data/ladder-floor.json</code>, que genera{' '}
+      <code>labs/m6/ladder_floor_export.py</code> a partir de las cuatro tiradas reales y llega aquí
+      con <code>pnpm sync:data</code>.
+    </p>
+    <p class="caption fig__pending-note">
+      Lo que se mira es cuánto se mueve el Elo cuando no cambia nada más que la semilla. Un suelo
+      inventado respondería a esa pregunta con una mentira, así que hasta que las tiradas terminen
+      aquí no hay figura.
+    </p>
+  </figure>
+)}

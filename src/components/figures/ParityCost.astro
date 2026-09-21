@@ -1,0 +1,244 @@
+---
+/**
+ * What quantisation costs: the same checkpoint exported three ways, and how often each export
+ * picks the move the checkpoint picks (move parity), plus, when lab 2 measured it, the Elo of each
+ * export in the same match.
+ *
+ * Parity is drawn on the full 0-100 % axis on purpose. The three bars look almost equal, and that
+ * is the honest picture; the number that matters is the gap to 100 %, which is printed next to
+ * each bar as "jugadas distintas", because 95,4 % of agreement is 4,6 % of positions where the
+ * int8 file is another model (D-063). The Elo panel below, when present, says whether that other
+ * model is measurably weaker.
+ *
+ * Data comes from `src/data/parity-cost.json`, written by `labs/m6/parity_export.py` and copied
+ * here with `pnpm sync:data`; the schema is in `src/data/README.md`. With the committed
+ * placeholder the figure renders its "pendiente" state rather than a plausible-looking triple.
+ *
+ * Styles live in `src/styles/global.css` (`.fig*`), never in a scoped `<style>`.
+ */
+import raw from '../../data/parity-cost.json';
+import { formatInt, formatPercent } from '../../lib/format';
+
+interface Variant {
+  name: string;
+  parity: number;
+  elo?: number | null;
+  lo?: number | null;
+  hi?: number | null;
+}
+
+interface ParityCost {
+  meta: { generated: string | null; [key: string]: unknown };
+  model?: string;
+  variants: Variant[];
+}
+
+const data = raw as ParityCost;
+const variants = Array.isArray(data.variants)
+  ? data.variants.filter((v) => v && typeof v.parity === 'number')
+  : [];
+const ready = data.meta?.generated !== null && variants.length > 0;
+
+const rated = variants.filter(
+  (v): v is Variant & { elo: number; lo: number; hi: number } =>
+    typeof v.elo === 'number' && typeof v.lo === 'number' && typeof v.hi === 'number',
+);
+const hasElo = rated.length > 0;
+
+const X0 = 110;
+const X1 = 560;
+const ROW = 30;
+const TOP = 26;
+
+/* Parity panel: a fixed 0-100 % axis. */
+const px = (fraction: number) => X0 + Math.min(Math.max(fraction, 0), 1) * (X1 - X0);
+const parityTicks = [0, 0.25, 0.5, 0.75, 1];
+const parityAxisY = TOP + variants.length * ROW + 4;
+
+/* Elo panel: fitted to the intervals, rounded outwards to a multiple of 50. */
+const ends = rated.flatMap((v) => [v.lo, v.hi]);
+const pad = hasElo ? Math.max((Math.max(...ends) - Math.min(...ends)) * 0.1, 10) : 0;
+const LOW = hasElo ? Math.floor((Math.min(...ends) - pad) / 50) * 50 : 0;
+const HIGH = hasElo ? Math.ceil((Math.max(...ends) + pad) / 50) * 50 : 1;
+const eloStep = HIGH - LOW > 400 ? 100 : 50;
+const eloTicks: number[] = [];
+if (hasElo) for (let value = LOW; value <= HIGH; value += eloStep) eloTicks.push(value);
+const ex = (elo: number) => X0 + ((elo - LOW) / (HIGH - LOW || 1)) * (X1 - X0);
+const eloTop = parityAxisY + 50;
+const eloAxisY = eloTop + rated.length * ROW + 4;
+
+const HEIGHT = (hasElo ? eloAxisY : parityAxisY) + 24;
+
+const mismatch = (parity: number) => formatPercent(Math.max(1 - parity, 0));
+
+const summary = variants
+  .map(
+    (v) =>
+      `${v.name}: paridad ${formatPercent(v.parity)}${
+        typeof v.elo === 'number' ? `, Elo ${formatInt(v.elo)}` : ''
+      }${
+        typeof v.lo === 'number' && typeof v.hi === 'number'
+          ? ` (${formatInt(v.lo)} a ${formatInt(v.hi)})`
+          : ''
+      }`,
+  )
+  .join('. ');
+---
+
+{ready ? (
+  <figure class="fig fig--parity" data-parity-cost data-state="ready">
+    <svg
+      viewBox={`0 0 640 ${HEIGHT}`}
+      role="img"
+      aria-label={`Paridad de jugada de cada exportación del mismo modelo${
+        data.model ? ` (${data.model})` : ''
+      } y, cuando se midió, su Elo. ${summary}.`}
+    >
+      <g font-family="var(--font-mono)" font-size="10" fill="var(--muted)">
+        <text x="10" y="14" fill="var(--ink)">
+          paridad de jugada con el checkpoint
+        </text>
+        {parityTicks.map((tick) => (
+          <g>
+            <line
+              x1={px(tick)}
+              y1={TOP - 4}
+              x2={px(tick)}
+              y2={parityAxisY}
+              stroke="var(--line-soft)"
+              stroke-width="1"
+            />
+            <text x={px(tick)} y={parityAxisY + 14} text-anchor="middle" font-size="9">
+              {`${Math.round(tick * 100)} %`}
+            </text>
+          </g>
+        ))}
+        <line
+          x1={X0}
+          y1={parityAxisY}
+          x2={X1}
+          y2={parityAxisY}
+          stroke="var(--line)"
+          stroke-width="0.8"
+        />
+        {variants.map((v, index) => {
+          const y = TOP + index * ROW + ROW / 2;
+          const full = v.parity >= 0.9995;
+          return (
+            <g>
+              <text x="10" y={y + 4} font-size="10" fill="var(--ink)">
+                {v.name}
+              </text>
+              <rect
+                x={X0}
+                y={y - 8}
+                width={Math.max(px(v.parity) - X0, 1)}
+                height="16"
+                rx="2"
+                fill={full ? 'var(--ok)' : 'var(--accent)'}
+                fill-opacity={full ? 0.45 : 0.3}
+                stroke={full ? 'var(--ok)' : 'var(--accent)'}
+                stroke-width="0.8"
+              />
+              <text x={X1 + 8} y={y + 4} font-size="9" fill="var(--ink)">
+                {formatPercent(v.parity)}
+              </text>
+              <text
+                x={px(v.parity) - 6}
+                y={y + 4}
+                font-size="9"
+                text-anchor="end"
+                fill={full ? 'var(--ok)' : 'var(--accent-text-aa)'}
+              >
+                {full ? 'misma jugada siempre' : `${mismatch(v.parity)} de jugadas distintas`}
+              </text>
+            </g>
+          );
+        })}
+
+        {hasElo && (
+          <g>
+            <text x="10" y={eloTop - 12} fill="var(--ink)">
+              Elo de cada exportación en el mismo enfrentamiento (IC 95 %)
+            </text>
+            {eloTicks.map((tick) => (
+              <g>
+                <line
+                  x1={ex(tick)}
+                  y1={eloTop - 4}
+                  x2={ex(tick)}
+                  y2={eloAxisY}
+                  stroke="var(--line-soft)"
+                  stroke-width="1"
+                />
+                <text x={ex(tick)} y={eloAxisY + 14} text-anchor="middle" font-size="9">
+                  {tick}
+                </text>
+              </g>
+            ))}
+            <line
+              x1={X0}
+              y1={eloAxisY}
+              x2={X1}
+              y2={eloAxisY}
+              stroke="var(--line)"
+              stroke-width="0.8"
+            />
+            {rated.map((v, index) => {
+              const y = eloTop + index * ROW + ROW / 2;
+              return (
+                <g>
+                  <text x="10" y={y + 4} font-size="10" fill="var(--ink)">
+                    {v.name}
+                  </text>
+                  <rect
+                    x={ex(v.lo)}
+                    y={y - 6}
+                    width={Math.max(ex(v.hi) - ex(v.lo), 1)}
+                    height="12"
+                    rx="2"
+                    fill="var(--diagram-stroke)"
+                    fill-opacity="0.22"
+                    stroke="var(--line)"
+                    stroke-width="0.8"
+                  />
+                  <line
+                    x1={ex(v.elo)}
+                    y1={y - 8}
+                    x2={ex(v.elo)}
+                    y2={y + 8}
+                    stroke="var(--ink)"
+                    stroke-width="1.6"
+                  />
+                  <text x={X1 + 8} y={y + 4} font-size="9" fill="var(--ink)">
+                    {formatInt(v.elo)}
+                  </text>
+                </g>
+              );
+            })}
+          </g>
+        )}
+      </g>
+    </svg>
+    <figcaption class="caption">
+      Paridad: en qué fracción de posiciones la exportación elige la misma jugada que el checkpoint
+      en PyTorch. Un 100 % es el mismo modelo; lo que falta hasta 100 es otro modelo, y solo un
+      enfrentamiento dice cuánto Elo cuesta.
+      {data.model ? ` Modelo: ${data.model}.` : ''}
+      {!hasElo ? ' El Elo por exportación todavía no se ha medido.' : ''}
+    </figcaption>
+  </figure>
+) : (
+  <figure class="fig fig--pending" data-parity-cost data-state="pending">
+    <p class="fig__pending-main">
+      <strong>Pendiente:</strong> el coste de la cuantización se dibuja con{' '}
+      <code>src/data/parity-cost.json</code>, que genera <code>labs/m6/parity_export.py</code> sobre
+      las exportaciones reales y llega aquí con <code>pnpm sync:data</code>.
+    </p>
+    <p class="caption fig__pending-note">
+      Lo que se mira es en cuántas posiciones el int8 deja de ser el modelo que dicen las cards.
+      Tres barras inventadas responderían con una cifra que nadie midió, así que hasta que el lab
+      termine aquí no hay figura.
+    </p>
+  </figure>
+)}
