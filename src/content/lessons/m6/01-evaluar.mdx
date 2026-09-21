@@ -1,0 +1,268 @@
+---
+title: 'Evaluar: la teoría justa'
+description:
+  'Qué mide cada número de la tabla y qué no: la pérdida no es fuerza, el top-1 es imitación, los
+  puzles son táctica y el Elo es un par modelo y muestreo. De dónde sale el intervalo, cuánto se
+  mueve el instrumento cuando no cambias nada, qué es una paridad del 95 % y qué tiene que decir una
+  model card para que alguien pueda contradecirla.'
+module: m6
+order: 1
+duration: 90
+level: medio
+status: vigente
+updated: '2026-09-21'
+keywords:
+  - evaluación
+  - proxy
+  - métrica de dominio
+  - Elo
+  - intervalo de confianza
+  - bootstrap
+  - reproducibilidad
+  - límite por nodos
+  - cuantización
+  - paridad
+  - model card
+  - licencia
+  - baseline
+artifacts:
+  - kind: report
+    label: Tabla única de resultados
+demo: ?mode=arena
+---
+
+<RepoTag tag="p5" at="inicio" module="M5" next="m6" />
+
+## Qué vas a construir
+
+Al terminar esta sección sabrás leer la tabla del proyecto sin que te engañe: qué pregunta responde
+cada columna, cuál es el ruido de cada número y qué frases no se pueden decir de un modelo así
+aunque los números inviten a decirlas.
+
+Los cinco módulos anteriores produjeron modelos y, cada uno, una medición. Este no produce ningún
+modelo. Produce la **tabla única**: todas las etapas, la misma suite, el mismo día, más dos
+baselines que no entrenó nadie de aquí. Y produce lo que rodea a la tabla para que otra persona la
+pueda contradecir: el comando que la regenera, una card por modelo que dice sobre qué fichero se
+midió, una colección en el Hub y una demo en la que dos etapas juegan entre sí delante de ti.
+
+La parte difícil no es medir. Medir ya se hizo en cada módulo. La parte difícil es **no creerse
+las medidas más de lo que valen**, y para eso hay que saber tres cosas de cada número: qué
+pregunta responde, cuánto se mueve cuando no cambias nada y qué se está comparando con qué.
+
+<Callout kind="hoy" title="Punto de partida, si te saltaste algo">
+  Este módulo mide lo que los cinco anteriores dejaron en el Hub. `uv run rukh pull --module m6`
+  trae todos los checkpoints publicados a las rutas que leen las configs, más los puzles y las
+  partidas de la suite. Hace falta Stockfish (`scripts/get_stockfish.py`). Los comandos de la parte
+  3 son los que se ejecutaron; la secuencia completa está en `docs/reproducir.md`.
+</Callout>
+
+## Métricas de dominio frente a proxies
+
+Un <Term id="modelo-de-lenguaje">modelo de lenguaje</Term> se entrena minimizando una pérdida, y la
+tentación de todo el proyecto es mirar esa pérdida como si fuera la nota. No lo es. La pérdida es
+un **proxy**: un número que se mueve en la misma dirección que lo que importa, casi siempre, hasta
+que deja de hacerlo. M2 lo vio de la forma más cruda posible (D-047): el mismo checkpoint, la
+misma <Term id="perplejidad">perplejidad</Term>, dos muestreos, y más de 200 Elo de diferencia. La
+pérdida no había cambiado nada y el jugador era otro. M5 lo vio desde el otro lado: GRPO subió la
+recompensa que optimizaba mientras colapsaba la política, y ninguna pérdida avisó.
+
+La tabla de Rukh tiene cuatro columnas de dominio, y cada una responde a una pregunta distinta. Es
+importante no mezclarlas, porque los cuatro números salen del mismo modelo y se mueven de forma
+independiente.
+
+**Legalidad sin máscara** responde a «¿sabe el modelo qué jugadas existen?». Se mide sin ayudar:
+argmax sobre los <Term id="logits">logits</Term> y a ver si la jugada es legal. Es la métrica de
+suelo. Un modelo que no pasa del 99 % no ha aprendido las reglas del todo, y ningún número de más
+abajo se puede interpretar mientras eso pase: la fila `tiny-greedy` está en el 94,5 %, y por eso
+su Elo de 921 con un intervalo de 713 a 1040 dice más del rescate de jugadas ilegales que del
+modelo.
+
+**Top-1 y top-3** responden a «¿juega lo que jugó la gente?». Es **imitación**, no calidad. Los
+datos son partidas de humanos de 1800 Elo en adelante, así que un modelo que acierte el 100 % del
+top-1 jugaría exactamente como esos jugadores, con sus errores incluidos. M4 lo demostró por
+construcción: `medium-masters` se afinó con partidas de maestros y su top-1 contra la validación
+de aficionados no subió, porque lo que mide esa columna es la distancia a **esos** humanos. El
+top-3 es la misma pregunta con más margen; suele ir unos 28 puntos por encima y sirve para ver si
+el modelo tiene la jugada buena en la cabeza aunque no la ponga primera.
+
+**Puzles** responden a «¿ve la táctica?». Son posiciones de Lichess con una línea única que gana
+material o da mate, partidas en tres tramos de dificultad. El criterio es estricto: la línea
+entera, no la primera jugada, porque la primera jugada de un puzle es a menudo una captura obvia y
+lo que distingue a un jugador es la segunda. Es la columna más sensible al tamaño del modelo:
+`small-v3` resuelve el 41,0 % del tramo fácil y `medium-v4` el 57,9 %, mientras el top-1 de los
+dos se lleva dos puntos.
+
+**Elo estimado** responde a «¿cuánto gana contra un rival de fuerza conocida?». Es la única
+columna que mide **jugar**, y es también la más cara, la más ruidosa y la más fácil de leer mal.
+Se le dedica la sección siguiente.
+
+Hay una quinta cosa que no es una métrica y sí es una columna: **la entropía de la primera
+jugada**. No dice si el modelo es bueno. Dice si es **uno**: un modelo que abre siempre igual
+tiene entropía cero y se puede analizar en la demo en cinco partidas. M4 la usó como instrumento
+para ver que un adaptador de 1,6 MB cambiaba el repertorio entero; aquí se publica para que se
+vea que las etapas alineadas no lo perdieron.
+
+<Callout kind="teoria" title="La regla de las cuatro columnas">
+  Antes de decir que un modelo es mejor que otro, di **en qué columna**. `medium-v4-dpo-onpolicy`
+  tiene mejor Elo que `medium-v4` y peor top-1. No es una contradicción: dejó de imitar a los
+  humanos de 1800 en adelante y empezó a ganar más a Stockfish limitado. Son dos preguntas distintas
+  con dos respuestas distintas, y la tabla está para que se vean las dos.
+</Callout>
+
+## El Elo es un par: modelo y muestreo
+
+El primer error que corrigió el proyecto (D-047) es tratar el Elo como una propiedad del modelo.
+No lo es. Es una propiedad del **par** modelo y muestreo: el mismo checkpoint jugando a
+
+<Term id="temperatura">temperatura</Term> 0,05 con `top_k` 1 y jugando a temperatura 0,6 con `top_k`
+20 son dos jugadores distintos, y en la tabla van en filas distintas con sufijo (`small` y
+`small-greedy`). Las etapas con `-greedy` son las que juegan casi deterministas, y son las que se
+comparan entre sí. Por eso la demo deja elegir el muestreo y por eso una card lleva siempre el
+muestreo con el que se midió lo que dice.
+
+Con eso fijado, el número sale así. El modelo juega contra <Term id="stockfish">Stockfish</Term> a
+una fuerza limitada: ocho **peldaños** de una escalera, cuatro con `UCI_Elo` (1320, 1500, 1800
+y 2000) y cuatro con `Skill Level` intercalados entre ellos como anclas nominales (0 a 3, a los
+que se les asignan 1381, 1467, 1589 y 1678), 20 partidas por peldaño con los colores repartidos,
+160 en total. Cada partida es un resultado: 1, ½ o 0. Sobre esos 160 resultados se ajusta una regresión
+logística con la fórmula del Elo (la probabilidad de ganar es una sigmoide de la diferencia de
+puntuación) y el punto que mejor explica los resultados es el <Term id="elo-estimado">Elo
+estimado</Term>.
+
+Las partidas contra la máquina tienen dos detalles que la card cuenta y que conviene saber leer.
+Primero, el modelo juega **con máscara de legalidad**: si propone una jugada ilegal, se rescata
+con un sorteo entre las legales ponderado por los logits. Eso hace que la partida siga, y hace
+que el Elo de un modelo con mala legalidad sea en parte el Elo del rescate. Segundo, una partida
+que llega al límite de contexto sin terminar se **adjudica** por material y evaluación del motor,
+no se anota como tablas; la nota de cada resultado dice cuántas fueron.
+
+### El intervalo, y de qué es intervalo
+
+Un Elo sin intervalo no es un número, es una anécdota. El de Rukh sale por
+
+<Term id="bootstrap">bootstrap</Term>: se remuestrean las 160 partidas con reemplazo mil veces, se
+vuelve a ajustar el Elo en cada remuestreo y se cogen los percentiles 2,5 y 97,5. Con 160 partidas
+contra peldaños bien colocados sale un intervalo de unos ±55 a ±60 puntos; con las 40 de un peldaño
+solo, de más de cien.
+
+Lo que ese intervalo cubre es **el ruido del muestreo de las partidas**: si volvieras a jugar
+160 partidas con el mismo modelo, el mismo muestreo y el mismo rival, el 95 % de las veces el
+número caería dentro. Lo que **no** cubre es más largo y es lo que hay que tener en la cabeza:
+
+- que los peldaños estén donde dicen. `UCI_Elo` a 1320 está calibrado por los autores de
+  Stockfish para partidas a un ritmo de torneo, no a 0,1 segundos por jugada; los cuatro peldaños
+  de `Skill Level` no están calibrados en absoluto, son anclas nominales;
+- que el rival sea el mismo en dos corridas (la sección siguiente);
+- que el Elo de una partida contra un motor limitado se parezca al Elo de Lichess. No se parece,
+  y no hay ningún factor de conversión honesto.
+
+Por eso la tabla dice «Elo estimado» y la card dice contra qué. El número es útil para **ordenar
+las etapas del proyecto entre sí**, medidas con el mismo instrumento y el mismo día. Para eso
+vale y para eso se usa.
+
+## Reproducibilidad: cuánto se mueve el montaje cuando no cambias nada
+
+Fijar la semilla no repite el experimento. El proyecto lo aprendió tres veces y las tres se
+enseñan, porque cada una tiene una causa distinta.
+
+**D-107, la escalera.** `medium-elo` se midió dos veces con la misma configuración en todo lo
+que afecta a las partidas: los mismos peldaños, `elo_games: 20`, `elo_move_time: 0.1`, `seed: 42`,
+la misma temperatura. Salió **1498** una vez y **1558** la otra. La semilla fija nuestro muestreo,
+no el de Stockfish: el rival juega con un límite de **tiempo**, y a 0,1 segundos el número de
+nodos que explora depende de lo que esté haciendo la máquina en ese momento. Además
+`UCI_LimitStrength` aleatoriza a propósito para acertar el Elo pedido. «Las mismas 160
+partidas» eran 160 partidas nuevas. Los 60 puntos de diferencia son 1,18 σ de la resta de dos
+tiradas de 160: ruido de manual, y ruido que ningún número de partidas quita mientras el rival
+vaya por tiempo.
+
+**D-113, el reward model.** Se entrenó dos veces con la misma config, la misma semilla 42 y el
+mismo reparto de datos (484 pares de mate en validación las dos veces). Salió **72,91 %** y
+**74,21 %**. Aquí no hay motor: la diferencia son los kernels no deterministas de la GPU, sumas
+en coma flotante en distinto orden que se amplifican a lo largo de miles de pasos. El criterio del
+módulo pedía 75 %, y con un suelo de 1,3 puntos entre corridas idénticas perseguirlo con más
+semillas habría sido pescar.
+
+**La tercera es de este módulo**, y es la que cierra la de D-107: si el rival jugara con un
+límite de **nodos** en vez de tiempo, ¿repetiría? La parte 2 trae las cuatro tiradas, dos por
+tiempo y dos por nodos, y la decisión que se tomó con ellas. Lo que importa aquí es el método,
+porque es el que se reutiliza en cualquier medición que hagas después: **antes de explicar una
+diferencia pequeña, mide cuánto se mueve tu montaje cuando no cambias nada**. Dos corridas
+idénticas cuestan lo mismo que una comparación, y sin ellas la comparación no se puede leer.
+
+<Callout kind="mundo-real" title="Tres fuentes de ruido, tres remedios">
+  El ruido del muestreo de partidas se reduce con más partidas (va como `1/√n`). El del rival por
+  tiempo se quita cambiando el límite a nodos, y es una decisión, no un coste. El de la GPU no se
+  quita a un precio razonable: `torch.use_deterministic_algorithms` cuesta velocidad y no cubre
+  todos los kernels; se **mide** y se publica con el número.
+</Callout>
+
+## Cuantización y paridad: el 95 % es otro modelo
+
+M2 exportó `small` a <Term id="onnx">ONNX</Term> en tres precisiones y midió la **paridad**: en
+cuántas posiciones de validación la jugada elegida por el modelo exportado es la misma que la del
+modelo en PyTorch. fp16 dio 99,80 % e int8 dio **95,40 %**. El criterio del spec era 99,9 % y no
+se alcanzó ni con fp16.
+
+La lectura correcta de esos dos números es la que da nombre a esta sección. Un 95,4 % de paridad
+no es «casi el mismo modelo». Es un modelo que en una de cada veinte posiciones juega otra cosa,
+y que por tanto tiene **otro Elo**, que M2 no midió. La <Term id="cuantizacion">cuantización</Term>
+a int8 es dinámica: los pesos se guardan como enteros con una escala por tensor y las activaciones
+se cuantizan en cada inferencia; el error de redondeo no se reparte de forma uniforme sino que se
+concentra donde los logits de las dos mejores jugadas están cerca, que es precisamente donde la
+decisión es difícil. Así que la pregunta «¿cuánto Elo cuesta el int8?» no se responde con la
+paridad. Se responde jugando, y es el segundo lab de la parte 3.
+
+Lo que la paridad **sí** dice, y por eso se mide primero, es si la exportación está bien hecha:
+un 99,80 % en fp16 es lo que se espera de redondear a media precisión; un 80 % en fp16 sería un
+bug en el grafo. La demo sirve fp16 por eso, y sirve int8 para los móviles con la advertencia en
+la interfaz de que es una etapa distinta.
+
+## Model cards y licencias
+
+Una card no es documentación. Es la **afirmación pública** de qué se publicó y qué se midió, y su
+prueba es si otra persona puede contradecirla con lo que hay dentro. Las de Rukh se generan desde
+el `run.json` del entrenamiento y el `results.json` de la evaluación, no se escriben a mano, y
+cada una lleva lo mínimo para que la afirmación sea contrastable:
+
+- **el fichero exacto que se midió**: el SHA-256 del checkpoint y, desde este módulo, el de los
+  pesos solos, porque el fichero que sube al Hub no es byte a byte el que se entrenó (se le quita
+  el optimizador) y el proyecto se negó a publicar durante una tarde hasta que se separaron las
+  dos identidades;
+- **el muestreo y la suite** con que se midió cada número, y la fecha, porque la tabla se regenera
+  y un número de ayer no se compara con uno de hoy;
+- **qué no se midió**: `n/a` es un valor, y un hueco en la tabla dice más que un número
+  inventado para rellenarlo;
+- **de dónde vienen los datos y con qué licencia**: las partidas de Lichess son
+  <Term id="cc0">CC0</Term>, los puzles también; el código y los pesos del proyecto salen con Apache
+  2.0. Un modelo entrenado sobre datos CC0 puede publicarse con cualquier licencia; uno entrenado
+  sobre datos con restricciones hereda las restricciones, y la card es el sitio donde se dice.
+
+El lab 3 regenera las veintiuna cards del proyecto desde la tabla final y sube solo el `README.md`
+de cada repositorio, y monta la colección del Hub desde el catálogo de `rukh pull`, para que las
+tres cosas (lo que se puede descargar, lo que se puede leer y lo que está en la tabla) sean la
+misma lista.
+
+## Qué no decir de un modelo así
+
+Termina con la lista que hay que tener a mano cuando alguien pregunte cuánto juega Rukh.
+
+- **«Juega a 1500 Elo».** No: gana lo que ganaría un jugador de unos 1500 contra Stockfish
+  limitado a 0,1 segundos por jugada con `UCI_LimitStrength`, con máscara de legalidad, en
+  partidas que se adjudican si agotan el contexto. Contra personas en Lichess no se ha medido, y
+  el rival del instrumento no es una persona.
+- **«El modelo alineado es 56 puntos mejor».** Lo que se puede decir es que el enfrentamiento
+  directo dio +57 con un intervalo de 36 a 79 (M5), y que las dos filas de la tabla se llevan lo
+  que se llevan **dentro de la misma tirada**. Restar dos Elo de escalera de días distintos es
+  restar dos ruidos de ±55.
+- **«Entiende ajedrez».** Predice el siguiente token de una secuencia de jugadas con un 54 % de
+  acierto sobre lo que jugaron humanos de 1800 en adelante. El encoder de M3 muestra que sus representaciones
+  contienen material y amenazas; ninguna de las dos cosas es «entender», y el proyecto no tiene un
+  instrumento que lo mida.
+- **«Es mejor que el baseline».** Solo si el baseline se midió con el mismo harness, los mismos
+  peldaños y el mismo día. Por eso los baselines de la tabla se juegan aquí, con nuestro código,
+  y no se copian de su paper.
+- **«Reproduce el número».** Reproduce el **intervalo**. Un lector que entrene `medium-v4` con la
+  misma config obtendrá un modelo cuyo Elo caerá con alta probabilidad dentro del intervalo
+  publicado, y muy probablemente no en el mismo punto.
+
+La parte 2 pone la tabla entera con estas gafas puestas.
