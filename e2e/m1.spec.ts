@@ -1,7 +1,9 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
-const LESSON = '/curso/m1/01-datos-y-tokenizacion/';
+/** M1 is two lessons: the theory and the pipeline, then the labs with the playground. */
+const THEORY = '/curso/m1/01-datos-y-tokenizacion/';
+const LABS = '/curso/m1/02-labs-del-pipeline/';
 
 function directive(csp: string, name: string): string | undefined {
   return csp
@@ -20,17 +22,26 @@ async function hydrated(page: Page): Promise<Locator> {
 }
 
 test.describe('lesson M1 and TokenizerPlayground', () => {
-  test('the lesson loads with its sections and the cheatsheet', async ({ page }) => {
-    await page.goto(LESSON);
+  test('the theory part opens the module and the labs part closes it with the cheatsheet', async ({
+    page,
+  }) => {
+    await page.goto(THEORY);
     await expect(page.getByRole('heading', { level: 1 })).toContainText('Del PGN al tensor');
     const h2 = page.locator('.prose h2');
     await expect(h2.first()).toHaveText('Qué vas a construir');
-    expect(await h2.count()).toBeGreaterThanOrEqual(7);
+    await expect(page.locator('.prose h2', { hasText: 'Teoría justa' }).first()).toBeVisible();
+    /* The cheatsheet belongs to the module's last lesson only. */
+    await expect(page.locator('.cheat')).toHaveCount(0);
+    await page.locator('.lesson__nav-link--next').click();
+    await expect(page).toHaveURL(new RegExp(`${LABS}$`));
+    await expect(page.locator('.prose h2').first()).toHaveText('Labs');
     await expect(page.locator('[data-tokenizer-stats]')).toHaveCount(1);
+    expect(await page.locator('.prose details').count()).toBeGreaterThanOrEqual(5);
+    await expect(page.locator('.cheat')).toHaveCount(1);
   });
 
   test('the playground tokenizes the default PGN with three counters > 0', async ({ page }) => {
-    await page.goto(LESSON);
+    await page.goto(LABS);
     const island = await hydrated(page);
     const counters = island.locator('[data-count]');
     await expect(counters).toHaveCount(3);
@@ -49,7 +60,7 @@ test.describe('lesson M1 and TokenizerPlayground', () => {
   });
 
   test('an invalid PGN shows a friendly error instead of tokens', async ({ page }) => {
-    await page.goto(LESSON);
+    await page.goto(LABS);
     const island = await hydrated(page);
     const textarea = island.getByRole('textbox', { name: /PGN/ });
     await textarea.fill('1. e4 e5 2. Nf9 Nc6');
@@ -59,34 +70,36 @@ test.describe('lesson M1 and TokenizerPlayground', () => {
   });
 
   test('a long game raises the 200-token warning', async ({ page }) => {
-    await page.goto(LESSON);
+    await page.goto(LABS);
     const island = await hydrated(page);
     await island.getByRole('button', { name: /Partida larga/ }).click();
     await expect(island).toHaveAttribute('data-state', 'ok');
     await expect(island.locator('[data-warning]').first()).toBeVisible();
   });
 
-  test('axe: no serious or critical violations', async ({ page }) => {
-    await page.goto(LESSON);
-    await hydrated(page);
-    const results = await new AxeBuilder({ page })
-      .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'best-practice'])
-      .analyze();
-    const blocking = results.violations.filter(
-      (v) => v.impact === 'serious' || v.impact === 'critical',
-    );
-    expect(
-      blocking,
-      blocking.map((v) => `${v.id}: ${v.help} (${v.nodes.length} nodes)`).join('\n'),
-    ).toEqual([]);
-  });
+  for (const lesson of [THEORY, LABS]) {
+    test(`axe: no serious or critical violations on ${lesson}`, async ({ page }) => {
+      await page.goto(lesson);
+      if (lesson === LABS) await hydrated(page);
+      const results = await new AxeBuilder({ page })
+        .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'best-practice'])
+        .analyze();
+      const blocking = results.violations.filter(
+        (v) => v.impact === 'serious' || v.impact === 'critical',
+      );
+      expect(
+        blocking,
+        blocking.map((v) => `${v.id}: ${v.help} (${v.nodes.length} nodes)`).join('\n'),
+      ).toEqual([]);
+    });
+  }
 
   test('CSP: hash-only script-src and no violations with the island hydrated', async ({ page }) => {
     const cspMessages: string[] = [];
     page.on('console', (message) => {
       if (message.text().includes('Content Security Policy')) cspMessages.push(message.text());
     });
-    await page.goto(LESSON);
+    await page.goto(LABS);
     const csp = await page
       .locator('meta[http-equiv="content-security-policy"]')
       .getAttribute('content');
@@ -100,7 +113,7 @@ test.describe('lesson M1 and TokenizerPlayground', () => {
 
   test('no horizontal scroll at 390px with the island rendered', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.goto(LESSON);
+    await page.goto(LABS);
     await hydrated(page);
     const fits = await page.evaluate(
       () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,

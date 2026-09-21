@@ -1,0 +1,857 @@
+---
+title: 'El decoder: entrenarlo y medirlo'
+description:
+  'Cómo se mide un modelo de ajedrez sin engañarse —legalidad sin máscara, top-1, puzles y
+  un Elo con intervalo de confianza— y los cuatro labs que lo ponen a prueba: contar los parámetros a
+  mano, demostrar la causalidad, entrenar `tiny` en tres minutos y `small` entero con la suite completa.'
+module: m2
+order: 2
+duration: 150
+level: base
+status: vigente
+updated: '2026-09-21'
+keywords:
+  - decoder
+  - atención
+  - máscara causal
+  - embedding
+  - RoPE
+  - pre-norm
+  - AdamW
+  - warmup
+  - bf16
+  - temperatura
+  - top-k
+  - ONNX
+  - Elo
+---
+
+Parte 2 de 3 del módulo «El decoder». Viene de «El decoder: escribirlo a mano» y sigue en «El decoder: exportarlo y mirar dentro».
+
+## Cómo se mide
+
+Al terminar esta sección sabrás leer cada columna de la tabla única, explicar de dónde sale el
+intervalo de confianza del Elo y decir con cuántas partidas una mejora es real.
+
+Un modelo sin números es una anécdota. `rukh eval --model <ckpt> --suite full` produce una fila
+completa, con caché SQLite para que repetir la evaluación no vuelva a jugar las mismas partidas.
+Seis medidas, cada una respondiendo a una pregunta distinta.
+
+**Legalidad sin máscara, en sus dos versiones.** Diez mil prefijos de partidas de validación; en
+cada uno se le pide una jugada sin máscara y se comprueba si el token propuesto es legal en esa
+posición. Salen dos columnas: `legality_argmax` (el token más probable; es el titular y el listón
+de GOAL) y `legality_sampled` (temperatura 0,6 y top-k 20, como juega la demo), que es siempre
+menor porque muestrear mete cola. Es lo primero que sube durante el entrenamiento y lo que más
+impresiona: el modelo no tiene tablero, no tiene reglas, no sabe qué es un alfil, y aun así acaba
+proponiendo jugadas legales casi siempre. Ojo con el sesgo de la medida: las posiciones de apertura
+son fáciles (casi cualquier desarrollo razonable es legal) y los finales son difíciles (pocas
+jugadas legales, muchas parecidas). Una legalidad global del 95 % puede esconder un 99 % en
+apertura y un 70 % en finales.
+
+**Top-1 y top-3 de siguiente jugada.** Porcentaje de posiciones en que la jugada más probable del
+modelo (o alguna de sus tres primeras) coincide con la que jugó el humano. Es la métrica más
+directa de "imita bien", y también la más engañosa como medida de fuerza: el techo no es el 100 %,
+porque en muchas posiciones hay tres jugadas razonables y el humano eligió una. La expectativa con
+la que se entra al lab 4 es un top-1 del 35-45 % contra jugadores de club; es una horquilla de
+andar por casa, sin fuente detrás, así que trátala como hipótesis y compárala con la cifra que
+salga de `rukh eval`, que es la que vale. Se desglosa por tramo de Elo, y ese desglose es lo que
+hace posible el Elo-conditioning de M4: si el modelo predice mejor a los 1800 que a los 2400, es
+que ha aprendido a imitar el nivel medio de sus datos.
+
+**Puzles por tramo.** Dos mil puzles de Lichess por banda de dificultad (1000-1500, 1500-2000,
+2000+), con un criterio duro: un puzle cuenta como resuelto solo si el modelo acierta **toda** la
+secuencia, no la primera jugada. Mide algo distinto de la imitación: encontrar la jugada única que
+gana. Un modelo entrenado solo para imitar suele ir mal en puzles, y ver cuánto sube eso con DPO y
+GRPO en M5 es uno de los resultados bonitos del curso.
+
+**Elo estimado con intervalo de confianza.** El modelo juega contra Stockfish en ocho escalones
+—cuatro por `Skill Level` (por debajo de 1320, que es el suelo de `UCI_Elo`) y cuatro por `UCI_Elo`
+en 1320, 1500, 1800 y 2000— con ambos colores y con máscara de legalidad. Después se ajusta el
+número que mejor explica esos resultados. La fórmula es la logística de Elo de toda la vida:
+
+```text
+P(puntuación) = 1 / (1 + 10 ** ((elo_rival − elo_modelo) / 400))
+```
+
+Se lee así: 400 puntos de diferencia son una probabilidad de ganar de 10 a 1; 0 puntos, 50 %. El
+ajuste es encontrar el `elo_modelo` que hace más verosímiles los resultados observados, y se
+resuelve por Newton en un par de líneas, sin SciPy. Con `c = ln(10)/400 = 0,005756`, el gradiente
+de la log-verosimilitud es `c · Σ(s − p)` y la curvatura `−c² · Σ p(1−p)`, así que cada paso es
+`Σ(s − p) / (c · Σ p(1−p))`. Las tablas entran como puntuación 0,5.
+
+**Y ahora la parte que casi nadie cuenta.** La misma curvatura que resuelve el ajuste da la
+varianza del resultado: `1 / (c² · Σ p(1−p))`. Haz el número. Si juegas 100 partidas contra un
+rival donde rindes al 50 %, `Σ p(1−p) = 25`, la varianza es `1 / (0,005756² · 25) ≈ 1 207` y la
+desviación típica **35 puntos de Elo**: el intervalo del 95 % mide unos ±68. Con los ocho escalones
+de la suite completa, 800 partidas, la desviación baja a unos 12 puntos y el intervalo a ±24. En
+la práctica el harness no usa esa fórmula sino un **bootstrap percentil**: remuestrea con
+reemplazo las partidas jugadas mil veces, reajusta el Elo en cada remuestreo y se queda con los
+percentiles 2,5 y 97,5. Da un intervalo parecido sin suponer que la verosimilitud es gaussiana, y
+las tablas —que reducen la varianza— quedan contadas tal como ocurrieron.
+
+La conclusión práctica: **con 100 partidas por escalón no puedes presumir de 10 puntos de Elo**.
+Ni de 30. La mejora que Elo-conditioning o DPO produzcan en M4 y M5 tiene que superar el ancho del
+intervalo para que signifique algo, y si no lo supera, lo honesto es escribir "no medimos una
+diferencia" en vez de "mejoró un poco". Es exactamente el mismo error que cometen los benchmarks de
+LLM que celebran medio punto en una evaluación de 200 ejemplos.
+
+<Callout kind="entrevista" title="¿Por qué los rivales por debajo de 1320 no son Elo de verdad?">
+  Porque `UCI_Elo` de Stockfish no baja de 1320; para escalones más bajos se usa `Skill Level`, que
+  es otro mecanismo (introduce errores deliberados) y cuya equivalencia en Elo es una convención, no
+  una medida. Los escalones bajos existen porque un modelo débil que pierde todas las partidas no da
+  información: la verosimilitud es monótona y el ajuste se escapa a menos infinito. Si el Elo final
+  se apoya sobre todo en esos escalones, hay que decirlo en la model card. Un número sin sus
+  supuestos es propaganda.
+</Callout>
+
+**Δcp medio.** Pérdida media en centipeones respecto a la mejor jugada según Stockfish a
+profundidad 12, sobre 500 posiciones. Es la métrica que mejor correlaciona con "juega bien", porque
+no penaliza elegir una jugada distinta de la del humano si es igual de buena.
+
+**Diversidad.** Entropía de las aperturas jugadas en 200 partidas propias. Es la métrica de
+guardia: cuando en M5 empieces a optimizar recompensas, lo primero que hace un modelo alineado es
+colapsar en una sola línea que funciona. Una diversidad que se hunde mientras el Elo sube es la
+firma del _reward hacking_.
+
+Δcp y diversidad se calculan en un hito posterior, así que en las primeras filas de la tabla
+aparecen como `null`. Un hueco explícito es información; un cero inventado, no.
+
+<Callout kind="teoria" title="Perplejidad: la misma pérdida en otra escala">
+  La <Term id="perplejidad">perplejidad</Term> es `exp(entropía cruzada)` y se lee como "entre
+  cuántas opciones equiprobables duda el modelo". Un modelo sin entrenar, sobre 2 030 jugadas, tiene
+  perplejidad ≈ 2 030 y pérdida ≈ 7,6 (`ln 2030`). Si la pérdida baja a 3,0, la perplejidad es 20:
+  duda como si eligiera al azar entre veinte jugadas. Como en una posición típica hay unas treinta
+  legales, esa cifra ya implica que ha aprendido bastante. No es una métrica extra que haya que
+  calcular: es la columna de pérdida mirada de otra manera, y por eso el harness no la reporta
+  aparte.
+</Callout>
+
+## Labs
+
+Al terminar esta sección tendrás el modelo escrito, entrenado, evaluado, exportado y jugando, y los
+cuatro scripts de `labs/m2/` que hacen falta para verlo por dentro. Todos los comandos se ejecutan
+desde la raíz del repo `rukh`.
+
+<Callout kind="hoy" title="Punto de partida, si te saltaste algo">
+  Los labs 3 y 4 entrenan sobre `data/tokens/uci/` (M1, lab 3) y la suite completa lee
+  `data/puzzles/` y `data/uci/` (M1, lab 6). `uv run rukh pull --module m2` trae las partidas, el
+  tokenizador, los puzles y las evaluaciones; los tokens se empaquetan en minutos con el comando de
+  M1. También trae `tiny` y `small` ya entrenados, por si quieres evaluar antes de esperar 42
+  minutos. Un entrenamiento deja su checkpoint en una carpeta con fecha
+  (`checkpoints/small-20260919-062911/`); los comandos de esta página lo nombran sin ella
+  (`checkpoints/small/best.pt`), que es también donde `rukh pull` lo deja, y cuando esa carpeta no
+  existe cualquier comando o config busca la corrida con fecha más reciente de ese nombre.
+</Callout>
+
+### Lab 1 · `MoveDecoder` a mano, y contar sus parámetros
+
+Escribe `src/rukh/models/decoder.py` siguiendo el plan: `CausalSelfAttention` con una `qkv`
+fusionada, `Mlp` con GELU, `Block` pre-norm, `MoveDecoder` con embeddings, posiciones, la pila de
+bloques, el `LayerNorm` final y el `lm_head` atado. Los tests de formas y causalidad son la parte
+que no se salta.
+
+Y después cuenta. Guarda este script como **`labs/m2/params.py`** en el repo `rukh`: recorre el
+modelo bloque a bloque, suma, y compara con la fórmula escrita a mano. Si las dos cifras no
+coinciden, es que tienes una idea equivocada de tu propio modelo.
+
+```python title="labs/m2/params.py"
+"""Parameter count of a MoveDecoder, block by block, against the closed-form formula."""
+
+from rukh.models import MoveDecoder, preset
+
+def formula(cfg) -> int:
+    """What the architecture says it should be, computed by hand."""
+    d, ff, v = cfg.d_model, cfg.ff, cfg.vocab_size
+    per_block = (
+        2 * d  # ln1
+        + (d * 3 * d + 3 * d)  # qkv
+        + (d * d + d)  # attn out projection
+        + 2 * d  # ln2
+        + (d * ff + ff)  # mlp in
+        + (ff * d + d)  # mlp out
+    )
+    total = v * d + per_block * cfg.n_layer + 2 * d  # tokens + blocks + final ln
+    if cfg.pos == "learned":
+        total += cfg.block * d
+    if not cfg.tie_embeddings:
+        total += v * d
+    return total
+
+for name in ("tiny", "small", "medium"):
+    cfg = preset(name)
+    model = MoveDecoder(cfg)
+    counted = sum(p.numel() for p in model.parameters())
+    groups = {
+        "tokens": model.tokens.weight.numel(),
+        "positions": model.positions.weight.numel() if model.positions is not None else 0,
+        "blocks": sum(p.numel() for p in model.blocks.parameters()),
+        "ln_f": sum(p.numel() for p in model.ln_f.parameters()),
+        "lm_head (tied)": 0 if cfg.tie_embeddings else model.lm_head.weight.numel(),
+    }
+    print(f"== {name}: {cfg.n_layer} layers, d={cfg.d_model}, {cfg.n_head} heads ==")
+    for key, value in groups.items():
+        print(f"  {key:<16} {value:>12,}")
+    print(f"  {'total':<16} {counted:>12,}   formula {formula(cfg):>12,}")
+    print(f"  {'non-embedding':<16} {model.num_params():>12,}")
+    assert counted == formula(cfg), f"{name}: the formula does not match the model"
+```
+
+```bash title="Terminal"
+uv run python labs/m2/params.py
+```
+
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
+
+```text
+== tiny: 6 layers, d=256, 4 heads ==
+  tokens                519,680
+  positions              51,200
+  blocks              4,738,560
+  ln_f                      512
+  lm_head (tied)              0
+  total               5,309,952   formula    5,309,952
+  non-embedding       5,258,752
+== small: 12 layers, d=512, 8 heads ==
+  tokens              1,039,360
+  positions             102,400
+  blocks             37,828,608
+  ln_f                    1,024
+  lm_head (tied)              0
+  total              38,971,392   formula   38,971,392
+  non-embedding      38,868,992
+== medium: 16 layers, d=768, 12 heads ==
+  tokens              1,559,040
+  positions             153,600
+  blocks            113,405,952
+  ln_f                    1,536
+  lm_head (tied)              0
+  total             115,120,128   formula  115,120,128
+  non-embedding     114,966,528
+```
+
+Lo que debe salir para `small`, y que puedes verificar con una calculadora antes de ejecutarlo:
+embeddings 2 030 × 512 = 1 039 360; posiciones 200 × 512 = 102 400; por bloque 1 024 + 787 968 +
+262 656 + 1 024 + 1 050 624 + 1 049 088 = 3 152 384, que por 12 capas son 37 828 608; el `LayerNorm`
+final, 1 024. Total **38 971 392**, y 38 868 992 sin contar la tabla de posiciones. Fíjate en el
+reparto: el 97 % de los parámetros está en los bloques, y dentro de un bloque, dos tercios están en
+el MLP. La atención, que es la idea, es la minoría de los pesos.
+
+<Exercise n="01" title="¿Dónde meterías el próximo millón de parámetros?">
+  Tienes un millón de parámetros extra de presupuesto para `small`. Calcula, con la fórmula del
+  script, cuánto cuesta cada una de estas tres opciones y cuál cabe: (a) una capa más, (b) subir
+  `d_ff` de 2 048 a 2 304, (c) subir `d_model` de 512 a 528 (y ajustar `n_head` para que siga
+  dividiendo). ¿Cuál elegirías y por qué?
+
+  <Solution>
+    (a) Una capa más son 3 152 384 parámetros: **no cabe**, se pasa tres veces. (b) Subir `d_ff` en
+    256 añade `d·256 + 256 + 256·d + d` = 262 912 por bloque, 3 154 944 en total: tampoco cabe.
+    (c) Subir `d_model` a 528 recalcula todo: el término `d²` de cada bloque crece un 6,3 %, y sale
+    en torno a 41,4 millones, más de dos millones por encima. Con un millón de margen no cabe
+    ninguna de las tres a lo largo de las doce capas; lo único que cabría es aplicar (b) a la mitad
+    de los bloques, que es una arquitectura rara.
+
+    La lección es la que cuenta: en un Transformer el presupuesto **no es continuo**. Los
+    parámetros van en cuantos de una capa entera o de un incremento de anchura multiplicado por
+    `n_layer`, y por eso los modelos publicados vienen en tallas y no en cualquier tamaño. Y si
+    hubiera que elegir, el consenso empírico (las leyes de escala de Kaplan y las correcciones de
+    Chinchilla) es que profundidad y anchura deben crecer juntas: un modelo muy profundo y estrecho
+    o muy ancho y plano rinde peor que el cuadrado a igualdad de parámetros. Nuestros tres presets
+    —6×256, 12×512, 16×768— siguen esa diagonal.
+
+  </Solution>
+</Exercise>
+
+### Lab 2 · Dibujar la máscara causal y demostrar que funciona
+
+Un test que pasa no te enseña nada si no ves lo que comprueba. Guarda este script como
+**`labs/m2/causal_mask.py`**: dibuja la máscara en la terminal y después hace el experimento que
+importa, que es cambiar un token del futuro y comprobar que los logits del pasado no se mueven ni
+un bit.
+
+```python title="labs/m2/causal_mask.py"
+"""Draw the causal mask and prove causality empirically on a real MoveDecoder."""
+
+import torch
+
+from rukh.models import DecoderConfig, MoveDecoder
+
+T = 8
+mask = torch.ones(T, T, dtype=torch.bool).tril()
+print("Causal mask (row = query, column = key):")
+print("      " + " ".join(f"{j:>2}" for j in range(T)))
+for i in range(T):
+    cells = " ".join(" #" if mask[i, j] else " ." for j in range(T))
+    print(f"  q{i:<3} {cells}")
+print(f"\nVisible pairs: {int(mask.sum())} of {T * T} ({100 * mask.float().mean():.1f} %)\n")
+
+torch.manual_seed(0)
+model = MoveDecoder(DecoderConfig(n_layer=2, n_head=2, d_model=32, vocab_size=64, block=T)).eval()
+idx = torch.randint(1, 64, (1, T))
+
+with torch.no_grad():
+    base, _ = model(idx)
+    for t in range(T - 1):
+        changed = idx.clone()
+        # Replace every token after t with a different one.
+        changed[:, t + 1 :] = (changed[:, t + 1 :] + 7) % 63 + 1
+        other, _ = model(changed)
+        past = (base[:, : t + 1] - other[:, : t + 1]).abs().max().item()
+        future = (base[:, t + 1 :] - other[:, t + 1 :]).abs().max().item()
+        print(f"  cut after position {t}: max |delta| past {past:.3e}   future {future:.3e}")
+        assert past == 0.0, "the past moved: the mask is not causal"
+```
+
+```bash title="Terminal"
+uv run python labs/m2/causal_mask.py
+```
+
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
+
+```text
+Causal mask (row = query, column = key):
+       0  1  2  3  4  5  6  7
+  q0    #  .  .  .  .  .  .  .
+  q1    #  #  .  .  .  .  .  .
+  q2    #  #  #  .  .  .  .  .
+  q3    #  #  #  #  .  .  .  .
+  q4    #  #  #  #  #  .  .  .
+  q5    #  #  #  #  #  #  .  .
+  q6    #  #  #  #  #  #  #  .
+  q7    #  #  #  #  #  #  #  #
+
+Visible pairs: 36 of 64 (56.2 %)
+
+  cut after position 0: max |delta| past 0.000e+00   future 5.934e-01
+  cut after position 1: max |delta| past 0.000e+00   future 5.969e-01
+  cut after position 2: max |delta| past 0.000e+00   future 5.884e-01
+  cut after position 3: max |delta| past 0.000e+00   future 5.925e-01
+  cut after position 4: max |delta| past 0.000e+00   future 5.863e-01
+  cut after position 5: max |delta| past 0.000e+00   future 4.818e-01
+  cut after position 6: max |delta| past 0.000e+00   future 3.524e-01
+```
+
+Lo que tiene que salir: la diferencia en el pasado es **exactamente** 0,0 —no 1e-7, cero— y la del
+futuro es grande. Cero exacto porque no es una cuestión de precisión numérica sino de grafo: los
+tokens futuros ni siquiera entran en el cálculo de las posiciones pasadas. Si alguna vez ves 1e-7
+ahí, tienes una fuga sutil, típicamente una normalización aplicada a lo largo del eje de tiempo en
+vez del de canales.
+
+<Exercise n="02" title="Rompe la causalidad a propósito">
+  Cambia `is_causal=True` por `is_causal=False` en `CausalSelfAttention` y vuelve a ejecutar el
+  script. Después entrena `tiny` durante 200 pasos con y sin máscara y compara las dos curvas de
+  pérdida. ¿Cuál baja más rápido? ¿Cuál modelo es mejor? ¿Qué medirías para no dejarte engañar?
+
+Aviso práctico: esto **no** es una opción de configuración, es una edición de
+`src/rukh/models/decoder.py`. Deshazla en cuanto termines (`git checkout -- src/rukh/models/`),
+porque un modelo entrenado con ese cambio puesto pasa los tests de forma y falla el de
+causalidad, y un checkpoint contaminado no se distingue de uno bueno mirando los pesos.
+
+  <Solution>
+    Sin máscara, el `assert` del script salta en la primera iteración: los logits pasados cambian
+    al tocar el futuro. Entrenando, la curva sin máscara baja muchísimo más rápido y llega a
+    pérdidas que la causal no alcanza jamás, porque la tarea es distinta: con acceso al futuro,
+    predecir el token `t+1` se resuelve leyendo el token `t+1`. En el límite, la pérdida tiende a
+    cero y el top-1 al 100 %.
+
+    El modelo es basura y no hay forma de verlo en la curva de entrenamiento. Lo que lo delata es
+    **generar**: en inferencia el futuro no existe, el modelo recibe una secuencia que no se parece
+    a ninguna que haya visto y propone jugadas al azar. Las dos métricas que lo cazan en un minuto
+    son la **legalidad sin máscara** (se hunde) y una partida de `rukh play` (jugadas sin sentido
+    desde el ply 2). Es el caso general de una lección que vale para cualquier proyecto de ML: una
+    pérdida sospechosamente buena es casi siempre una fuga, y la única defensa fiable es una métrica
+    calculada como se va a usar el modelo, no como se entrena.
+
+  </Solution>
+</Exercise>
+
+### Lab 3 · Entrenar `tiny` en tres minutos
+
+Ahora sí. `tiny` son 6 capas, 256 dimensiones, 4 cabezas y 5 309 952 parámetros; la configuración
+pide 6 000 pasos con lotes de 128 × 2 acumulaciones (256 secuencias efectivas de 200 tokens, unos
+51 200 tokens por paso) y tasa de aprendizaje 1e-3 con 500 pasos de warmup. Es el modelo con el que
+se itera: si algo está mal, lo sabes en tres minutos y no en cuarenta.
+
+```bash title="Terminal"
+uv run rukh train --config configs/train/tiny.yaml
+```
+
+La consola de esta tirada no se capturó. El run sí quedó registrado: estas son las 24 evaluaciones
+de validación de `tiny-20260919-061533` tal como están en `mlruns/mlflow.db`, de principio a fin
+del entrenamiento (189 segundos en total, poco más de tres minutos):
+
+```text
+step   250  val/loss 4.5869  val/top1 0.1903
+step   500  val/loss 3.5244  val/top1 0.2544
+step   750  val/loss 3.0194  val/top1 0.2953
+step  1000  val/loss 2.7751  val/top1 0.3175
+step  1250  val/loss 2.6150  val/top1 0.3326
+step  1500  val/loss 2.5098  val/top1 0.3443
+step  1750  val/loss 2.4252  val/top1 0.3537
+step  2000  val/loss 2.3687  val/top1 0.3611
+step  2250  val/loss 2.3210  val/top1 0.3665
+step  2500  val/loss 2.2764  val/top1 0.3723
+step  2750  val/loss 2.2394  val/top1 0.3776
+step  3000  val/loss 2.2115  val/top1 0.3816
+step  3250  val/loss 2.1809  val/top1 0.3858
+step  3500  val/loss 2.1552  val/top1 0.3902
+step  3750  val/loss 2.1312  val/top1 0.3934
+step  4000  val/loss 2.1111  val/top1 0.3970
+step  4250  val/loss 2.0932  val/top1 0.3993
+step  4500  val/loss 2.0770  val/top1 0.4022
+step  4750  val/loss 2.0622  val/top1 0.4048
+step  5000  val/loss 2.0500  val/top1 0.4066
+step  5250  val/loss 2.0398  val/top1 0.4080
+step  5500  val/loss 2.0316  val/top1 0.4101
+step  5750  val/loss 2.0251  val/top1 0.4106
+step  6000  val/loss 2.0200  val/top1 0.4121
+```
+
+Mientras corre, abre MLflow (`uv run rukh mlflow ui`) y mira cuatro series. `train/loss` debe bajar
+deprisa los primeros cientos de pasos y después despacio. `val/loss` debe acompañarla; cuando se
+separen —la de entrenamiento sigue bajando y la de validación se queda plana o sube— has llegado al
+sobreajuste y el `best.pt` ya está guardado del paso anterior. `lr` debe dibujar la rampa de warmup
+y el coseno. Y `grad_norm` debe estabilizarse: picos recurrentes significan que el clipping está
+trabajando demasiado y que la tasa de aprendizaje es alta para este modelo.
+
+Cada 1 000 pasos se escribe un checkpoint, y esos checkpoints son exactamente los que alimentan la
+repetición del entrenamiento de la parte siguiente.
+
+Después, la evaluación rápida —una décima parte del trabajo de la completa, pensada para iterar:
+
+```bash title="Terminal"
+uv run rukh eval --model checkpoints/tiny/best.pt --suite quick
+```
+
+El informe que escribió esa ejecución, `artifacts/eval/tiny/report.md`, real y sin recortar:
+
+```markdown
+# Evaluation of `tiny`
+
+- Suite: `quick`
+- Checkpoint: `checkpoints/tiny-20260919-061533/best.pt`
+- Weights SHA-256: `4591cf8cca0b91b38fc3c4969c7bbf18aa5d3b4b79b36558727b981c24df281a`
+- Parameters: 5,309,952
+- Device: `cuda`
+- Date: 2026-09-19
+- MLflow run: b1836b7e8934483693df84ff2f090a3d
+
+## Headline
+
+| Metric                                               | Value                 |
+| ---------------------------------------------------- | --------------------- |
+| Legality without the mask, argmax                    | 94.5 %                |
+| Legality without the mask, sampled (T=0.6, top-k 20) | 93.8 %                |
+| Top-1 next move                                      | 40.3 %                |
+| Top-3 next move                                      | 67.1 %                |
+| Puzzles solved                                       | n/a                   |
+| Estimated Elo                                        | 64 (95 % CI -200-292) |
+| Mean centipawn loss                                  | n/a                   |
+| Opening diversity                                    | n/a                   |
+
+## Legality
+
+Two rates, because they answer different questions. **argmax** is the share of validation positions whose single most likely token is a legal move, with no temperature, no top-k and no mask: it is a property of the weights and it is the definition behind the ≥ 99 % bar of `GOAL.md`. **sampled** draws the token exactly as the demo does(T=0.6, top-k 20), so it is what a player would meet with the mask switched off, and it is always the lower of the two.
+
+| Definition | Positions | Legal |   Rate |
+| ---------- | --------: | ----: | -----: |
+| argmax     |      1000 |   945 | 94.5 % |
+| sampled    |      1000 |   938 | 93.8 % |
+
+## Next-move accuracy by Elo band
+
+| Band      | Positions |  Top-1 |  Top-3 |
+| --------- | --------: | -----: | -----: |
+| 1800-2000 |       543 | 38.9 % | 66.1 % |
+| 2000-2200 |       328 | 45.4 % | 71.0 % |
+| 2200-2400 |        97 | 33.0 % | 59.8 % |
+| 2400-2600 |        28 | 32.1 % | 64.3 % |
+| 2600+     |         4 | 50.0 % | 75.0 % |
+
+## Games against Stockfish
+
+| Rung     | Opponent Elo | Games |   W |   D |   L | Score | Cut | Adjudicated |
+| -------- | -----------: | ----: | --: | --: | --: | ----: | --: | ----------: |
+| skill-0  |          800 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+| skill-1  |          950 |    20 |   0 |   1 |  19 | 0.025 |   0 |           0 |
+| skill-2  |         1100 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+| skill-3  |         1250 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+| uci-1320 |         1320 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+| uci-1500 |         1500 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+| uci-1800 |         1800 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+| uci-2000 |         2000 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+
+0 of 160 games hit the context limit; 0 of those were adjudicated on the final position (shallow engine analysis, or the material count when no engine was available) rather than scored as draws.
+
+## Notes
+
+- legality_argmax is the share of validation positions where the single most likely token is a legal move (no temperature, no top-k, no mask): this is the >= 99 % bar of GOAL.md. legality_sampled draws the token the way the demo does (temperature 0.6, top-k 20) and is always the lower of the two.
+- puzzles not found at E:\work\ai\chess-lm\rukh\data\puzzles\puzzles.parquet: puzzle suite skipped
+- the Elo interval covers sampling noise only: the four `skill-*` rungs are nominal `Skill Level` anchors rather than measured ratings, and Stockfish plays at 0.1 s per move, far below any setting `UCI_Elo` is calibrated for
+```
+
+Léelo entero, porque `tiny` es el contraejemplo del módulo. En tres minutos de GPU aprende
+bastante: la pérdida de validación baja de 4,59 a 2,02, el top-1 de siguiente jugada llega al
+**40,3 %** y el **94,5 %** de sus argmax son jugadas legales. Es muchísimo para un modelo que no ha
+visto un tablero en su vida. Y es del todo insuficiente: el listón de `GOAL.md` es ≥ 99 % de
+legalidad, y 94,5 % significa que una de cada dieciocho jugadas propuestas es imposible en la
+posición. Contra Stockfish el resultado es demoledor: **cero victorias en 160 partidas**, unas
+tablas sueltas contra el escalón más bajo, y un Elo estimado de **64 con un intervalo del 95 % que
+va de −200 a 292**, es decir, un intervalo tan ancho que lo único que dice es "no gana nunca". Con
+`suite: quick` no se evalúan puzles (el fichero no estaba aún en disco: mira la última línea de las
+notas), así que esa fila sale `n/a`.
+
+`tiny` existe para eso: para que cuando `small` dé 99,4 % de legalidad y 1359 de Elo sepas de dónde
+viene y cuánto costó cada punto. Y para descubrir un bug de tubería en tres minutos.
+
+<Exercise n="03" title="Dos entrenamientos de 300 pasos que explican la receta">
+  Con `--max-steps 300`, lanza `tiny` tres veces: (a) tal cual; (b) con `warmup: 0` en una copia de
+  la configuración; (c) con `lr: 1.0e-2`. Compara las tres curvas de `train/loss` y de `grad_norm`
+  en MLflow. Después responde: ¿cuál de las dos variantes rotas se parece más a la sana en los
+  primeros diez pasos, y por qué es eso peligroso?
+
+  <Solution>
+    (a) baja suave desde `ln(2030) ≈ 7,6`. (b) sin warmup pega un salto en los primeros pasos: o la
+    pérdida sube por encima de 8 antes de volver, o se queda estancada alrededor de 6, que es
+    aproximadamente la entropía de la distribución de jugadas más frecuentes del corpus; el modelo
+    ha caído en "predecir siempre lo común". (c) con lr diez veces mayor, `grad_norm` se pega al
+    techo del clipping en casi todos los pasos, señal de que el paso real es el que decide el
+    clipping y no el optimizador; la pérdida oscila o diverge.
+
+    Lo peligroso es la comparación en los primeros diez pasos: **las tres bajan**. Cualquier
+    configuración razonable baja de 7,6 a 5 en unos pocos cientos de pasos, simplemente aprendiendo
+    la frecuencia marginal de cada jugada. Mirar la curva al principio no distingue un
+    entrenamiento sano de uno roto; hay que esperar a la zona donde la pendiente se suaviza, o
+    mirar métricas que no sean la pérdida (legalidad, top-1). Es la razón de que `eval_every` sea
+    250 en `tiny`: la señal útil llega de la validación, no del bucle.
+
+  </Solution>
+</Exercise>
+
+### Lab 4 · `small` entero, y la evaluación completa
+
+`small` es el modelo del curso: 12 capas, 512 dimensiones, 8 cabezas, 38 971 392 parámetros,
+20 000 pasos de 64 × 4 secuencias (51 200 tokens por paso, 1 024 millones de tokens en total), tasa
+6e-4 con 1 000 de warmup.
+
+Cuánto tardó, ya medido y no estimado: el bucle sostuvo **422 000 tokens/s** de mediana en esta
+5090 —423 309 en el último paso registrado—, en modo eager (`torch.compile` no arranca en este
+Windows porque no hay Triton, y el bucle cae a eager sin romperse). Mil veinticuatro millones de
+tokens a esa velocidad son **2 498 segundos de principio a fin: 42 minutos**. El spec del proyecto
+estimaba entre cuatro y ocho horas; era una estimación conservadora escrita antes de medir nada, y
+la dejamos dicha aquí para que se vea la diferencia entre estimar y medir: el error fue de un
+factor de entre seis y once. Los ficheros de configuración que vienen en el repo todavía llevan la
+estimación vieja en un comentario.
+
+```bash title="Terminal"
+uv run rukh train --config configs/train/small.yaml
+```
+
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
+
+```text
+2026-09-19 08:56:21,493  step 13000  val/loss 1.5787  val/top1 0.4981
+2026-09-19 08:57:23,733  step 13500  val/loss 1.5695  val/top1 0.5006
+2026-09-19 08:58:25,635  step 14000  val/loss 1.5641  val/top1 0.5019
+2026-09-19 08:59:27,866  step 14500  val/loss 1.5586  val/top1 0.5034
+2026-09-19 09:00:29,794  step 15000  val/loss 1.5528  val/top1 0.5045
+2026-09-19 09:01:32,021  step 15500  val/loss 1.5475  val/top1 0.5060
+2026-09-19 09:02:33,968  step 16000  val/loss 1.5424  val/top1 0.5069
+2026-09-19 09:03:36,099  step 16500  val/loss 1.5378  val/top1 0.5077
+2026-09-19 09:04:37,972  step 17000  val/loss 1.5332  val/top1 0.5087
+2026-09-19 09:05:40,223  step 17500  val/loss 1.5308  val/top1 0.5092
+2026-09-19 09:06:42,081  step 18000  val/loss 1.5275  val/top1 0.5101
+2026-09-19 09:07:44,246  step 18500  val/loss 1.5253  val/top1 0.5110
+2026-09-19 09:08:46,056  step 19000  val/loss 1.5226  val/top1 0.5113
+2026-09-19 09:09:48,207  step 19500  val/loss 1.5201  val/top1 0.5116
+2026-09-19 09:10:50,062  step 20000  val/loss 1.5197  val/top1 0.5120
+preset:     small
+steps:      20000
+checkpoint: E:\work\ai\chess-lm\rukh\checkpoints\small-20260919-062911\step-20000.pt
+```
+
+Si el proceso se corta —se reinicia la máquina, se cae el driver—, no se pierde nada: cada
+checkpoint lleva el estado del optimizador y el de los generadores aleatorios, así que
+`--resume checkpoints/small/step-12000.pt` continúa exactamente donde estaba. Esa es la diferencia
+entre guardar los pesos y guardar un checkpoint.
+
+Cuando termina, la suite completa: mil posiciones de legalidad —con sus dos definiciones—, mil de
+exactitud, dos mil puzles por cada una de las tres bandas y veinte partidas contra cada uno de los
+ocho escalones de Stockfish, 160 en total. Aquí sí hay horas, y no de entrenamiento sino de
+partidas; la caché SQLite hace que repetirla sea casi gratis.
+
+```bash title="Terminal"
+uv run rukh eval --model checkpoints/small/best.pt --suite full --stage small-greedy
+```
+
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
+
+```text
+2026-09-19 10:00:22,143  evaluating checkpoints\small-20260919-062911\best.pt on cuda
+stage:    small-greedy (38,971,392 parameters)
+suite:    full on cuda
+legality: 0.9940 argmax, unmasked
+          0.9940 sampled, unmasked
+accuracy: top1 0.5110  top3 0.7940
+puzzles:  0.0107 solved
+elo:      1007 (95 % CI 920-1101) over 160 games
+report:   E:/work/ai/chess-lm/rukh/artifacts/eval/small-greedy/report.md
+results:  E:/work/ai/chess-lm/rukh/artifacts/eval/small-greedy/results.json
+table:    E:/work/ai/chess-lm/rukh/artifacts/web/results.json
+```
+
+Dos cosas de esa salida antes de mirar el informe.
+
+`stage: small-greedy` no es otro modelo: son los mismos pesos evaluados con el muestreo casi
+determinista (temperatura 0,05, top-k 1). La misma suite sobre el mismo `best.pt` con el muestreo
+de la demo (temperatura 0,6, top-k 20) es la fila `small` de la tabla única, y da **1181 de Elo (IC
+95 % 1076-1249)** en vez de 1359. Los dos números están publicados porque miden cosas distintas:
+uno es la fuerza del modelo, el otro es la fuerza con la que juega la demo. **La temperatura vale
+unos 180 puntos de Elo**, más que cualquier decisión de arquitectura de este módulo.
+
+Fíjate en lo que eso hace con el criterio: los mismos pesos cumplen el listón de 1200 jugando a lo
+seguro (1359) y no lo cumplen jugando como la demo (1181). Un Elo nunca es del fichero que te
+descargas; es del par modelo+muestreo, y una tabla que compare etapas tiene que fijar el muestreo
+antes de comparar nada.
+
+Y la línea `puzzles: 0.0107` es un error, no un resultado. Esa tirada montaba el prompt del puzle
+mal —le daba al modelo la posición suelta en vez del prefijo real de la partida de la que sale el
+puzle, que es lo que el tokenizador UCI necesita para saber dónde están las piezas— y el modelo
+resolvía el **1,07 %**. Con el prompt arreglado y la suite repetida, la cifra real es el **22,1 %**,
+que es la que está en el informe de abajo y en la tabla única. La métrica no estaba midiendo al
+modelo: estaba midiendo un bug, y "1 %" era lo bastante creíble para un modelo pequeño como para no
+levantar sospechas. Guárdate esa forma de fallar: una métrica baja y plausible es más peligrosa que
+una métrica absurda.
+
+El informe completo que escribió la ejecución buena, `artifacts/eval/small-greedy/report.md`:
+
+```markdown
+# Evaluation of `small-greedy`
+
+- Suite: `full`
+- Checkpoint: `checkpoints/small-20260919-062911/best.pt`
+- Weights SHA-256: `7130d64ac1c409332dfd9b753281b38a7b0b434103eb1908533942e30c243f4e`
+- Parameters: 38,971,392
+- Device: `cuda`
+- Date: 2026-09-19
+- MLflow run: not tracked
+
+## Headline
+
+| Metric                                               | Value                   |
+| ---------------------------------------------------- | ----------------------- |
+| Legality without the mask, argmax                    | 99.4 %                  |
+| Legality without the mask, sampled (T=0.05, top-k 1) | 99.4 %                  |
+| Top-1 next move                                      | 51.1 %                  |
+| Top-3 next move                                      | 79.4 %                  |
+| Puzzles solved                                       | 22.1 %                  |
+| Estimated Elo                                        | 1007 (95 % CI 920-1101) |
+| Mean centipawn loss                                  | n/a                     |
+| Opening diversity                                    | n/a                     |
+
+Ese `Estimated Elo` es el que escribió la model card **y está mal**: el ajuste se apoyaba
+en cuatro rivales con el Elo puesto a mano. Se deja tal cual porque es lo que la tirada
+produjo y porque más abajo se cuenta cómo se destapó; con los escalones medidos, las mismas
+160 partidas dan **1359 (IC 1293-1429)**.
+
+## Legality
+
+Two rates, because they answer different questions. **argmax** is the share of validation positions whose single most likely token is a legal move, with no temperature, no top-k and no mask: it is a property of the weights and it is the definition behind the ≥ 99 % bar of `GOAL.md`. **sampled** draws the token exactly as the demo does(T=0.05, top-k 1), so it is what a player would meet with the mask switched off, and it is always the lower of the two.
+
+| Definition | Positions | Legal |   Rate |
+| ---------- | --------: | ----: | -----: |
+| argmax     |      1000 |   994 | 99.4 % |
+| sampled    |      1000 |   994 | 99.4 % |
+
+## Next-move accuracy by Elo band
+
+| Band      | Positions |  Top-1 |   Top-3 |
+| --------- | --------: | -----: | ------: |
+| 1800-2000 |       543 | 49.9 % |  78.5 % |
+| 2000-2200 |       328 | 52.7 % |  79.9 % |
+| 2200-2400 |        97 | 52.6 % |  82.5 % |
+| 2400-2600 |        28 | 50.0 % |  78.6 % |
+| 2600+     |         4 | 50.0 % | 100.0 % |
+
+## Puzzles by difficulty band
+
+Prompt: game-prefix.
+
+| Band      | Attempted | Solved |   Rate |
+| --------- | --------: | -----: | -----: |
+| 1000-1500 |      2000 |    694 | 34.7 % |
+| 1500-2000 |      2000 |    423 | 21.1 % |
+| 2000+     |      2000 |    207 | 10.3 % |
+
+## Games against Stockfish
+
+| Rung     | Opponent Elo | Games |   W |   D |   L | Score | Cut | Adjudicated |
+| -------- | -----------: | ----: | --: | --: | --: | ----: | --: | ----------: |
+| skill-0  |          800 |    20 |  10 |   1 |   9 | 0.525 |   2 |           2 |
+| skill-1  |          950 |    20 |   8 |   2 |  10 | 0.450 |   0 |           0 |
+| skill-2  |         1100 |    20 |   2 |   0 |  18 | 0.100 |   0 |           0 |
+| skill-3  |         1250 |    20 |   1 |   0 |  19 | 0.050 |   0 |           0 |
+| uci-1320 |         1320 |    20 |  10 |   1 |   9 | 0.525 |   1 |           1 |
+| uci-1500 |         1500 |    20 |   4 |   1 |  15 | 0.225 |   0 |           0 |
+| uci-1800 |         1800 |    20 |   4 |   0 |  16 | 0.200 |   1 |           1 |
+| uci-2000 |         2000 |    20 |   0 |   2 |  18 | 0.050 |   0 |           0 |
+
+4 of 160 games hit the context limit; 4 of those were adjudicated on the final position (shallow engine analysis, or the material count when no engine was available) rather than scored as draws.
+
+## Notes
+
+- legality_argmax is the share of validation positions where the single most likely token is a legal move (no temperature, no top-k, no mask): this is the >= 99 % bar of GOAL.md. legality_sampled draws the token the way the demo does (temperature 0.05, top-k 1) and is always the lower of the two.
+- the Elo interval covers sampling noise only: the four `skill-*` rungs are nominal `Skill Level` anchors rather than measured ratings, and Stockfish plays at 0.1 s per move, far below any setting `UCI_Elo` is calibrated for
+- 4 of 160 games hit the context limit and were adjudicated (4 of them) instead of being scored as draws
+```
+
+Qué dice, sin adornos:
+
+- **Legalidad 99,4 % por argmax.** El listón de `GOAL.md` es ≥ 99 % y **se cumple**. 994 de 1 000
+  posiciones de validación tienen como token más probable una jugada legal, sin máscara, sin
+  temperatura y sin top-k. Es la métrica de comprensión del módulo y es la única de las tres que
+  pasa limpia.
+- **Top-1 51,1 % y top-3 79,4 %.** El modelo acierta la jugada humana una de cada dos veces, y la
+  tiene entre sus tres primeras cuatro de cada cinco. Por tramo de Elo apenas se mueve (49,9 % en
+  1800-2000, 52,7 % en 2000-2200), lo cual tiene sentido: imita la media del corpus, y el corpus es
+  sobre todo 1800-2000.
+- **Puzles 22,1 %**, con la pendiente que se espera: 34,7 % en 1000-1500, 21,1 % en 1500-2000 y
+  10,3 % en 2000+. Resolver un puzle exige acertar **toda** la secuencia, así que es una métrica
+  dura, y esa caída por dificultad es la señal de que mide algo real.
+- **Elo 1007, IC 95 % 920-1101.** El objetivo de `GOAL.md` para `small` es ≥ 1200, así que esta
+  cifra decía que faltaban casi doscientos puntos.
+
+**Esa cifra era falsa, y la propia tabla de partidas llevaba la pista dentro.** El modelo puntúa
+0,525 contra `skill-0` y contra `uci-1320`, se hunde a 0,100 contra `skill-2` y a 0,050 contra
+`skill-3`, y vuelve a marcar 0,225 contra `uci-1500`. Esa no monotonía es imposible si los ocho
+escalones están en una misma escala: los cuatro `skill-*` son valores nominales de `Skill Level`
+—etiquetas que pusimos a mano— y no ratings medidos.
+
+Ninguna medición del modelo puede resolverlo, porque el modelo es justo lo que se está midiendo.
+Motor contra motor sí: se hicieron jugar los escalones entre ellos, 40 partidas por pareja, a los
+mismos 0,1 s por jugada.
+
+| Escalón   | Etiqueta que tenía | Medido   | Error |
+| --------- | ------------------ | -------- | ----- |
+| `skill-0` | 800                | **1381** | +581  |
+| `skill-1` | 950                | **1467** | +517  |
+| `skill-2` | 1100               | **1589** | +489  |
+| `skill-3` | 1250               | **1678** | +428  |
+
+Los cuatro se habían metido en la escalera para llegar **por debajo** del suelo de 1320 de
+`UCI_Elo`, y ninguno llega. El método se valida con su propio control: `uci-1500` midió **+179**
+Elo sobre `uci-1320` frente a los +180 nominales, así que el procedimiento no está sesgado.
+(`UCI_Elo` sí se comprime más arriba: `uci-1800` midió +215 sobre `uci-1500`, no +300.)
+
+Con las etiquetas medidas, el mismo checkpoint, las mismas 160 partidas y el mismo ajuste dan
+**1359 Elo (IC 1293-1429)**. El listón de 1200 nunca se falló; la regla estaba torcida y lo estuvo
+durante meses, mirada muchas veces.
+
+La lección que hay que llevarse no es el número. Es que **un banco de pruebas es código sin tests**
+mientras nadie lo mida, y que la señal de alarma estaba publicada en una tabla desde el principio,
+mirada muchas veces, sin que nadie tirase del hilo. Cuando una medición contradice a otra, una de
+las dos miente, y averiguar cuál casi siempre es más barato que discutirlo. El intervalo del 95 %
+nunca habría avisado: solo cubre el ruido de muestreo de 160 partidas, y el sesgo del banco de
+pruebas no está dentro de él.
+
+Y hay un detalle del arreglo que vale más que el arreglo: `uci-1500` midió **+179** Elo sobre
+`uci-1320` cuando lo nominal son +180. Ese no era un dato bonito, era **el control**. Si el
+procedimiento hubiera estado sesgado, ese número habría fallado y no habría forma de fiarse del
+resto. De ahí sale la regla: **un banco de pruebas necesita al menos un punto cuya respuesta
+conoces de antemano, y se comprueba cada vez que se toca.**
+
+<Transfer concept="Validez del instrumento, y por qué un sesgo sistemático respeta lo relativo" where="Una rúbrica de LLM-como-juez donde «3 = aceptable» lo definiste tú y nunca se calibró.">
+  El error fue tratar un número que escribiste tú como si lo hubieras medido. Las etiquetas
+  800/950/1100/1250 salían de una suposición sobre los niveles del motor que nadie comprobó nunca.
+  Lo mismo, sin tablero:
+
+- Una rúbrica de juez donde las notas las definiste tú y no se contrastaron con juicios humanos.
+- Una evaluación de RAG cuyas respuestas correctas las escribió el mismo modelo que evalúas.
+- Un umbral de latencia medido con un reloj que deriva.
+
+Y la asimetría que hay que llevarse, porque es lo que decide qué hay que rehacer: un sesgo
+sistemático **mata lo absoluto y respeta lo relativo**.
+
+Imagina una cinta métrica en la que el dueño anterior repasó a boli cuatro de las marcas, y las
+puso mal. Todo lo que has medido con ella está equivocado en centímetros. Pero si con esa misma
+cinta mediste tres estanterías y anotaste cuál era la más alta, ese orden sigue siendo correcto:
+el error se fue en la misma dirección en las tres. Aquí pasó eso: los cuatro modelos subieron por
+igual, las comparaciones entre ellos aguantaron y solo hubo que corregir las cifras publicadas. Si
+el sesgo hubiera dependido del modelo —una cinta que se estira más cuanto más larga es la
+estantería— no se habría salvado nada.
+
+</Transfer>
+
+Y una partida, para verlo con tus ojos, que es una forma de evaluación que ninguna tabla sustituye:
+
+```bash title="Terminal"
+uv run rukh play --ckpt checkpoints/small/best.pt --games 1
+```
+
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
+
+```text
+opponent: random
+mask:     on
+  game 1: 1/2-1/2 117 plies  0 illegal  (stalemate)
+illegal:  0 proposals
+```
+
+Ciento diecisiete plies contra un oponente que juega al azar, y tablas por **ahogado**. No es la
+partida lucida que uno querría enseñar, y por eso está aquí. Con la máscara puesta el contador de
+ilegales es **0**, como tiene que ser: el muestreo enmascarado no puede producir una jugada ilegal,
+así que ese cero no dice nada del modelo —dice que la máscara funciona, y si alguna vez ves ahí un
+número distinto de cero, lo que está roto es la máscara—. El ahogado, en cambio, sí es del modelo:
+llegó a un final ganado contra un rival aleatorio y no supo dar mate.
+
+La misma partida sin máscara enseña el otro lado: cada vez que el modelo propone algo ilegal se
+cuenta y se rescata con un muestreo enmascarado, así que la partida siempre termina y el contador
+`illegal` es la señal cruda.
+
+```bash title="Terminal"
+uv run rukh play --ckpt checkpoints/small/best.pt --games 1 --no-mask
+```
+
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19):
+
+```text
+opponent: random
+mask:     off
+  game 1: 1-0      79 plies  1 illegal  (checkmate)
+illegal:  1 proposals
+```
+
+Mate en 79 plies y **una sola propuesta ilegal en toda la partida**. Ese `1` es lo que conecta esta
+partida con la tabla de arriba, y merece la pena hacer la cuenta: es la única vez en el módulo en
+que una métrica agregada y un caso concreto se pueden contrastar a mano. Una legalidad por argmax
+del **99,4 %** son 6 fallos por cada 1 000 posiciones, es decir **uno cada 167 jugadas propuestas**.
+En una partida de 79 plies el modelo mueve la mitad de las veces —el otro lado es el oponente
+aleatorio—, así que propone unas 40 jugadas y el número esperado de ilegales es 0,24: sale 1. Con
+una sola partida eso es ruido puro y no confirma nada, pero el orden de magnitud coincide, y esa es
+la comprobación barata que conviene hacerse siempre que tengas una métrica agregada y un caso
+suelto delante. Si aquí hubieran salido quince ilegales, el 99,4 % de la tabla estaría midiendo
+otra cosa.
+
+<Exercise n="04" title="¿Cuántas partidas necesitas para creerte una mejora de 40 Elo?">
+  Usando la fórmula de la varianza de la sección anterior —`var = 1 / (c² · Σ p(1−p))` con
+  `c = 0,005756`— calcula cuántas partidas con resultados cercanos al 50 % hacen falta para que la
+  desviación típica del Elo baje a 20 puntos. Después: si comparas dos modelos, ¿basta con que sus
+  intervalos del 95 % no se solapen?
+
+  <Solution>
+    Con `p = 0,5`, `Σ p(1−p) = 0,25·n`, así que `var = 1 / (0,005756² · 0,25 n) = 1 / (8,28e-6 · n)`.
+    Para una desviación de 20 hace falta `var = 400`, es decir `n = 1 / (8,28e-6 · 400) ≈ 302`
+    partidas. Para 10 puntos harían falta unas 1 208: la precisión va con la raíz, así que **dividir
+    el error por dos cuesta cuatro veces más partidas**. Con 800 partidas la desviación ronda los
+    12 puntos y el intervalo del 95 % mide unos 48 de ancho: una mejora de 40 puntos es detectable,
+    una de 15 no.
+
+    Y no, los intervalos que no se solapan no son el criterio correcto: es una prueba demasiado
+    conservadora (dos intervalos pueden solaparse y la diferencia ser significativa). Lo correcto
+    es estimar el intervalo **de la diferencia**. Y, mucho mejor que cualquiera de las dos cosas,
+    enfrentar los dos modelos directamente entre sí: comparar A y B contra un tercero acumula el
+    error de dos estimaciones, mientras que el emparejamiento directo mide lo que te importa. Es la
+    misma razón por la que las listas de motores se construyen con torneos y no con puntuaciones
+    independientes.
+
+  </Solution>
+</Exercise>

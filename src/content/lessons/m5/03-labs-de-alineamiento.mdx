@@ -1,0 +1,387 @@
+---
+title: 'Alineamiento: los labs'
+description:
+  'Ocho labs con sus comandos, en el orden en que se hicieron: cuántas partidas cuesta la pregunta,
+  el control que tiene que dar 0,5000, agrupar las dos direcciones, la recompensa con la profundidad,
+  pares del propio modelo, DPO con dos fuentes, ventajas de grupo a mano, el reward model, GRPO y romper
+  la recompensa a propósito.'
+module: m5
+order: 3
+duration: 180
+level: medio
+status: vigente
+updated: '2026-09-21'
+keywords:
+  - alineamiento
+  - par de preferencia
+  - Bradley-Terry
+  - reward model
+  - DPO
+  - beta
+  - on-policy
+  - off-policy
+  - GRPO
+  - ventaja relativa
+  - línea base
+  - recompensa verificable
+  - RLVR
+  - reward hacking
+  - KL
+  - k3
+  - enfrentamiento directo
+  - potencia estadística
+  - reproducibilidad
+---
+
+Parte 3 de 3 del módulo «Alineamiento». Viene de «Alineamiento: cómo se mide y lo que salió» y cierra el módulo.
+
+## Labs
+
+Once laboratorios, en el orden en que se hicieron. Los tres primeros no entrenan nada: el hito
+empezó cambiando de instrumento y comprobándolo, que es lo que permitió creerse el resto. Los tres
+últimos son los que producen lo que está en el Hub: el reward model, los dos GRPO y la evaluación
+que decide cuál se publica.
+
+<Callout kind="hoy" title="Punto de partida, si te saltaste algo">
+  Todo parte de `checkpoints/medium-v4/best.pt` (M2, parte 4) y de `data/pairs/dpo-prompts.parquet`
+  (M1, el paso `pairs`). `uv run rukh pull --module m5` deja los dos, más los puzles y las partidas
+  que usa la suite y los tres modelos alineados publicados, por si solo quieres medirlos. Hace falta
+  Stockfish (`scripts/get_stockfish.py`). Los comandos son los que se ejecutaron y los tiempos, los
+  de una RTX 5090; la secuencia completa con cada salida está en `docs/runbooks/alineamiento.md`.
+</Callout>
+
+### Lab 1 · ¿Cuántas partidas cuesta la pregunta?
+
+Antes de jugar nada, el precio. Dos maneras de contestar «¿este modelo es 50 Elo mejor?», y la
+cuenta que dice cuál cuesta ocho veces menos.
+
+```bash
+uv run python labs/m5/games_needed_match.py
+```
+
+<Exercise>
+  Cambia la diferencia buscada de 50 a 20 Elo y vuelve a correrlo. ¿Cuántas partidas pide el
+  enfrentamiento directo? ¿Y la resta de dos escaleras? ¿Es el mismo factor 8,1 o cambia con la
+  diferencia?
+</Exercise>
+
+<Solution>
+  El factor se mantiene cerca de 8 porque las dos fórmulas escalan igual, con el cuadrado de la
+  diferencia: al bajar de 50 a 20 Elo las dos multiplican sus partidas por unas 6,3 veces —`(50/20)²
+  = 6,25`— y la razón entre ellas apenas se mueve. Lo que sí cambia, y mucho, es el valor absoluto:
+  20 Elo son unas 1 900 partidas en un enfrentamiento, casi cinco veces las 400 que el hito jugó.
+  Por eso la tabla al revés es la útil: con el presupuesto que tienes, ¿cuál es la diferencia más
+  pequeña que podrías ver?
+</Solution>
+
+### Lab 2 · El control que tiene que dar 0,5000
+
+El instrumento se estrena midiendo algo cuya respuesta ya se sabe.
+
+```bash
+uv run rukh eval match --a checkpoints/medium-v4-*/best.pt --b checkpoints/medium-v4-*/best.pt --games 100
+```
+
+<Exercise>
+  Corre el control. Luego corre el mismo comando con `--games 101`. ¿Qué pasa, y por qué está puesto
+  así a propósito?
+</Exercise>
+
+<Solution>
+  Falla con un `ValueError`: «a mirrored match needs an even number of games». Cada apertura se
+  juega dos veces con los colores cambiados, así que un número impar significa que alguien jugó una
+  partida de más con un color. Podría redondearse hacia abajo en silencio y nadie se enteraría — y
+  esa es exactamente la razón de no hacerlo. Un reparto de colores torcido es un sesgo que no
+  aparece en ninguna métrica, así que el sitio donde tiene que doler es al escribir el comando.
+</Solution>
+
+### Lab 3 · Agrupar las dos direcciones de un enfrentamiento
+
+```bash
+uv run rukh eval match --a <A> --b <B> --games 400 --seed 7
+uv run rukh eval match --a <B> --b <A> --games 400 --seed 7
+uv run python labs/m5/pooled_match.py
+```
+
+<Exercise>
+  Corre las dos direcciones de un par cualquiera y luego el agrupador. ¿Cuánto se estrecha el
+  intervalo al pasar de 400 a 800 partidas? ¿Y por qué no se estrecha a la mitad?
+</Exercise>
+
+<Solution>
+Se estrecha por `√2`, no por dos: el error típico de una media va con la raíz del número de
+muestras. Doblar las partidas divide el intervalo por 1,41. Para dividirlo por dos hacen falta
+**cuatro** veces las partidas, y por eso la tabla del lab 1 se lee al revés antes de pagar nada.
+
+Lo que sí puede pasar al agrupar es que el veredicto cambie, y no siempre a mejor: en M5, `on`
+contra `off` daba «separado» en una dirección e «incluye el cero» en la otra, y agrupado vuelve a
+«separado» con la mitad de incertidumbre. El agrupado es el número honesto de las dos corridas, no
+el mejor de los dos.
+
+</Solution>
+
+### Lab 4 · Mirar cuánto se mueve la recompensa con la profundidad
+
+La comprobación que no se ve mirando ordenaciones.
+
+```bash
+uv run python labs/m5/reward_hacking.py --depth 10
+```
+
+<Exercise>
+  Fíjate en la fila «reescalada sola» del último bloque. Entre profundidad 10 y 14 el motor da el
+  mismo 9 998 y la recompensa pasa de 1,000 a 0,667. Si el motor dijo lo mismo, ¿qué cambió?
+</Exercise>
+
+<Solution>
+  El grupo. Esa recompensa normaliza por la dispersión de las candidatas que tiene delante, y a
+  profundidad 14 el motor encuentra el mate en otra candidata más: el mínimo del grupo sube, la
+  dispersión se encoge, y la misma jugada con la misma evaluación vale otra cosa. Es la única
+  recompensa de la galería cuyo valor depende de con quién la compares, y por eso dos corridas suyas
+  no se pueden comparar ni entre sí.
+</Solution>
+
+### Lab 5 · Construir pares con las jugadas del propio modelo
+
+```bash
+uv run rukh data onpolicy --config configs/data/onpolicy.yaml --max-positions 500
+```
+
+<Exercise>
+  Mira el `manifest.json` que escribe. ¿Qué fracción de posiciones no produjo par, y por qué dos
+  razones distintas? Luego baja `temperature` a 0,3 —la temperatura a la que se leen todos los
+  números publicados del proyecto— y vuelve a correrlo. ¿Qué pasa con `skipped_all_same`?
+</Exercise>
+
+<Solution>
+Sobre las 13 838 posiciones completas, el 27,1 % no dio par porque el modelo propuso una sola
+jugada distinta, y el 26,8 % porque las dos extremas estaban a menos de 100 cp. Son dos fallos
+distintos: el primero es falta de diversidad, el segundo es falta de desacuerdo.
+
+Con `temperature: 0.3` el primero se dispara: a esa temperatura el modelo propone su moda cuatro
+veces de cada cuatro en la gran mayoría de las posiciones, y no hay nada que comparar. Es la misma
+lección con la que terminó M4 desde el otro lado: el muestreo casi determinista es lo que hace que
+los números publicados sean estables, y es exactamente lo que impide construir un par.
+
+</Solution>
+
+### Lab 6 · DPO con dos fuentes de pares, y la trampa de no igualarlas
+
+```bash
+uv run rukh train dpo --config configs/train/dpo-onpolicy.yaml
+uv run rukh train dpo --config configs/train/dpo-offpolicy.yaml
+```
+
+<Exercise>
+  Antes de correr nada: el conjunto off-policy tiene 13 838 pares y el on-policy 6 386. Si entrenas
+  los dos tal cual y el off-policy sale mejor, ¿qué has medido?
+</Exercise>
+
+<Solution>
+La cantidad de datos, no la fuente. Por eso `configs/train/dpo-offpolicy.yaml` apunta a
+`data/pairs-offpolicy-matched/`, que es el conjunto original submuestreado a 6 386 con semilla
+fija. Es la misma disciplina que la galería del lab 3 necesitó para que sus inversiones fueran
+atribuibles: si dos condiciones difieren en dos cosas, no has medido ninguna de las dos.
+
+Hay una segunda diferencia que **no** se puede igualar y hay que decir: los pares off-policy tienen
+un 29 % de mates y los on-policy un 2,9 %. Eso no es un defecto de la construcción, es lo que
+significa «on-policy» — el modelo casi nunca propone a la vez un mate y una pifia —, y hay que
+declararlo en vez de esconderlo.
+
+</Solution>
+
+### Lab 7 · Ventajas de grupo a mano
+
+Sin GPU y sin motor, para ver el paso que todo el mundo reconstruye mal.
+
+```python
+import torch
+from rukh.train.grpo import group_advantages, grpo_loss
+
+# Un grupo con dispersión y uno sin ella.
+print(group_advantages([0.98, 0.74, 1.21, 0.31, 0.62, 0.05, 0.88, 0.45]))
+print(group_advantages([0.74] * 8))
+
+# La KL, en las dos direcciones.
+policy = torch.log_softmax(torch.randn(4, 8), dim=-1)
+reference = torch.log_softmax(torch.randn(4, 8), dim=-1)
+_, kl = grpo_loss(policy, reference, torch.tensor([0, 1, 2, 3]), torch.zeros(4), beta_kl=1.0)
+print(float(kl))
+```
+
+<Exercise>
+  Multiplica por diez todas las recompensas del primer grupo. ¿Cambian las ventajas? ¿Y si les sumas
+  diez a todas?
+</Exercise>
+
+<Solution>
+  No cambian en ninguno de los dos casos, y por razones distintas. Sumar una constante no cambia
+  nada porque la media se mueve con ella: es la misma invariancia que tiene Bradley-Terry, vista en
+  otro sitio. Multiplicar por diez no cambia nada porque la desviación se multiplica por diez
+  también. La ventaja de grupo es invariante a traslaciones **y** a escala, lo cual es justo lo que
+  la hace utilizable sin calibrar la recompensa — y justo lo que hace que un grupo de ocho pifias y
+  un grupo de ocho jugadas excelentes produzcan ventajas del mismo tamaño.
+</Solution>
+
+### Lab 8 · Romper la recompensa a propósito
+
+```bash
+uv run python labs/m5/reward_hacking.py --depth 12
+```
+
+<Exercise>
+  Añade una sexta recompensa rota a `REWARDS`: la sana, pero con `WEIGHTS.mate` subido de 0,25 a
+  2,0. ¿Invierte algún par? ¿Qué le pasa a la columna «cabeza» en la posición «hay mate»?
+</Exercise>
+
+<Solution>
+  No invierte nada —el mate ya era la mejor jugada por evaluación, así que pagarlo más no cambia el
+  orden— y la cabeza se dispara, porque toda la masa de ventaja del grupo se va a la candidata que
+  mata y las demás se aplastan. Es el mismo daño que hace «sin suelo» por el otro extremo: una
+  recompensa puede romper un grupo tirando de arriba o empujando desde abajo, y en las dos el
+  síntoma es el mismo — deja de haber señal para ordenar lo que queda en medio.
+</Solution>
+
+### Lab 9 · El reward model, y por qué su número depende de la semilla
+
+Un encoder de casillas con una cabeza escalar, entrenado con la pérdida de Bradley-Terry sobre los
+pares fuera de política. Cuatro minutos, desde cero: la parte 2 midió que partir del encoder de M3
+**estorba** (62 % frente a 69 % a la misma talla), así que `encoder_ckpt: null`.
+
+```bash title="Terminal"
+uv run rukh train reward --config configs/train/rm.yaml
+```
+
+Salida real de la corrida de referencia (`checkpoints/rm-20260920-223655/`):
+
+```text
+accuracy:   74.76 % on held-out pairs
+            77.30 % over the pairs an evaluation can decide
+    100-200 cp    556 pairs   77.52 %
+    200-400 cp    242 pairs   74.79 %
+    400-800 cp    104 pairs   80.77 %
+   800-2000 cp     10 pairs   90.00 %
+       mate cp    356 pairs   68.26 %
+margin vs delta cp: Pearson -0.128, Spearman -0.067
+        without mates: Pearson +0.058, Spearman +0.075
+```
+
+<Exercise>
+  Corre la misma config con `seed: 1`, `2` y `3` (cambia también `run_name`, o las tres corridas se
+  pisarán el nombre). Anota el acierto global y el de la banda de mate de cada una. ¿Cuánto se mueve
+  el titular? ¿Qué banda lo mueve?
+</Exercise>
+<Solution>
+  En la referencia, las tres semillas dieron 74,76 %, 75,19 % y 74,71 % de acierto global, con la
+  banda de mate en 68,26 %, 71,69 % y 69,57 % y con 356, 438 y 368 pares de mate en validación. La
+  semilla reparte la partición **y** entrena el modelo, así que cuántos pares de mate le tocan al
+  conjunto de validación mueve el titular, y la banda de mate —un tercio de los pares y la peor— es
+  la que lo mueve. Comparar dos corridas con semillas distintas no dice nada del modelo; y dos con
+  la misma semilla tampoco se repiten exactas: la config publicada, corrida dos veces sin cambiar
+  nada, dio 72,91 % y 74,21 % (D-113). Ese 1,3 es el suelo de reproducibilidad de la GPU, y
+  cualquier diferencia que publiques tiene que ser mayor que él.
+</Solution>
+
+### Lab 10 · GRPO a dos tasas, y elegir sin restar
+
+Sin pares y sin reward model: las posiciones se leen del fichero de pares y las etiquetas se
+ignoran. Ocho candidatas por posición, la recompensa verificable con el motor a profundidad 8 y
+una caché en disco para que la segunda visita a una posición sea gratis. La corrida de referencia
+son 1 500 pasos; `grpo.yaml` deja 300 para que la primera vuelta tarde minutos.
+
+```bash title="Terminal"
+uv run rukh train grpo --config configs/train/grpo.yaml --steps 1500
+sed 's/^lr: 1.0e-6/lr: 5.0e-6/' configs/train/grpo.yaml > configs/train/grpo-fast.yaml
+uv run rukh train grpo --config configs/train/grpo-fast.yaml --steps 1500 --run-name medium-v4-grpo-fast
+uv run rukh eval match --a checkpoints/medium-v4-grpo-fast/grpo.pt --b checkpoints/medium-v4-grpo/grpo.pt --games 400 --seed 7
+uv run rukh eval match --a checkpoints/medium-v4-grpo/grpo.pt --b checkpoints/medium-v4-grpo-fast/grpo.pt --games 400 --seed 7
+uv run python labs/m5/pooled_match.py
+```
+
+La salida de `rukh train grpo` tiene dos líneas de recompensa, y la que puntúa es la segunda:
+
+```text
+reward:     +0.8657 -> +0.8937 (group best)
+            +0.8250 -> +0.8529 (engine best -- this is the score)
+flat:       0.385 -> 0.472
+illegal:    0.0000 -> 0.0000
+kl:         0.12169 against the frozen start
+```
+
+<Exercise>
+  Las dos corridas dan estas cifras contra la base: la lenta +44 Elo (23 a 66) y la rápida +68 (46 a
+  90). Antes de mirar el agrupado de sus enfrentamientos directos: ¿cuál publicarías, y con qué
+  argumento?
+</Exercise>
+<Solution>
+  Si respondiste «la rápida, por 24 puntos», acabas de restar dos mediciones contra un tercero, que
+  es exactamente lo que la parte 1 desaconseja y lo que la referencia hizo una vez antes de darse
+  cuenta (D-126). Enfrentadas entre sí y agrupando las dos direcciones, las dos corridas empatan:
+  −0,87 Elo con intervalo de −22,2 a +20,4. Con un empate medido, el desempate no es el Elo sino el
+  coste, y ahí la lenta gana en todo: menos grupos planos (0,472 frente a 0,560), menos KL contra el
+  inicio (0,122 frente a 0,555) y menos propuestas ilegales (1,66 veces la base frente a 2,08). Se
+  publica la lenta. La regla completa está en la parte 2.
+</Solution>
+
+### Lab 11 · La suite, la exportación y el Hub
+
+Lo que cierra el módulo no es un enfrentamiento sino la fila de la tabla única, medida con la
+misma config y la misma semilla que todas las etapas anteriores, y el modelo en el Hub con esa
+fila en su card.
+
+```bash title="Terminal"
+uv run rukh eval --model checkpoints/medium-v4-dpo-onpolicy/dpo.pt --config configs/eval/greedy.yaml --stage medium-v4-dpo-onpolicy-greedy
+uv run rukh eval --model checkpoints/medium-v4-grpo/grpo.pt --config configs/eval/greedy.yaml --stage medium-v4-grpo-greedy
+uv run rukh export --ckpt checkpoints/medium-v4-dpo-onpolicy/dpo.pt --out artifacts/onnx/medium-dpo --fp16 --int8 --check-parity
+uv run rukh publish model --ckpt checkpoints/medium-v4-dpo-onpolicy/dpo.pt --repo chorcat/rukh-medium-dpo --stage medium-v4-dpo-onpolicy-greedy --onnx artifacts/onnx/medium-dpo --dry-run
+uv run rukh publish reward --run checkpoints/rm --repo chorcat/rukh-rm --dry-run
+uv run rukh data publish --name rukh-pairs-onpolicy --dry-run
+```
+
+Cada evaluación canónica tarda unos 26 minutos y una exportación unos 12; `--dry-run` deja la
+carpeta entera en `artifacts/publish/` sin tocar la red. El `--stage` del `publish` tiene que ser
+**el mismo** con el que se corrió la evaluación, o la card sale sin números; y si el checkpoint no
+es el que se midió, el publicador se niega en vez de publicar los números de otro modelo.
+
+<Exercise>
+  Antes de quitar `--dry-run`, lista la carpeta staged con `ls -la`. ¿Cuánto tiene que pesar
+  `model.safetensors` de un modelo de 115 millones de parámetros en fp32? ¿Y el del reward model?
+</Exercise>
+<Solution>
+  Unos 460 MB (115 M × 4 bytes) y unos 152 MB (37,9 M × 4). La referencia encontró una vez 25 KB
+  donde debían estar los 152 MB del reward model: un test cuyo aislamiento no funcionaba había
+  escrito su modelo de juguete en la carpeta real (D-129). Contar bytes es la comprobación más
+  barata que existe, y la única que lo habría pillado.
+</Solution>
+
+## Lo que te llevas
+
+Tres cosas, y las tres son sobre cómo medir, no sobre alineamiento. Eso no es un accidente del
+módulo: es lo que pasa cuando el instrumento y el experimento se construyen a la vez.
+
+**Para medir una diferencia, mide la diferencia.** Cada absoluto trae su ruido entero a la resta, y
+la resta acaba más ancha que las medidas que entraron. En este módulo la regla falló tres veces por
+tres caminos distintos —restando dos escaleras, restando dos enfrentamientos contra la base en un
+triángulo que no cierra, y eligiendo entre dos GRPO por lo que cada uno hizo contra un tercero— y
+las tres veces el enfrentamiento directo dio otra respuesta. Dos de las tres las cometí yo **después**
+de escribir la regla.
+
+**Antes de explicar una diferencia pequeña, mide cuánto se mueve tu montaje cuando no cambias nada.**
+La escalera repite 1498 y 1558. El reward model repite 72,91 % y 74,21 % con la misma semilla y la
+misma partición. Un veredicto de «separado del cero» se dio la vuelta al intercambiar los lados
+mientras la estimación apenas se movía. Ninguna de las tres se descubre mirando el modelo.
+
+**Y antes de publicar una métrica, describe la política que la maximizaría.** Si esa política no es
+la que quieres, la métrica no es la que quieres. Esa pregunta encontró en nuestro propio bucle un
+fallo que ninguna de las cinco recompensas rotas a propósito habría enseñado: la recompensa que GRPO
+optimiza se maximiza **dejando de ser diverso**, y la curva de tres puntos que lo demuestra tiene el
+mecanismo en la columna de al lado.
+
+El modelo, mientras tanto, mejoró: los tres métodos baten a su base con el intervalo separado del
+cero, que es la primera vez en el proyecto. Lo que cambió no fue el modelo, fue cómo se mira.
+
+Lo siguiente es M6, el cierre de la primera fase: la tabla única con todas las etapas, las model
+cards desde MLflow, y la demo final. Después empieza la fase agéntica, donde el modelo deja de ser
+lo único que hay y pasa a ser una herramienta que algo más usa.
+
+La cheatsheet del módulo, con su pregunta y su respuesta corta, está justo debajo.

@@ -1,0 +1,688 @@
+---
+title: 'Fine-tuning: cómo se mide y lo que salió'
+description:
+  '«Monótono» y «separado» no son lo mismo, un solo número cambia entre filas, la entropía
+  de aperturas, y lo que salió: la cabecera dejó de ser ruido, el Elo por condición no cumple el criterio
+  y la aritmética dice por qué, el afinado de maestros, los adaptadores de 1,6 MB y Qwen3 contra el decoder.'
+module: m4
+order: 2
+duration: 150
+level: medio
+status: vigente
+updated: '2026-09-21'
+keywords:
+  - fine-tuning
+  - SFT
+  - instruction tuning
+  - condicionamiento
+  - Elo
+  - LoRA
+  - rango
+  - adaptador
+  - peft
+  - PreTrainedModel
+  - QLoRA
+  - cuantización de 4 bits
+  - olvido catastrófico
+  - entropía de aperturas
+  - diversidad
+  - SAN
+  - monotonía
+  - intervalo de confianza
+---
+
+import IntervalShrink from '../../../components/figures/IntervalShrink.astro';
+import EloDial from '../../../islands/EloDial.tsx';
+
+Parte 2 de 3 del módulo «Fine-tuning e instrucción». Viene de «Fine-tuning: el agujero y la teoría justa» y sigue en «Fine-tuning: los labs».
+
+## Cómo se mide y contra qué
+
+Al terminar esta sección sabrás por qué el criterio de este hito son dos afirmaciones y no una, qué
+mide cada columna del barrido, y qué métrica del spec llevaba tres hitos saliendo `n/a` y por qué
+hacía falta ahora.
+
+### «Monótono» y «separado» no son lo mismo
+
+`GOAL.md` pide para P4: _Elo por condición monótono (1500 < 2000 < 2400 con IC)_. Esa frase esconde
+dos afirmaciones distintas y hay que medirlas por separado, porque una es barata y la otra es la
+que vale.
+
+**Monótono** quiere decir que las estimaciones puntuales suben con la condición. Es fácil de
+conseguir por casualidad: con tres números y ruido, la probabilidad de que salgan ordenados por azar
+es una de seis.
+
+**Separado** quiere decir que los intervalos de confianza consecutivos no se solapan. Eso ya no pasa
+por casualidad: es la afirmación de que la diferencia sobrevive al ruido de la medición.
+
+Y hay una tercera pregunta que solo aparece cuando la segunda sale que no, que es lo que le pasó a
+este hito: **si no están separados, ¿es porque faltan partidas o porque no hay diferencia?** Las dos
+se escriben igual en el informe y no se parecen en nada. Se contesta con aritmética, no con más
+máquina, y la sección de resultados la contesta con los números delante.
+
+El proyecto ya se quemó con esto. En el hito anterior, una prueba de 32 partidas dio 0,703 contra
+0,609 a favor de `<2600>` frente a `<1800>` y pareció una victoria del condicionamiento. Con 160
+partidas se cayó: 1058 frente a 1095, con los intervalos casi superpuestos. La conclusión hubo que
+retirarla. Por eso `rukh eval sweep` imprime **los dos veredictos** y el hito se juzga con el
+segundo:
+
+```python title="src/rukh/eval/sweep.py"
+def is_separated(rows: list[SweepRow]) -> bool:
+    """Whether every consecutive pair of intervals is disjoint, in the right order."""
+    usable = [row for row in rows if row.elo is not None]
+    for low, high in zip(usable, usable[1:], strict=False):
+        top_of_low = low.elo_ci[1] if low.elo_ci else low.elo_upper
+        bottom_of_high = high.elo_ci[0] if high.elo_ci else high.elo_lower
+        if top_of_low is None or bottom_of_high is None or top_of_low >= bottom_of_high:
+            return False
+    return True
+```
+
+<Callout kind="entrevista" title="Tu métrica sube en las tres condiciones. ¿Ya está?">
+  No. La pregunta siguiente es siempre cuál es el ruido de la medición, y la respuesta honesta
+  empieza midiéndolo: intervalos por bootstrap, o dos tiradas con semillas distintas y la diferencia
+  entre ellas. Una ordenación de tres números sin barras de error es una anécdota con formato de
+  tabla. La versión avanzada de la respuesta añade que el ruido tiene estructura —aquí, los mismos
+  rivales y las mismas aperturas en todas las filas— y que por eso conviene cambiar **una** cosa
+  entre condiciones y no dos.
+</Callout>
+
+### Un solo número cambia entre filas
+
+El barrido corre la misma suite una vez por condición: mismos rivales de Stockfish, mismas
+posiciones de validación, mismos puzles, misma semilla, misma temperatura. Lo único que cambia son
+los dos tokens de cabecera. Cualquier cosa que difiera entre filas es la condición, y eso es lo que
+hace que la tabla se pueda leer.
+
+Hay un detalle que casi arruina esa propiedad y que conviene contar porque es el tipo de error que
+se publica sin que nadie lo note. Los puzles del conjunto llevan **el Elo real** de los jugadores de
+la partida de la que salieron, y `start_history` los usa cuando están. Correcto para medir puzles;
+desastroso para un barrido: la columna de puzles habría salido **idéntica en las seis filas**, que
+es indistinguible de la evidencia de que la condición no hace nada. Por eso existe `force_header`,
+activado solo aquí, que fuerza la cabecera de la condición en los puzles **y en las posiciones de
+validación**, que tenían exactamente el mismo problema por exactamente la misma razón: cada partida
+lleva el Elo real de quien la jugó. La consecuencia es que el barrido tiene su propia caché, porque
+estas tentativas responden a otra pregunta y no deben confundirse con las anteriores.
+
+### ¿Juega peor o juega ilegal?
+
+La legalidad sin máscara vuelve al barrido como columna propia, y no es decorativa. Si el modelo
+condicionado a 1200 empeora, hay dos maneras muy distintas de empeorar: elegir jugadas legales
+peores —que es lo que hace un humano débil— o proponer jugadas que no existen —que es lo que hace un
+modelo que ha dejado de entender el tablero.
+
+La primera sería un dial que funciona. La segunda sería un dial roto con aspecto de funcionar,
+porque la máscara de legalidad de la demo esconde las jugadas ilegales y el jugador solo vería que
+el rival es más flojo. Medir las dos cosas por separado es lo que distingue «aprendió a imitar a un
+1200» de «se le deshizo el modelo al leer un token que apenas ha visto».
+
+Adelanto del resultado, porque cambia cómo se lee el resto: la legalidad salió **100,00 %** a 1200 y
+**99,70 %** a 2400. Es decir, lo contrario de romperse — el modelo condicionado a 1200 es el que
+menos jugadas imposibles escribe de los seis.
+
+### Entropía de aperturas: la métrica que llevaba tres hitos vacía
+
+`docs/spec/02` lista, desde el primer día, una columna de diversidad: _entropía de las aperturas
+jugadas en 200 partidas propias_. Ha salido `n/a` en todos los informes del proyecto, porque hasta
+ahora ninguna afirmación la necesitaba.
+
+Este módulo la necesita. El spec predice del afinado con maestros que _sube el Elo y baja la
+diversidad_, y esa frase tiene dos mitades: una tabla que solo mide la primera no puede comprobarla.
+
+Se mide con dos números, porque fallan de maneras distintas:
+
+**La entropía de líneas** juega N aperturas del modelo contra sí mismo y mide la entropía de
+Shannon de la distribución de líneas distintas. Es la métrica que pide el spec y **depende del
+muestreo**: leída al ajuste casi determinista con el que se comparan todas las etapas (T = 0,05,
+top-k 1), cualquier decoder juega una sola partida y saca exactamente 0. Eso es verdad y dice más
+del muestreador que de los pesos, así que se lee a su propia temperatura y **siempre se publica con
+ella al lado**.
+
+**La entropía de la primera jugada** es analítica: la distribución del propio modelo sobre las
+veinte primeras jugadas legales, renormalizada, sin muestreo de ninguna clase. No tiene varianza
+entre tiradas, es una propiedad de los pesos, y es la que se puede comparar entre etapas tal cual.
+Su techo es log₂(20) = 4,32 bits para un modelo sin ninguna opinión; un modelo afinado sobre un
+repertorio estrecho la hunde.
+
+Las auto-partidas van en lote: las N avanzan un ply a la vez, todas en la misma pasada, así que 200
+aperturas de 12 plies son 12 pasadas de lote 200 en vez de 2 400 pasadas de lote 1. Y el lote es
+rectangular por construcción, lo que en este modelo no es un detalle: las posiciones son
+**aprendidas**, así que rellenar por la izquierda desplazaría cada token real a una posición en la
+que nunca se entrenó, y rellenar por la derecha dejaría un `<pad>` en la columna que predice. El
+código prefiere fallar a rellenar.
+
+<Callout kind="roto" title="Lo que una métrica de diversidad no mide">
+  La entropía de aperturas dice si el modelo varía, no si varía **bien**. Un modelo que juegue
+  veinte primeras jugadas distintas al azar saca una entropía magnífica y es peor que uno que juega
+  siempre `1. e4`. Por eso viaja siempre junto al Elo y nunca sola: la pareja «más fuerte y menos
+  variado» es un resultado, y «más variado» a secas no es ninguno.
+</Callout>
+
+## Lo que salió
+
+Al terminar esta sección sabrás qué cambió cada afinado, qué no cambió ninguno, y qué criterios de
+`GOAL.md` se cumplen y cuáles no.
+
+El resumen, para leer el resto sabiendo a dónde va: **el comportamiento se mueve del todo y la
+competencia no se mueve nada.** Un fichero de 1,6 MB fija una apertura en el 99,85 % de las
+partidas sin costar una décima en ninguna otra métrica; la cabecera de Elo ordena el repertorio en
+las seis condiciones sin jugar una partida; y ni el afinado condicionado ni el de maestros separan
+su intervalo de Elo del modelo del que salieron. Las cuatro secciones siguientes son las
+mediciones que sostienen esas tres frases, en ese orden.
+
+### La cabecera dejó de ser ruido, y se ve sin jugar una partida
+
+La primera medida no necesita a Stockfish ni una sola partida. Es la distribución del propio
+modelo sobre las veinte primeras jugadas legales —la softmax tal y como la producen los pesos, sin
+temperatura, sin top-k y sin semilla— y su entropía en bits. Al no haber muestreo no hay varianza
+entre tiradas: dos ejecuciones dan el mismo número hasta el último decimal.
+
+| Cabecera  | `medium-v4` | `medium-elo` |
+| --------- | ----------: | -----------: |
+| `<w1200>` | 2,8556 bits |   **1,5955** |
+| `<w1500>` |  **2,9369** |   **1,6470** |
+| `<w1800>` |      1,7695 |       1,7408 |
+| `<w2000>` |      1,8694 |       1,8406 |
+| `<w2100>` |      1,9033 |       1,8809 |
+| `<w2400>` |      2,0104 |       1,9916 |
+
+Hay tres cosas ahí y las tres importan.
+
+**La huella del suelo del corpus está en los pesos.** En `medium-v4` hay un escalón de **1,17
+bits** entre `<w1500>` y `<w1800>`, exactamente donde `min_elo: 1800` cortaba los datos. Y el signo
+es el que delata el problema: por debajo del suelo el modelo está _menos_ decidido que en cualquier
+cabecera que sí conoce. Eso no es debilidad —un jugador débil tiene un repertorio **estrecho**, no
+ancho—, es confusión. Un prefijo que nunca ha visto no le pide nada; le mete ruido en la entrada.
+
+**Después del afinado el eje es monótono y con el signo correcto:** 1,5955 → 1,6470 → 1,7408 →
+1,8406 → 1,8809 → 1,9916 bits, **seis de seis**. Un jugador de club abre `1. e4` o `1. d4` y poco
+más (66,9 % de `e2e4` a 1200); el repertorio se ensancha con la fuerza (47,2 % a 2400). El modelo
+condicionado reproduce esa forma, y la reproduce **en orden**, sin que nadie se lo pidiera: el
+objetivo de entrenamiento no menciona la entropía por ninguna parte.
+
+**Por encima de 1800 los dos modelos coinciden** —1,7408 frente a 1,7695; 1,9916 frente a 2,0104—.
+El afinado llenó lo que faltaba sin deshacer lo que había, que es exactamente lo que había que
+comprobar antes de creerse nada de lo anterior.
+
+<Callout kind="teoria" title="Por qué esta medida vale aparte del Elo">
+  No cuesta una partida, no tiene ruido de muestreo y no depende de Stockfish ni de la escalera de
+  rivales. Mide una propiedad de los pesos y solo eso. Si la escalera de Elo saliera ambigua —y los
+  intervalos de este proyecto se han solapado antes—, esto seguiría siendo evidencia de que la
+  cabecera dejó de ser ruido. Dos instrumentos independientes que apuntan a lo mismo valen más que
+  uno preciso.
+</Callout>
+
+### El Elo por condición: el criterio que no se cumple, y por qué no es cuestión de partidas
+
+Ahora la medida cara. Seis condiciones, la misma suite entera en cada una y **160 partidas** contra
+los ocho peldaños de Stockfish por fila: mismos rivales, mismas posiciones, mismos puzles, misma
+semilla. Lo único que cambia entre filas son los dos tokens de la cabecera.
+
+| Cabecera  |      Elo |     IC 95 % |
+| --------- | -------: | ----------: |
+| `<w1200>` |     1425 | 1361 – 1479 |
+| `<w1500>` |     1549 | 1481 – 1609 |
+| `<w1800>` |     1498 | 1435 – 1552 |
+| `<w2000>` |     1538 | 1479 – 1597 |
+| `<w2100>` |     1606 | 1543 – 1670 |
+| `<w2400>` | **1644** | 1578 – 1707 |
+
+El criterio de `GOAL.md` es literal: `Elo(<w1500>) < Elo(<w2000>) < Elo(<w2400>)`, con intervalos.
+**No se cumple.** El primer par va del revés —1549 contra 1538— y ningún intervalo de la tabla está
+separado del siguiente.
+
+Lo interesante empieza aquí, porque «no separado» tiene dos causas que se parecen en el informe y
+no se parecen en nada más: **faltan partidas** o **no hay diferencia**. Distinguirlas es aritmética,
+no opinión, y cuesta un segundo en vez de una noche de máquina.
+
+<Callout kind="teoria" title="Cuántas partidas harían falta">
+  Lo que la escalera mide no es Elo sino una **tasa de puntos**: partidas ganadas más medio empate,
+  entre partidas jugadas. El Elo es una transformación de esa tasa. Y una tasa es una proporción,
+  así que su error típico es `sqrt(p(1-p)/n)` y dos intervalos del 95 % dejan de tocarse cuando la
+  distancia entre las tasas supera `1,96 (se₁ + se₂)`. Despejando `n`, para proporciones cerca de la
+  mitad: **`n > 3,84 / (Δp)²` partidas por condición**. Es todo. Metes la diferencia medida y sale
+  el número de partidas.
+</Callout>
+
+Con los números de la tabla (`labs/m4/games_needed.py`, lab 6):
+
+| Par                   |          tasa |      Δ | partidas por condición |
+| --------------------- | ------------: | -----: | ---------------------: |
+| `<w1500>` → `<w2000>` | 0,466 → 0,453 | −0,013 |             **24 420** |
+| `<w2000>` → `<w2400>` | 0,453 → 0,569 | +0,116 |                    284 |
+| `<w1500>` → `<w2400>` | 0,466 → 0,569 | +0,103 |                    357 |
+| `<w1200>` → `<w2400>` | 0,331 → 0,569 | +0,238 |       64 · ya separado |
+
+<IntervalShrink />
+
+Las dos primeras filas dicen «no separado» en el informe y significan lo contrario. Doscientas
+ochenta y cuatro partidas son una hora de máquina: eso es un problema de medición y se arregla
+midiendo más. Veinticuatro mil cuatrocientas veinte son **sesenta horas de Stockfish** para
+estrechar el intervalo alrededor de una diferencia que no está: eso es un resultado, y medir más no
+lo cambia.
+
+Así que el criterio se declara **no cumplido** y no se vuelve a pagar por `<w2000>`. Sí se paga por
+el par exterior —`<w1500>` y `<w2400>` con 400 partidas cada una— porque ahí el mismo cálculo dice
+que 357 bastan y la respuesta, salga como salga, será una medición y no un empate técnico.
+
+<Callout kind="roto" title="El criterio 1 de `GOAL.md` no se cumple">
+  Está escrito así: «Elo por condición monótono (1500 < 2000 < 2400 con IC)». Ni las estimaciones
+  puntuales son monótonas ni los intervalos están separados, y la aritmética de arriba dice que
+  entre 1500 y 2000 no lo estarían nunca. Lo que sí está medido es que **los extremos del eje se
+  separan** (1200 contra 2400, con 64 partidas habría bastado y se jugaron 160) y que el eje mueve
+  **219 puntos de Elo** de punta a punta. Un criterio se cumple o no se cumple; lo que no se puede
+  es reescribirlo cuando sale que no.
+</Callout>
+
+#### Y lo mismo, medido dos veces, se mueve 60 puntos
+
+Hay un número más que no estaba planeado y que decide cómo hay que leer toda la tabla. `medium-elo`
+a `<w1800>` acabó midiéndose **dos veces** por caminos distintos —la fila del barrido y la
+evaluación canónica de la etapa— con exactamente la misma configuración en todo lo que afecta a las
+partidas: los mismos ocho peldaños, 20 partidas cada uno, 0,1 s por jugada del rival, `seed: 42`,
+la misma temperatura.
+
+|                     |  tasa |      Elo |     IC 95 % |
+| ------------------- | ----: | -------: | ----------: |
+| tirada A (barrido)  | 0,409 |     1498 | 1435 – 1552 |
+| tirada B (canónica) | 0,475 | **1558** | 1500 – 1609 |
+
+Sesenta puntos de Elo entre dos tiradas del mismo modelo con la misma semilla. Y no es un fallo: la
+semilla fija **nuestro** muestreo, no el de Stockfish. El rival juega con un límite de **tiempo** y
+con `UCI_LimitStrength`, que además aleatoriza a propósito para acertar el Elo que se le pide. «Las
+mismas 160 partidas» no son las mismas partidas.
+
+La aritmética lo confirma sin dramatismo: la diferencia de tasa es 0,0656 y el error típico de la
+diferencia entre dos tiradas independientes de 160 partidas con `p ≈ 0,44` es `sqrt(2p(1-p)/160) =
+0,0555`. Son **1,18 σ**. Ruido de manual.
+
+<Callout kind="roto" title="Mide cuánto se mueve tu montaje cuando no cambias nada">
+  Esto es lo que convierte el resultado de la sección anterior en algo que se puede afirmar. El
+  suelo de **reproducibilidad** de la escalera es de unos 40 puntos de Elo de una sigma, es decir,
+  unos ±80 al 95 %. Los pares contiguos del barrido están a 11, 40, 51 y 38 puntos: **por debajo de
+  lo que el instrumento repite**. No hay número de partidas que arregle eso mientras el rival vaya
+  por tiempo; lo arreglaría hacerlo determinista —límite por nodos en vez de por segundos— y volver
+  a calibrar los ocho peldaños, que es trabajo de otro hito porque invalida todos los Elo ya
+  publicados.
+</Callout>
+
+La consecuencia práctica, y por eso las dos cifras se publican las dos: **comparar dentro de una
+tirada es válido, comparar entre tiradas no**. La tabla única lleva la canónica (1558), que comparte
+suite con el resto de etapas; el barrido lleva la suya, que comparte suite con las otras cinco
+condiciones. Cada número dice de qué corrida sale, y ninguno se mezcla con el otro.
+
+#### El control que impide cantar victoria
+
+Antes de seguir hay que parar en un número que sí sale bien y que no significa lo que parece. Los
+pares **contiguos** no se separan, pero los lejanos sí: de `<w1200>` a `<w2100>` el modelo
+condicionado va de **1425 a 1606**, con los intervalos limpiamente disjuntos. Leído solo, eso es «el condicionamiento da fuerza» y habría sido el titular
+del hito.
+
+Hay una segunda explicación, y distinguirlas cuesta una hora de máquina: que **cualquier** modelo
+puntúe menos con una cabecera baja. Se comprueba corriendo el mismo barrido sobre el modelo **base**,
+que por debajo de 1800 no tiene cabecera ninguna: para él `<w1200>` es un vector de la
+inicialización, exactamente el ruido que este módulo vino a arreglar.
+
+| Cabecera  | Modelo             |      Elo |     IC 95 % |
+| --------- | ------------------ | -------: | ----------: |
+| `<w1200>` | `medium-v4` (base) |     1419 | 1358 – 1479 |
+| `<w1200>` | `medium-elo`       |     1425 | 1361 – 1479 |
+| `<w2100>` | `medium-v4` (base) |     1580 | 1512 – 1649 |
+| `<w2100>` | `medium-elo`       | **1606** | 1543 – 1670 |
+
+**El modelo sin afinar también recorre el eje.** 161 puntos de Elo, con los intervalos separados, y
+no puede ser condicionamiento porque su `<w1200>` nunca recibió un gradiente. Lo que le pasa es otra
+cosa: un prefijo desconocido le **estorba**, y estorbarle cuesta unos ciento sesenta puntos. El
+afinado mueve 181, que está dentro del ruido de los 161.
+
+Conclusión: **la columna de Elo no distingue las dos causas.** Por sí sola no es evidencia de nada.
+
+<Callout kind="roto" title="Si tu métrica sube con el tratamiento, mídela también sin él">
+  Es la trampa más barata de caer y la más barata de evitar. Aquí el «grupo de control» era el mismo
+  modelo antes del afinado, corriendo la misma suite, y contestó que el 60 % del efecto ya estaba
+  ahí sin haber entrenado nada. Si el control hubiera salido plano, los 181 puntos serían del
+  condicionamiento y este módulo tendría otro titular. No salió plano, así que hay que buscar la
+  evidencia en otro sitio — y está, en las otras cuatro columnas de la misma tirada.
+</Callout>
+
+Porque en la **misma** tabla, a la misma cabecera y con el mismo Elo, los dos modelos no se parecen
+en nada más:
+
+| `<w1200>`          |        legal |       top-1 |      puzles | entropía 1.ª |
+| ------------------ | -----------: | ----------: | ----------: | -----------: |
+| `medium-v4` (base) |      99,60 % |     49,80 % |     36,42 % |        2,856 |
+| `medium-elo`       | **100,00 %** | **51,40 %** | **37,02 %** |    **1,596** |
+
+Cero jugadas ilegales contra cuatro de mil. Punto y medio más de top-1. Seis décimas más de puzles.
+Y **1,26 bits menos** de entropía de primera jugada. El afinado convirtió «ruido en la entrada» en
+«un jugador de club decidido», y eso se ve en todo menos en el resultado contra Stockfish.
+
+Y a `<w2100>` los dos modelos coinciden en las cinco columnas —1580 contra 1606, 53,80 contra
+53,40 % de top-1, 1,903 contra 1,881 bits—, que es como tenía que ser: esa cabecera siempre estuvo
+entrenada y el afinado no debía tocarla. Que no la tocara es la prueba de que no
+hubo <Term id="olvido-catastrofico">olvido catastrófico</Term>.
+
+#### Entonces, ¿qué mueve la cabecera?
+
+Las otras tres columnas de la misma tirada lo dicen, y ninguna de las tres es el Elo.
+
+| Cabecera  | legal argmax |       top-1 | puzles |
+| --------- | -----------: | ----------: | -----: |
+| `<w1200>` |   **100,00** |     51,40 % | 37,0 % |
+| `<w1500>` |   **100,00** |     53,90 % | 37,7 % |
+| `<w1800>` |      99,80 % | **54,10 %** | 38,2 % |
+| `<w2000>` |      99,70 % |     54,00 % | 38,0 % |
+| `<w2100>` |      99,70 % |     53,40 % | 38,1 % |
+| `<w2400>` |      99,70 % |     53,30 % | 38,1 % |
+
+**Los puzles no se mueven.** 37,0 · 37,7 · 38,2 · 38,0 · 38,1 · 38,1 %. Un puzle es una posición con
+una jugada que gana a la fuerza: mide táctica, y la táctica del modelo es la misma le pidas lo que
+le pidas. Un rango de 1,2 puntos sobre 6 000 puzles, sin orden reconocible.
+
+**El top-1 tiene un máximo, y está donde debe.** 51,4 → 53,9 → **54,1** → 54,0 → 53,4 → 53,3 %: sube
+hasta `<w1800>` y baja después. No es ruido. Las posiciones de validación son partidas reales con su
+reparto real de fuerza, cuya media anda cerca de 1800, así que la cabecera que mejor predice la
+jugada siguiente es la que describe a los jugadores que la hicieron. Pedirle que juegue como 2400
+lo hace **peor** adivinando la jugada de un jugador medio, y eso es exactamente lo que tiene que
+pasar si la cabecera significa algo.
+
+**La legalidad baja al subir la cabecera**, de 100,00 % a 99,70 %. Tres jugadas de mil, y el signo
+es el mismo que el de la entropía: cuanto más ancho el repertorio, más lejos de las líneas
+trilladas y más ocasiones de escribir algo que no se puede jugar.
+
+Las tres, más la entropía monótona seis de seis, cuentan la misma historia: **la cabecera mueve el
+estilo, no la fuerza táctica**. Que es lo que P3 sospechaba y no podía afirmar, porque entonces la
+mitad del eje ni siquiera se había entrenado y cualquier explicación valía.
+
+<Callout kind="teoria" title="Por qué este resultado vale más que el que se buscaba">
+  Un «1500 < 2000 < 2400» limpio habría sido una casilla marcada y una frase vaga: «el
+  condicionamiento funciona». Lo que hay en su lugar es un mecanismo: el corpus le enseñó a cada
+  cabecera **qué se juega** a ese nivel, no **cómo de bien** se calcula, porque el objetivo de
+  entrenamiento solo premia predecir la jugada siguiente y nadie le pidió nunca que calculara mejor.
+  Para mover la fuerza hacen falta otras herramientas —búsqueda, o preferencias sobre pares de
+  jugadas, que es lo que hizo DPO en P3—. La cabecera no es una de ellas, y ahora se sabe por qué.
+</Callout>
+
+#### Una segunda explicación que los propios datos sugieren: la moda y la cola
+
+Hay algo más en esa tabla que conviene mirar de cerca, porque distingue dos cosas que parecen la
+misma. Fíjate en **qué parte de la distribución lee cada columna**:
+
+| Columna                    | Qué lee de la distribución |                               Resultado |
+| -------------------------- | -------------------------- | --------------------------------------: |
+| entropía de 1.ª jugada     | **la softmax entera**      |                            monótona 6/6 |
+| top-1 contra jugada humana | la moda                    | se mueve 2,8 puntos, con máximo en 1800 |
+| puzles                     | la moda                    |                                   plano |
+| Elo                        | la moda                    |                                   plano |
+
+Todo lo que mide la distribución completa se ordena; todo lo que mide **solo la moda** no. Y hay una
+razón por la que eso podría no ser casualidad: la suite juega con `temperature: 0.05, top_k: 1`, es
+decir, siempre la jugada más probable. La diferencia entre un 1200 y un 2400 **no está en la moda**
+—los dos hacen la recaptura obvia— sino en la **cola**: cada cuánto eligen algo malo. El argmax tira
+la cola a la basura antes de que llegue al tablero.
+
+Si eso es lo que pasa, la cabecera sí controlaría la fuerza y lo que faltaba sería dejar de jugar el
+pico. Es contrastable y cuesta una hora, así que se contrastó: la misma escalera a **temperatura 1,0
+con top-k 20** —el ajuste con el que la demo juega de verdad— en las dos puntas del eje.
+
+#### Se probó, y no era eso
+
+|                    |        `<w1200>` |        `<w2400>` | brecha / IC |
+| ------------------ | ---------------: | ---------------: | ----------: |
+| moda (greedy)      | 1425 (1361–1479) | 1644 (1578–1707) |    **1,78** |
+| muestreado (T=1,0) |  1002 (866–1109) | 1272 (1193–1340) |        1,38 |
+
+En puntos de Elo la brecha **sí** se ensancha, de 219 a 270. Pero los intervalos se ensanchan más,
+de 123 a 195 de anchura media, y lo que decide si una diferencia se puede afirmar es el cociente
+entre las dos cosas: **1,78 jugando la moda, 1,38 muestreando**. La medición empeora.
+
+Y en el espacio donde de verdad se mide —la tasa de puntos, que es de lo que el Elo es una
+transformación— la diferencia directamente **se encoge**: de **0,2375 (4,40 σ)** a **0,1375
+(3,85 σ)**.
+
+La causa está a la vista en cuanto se mira el detalle por peldaño. Muestrear a temperatura 1,0 le
+cuesta al modelo unos **400 puntos de Elo**, y eso lo tira por debajo del rango para el que la
+escalera está calibrada: a `<w1200>` saca 0,053 de tasa —cinco victorias en ciento sesenta
+partidas—, aplastado contra el suelo. Las dos condiciones acaban comprimidas en el mismo rincón, y
+en un rincón no se distinguen dos cosas mejor que en el medio.
+
+<Callout
+  kind="roto"
+  title="Tu instrumento tiene un rango, y sacar al sujeto de él no mejora la medida"
+>
+  La hipótesis era razonable, era barata y **salió que no**. Eso también es un resultado, y es el
+  que faltaba para poder decir que la cabecera no mueve la fuerza sin dejarse una explicación obvia
+  sin comprobar. Lo que deja es una regla que se olvida con facilidad: una escalera calibrada para
+  un jugador de 1500 mide mal a uno de 1000, igual que una báscula de cocina mide mal un camión. Un
+  tratamiento que saca al sujeto del rango del instrumento no revela el efecto: lo esconde debajo
+  del ruido del propio instrumento. Para probar esto de verdad haría falta una escalera con peldaños
+  más flojos, y eso es recalibrar los ocho y tirar todos los Elo publicados.
+</Callout>
+
+<Callout kind="mundo-real" title="El muestreo forma parte del modelo que estás midiendo">
+  Esta es de las que se llevan fuera del ajedrez. Un modelo no es solo sus pesos: es sus pesos
+  **más** cómo se decodifican, y aquí el decodificador vale **400 puntos de Elo** — más que todo lo
+  que separa a las seis condiciones entre sí. Dos ajustes de muestreo sobre los mismos pesos son dos
+  modelos distintos. Cuando publiques un número, publica con él la temperatura —este proyecto lo
+  hace desde D-047—, y cuando compares dos cosas, comprueba antes que las dos caen dentro del rango
+  de lo que estás usando para medirlas.
+</Callout>
+
+### El afinado de maestros: el corpus estrecho se nota en los dos extremos
+
+El otro afinado del módulo no toca la cabecera: coge el mismo `medium-v4` y le da una última mano
+de 3 800 pasos sobre partidas de élite. `docs/spec/02` predecía «sube el Elo, baja la diversidad», y
+la segunda mitad de esa frase sale del revés.
+
+| Cabecera  | `medium-v4` | `medium-masters` |
+| --------- | ----------: | ---------------: |
+| `<w1200>` | 2,8556 bits |    **3,3067** ↑↑ |
+| `<w1500>` |      2,9369 |    **3,3340** ↑↑ |
+| `<w1800>` |      1,7695 |       **1,8850** |
+| `<w2000>` |      1,8694 |           1,9680 |
+| `<w2100>` |      1,9033 |           1,9871 |
+| `<w2400>` |      2,0104 |           1,9972 |
+
+**Arriba, el repertorio se ensancha.** A `<w1800>` el modelo de maestros abre `1. e4` el 55,1 % de
+las veces frente al 59,6 % del base, y su entropía sube de 1,7695 a 1,8850 bits. Tiene sentido y
+contradice la predicción: la élite juega **más** aperturas distintas que el jugador medio de 1800,
+no menos. La intuición de que «afinar concentra» venía de pensar en el modelo, no en los datos.
+
+**Abajo, el agujero se hace más hondo.** A `<w1200>` la entropía pasa de 2,856 a **3,307** bits: más
+ruido que antes. El corpus de maestros también es de 1800 para arriba, así que este afinado tampoco
+entrenó las cabeceras bajas — y, encima, movió a su alrededor todo lo demás. Un token que nunca
+recibe un gradiente no se queda quieto: el resto del modelo se mueve debajo de él.
+
+**Y en la parte alta se le acaba el eje.** Entre `<w2100>` y `<w2400>` el base separa 0,107 bits y
+el de maestros solo **0,010**: para un modelo entrenado únicamente con partidas de élite, «2100» y
+«2400» han pasado a querer decir casi lo mismo. Estrechar el corpus estrecha el eje justo en el
+tramo que el corpus cubre.
+
+<Callout kind="teoria" title="Las dos mitades del olvido catastrófico, en una tabla">
+  Esta tabla enseña el fenómeno mejor que cualquier definición. Afinar sobre un recorte no solo
+  «pierde» lo que no está en el recorte: también **redistribuye** lo que sí está. Arriba el modelo
+  aprendió algo real —los maestros varían más— y abajo se deterioró una parte que el afinado ni
+  siquiera tocó, porque las capas que comparten no son independientes. Por eso la comparación
+  honesta de un afinado necesita medir en el recorte **original** y no solo en el nuevo.
+</Callout>
+
+¿Y la primera mitad de la predicción, la de que sube el Elo? Sube, y no lo suficiente como para
+poder decirlo:
+
+|                    |      Elo |     IC 95 % |  top-1 | puzles |
+| ------------------ | -------: | ----------: | -----: | -----: |
+| `medium-v4` (base) |     1504 | 1446 – 1558 | 54,4 % | 37,5 % |
+| `medium-masters`   | **1583** | 1525 – 1641 | 54,9 % | 38,0 % |
+| `medium-elo`       |     1558 | 1500 – 1609 | 54,9 % | 37,8 % |
+
+Setenta y nueve puntos de diferencia entre el base y el de maestros, con los intervalos solapados —y
+con un suelo de reproducibilidad de unos 40 puntos, son dos sigmas: sugerente, no establecido. Los
+tres modelos del hito caben dentro del intervalo de los otros dos.
+
+Que es el resultado del módulo dicho con los tres modelos delante: **ninguno de los dos afinados
+mueve la fuerza de forma demostrable**, y los dos mueven cosas que sí se ven. El de maestros ensancha
+el repertorio y estrecha el eje; el condicionado ordena el repertorio a lo largo del eje y arregla
+la mitad que era ruido. Lo que ninguno hace es enseñar táctica, porque la táctica no estaba en el
+objetivo de entrenamiento de ninguno de los dos.
+
+### Los adaptadores: 1,6 MB que fijan una decisión y no cuestan nada
+
+Cada adaptador de estilo son **1 578 824 bytes** —393 216 números de `float32` más la cabecera de
+`safetensors`— sobre unos pesos de 440 MB que no se tocan. Mil quinientos pasos sobre 200 000
+partidas que empiezan por su jugada, con `r = 8` en las proyecciones de consulta y valor.
+
+Lo que hacen, medido sobre la distribución analítica de la primera jugada, sin muestreo —la
+entropía en bits, y el peso de las dos aperturas que se reparten el 86 % del modelo base—:
+
+| Modelo        | entropía |      `e2e4` |      `d2d4` |
+| ------------- | -------: | ----------: | ----------: |
+| `medium-v4`   |   1,7695 |     59,64 % |     26,68 % |
+| con `lora-e4` |   0,0209 | **99,85 %** |      0,06 % |
+| con `lora-d4` |   0,0160 |      0,06 % | **99,88 %** |
+
+Funciona, y se ve: cargas un fichero de megabyte y medio sobre un modelo de 115 millones de
+parámetros y abre `1. e4` el 99,85 % de las veces, cuando antes lo hacía el 59,64 %.
+
+La pregunta siguiente —la única que importa— es qué costó. La respuesta, medida con la misma suite
+que todas las etapas salvo la escalera de Stockfish:
+
+|               | legales sin máscara |       top-1 |      puzles |
+| ------------- | ------------------: | ----------: | ----------: |
+| `medium-v4`   |             99,80 % |     54,40 % |     37,50 % |
+| con `lora-e4` |         **99,80 %** | **54,70 %** | **37,80 %** |
+
+**Nada.** Ni una décima de legalidad, ni de exactitud, ni de puzles; si acaso, tres décimas hacia
+arriba en las dos últimas, que es ruido. El 0,34 % del modelo que se movió cambió por completo una
+decisión y dejó intacto todo lo demás.
+
+Y la prueba de que «todo lo demás» es literal está en la otra métrica de diversidad, que dice lo
+contrario que la primera y también tiene razón:
+
+|               | entropía de 1.ª jugada | líneas distintas |  entropía de líneas |
+| ------------- | ---------------------: | ---------------: | ------------------: |
+| con `lora-e4` |             0,021 bits |   **199 de 200** | 7,634 de 7,644 bits |
+
+Con la primera jugada clavada en `1. e4`, doscientas auto-partidas de doce plies produjeron
+**ciento noventa y nueve líneas distintas**: el 99,9 % del techo. El adaptador fijó el primer
+movimiento y no tocó ninguno de los once siguientes.
+
+<Callout kind="teoria" title="Dos métricas de diversidad que se contradicen, y las dos aciertan">
+  Este es el ejemplo que justifica publicar las dos. La entropía de la primera jugada dice «este
+  modelo no varía en absoluto» (0,021 bits de 4,32) y la de líneas dice «este modelo no repite una
+  partida» (7,634 de 7,644). Las dos son ciertas porque miden decisiones distintas, y quedarse con
+  una sola habría dado un titular falso en cualquiera de las dos direcciones. Cuando dos métricas
+  del mismo nombre discrepan, casi siempre es que estaban midiendo cosas distintas y el nombre era
+  lo único que compartían.
+</Callout>
+
+<Callout kind="roto" title="Un corpus sin contraejemplos enseña una regla, no un repertorio">
+  El corte se hizo con `first_move: e2e4`, que selecciona exactamente las partidas que empiezan así
+  y ninguna más. Es un corpus de una sola clase, y el adaptador aprendió lo único que se podía
+  aprender de él: «aquí siempre se juega `1. e4`». Que el resultado no dañe al modelo es una suerte
+  y no un mérito del diseño. Un corte que quisiera enseñar un *repertorio* tendría que dejar dentro
+  la proporción de veces que ese jugador abre de otra forma, lo que en la práctica significa cortar
+  por jugador y no por jugada. El adaptador publicado hace lo que dice su nombre; lo que no hace es
+  lo que uno imagina al leer «estilo».
+</Callout>
+
+<EloDial client:visible />
+
+### Qwen3 contra el decoder: la pregunta que el curso llevaba tres módulos sin contestar
+
+La pregunta es «¿merecía la pena escribir un modelo propio en vez de afinar uno general?», y para
+que la respuesta valga, las dos mitades tienen que diferenciarse en **una sola** cosa. Mismas
+partidas, mismo mes, misma validación reservada, mismo harness, mismos rivales. Lo único distinto
+es la **representación**: el decoder lee un token por jugada legal; Qwen lee `1. e4 e5 2. Nf3`
+partido en los trozos que decida su BPE.
+
+Y el presupuesto se eligió **generoso con Qwen**: `r = 16` sobre las cuatro proyecciones de atención
+—el doble del rango de nuestros adaptadores—, 1 500 pasos, unos 24 M de tokens de ajedrez, sobre un
+modelo de **600 millones** de parámetros que ya sabe hablar, contra los 115 M del decoder entrenados
+desde cero. Si aun así pierde por mucho, nadie puede decir que se le dejó sin comer.
+
+Pierde por mucho.
+
+| Métrica                     | `medium-v4` (decoder) | `qwen3-pgn-qlora` |
+| --------------------------- | --------------------: | ----------------: |
+| Parámetros                  |           115 120 128 |   **600 637 440** |
+| Jugadas legales sin máscara |            **99,8 %** |           62,50 % |
+| Top-1 contra jugada humana  |            **54,4 %** |            12,5 % |
+| Puzles resueltos            |            **37,5 %** |             0,9 % |
+| Elo estimado                |  **1504** (1446–1558) |         **< 807** |
+
+Ese último número no es una estimación con intervalo: es una **cota**. Qwen jugó 160 partidas contra
+los ocho peldaños de la escalera —incluido el más flojo, `uci-1320`— y perdió **todas**. Veinte de
+veinte en cada peldaño, un 0,000 limpio en las ocho filas. Cuando no se gana ni una, no hay curva
+que ajustar: solo se puede decir «por debajo de», con un límite de una cola.
+
+Y la columna que el decoder no puede ni tener:
+
+| Cómo falló la respuesta |       Cuota |
+| ----------------------- | ----------: |
+| legal                   |     62,50 % |
+| ilegal aquí             | **33,70 %** |
+| no es una jugada        |      2,90 % |
+| SAN ambigua             |      0,90 % |
+| no escribió nada        |      0,00 % |
+
+Una de cada tres respuestas es una jugada bien escrita que esa posición no permite, y casi cuatro de
+cada cien ni siquiera son una jugada: `Nf9`, una desambiguación que falta, una frase. El decoder no
+puede cometer ninguno de esos dos errores, porque su vocabulario **es** el conjunto de jugadas: un
+token, una jugada legal en alguna posición. La representación no es un detalle de implementación; es
+la mitad del resultado.
+
+<Callout kind="teoria" title="Qué demuestra y qué no demuestra esta tabla">
+  **No** demuestra que Qwen3-0.6B sea un mal modelo, ni que afinar un LLM general sea mala idea en
+  general. Demuestra algo más estrecho y más útil: para una tarea con un **espacio de salida
+  cerrado, pequeño y verificable** —1 970 jugadas posibles, y en cada posición se sabe cuáles son
+  legales—, gastar el vocabulario en describir ese espacio vale más que quinientos millones de
+  parámetros extra entrenados para otra cosa. La lección que se lleva fuera del ajedrez: cuando tu
+  salida tiene estructura conocida, métela en la representación en vez de esperar que el modelo la
+  reaprenda desde texto.
+</Callout>
+
+<Callout kind="roto" title="Y lo que QLoRA no ahorró">
+  El nombre promete memoria y a esta escala no la da. Cuatro bits sobre Qwen3-0.6B ahorraron **341
+  MB de pesos** (un 29 %) y **7 MB del pico** (un 0,4 %), porque la tabla de embeddings —el 25,9 %
+  del modelo— no se cuantiza y el pico lo marcan las activaciones y el optimizador, no los pesos
+  congelados. La ventaja de QLoRA es real cuando el modelo no cabe; a 0,6 B en una tarjeta de 32 GB
+  no hay nada que no quepa. Se intentó, se midió y se dice: 4 587 520 parámetros entrenables de 600
+  637 440, el **0,76 %**, y una pérdida final de 0,878.
+</Callout>
+
+### Los cuatro criterios, uno por uno
+
+`GOAL.md` escribió cuatro condiciones para este hito antes de medir nada. Así quedan.
+
+**1 · Elo por condición monótono (1500 < 2000 < 2400 con IC) — ❌ no se cumple.**
+Ni las estimaciones son monótonas ni los intervalos se separan, y el criterio falla ya en su primer
+par: `<w1500>` saca 1549 y `<w2000>` saca 1538. No es falta de partidas —harían falta 24 420 por
+condición para separar esa diferencia—, no es el instrumento roto —el modelo sin afinar recorre el
+mismo eje con cabeceras que nunca entrenó— y no es mala suerte de una tirada —la misma medición
+repetida da 1498 y 1558—. Es que la cabecera no mueve la fuerza. Se publica incumplido, con los
+números.
+
+**2 · Tabla comparativa con Qwen afinado con QLoRA sobre el mismo recorte — ✅ se cumple.**
+Está arriba. Mismo corpus, mismo harness, mismos rivales, y una columna más que el decoder no puede
+tener. 62,50 % de jugadas legales contra 99,8 %; 12,5 % de top-1 contra 54,4 %; 0,9 % de puzles
+contra 37,5 %; y 160 partidas perdidas de 160.
+
+**3 · Publicados con card los cinco artefactos — ✅ construido.**
+`rukh-medium-elo`, `rukh-medium-masters`, `rukh-lora-e4`, `rukh-lora-d4` y `rukh-qwen3-pgn-qlora`,
+cada uno con su card generada a partir de su propia corrida —nada escrito a mano— y con la paridad
+ONNX medida al lado. La card de un adaptador lleva dos tablas y no una: lo que cambió y lo que
+costó.
+
+**4 · En la demo, el selector de Elo y los adaptadores intercambiables — ✅ se cumple.**
+El selector ofrece las seis condiciones **medidas** y ninguna más. El de estilo carga 1,6 MB sobre
+el modelo ya descargado, y la prueba de navegador comprueba las tres cosas que lo hacen cierto: que
+la distribución cambia, que al quitar el adaptador vuelve el **mismo** número, y que en toda la
+prueba se ha pedido un solo `.onnx`.
+
+<Callout kind="mundo-real" title="Tres de cuatro, y el que falta es el que más enseña">
+  Un hito no se juzga por cuántas casillas marca. El criterio que falló es el que obligó a construir
+  las tres herramientas que este módulo se lleva —partidas necesarias, corrida de control, suelo de
+  reproducibilidad— y el que explica por qué existe M5. Si hubiera salido bien a la primera, la
+  lección diría «el condicionamiento funciona» y no sabríamos por qué, que es justo lo contrario de
+  lo que este curso intenta hacer.
+</Callout>

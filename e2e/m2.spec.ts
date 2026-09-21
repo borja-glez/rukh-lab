@@ -1,7 +1,14 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
-const LESSON = '/curso/m2/01-el-decoder/';
+/**
+ * M2 is four lessons. The theory opens it, the training and the measurement follow, the two
+ * islands live in the third part, and the fourth is the corpus work that produced `medium-v4`.
+ */
+const THEORY = '/curso/m2/01-el-decoder/';
+const TRAINING = '/curso/m2/02-entrenar-y-medir/';
+const INSIDE = '/curso/m2/03-exportar-y-mirar-dentro/';
+const DATA = '/curso/m2/04-mas-datos-no-mas-red/';
 
 function directive(csp: string, name: string): string | undefined {
   return csp
@@ -30,15 +37,31 @@ async function stateOf(island: Locator): Promise<'pending' | 'ready'> {
 }
 
 test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
-  test('the lesson loads with its sections and the cheatsheet', async ({ page }) => {
-    await page.goto(LESSON);
+  test('the four parts chain in order and only the last one carries the cheatsheet', async ({
+    page,
+  }) => {
+    await page.goto(THEORY);
     await expect(page.getByRole('heading', { level: 1 })).toContainText('El decoder');
-    const h2 = page.locator('.prose h2');
-    await expect(h2.first()).toHaveText('Qué vas a construir');
-    expect(await h2.count()).toBeGreaterThanOrEqual(7);
+    await expect(page.locator('.prose h2').first()).toHaveText('Qué vas a construir');
+    await expect(page.locator('.prose h2', { hasText: 'Teoría justa' }).first()).toBeVisible();
+    await expect(page.locator('.cheat')).toHaveCount(0);
+
+    await page.locator('.lesson__nav-link--next').click();
+    await expect(page).toHaveURL(new RegExp(`${TRAINING}$`));
     await expect(page.locator('.prose h2', { hasText: 'Cómo se mide' }).first()).toBeVisible();
-    /* The five labs are exercises with a solution each. */
-    expect(await page.locator('.prose details').count()).toBeGreaterThanOrEqual(5);
+    /* The four labs of this part are exercises with a solution each. */
+    expect(await page.locator('.prose details').count()).toBeGreaterThanOrEqual(4);
+    await expect(page.locator('.cheat')).toHaveCount(0);
+
+    await page.locator('.lesson__nav-link--next').click();
+    await expect(page).toHaveURL(new RegExp(`${INSIDE}$`));
+    await expect(page.locator('.prose h2').first()).toContainText('Lab 5');
+    await expect(page.locator('.cheat')).toHaveCount(0);
+
+    await page.locator('.lesson__nav-link--next').click();
+    await expect(page).toHaveURL(new RegExp(`${DATA}$`));
+    await expect(page.locator('.prose h2', { hasText: 'escalera' }).first()).toBeVisible();
+    await expect(page.locator('.cheat')).toHaveCount(1);
   });
 
   test('both islands render without console or page errors', async ({ page }) => {
@@ -47,7 +70,7 @@ test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
     page.on('console', (message) => {
       if (message.type() === 'error') problems.push(`console: ${message.text()}`);
     });
-    await page.goto(LESSON);
+    await page.goto(INSIDE);
     const replay = await hydrated(page, 'data-training-replay');
     const attention = await hydrated(page, 'data-attention-map');
     expect(await stateOf(replay)).toBeTruthy();
@@ -57,7 +80,7 @@ test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
   });
 
   test('AttentionMap: pending notice, or a heat map whose controls work', async ({ page }) => {
-    await page.goto(LESSON);
+    await page.goto(INSIDE);
     const island = await hydrated(page, 'data-attention-map');
     if ((await stateOf(island)) === 'pending') {
       await expect(island).toContainText(/Pendiente/);
@@ -77,7 +100,7 @@ test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
   });
 
   test('TrainingReplay: pending notice, or a chart the slider moves', async ({ page }) => {
-    await page.goto(LESSON);
+    await page.goto(INSIDE);
     const island = await hydrated(page, 'data-training-replay');
     if ((await stateOf(island)) === 'pending') {
       await expect(island).toContainText(/Pendiente/);
@@ -93,21 +116,25 @@ test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
     await expect(island).not.toHaveAttribute('data-step', before as string);
   });
 
-  test('axe: no serious or critical violations', async ({ page }) => {
-    await page.goto(LESSON);
-    await hydrated(page, 'data-training-replay');
-    await hydrated(page, 'data-attention-map');
-    const results = await new AxeBuilder({ page })
-      .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'best-practice'])
-      .analyze();
-    const blocking = results.violations.filter(
-      (v) => v.impact === 'serious' || v.impact === 'critical',
-    );
-    expect(
-      blocking,
-      blocking.map((v) => `${v.id}: ${v.help} (${v.nodes.length} nodes)`).join('\n'),
-    ).toEqual([]);
-  });
+  for (const lesson of [THEORY, TRAINING, INSIDE, DATA]) {
+    test(`axe: no serious or critical violations on ${lesson}`, async ({ page }) => {
+      await page.goto(lesson);
+      if (lesson === INSIDE) {
+        await hydrated(page, 'data-training-replay');
+        await hydrated(page, 'data-attention-map');
+      }
+      const results = await new AxeBuilder({ page })
+        .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'best-practice'])
+        .analyze();
+      const blocking = results.violations.filter(
+        (v) => v.impact === 'serious' || v.impact === 'critical',
+      );
+      expect(
+        blocking,
+        blocking.map((v) => `${v.id}: ${v.help} (${v.nodes.length} nodes)`).join('\n'),
+      ).toEqual([]);
+    });
+  }
 
   test('CSP: hash-only script-src and no violations with both islands hydrated', async ({
     page,
@@ -116,7 +143,7 @@ test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
     page.on('console', (message) => {
       if (message.text().includes('Content Security Policy')) cspMessages.push(message.text());
     });
-    await page.goto(LESSON);
+    await page.goto(INSIDE);
     const csp = await page
       .locator('meta[http-equiv="content-security-policy"]')
       .getAttribute('content');
@@ -133,7 +160,7 @@ test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
 
   test('no horizontal scroll at 390px with both islands rendered', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.goto(LESSON);
+    await page.goto(INSIDE);
     await hydrated(page, 'data-training-replay');
     await hydrated(page, 'data-attention-map');
     const fits = await page.evaluate(
