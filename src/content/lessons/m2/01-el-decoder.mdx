@@ -6,7 +6,7 @@ description:
   que hace converger 39 millones de parámetros en una GPU, y el muestreo con máscara de legalidad.'
 module: m2
 order: 1
-duration: 120
+duration: 160
 level: base
 status: vigente
 updated: '2026-09-21'
@@ -693,13 +693,97 @@ que se resiente cuando alguien mueve masa sin mirar adónde va.
 </Callout>
 
 **La máscara de legalidad.** Antes de nada, se calcula con `python-chess` la lista de jugadas
-legales en la posición y se ponen a menos infinito todos los demás logits:
+legales en la posición y se ponen a menos infinito todos los demás logits. Las tres perillas en
+una función, y el orden en que se aplican **no es libre**:
 
-```python
-keep = torch.zeros_like(out, dtype=torch.bool)
-keep[torch.tensor(legal, dtype=torch.long, device=out.device)] = True
-out = out.masked_fill(~keep, float("-inf"))
+```python title="src/rukh/infer/sampler.py"
+def filtered_logits(logits, legal: list[int], cfg: SampleConfig):
+    """Máscara, después temperatura, después top-k. En ese orden y no en otro."""
+    out = logits.float()
+    if cfg.mask_illegal:
+        keep = torch.zeros_like(out, dtype=torch.bool)
+        keep[torch.tensor(legal, dtype=torch.long, device=out.device)] = True
+        out = out.masked_fill(~keep, float("-inf"))
+    if cfg.temperature > 0:
+        out = out / cfg.temperature
+    if cfg.top_k is not None:
+        k = min(cfg.top_k, out.numel())
+        threshold = torch.topk(out, k).values[-1]
+        out = out.masked_fill(out < threshold, float("-inf"))
+    return out
 ```
+
+Hacer el top-k **antes** de la máscara se quedaría con los veinte tokens más probables y después
+descartaría los ilegales, lo que puede dejar dos candidatos o ninguno. Poner la temperatura
+**después** del top-k reescalaría una distribución a la que ya le han quitado la cola, así que la
+perilla significaría algo distinto con cada `k`. El orden es la mitad del diseño.
+
+Y hay una función corta de la que depende que el modelo juegue como se entrenó:
+
+```python title="src/rukh/infer/sampler.py"
+HEADER_TOKENS = 3  # <bos> <wXXXX> <bXXXX>
+
+
+def prompt_ids(history, block: int) -> list[int]:
+    """Recorta `history` a `block` ids **conservando la cabecera**.
+
+    Un recorte por la izquierda a secas (`history[-block:]`) se lleva `<bos> <wXXXX> <bXXXX>` en
+    cuanto una partida es más larga que el contexto. El modelo pierde el condicionamiento por Elo
+    con el que se entrenó y, además, todas sus posiciones aprendidas quedan desplazadas tres
+    lugares. Conservar la cabecera cuesta tres tokens de jugada y mantiene el prompt con la forma
+    de los datos de entrenamiento.
+    """
+    ids = list(history)
+    if len(ids) <= block:
+        return ids
+    if block <= HEADER_TOKENS:
+        return ids[:block]
+    return ids[:HEADER_TOKENS] + ids[len(ids) - (block - HEADER_TOKENS) :]
+
+
+def legal_token_ids(board, tok) -> list[int]:
+    """Los ids de vocabulario de cada jugada legal, ordenados.
+
+    El enroque es el movimiento de dos casillas del rey (`e1g1`), que es la cadena que enumera el
+    tokenizador de M1. Una jugada legal que faltara del vocabulario se salta en vez de adivinarse:
+    con esa enumeración no puede pasar, y si alguna vez pasa, una conjetura silenciosa sería peor
+    que una jugada que el muestreador no propone.
+    """
+    return sorted({tok.vocab[uci] for m in board.legal_moves if (uci := m.uci()) in tok.vocab})
+```
+
+El muestreador devuelve dos cosas, y esa es la decisión que hace medible todo el módulo:
+
+```python title="src/rukh/infer/sampler.py"
+def pick_move(model, tok, board, history_ids, cfg, generator=None):
+    """Saca el token de la siguiente jugada **y** cuenta qué propuso la red.
+
+    Devuelve la jugada (`None` cuando el token propuesto no es legal aquí) y un informe con
+    `legal`, `raw_token` y las cinco primeras. Un muestreador que solo devolviera la jugada haría
+    imposible medir la tasa de legalidad sin máscara, que es la primera columna de la tabla única.
+    """
+    legal = legal_token_ids(board, tok)
+    ids = prompt_ids(history_ids, model.cfg.block)
+    idx = torch.tensor([ids], dtype=torch.long, device=next(model.parameters()).device)
+    logits = filtered_logits(model.next_logits(idx)[0], legal, cfg)
+    probs = torch.softmax(logits, dim=-1)
+    token_id = (
+        int(torch.argmax(logits))
+        if cfg.temperature == 0
+        else int(torch.multinomial(probs, 1, generator=generator))
+    )
+    move = _as_move(tok.ids[token_id])
+    if move is not None and board.is_legal(move):
+        return move, {"legal": True, "raw_token": tok.ids[token_id], ...}
+    return None, {"legal": False, "raw_token": tok.ids[token_id], ...}
+```
+
+<Callout kind="roto" title="El generador tiene que vivir donde viven los pesos">
+  `SampleConfig.generator(device)` construye el `torch.Generator` en el dispositivo del modelo, y no
+  es una floritura: `torch.multinomial` **rechaza** un generador de CPU cuando las probabilidades
+  están en CUDA. Construirlo en otro sitio es una excepción que solo ocurre en la máquina con GPU,
+  es decir, nunca en los tests y siempre en la tirada larga.
+</Callout>
 
 Con la máscara puesta, el modelo **no puede** proponer una jugada ilegal. Eso hace la demo jugable
 y es lo que se usa en las partidas contra Stockfish. Y aquí está el argumento honesto de todo el
@@ -718,6 +802,283 @@ módulo:
   Publicar solo una de las dos sería quedarse con el número que conviene. Por eso `SampleConfig`
   tiene `mask_illegal` y por eso `rukh play` tiene `--no-mask`: no es un modo de depuración, es el
   experimento.
+</Callout>
+
+## El modelo, entero
+
+Todo lo anterior son piezas sueltas. Aquí están montadas, y es corto: tres ficheros, poco más de
+doscientas líneas, y puedes leerlos de una sentada. Esa es la razón de escribirlo a mano en vez de
+importarlo.
+
+### `config.py`: donde cada decisión se convierte en un número
+
+Es el fichero donde acaba todo lo que esta lección argumenta. Sin él, el lab 1 no puede llamar a
+`preset("small")` ni leer `cfg.ff`.
+
+```python title="src/rukh/models/config.py"
+class DecoderConfig(BaseConfig):
+    """La forma de un `MoveDecoder`."""
+
+    vocab_size: int = 2030
+    n_layer: int = 12
+    n_head: int = 8
+    d_model: int = 512
+    d_ff: int | None = None      # None -> 4 * d_model
+    block: int = 200
+    dropout: float = 0.0
+    """Cero en el decoder: con 240 M tokens y 39 M de parámetros no hay escasez de datos contra la
+    que regularizar, y el dropout solo frenaría el ajuste. El encoder de M3 lo enciende porque va a
+    ver muchísimas menos etiquetas en el afinado."""
+    pos: Literal["learned", "rope"] = "learned"
+    """Aprendidas por defecto. El argumento de RoPE es extrapolar más allá del contexto entrenado,
+    y con el contexto fijo en 200 ninguna partida es más larga que la tabla. Queda detrás de una
+    bandera para que el día que alguien entrene las dos, la decisión cambie por una medida."""
+    tie_embeddings: bool = True
+
+    @model_validator(mode="after")
+    def _check(self) -> DecoderConfig:
+        if self.d_model % self.n_head:
+            raise ValueError(f"d_model={self.d_model} no es divisible por n_head={self.n_head}")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError(f"dropout tiene que estar en [0, 1), era {self.dropout}")
+        if self.pos == "rope" and (self.d_model // self.n_head) % 2:
+            raise ValueError("rope necesita una dimensión de cabeza par")
+        return self
+
+    @property
+    def head_dim(self) -> int:
+        """Ancho de una cabeza. Entre 64 y 128 en los tres presets: por debajo se queda sin
+        resolución, por encima hay pocas cabezas para especializarse."""
+        return self.d_model // self.n_head
+
+    @property
+    def ff(self) -> int:
+        return self.d_ff if self.d_ff is not None else 4 * self.d_model
+
+
+PRESETS: dict[str, DecoderConfig] = {
+    # 5 309 952 parámetros, 189 segundos: el modelo con el que se itera.
+    "tiny": DecoderConfig(n_layer=6, n_head=4, d_model=256),
+    # 38 971 392 parámetros, 42 minutos: el modelo del curso.
+    "small": DecoderConfig(),
+    # 115 120 128 parámetros, 4 h 3 min: justificado solo cuando creció el corpus (parte 4).
+    "medium": DecoderConfig(n_layer=16, n_head=12, d_model=768),
+}
+
+
+def preset(name: str) -> DecoderConfig:
+    """Una **copia** del preset, para que quien lo llame pueda mutarlo sin envenenar la tabla."""
+    if name not in PRESETS:
+        raise ValueError(f"preset desconocido {name!r}; se esperaba uno de {', '.join(PRESETS)}")
+    return PRESETS[name].model_copy(deep=True)
+```
+
+Ese `model_copy(deep=True)` de `preset` parece paranoia y no lo es: sin él, un entrenamiento que
+sobreescribiera `cfg.block` estaría modificando el objeto del diccionario, y el siguiente preset
+que alguien pidiera en el mismo proceso —por ejemplo, el barrido de tres tallas del lab 1— vendría
+ya contaminado.
+
+### `layers.py`: los bloques, escritos una vez
+
+Este fichero lo comparten el decoder y el encoder de M3. La frase con la que abre M3 —«el encoder es
+el decoder con un booleano cambiado»— solo es cierta si hay **una** implementación, así que vive
+aquí y los dos modelos la importan. Las clases toman números y no un objeto de configuración
+precisamente para que ninguno de los dos modelos dependa de la config del otro.
+
+```python title="src/rukh/models/layers.py"
+class SelfAttention(nn.Module):
+    """Atención multi-cabeza con una sola proyección `qkv` fusionada.
+
+    Una matriz de `d_model x 3*d_model` produce consulta, clave y valor de golpe, y las cabezas
+    son una *reinterpretación de sus columnas*: los mismos pesos vistos como `n_head` bloques de
+    `head_dim`. Ocho cabezas cuestan exactamente lo que cuesta una.
+    """
+
+    def __init__(self, d_model: int, n_head: int, dropout: float = 0.0, causal: bool = True):
+        super().__init__()
+        self.n_head = n_head
+        self.head_dim = d_model // n_head
+        self.dropout = dropout
+        self.causal = causal
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.proj = nn.Linear(d_model, d_model)
+        self.resid_drop = nn.Dropout(dropout)
+
+    def forward(self, x, cos=None, sin=None, attn_mask=None):
+        batch, seq, _ = x.shape
+        q, k, v = self.qkv(x).split(x.shape[-1], dim=2)
+        shape = (batch, seq, self.n_head, self.head_dim)
+        q = q.view(shape).transpose(1, 2)
+        k = k.view(shape).transpose(1, 2)
+        v = v.view(shape).transpose(1, 2)
+        if cos is not None and sin is not None:
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=self.causal and attn_mask is None,
+        )
+        out = out.transpose(1, 2).contiguous().view(batch, seq, -1)
+        return self.resid_drop(self.proj(out))
+
+
+class Mlp(nn.Module):
+    """La parte aburrida y dos tercios de los parámetros de un bloque: `d -> 4d -> d` con GELU."""
+
+    def __init__(self, d_model: int, ff: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.fc = nn.Linear(d_model, ff)
+        self.proj = nn.Linear(ff, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.drop(self.proj(F.gelu(self.fc(x))))
+
+
+class Block(nn.Module):
+    """Un bloque pre-norm: `x + attn(ln1(x))` y después `x + mlp(ln2(x))`."""
+
+    def __init__(self, d_model, n_head, ff, dropout=0.0, causal=True) -> None:
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = SelfAttention(d_model, n_head, dropout, causal=causal)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = Mlp(d_model, ff, dropout)
+
+    def forward(self, x, cos=None, sin=None, attn_mask=None):
+        x = x + self.attn(self.ln1(x), cos, sin, attn_mask)
+        return x + self.mlp(self.ln2(x))
+
+
+def init_weights(module: nn.Module) -> None:
+    """Normal(0, 0.02) en cada `Linear` y `Embedding`; los sesgos arrancan en cero."""
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+```
+
+Y las dos funciones de RoPE, que están detrás de la opción `pos: "rope"`:
+
+```python title="src/rukh/models/layers.py"
+def rope_tables(seq_len, head_dim, device, base=10_000.0):
+    """`(cos, sin)` de forma `(seq_len, head_dim)`: una frecuencia por pareja de dimensiones."""
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+    angles = torch.outer(torch.arange(seq_len, dtype=torch.float32), inv_freq)
+    full = torch.cat([angles, angles], dim=-1)
+    return full.cos().to(device), full.sin().to(device)
+
+
+def apply_rope(x, cos, sin):
+    """Gira `x` de forma `(B, H, T, D)` con los ángulos de sus primeras `T` posiciones."""
+    t = x.shape[-2]
+    cos_t = cos[:t].to(dtype=x.dtype).view(1, 1, t, -1)
+    sin_t = sin[:t].to(dtype=x.dtype).view(1, 1, t, -1)
+    half = x.shape[-1] // 2
+    rotated = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+    return x * cos_t + rotated * sin_t
+```
+
+<Callout kind="roto" title="Los nombres de los módulos son el formato de disco">
+  `ln1`, `attn.qkv`, `attn.proj`, `ln2`, `mlp.fc`, `mlp.proj` y el orden en que se crean **son las
+  claves de todos los checkpoints escritos hasta hoy**. Renombrar uno no es una refactorización: es
+  una incompatibilidad silenciosa, porque `load_state_dict` con `strict=False` carga lo que reconoce
+  y deja el resto en la inicialización. El modelo arranca, entrena y es otro.
+</Callout>
+
+### `decoder.py`: el modelo
+
+```python title="src/rukh/models/decoder.py"
+IGNORE_INDEX = 0
+"""`<pad>`. Olvidar `ignore_index` aquí le enseña al modelo que después de cualquier cosa viene
+`<pad>`, y lo aprende con confianza, porque es verdad de los datos que le enseñaste."""
+
+
+class MoveDecoder(nn.Module):
+    """GPT sobre tokens de jugada. `forward` devuelve `(logits, loss)`."""
+
+    def __init__(self, cfg: DecoderConfig | None = None) -> None:
+        super().__init__()
+        self.cfg = cfg or DecoderConfig()
+        self.tokens = nn.Embedding(self.cfg.vocab_size, self.cfg.d_model)
+        self.positions = (
+            nn.Embedding(self.cfg.block, self.cfg.d_model) if self.cfg.pos == "learned" else None
+        )
+        self.drop = nn.Dropout(self.cfg.dropout)
+        self.blocks = nn.ModuleList(Block(self.cfg) for _ in range(self.cfg.n_layer))
+        self.ln_f = nn.LayerNorm(self.cfg.d_model)
+        self.lm_head = nn.Linear(self.cfg.d_model, self.cfg.vocab_size, bias=False)
+        if self.cfg.tie_embeddings:
+            self.lm_head.weight = self.tokens.weight
+        if self.cfg.pos == "rope":
+            cos, sin = rope_tables(self.cfg.block, self.cfg.head_dim, torch.device("cpu"))
+            self.register_buffer("rope_cos", cos, persistent=False)
+            self.register_buffer("rope_sin", sin, persistent=False)
+        self.apply(layers.init_weights)
+        # El truco de GPT-2: la corriente residual recibe 2 * n_layer escrituras, así que las
+        # proyecciones de salida arrancan divididas por sqrt(24) y el modelo va subiendo el
+        # volumen de las que le sirven.
+        scale = 0.02 / math.sqrt(2 * self.cfg.n_layer)
+        for name, param in self.named_parameters():
+            if name.endswith("proj.weight"):
+                nn.init.normal_(param, mean=0.0, std=scale)
+
+    def num_params(self, non_embedding: bool = True) -> int:
+        """Parámetros; `non_embedding` quita la tabla de posiciones (la regla de nanoGPT)."""
+        total = sum(p.numel() for p in self.parameters())
+        if non_embedding and self.positions is not None:
+            total -= self.positions.weight.numel()
+        return total
+
+    def forward(self, idx, targets=None):
+        """Logits `(B, T, V)` y, con `targets`, la pérdida escalar."""
+        seq = idx.shape[-1]
+        if seq > self.cfg.block:
+            raise ValueError(f"secuencia de {seq} tokens, más larga que el bloque {self.cfg.block}")
+        x = self.tokens(idx)
+        cos = sin = None
+        if self.positions is not None:
+            steps = torch.arange(seq, device=idx.device)
+            x = x + self.positions(steps)
+        else:
+            cos, sin = self.rope_cos, self.rope_sin
+        x = self.drop(x)
+        for block in self.blocks:
+            x = block(x, cos, sin)
+        logits = self.lm_head(self.ln_f(x))
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                targets.reshape(-1),
+                ignore_index=IGNORE_INDEX,
+            )
+        return logits, loss
+
+    @torch.no_grad()
+    def next_logits(self, idx):
+        """Solo los logits del último paso, `(B, vocab_size)`, recortados al bloque."""
+        cropped = idx[:, -self.cfg.block :]
+        logits, _ = self(cropped)
+        return logits[:, -1, :]
+```
+
+Eso es todo. Doce bloques, una tabla de embeddings atada por los dos extremos, un `LayerNorm` final
+y una entropía cruzada que ignora el relleno. **38 971 392** parámetros que puedes contar con la
+calculadora del lab 1, y que hacen el 99,4 % de sus jugadas legales sin que nadie les haya contado
+las reglas.
+
+<Callout kind="roto" title="El recorte de `next_logits` no sirve para jugar">
+  `idx[:, -block:]` es correcto para una pasada suelta y **equivocado** para muestrear una partida
+  más larga que el contexto: se lleva por delante el `<bos>` y los dos tokens de Elo. El modelo
+  pierde el condicionamiento con el que se entrenó y, además, todas sus posiciones aprendidas se
+  desplazan tres lugares. La versión que usa el muestreador conserva la cabecera y recorta por el
+  medio; está en `prompt_ids`, en la tercera parte de este módulo, y el recorte de aquí es solo la
+  red de seguridad para que el modelo nunca lance una excepción con una entrada larga.
 </Callout>
 
 Hasta aquí el objeto. Sigue en «El decoder: entrenarlo y medirlo»: cómo se lee cada columna de la

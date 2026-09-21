@@ -6,7 +6,7 @@ description:
   Pearson y Spearman a la vez, y por qué el reparto de los datos va por partida y no por posición.
 module: m3
 order: 2
-duration: 90
+duration: 110
 level: base
 status: vigente
 updated: '2026-09-21'
@@ -153,6 +153,107 @@ Las dos están implementadas a mano sobre rangos en `src/rukh/eval/`, sin `scipy
 
 </Callout>
 
+Las cuarenta líneas, porque cada una tapa una forma distinta de engañarse:
+
+```python title="src/rukh/eval/metrics.py"
+def _ranks(values: np.ndarray) -> np.ndarray:
+    """Rangos medios, empates compartidos. La única sutileza de un Spearman a mano.
+
+    Los empates tienen que recibir la **media** de los rangos que abarcan. Darles rangos
+    consecutivos arbitrarios inventa un orden que los datos no tienen, y aquí los empates abundan:
+    un `tanh` acotado aplasta muchas posiciones sobre casi el mismo número.
+    """
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(len(values), dtype=np.float64)
+    sorted_values = values[order]
+    i = 0
+    while i < len(values):
+        j = i
+        while j + 1 < len(values) and sorted_values[j + 1] == sorted_values[i]:
+            j += 1
+        ranks[order[i : j + 1]] = (i + j) / 2.0 + 1.0
+        i = j + 1
+    return ranks
+
+
+def spearman(x, y) -> float:
+    """Pearson sobre rangos medios: solo el orden, no la escala."""
+    a, b = np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+    return pearson(_ranks(a), _ranks(b)) if a.size >= 2 else math.nan
+
+
+def roc_auc(scores, labels) -> float:
+    """Probabilidad de que un positivo al azar quede por encima de un negativo al azar.
+
+    Calculado con la suma de rangos (la identidad de Mann-Whitney) en vez de recorriendo una
+    curva: es más corto y es exacto con empates.
+    """
+    s, y = np.asarray(scores, dtype=np.float64), np.asarray(labels, dtype=np.int64)
+    n_pos, n_neg = int((y == 1).sum()), int((y == 0).sum())
+    if not n_pos or not n_neg:
+        return math.nan
+    ranks = _ranks(s)
+    return float((ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+
+
+def average_precision(scores, labels) -> float:
+    """Área bajo precisión-exhaustividad. Su referencia es **la tasa base**, no 0,5."""
+    s, y = np.asarray(scores, dtype=np.float64), np.asarray(labels, dtype=np.int64)
+    total = int((y == 1).sum())
+    if not total:
+        return math.nan
+    order = np.argsort(-s, kind="mergesort")
+    hits, running = 0, 0.0
+    for seen, index in enumerate(order, start=1):
+        if y[index] == 1:
+            hits += 1
+            running += hits / seen
+    return float(running / total)
+
+
+def f1_at(scores, labels, threshold: float) -> OperatingPoint:
+    """Precisión, exhaustividad y F1 en un umbral, con los conteos que los explican."""
+    s, y = np.asarray(scores, dtype=np.float64), np.asarray(labels, dtype=np.int64)
+    flagged = s >= threshold
+    tp, n_flagged, positives = int((flagged & (y == 1)).sum()), int(flagged.sum()), int((y == 1).sum())
+    precision = tp / n_flagged if n_flagged else 0.0
+    recall = tp / positives if positives else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return OperatingPoint(threshold, len(y), positives, n_flagged, precision, recall, f1)
+
+
+def tune_threshold(scores, labels) -> float:
+    """El umbral que maximiza el F1 **sobre las filas que se le pasan**.
+
+    Dale la mitad `tune`. Dársela a las filas que vas a publicar convierte el número publicado en
+    un récord personal en vez de en una estimación.
+    """
+    s = np.asarray(scores, dtype=np.float64)
+    best = (0.0, 0.5)
+    for threshold in np.unique(s):
+        point = f1_at(s, labels, float(threshold))
+        if point.f1 > best[0]:
+            best = (point.f1, float(threshold))
+    return best[1]
+```
+
+Y el reparto, que es la otra mitad del procedimiento honesto:
+
+```python title="src/rukh/eval/metrics.py"
+def split_by_group(groups, seed: int = 0, fraction: float = 0.5) -> np.ndarray:
+    """Una máscara que parte las filas en dos **por grupo**, de forma reproducible.
+
+    Es una función pura del id y de la semilla —un CRC-32, no `hash()`, que Python aleatoriza por
+    proceso—. El CRC-32 con semilla es un bombo grabado en vídeo: cada vez que pones la cinta salen
+    las mismas bolas, en cualquier máquina y dentro de un año.
+    """
+    keys = np.array(
+        [zlib.crc32(f"{seed}:{int(group)}".encode()) % 1_000_000 for group in groups],
+        dtype=np.int64,
+    )
+    return keys < int(fraction * 1_000_000)
+```
+
 <Callout kind="mundo-real" title="El mismo error, fuera del ajedrez">
   Un clasificador de fraude con un 0,2 % de transacciones fraudulentas que presume de 99,8 % de
   exactitud. Un modelo de diagnóstico con una prevalencia del 1 % cuyo F1 se publica en el umbral
@@ -171,6 +272,61 @@ la etiqueta, `tanh(puntuación / 4)` en peones, que es idéntico a `tanh(cp / 40
 Para juzgar una jugada, se juega en un tablero de `python-chess` y se deja que el rival conteste con
 su captura o promoción más rentable, a un solo ply; si el balance de material del que movió cae un
 punto o más, la heurística dice "error".
+
+En código son cuatro funciones:
+
+```python title="src/rukh/eval/heuristic.py"
+PIECE_VALUES = {chess.PAWN: 1.0, chess.KNIGHT: 3.0, chess.BISHOP: 3.0,
+                chess.ROOK: 5.0, chess.QUEEN: 9.0, chess.KING: 0.0}
+MOBILITY_WEIGHT = 0.05
+BLUNDER_MATERIAL = 1.0
+VALUE_SCALE = 4.0   # `tanh(puntuación / 4)` en peones es `tanh(cp / 400)` en centipeones
+
+
+def _moves_for(board, color) -> int:
+    """Cuántas jugadas legales tiene `color`, **mueva quien mueva**.
+
+    Cambiar el turno sobre una copia es la única forma de hacer esa pregunta. Contar solo las del
+    bando que mueve haría que la movilidad dependiera de la paridad del ply y no de la posición.
+    """
+    if board.turn == color:
+        return board.legal_moves.count()
+    swapped = board.copy(stack=False)
+    swapped.turn = color
+    swapped.ep_square = None
+    return swapped.legal_moves.count()
+
+
+def worst_material(board, color) -> float:
+    """El material de `color` tras la única respuesta más rentable que tiene el rival.
+
+    Un ply, solo capturas y promociones: sin recaptura, sin amenaza, sin jaque. Esa es toda la
+    búsqueda, y las cegueras que eso produce están escritas en la lección en vez de arregladas.
+    """
+    worst = material_for(board, color)
+    for reply in _material_moves(board):
+        child = board.copy(stack=False)
+        child.push(reply)
+        worst = min(worst, material_for(child, color))
+    return worst
+
+
+def judge(fen: str, move: str, threshold=BLUNDER_MATERIAL, mobility_weight=MOBILITY_WEIGHT):
+    """Juzga `move` jugada en `fen` (la posición **anterior** a la jugada)."""
+    board = chess.Board(fen)
+    mover = board.turn
+    before = material_for(board, mover)
+    board.push(chess.Move.from_uci(move))
+    after = worst_material(board, mover)
+    loss = before - after
+    return Verdict(move=move, blunder=loss >= threshold, loss=loss,
+                   material_before=before, material_after=after,
+                   value=value(board, mobility_weight))
+```
+
+Ese `VALUE_SCALE = 4.0` es la otra mitad de «medirla igual»: `tanh(puntuación / 4)` en peones es
+exactamente `tanh(cp / 400)` en centipeones, así que la línea base y el modelo se leen en la misma
+escala y sus correlaciones se pueden poner en la misma tabla.
 
 Es mala a propósito, y eso es una decisión de diseño, no una concesión. Una línea base que ya
 entendiera los sacrificios no sería un suelo: sería un competidor, y el margen dejaría de significar
@@ -417,6 +573,33 @@ El arreglo es una pérdida que mire pares: por cada dos posiciones del lote, si 
 `i` vale más que `j`, la predicción debería ponerlas en ese orden, y el voto pesa según lo lejos que
 estén las etiquetas —distinguir una ganada de una perdida cuenta más que separar dos iguales, que
 es justo donde un evaluador sin búsqueda no tiene nada que hacer—.
+
+```python title="src/rukh/models/heads.py"
+def pairwise_rank_loss(pred, target, margin: float = 0.0):
+    """Un sustituto derivable de «¿salió bien el orden?».
+
+    Cada par del lote vota: si `target[i] > target[j]`, la predicción debería poner `i` por encima
+    de `j`. El voto es una logística sobre la diferencia predicha, ponderada por lo lejos que están
+    las etiquetas.
+
+    Devuelve cero para un lote cuyas etiquetas son todas iguales: ahí no hay orden que aprender, y
+    dividir por un peso cero sería peor que no decir nada.
+    """
+    diff_target = target.unsqueeze(1) - target.unsqueeze(0)
+    diff_pred = pred.unsqueeze(1) - pred.unsqueeze(0)
+    weight = diff_target.abs()
+    sign = torch.sign(diff_target)
+    total = weight.sum()
+    if not bool(total > 0):
+        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+    penalty = F.softplus(-(sign * diff_pred - margin))
+    return (weight * penalty).sum() / total
+```
+
+El peso `|target_i − target_j|` es la mitad del arreglo. Una pérdida de ordenación sin ponderar
+gastaría casi todo su gradiente en separar posiciones que el motor separa por diez centipeones
+—que es justo donde una pasada sin búsqueda no tiene nada que decir— en vez de en las parejas que
+deciden la partida.
 
 <div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
 

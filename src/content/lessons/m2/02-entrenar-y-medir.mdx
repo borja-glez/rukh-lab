@@ -6,7 +6,7 @@ description:
   mano, demostrar la causalidad, entrenar `tiny` en tres minutos y `small` entero con la suite completa.'
 module: m2
 order: 2
-duration: 150
+duration: 210
 level: base
 status: vigente
 updated: '2026-09-21'
@@ -59,6 +59,85 @@ salga de `rukh eval`, que es la que vale. Se desglosa por tramo de Elo, y ese de
 hace posible el Elo-conditioning de M4: si el modelo predice mejor a los 1800 que a los 2400, es
 que ha aprendido a imitar el nivel medio de sus datos.
 
+Las dos primeras columnas de la tabla única salen de dos ficheros cortos, y el detalle que importa
+de los dos está en cómo se construye el prompt:
+
+```python title="src/rukh/eval/legality.py"
+ARGMAX = SampleConfig(temperature=0.0, top_k=None, mask_illegal=False)
+"""La definición del titular: ninguna perilla puesta."""
+
+
+def prompt_of(position: Position, tok: UciTokenizer) -> list[int]:
+    """El prompt: la cabecera más las jugadas hasta aquí, la forma con la que se entrenó."""
+    ids = [
+        tok.bos_id,
+        tok.vocab[elo_token(position.white_elo, "w")],
+        tok.vocab[elo_token(position.black_elo, "b")],
+    ]
+    ids += [tok.vocab.get(uci, tok.unk_id) for uci in position.prefix]
+    return ids
+
+
+def legality(model, tok, positions, sampled=None, seed=0) -> LegalityResult:
+    """Las dos tasas sobre las **mismas** posiciones, en una pasada."""
+    legal_argmax = legal_sampled = 0
+    for position in positions:
+        board = board_of(position)
+        ids = prompt_ids(prompt_of(position, tok), model.cfg.block)
+        raw = model.next_logits(torch.tensor([ids], dtype=torch.long, device=device))[0]
+        legal_ids = set(legal_token_ids(board, tok))
+        legal_argmax += int(int(raw.argmax()) in legal_ids)          # sin temperatura ni top-k
+        probs = torch.softmax(filtered_logits(raw, sorted(legal_ids), sampled), dim=-1)
+        legal_sampled += int(int(torch.multinomial(probs, 1, generator=generator)) in legal_ids)
+    return LegalityResult(positions=len(positions), legal_argmax=legal_argmax,
+                          legal_sampled=legal_sampled)
+
+
+def sample_positions(games, count: int, seed: int = 0) -> list[Position]:
+    """Saca `count` posiciones, con el ply sorteado **a lo largo de toda la partida**.
+
+    Y no de la apertura, por el sesgo del párrafo de arriba: las posiciones de apertura son fáciles
+    y los finales difíciles, así que un muestreo cargado hacia el principio publicaría una
+    legalidad que nadie vive.
+    """
+    rng = random.Random(seed)
+    out = []
+    while len(out) < count and games:
+        uci, white, black = games[rng.randrange(len(games))]
+        moves = uci.split()
+        if len(moves) < 2:
+            continue
+        cut = rng.randrange(1, len(moves))
+        out.append(Position(prefix=moves[:cut], white_elo=white, black_elo=black))
+    return out
+```
+
+Las dos tasas se calculan **en el mismo bucle y sobre las mismas posiciones**, que es lo que hace
+que la comparación entre ellas signifique algo. Medirlas en dos pasadas con dos muestras distintas
+daría dos números que no se pueden restar.
+
+Y la exactitud, que es aún más corta:
+
+```python title="src/rukh/eval/accuracy.py"
+@torch.no_grad()
+def accuracy(model, tok, positions, truths) -> AccuracyResult:
+    """Top-1 y top-3, sin máscara y sin muestreo.
+
+    Mide la **ordenación** que producen los pesos, que es lo que la hace comparable entre etapas
+    con independencia de cómo se sirva cada una.
+    """
+    top1 = top3 = 0
+    for position, truth in zip(positions, truths, strict=True):
+        ids = prompt_ids(prompt_of(position, tok), model.cfg.block)
+        ranked = torch.topk(model.next_logits(torch.tensor([ids]))[0], 3).indices.tolist()
+        target = tok.vocab.get(truth)
+        top1 += int(target is not None and ranked[0] == target)
+        top3 += int(target is not None and target in ranked)
+        ...  # y lo mismo acumulado por tramo de Elo
+```
+
+Ese `prompt_of` es la misma función que la métrica de puzles no usaba, y por eso daba 1,07 %.
+
 **Puzles por tramo.** Dos mil puzles de Lichess por banda de dificultad (1000-1500, 1500-2000,
 2000+), con un criterio duro: un puzle cuenta como resuelto solo si el modelo acierta **toda** la
 secuencia, no la primera jugada. Mide algo distinto de la imitación: encontrar la jugada única que
@@ -104,6 +183,138 @@ con lo medido en el lab 4: las 160 partidas de `small` dan **1359 con IC 1293-14
 **±68**, no ±54. La diferencia es que la tabla supone el 50 % en todos los escalones, y el modelo
 real puntúa 0,05 contra unos y 0,5 contra otros; `Σ p(1−p)` se queda por debajo de 40 y el
 intervalo se ensancha. La fórmula da el suelo del ruido; el bootstrap da el ruido que hay.
+
+Antes del ajuste hacen falta las partidas, y la función que las juega tiene dos decisiones que la
+tabla de resultados hereda:
+
+```python title="src/rukh/infer/game.py"
+def play_game_with(player, opponent, model_color=chess.WHITE, white_elo=1800, black_elo=1800,
+                   max_plies=None, board=None) -> GameResult:
+    """Juega hasta que la partida acabe o se agote el contexto, y cuenta qué pasó."""
+    board = board if board is not None else chess.Board()
+    limit = max_plies if max_plies is not None else player.limit
+    player.start(white_elo, black_elo)
+    # Un tablero que llega con jugadas puestas es una posición de la que el jugador tiene que
+    # **enterarse**: su prompt es la partida desde el principio, no desde aquí.
+    for played in board.move_stack:
+        player.observe(played)
+        _tell(opponent, played)
+    illegal = 0
+    moves = [m.uci() for m in board.move_stack]
+    while not board.is_game_over(claim_draw=True) and len(moves) < limit:
+        if board.turn == model_color:
+            move, was_legal = player.choose(board)
+            if move is None:
+                break
+            if not was_legal:
+                illegal += 1          # el rescate no esconde que ocurrió
+        else:
+            move = opponent.choose(board)
+        board.push(move)
+        moves.append(move.uci())
+        player.observe(move)
+        _tell(opponent, move)
+    over = board.is_game_over(claim_draw=True)
+    return GameResult(
+        result=board.result(claim_draw=True) if over else "*",   # `*` = se agotó el contexto
+        plies=len(moves), illegal_proposals=illegal, moves=moves,
+        termination=_termination(board) if over else "context limit", fen=board.fen(),
+    )
+```
+
+El `Player` devuelve **dos cosas**: la jugada que va a hacer y si su propuesta sin máscara era
+legal. La partida tiene que terminar, así que una propuesta ilegal se rescata con un sorteo
+enmascarado, pero el rescate no puede esconder que ocurrió: ese contador es la señal cruda de
+legalidad sobre la que está montado el harness entero. Y el rescate **no le vuelve a preguntar al
+modelo**: insistir hasta que conteste algo legal mediría un modelo distinto del que describe la
+tasa de legalidad.
+
+La otra decisión es qué hacer con una partida que se queda sin contexto:
+
+```python title="src/rukh/infer/game.py"
+def adjudicate(fen: str, engine_path: Path | None = None, depth: int = 8) -> float:
+    """Puntúa una partida cortada, desde el punto de vista de las blancas.
+
+    Anotar una partida cortada como tablas **no es neutral**: le regala medio punto al bando que
+    iba perdiendo, y con un modelo que se queda sin contexto en las partidas largas ese sesgo
+    apunta siempre para el mismo lado. Así que la posición final se juzga —con una búsqueda corta
+    del motor si lo hay, contando material si no— y el informe dice cuántas se adjudicaron.
+    """
+    board = chess.Board(fen)
+    if engine_path is not None:
+        with chess_engine.SimpleEngine.popen_uci(str(engine_path)) as engine:
+            cp = engine.analyse(board, chess_engine.Limit(depth=depth))["score"].white().score(
+                mate_score=10_000
+            )
+        return 1.0 if cp > 100 else 0.0 if cp < -100 else 0.5
+    balance = sum(
+        value * (len(board.pieces(piece, chess.WHITE)) - len(board.pieces(piece, chess.BLACK)))
+        for piece, value in MATERIAL.items()
+    )
+    return 1.0 if balance > 1 else 0.0 if balance < -1 else 0.5
+```
+
+Las dos cosas —el ajuste y el intervalo— son treinta líneas sin SciPy, y merece la pena verlas
+porque cada guarda tapa una forma distinta de publicar un número falso:
+
+```python title="src/rukh/eval/elo.py"
+LOG10_400 = math.log(10.0) / 400.0   # la c de la fórmula: 0,005756
+MAX_STEP = 400.0
+SLACK = 1000.0
+
+
+def _fit_batch(opponents, scores, iterations: int = 60):
+    """Newton sobre lotes `(B, n)` de resultados; una puntuación por fila.
+
+    Vectorizado sobre el lote, que es lo que hace que mil remuestreos de bootstrap cuesten
+    milisegundos. Los recortes no son cosméticos: `MAX_STEP` impide que una curvatura casi plana
+    tire la estimación al otro extremo del universo en un solo paso, y `SLACK` acota la respuesta
+    al rango de rivales más un margen, que es lo que convierte una muestra separada en un valor
+    que se puede **reconocer** como separado en vez de en un infinito que acaba en una tabla.
+    """
+    opponents = np.asarray(opponents, dtype=np.float64)
+    scores = np.asarray(scores, dtype=np.float64)
+    low, high = opponents.min(axis=1) - SLACK, opponents.max(axis=1) + SLACK
+    elo = opponents.mean(axis=1)
+    for _ in range(iterations):
+        p = 1.0 / (1.0 + np.exp(-LOG10_400 * (elo[:, None] - opponents)))
+        gradient = (scores - p).sum(axis=1)
+        curvature = (p * (1.0 - p)).sum(axis=1)
+        step = np.where(curvature > 1e-12, gradient / (LOG10_400 * np.maximum(curvature, 1e-12)), 0)
+        elo = np.clip(elo + np.clip(step, -MAX_STEP, MAX_STEP), low, high)
+        if np.max(np.abs(step)) < 1e-6:
+            break
+    return elo
+
+
+def bootstrap_ci(opponents, scores, samples=1_000, seed=0, level=0.95):
+    """Bootstrap percentil sobre las partidas mismas: un ajuste por remuestreo."""
+    opponents = np.asarray(opponents, dtype=np.float64)
+    scores = np.asarray(scores, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    index = rng.integers(0, len(opponents), size=(samples, len(opponents)))
+    fitted = _fit_batch(opponents[index], scores[index])
+    tail = (1.0 - level) / 2.0 * 100.0
+    return float(np.percentile(fitted, tail)), float(np.percentile(fitted, 100.0 - tail))
+
+
+def separation(scores) -> str | None:
+    """`"wins"`, `"losses"` o None: si todas las partidas fueron en la misma dirección.
+
+    Sin un contraejemplo la verosimilitud sigue subiendo hasta el infinito, el ajuste se para en el
+    recorte y **todos** los remuestreos devuelven ese mismo recorte: de ahí salía el «IC del 95 %»
+    de anchura cero. Cuando pasa, lo que se publica es una cota de un solo lado y la palabra
+    `separated`, no un intervalo simétrico que sería mentira.
+    """
+    values = np.asarray(scores, dtype=np.float64)
+    if values.size == 0:
+        return None
+    if np.all(values >= 1.0):
+        return "wins"
+    if np.all(values <= 0.0):
+        return "losses"
+    return None
+```
 
 Una encuesta electoral a 100 personas sale con un margen de ±10 puntos, y nadie serio titula
 «sube dos puntos» con ella; a 1 000 personas el margen baja a ±3, y para bajarlo a ±1 harían
@@ -386,6 +597,212 @@ causalidad, y un checkpoint contaminado no se distingue de uno bueno mirando los
   </Solution>
 </Exercise>
 
+### El bucle, antes de lanzarlo
+
+`rukh train` es un comando de una línea y conviene haber leído lo que hay detrás, porque la receta
+que la parte anterior justifica número a número está aquí y no en un fichero de configuración.
+
+Empieza por lo que **no** es específico de predecir una jugada, que es casi todo. El bucle del
+decoder y el del encoder de M3 se diferencian en un único sitio —cómo un lote se convierte en una
+pérdida—; el optimizador, el planificador, los checkpoints, el dispositivo y las métricas son los
+mismos, así que viven aparte y los dos los llaman. Duplicarlos significaría dos recetas que se
+separan, y dos entrenamientos solo son comparables cuando la receta es la misma.
+
+```python title="src/rukh/train/common.py"
+def param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
+    """Decaimiento desacoplado solo en las matrices: las normas y los sesgos se quedan fuera.
+
+    La regla es literalmente «tensores de dos dimensiones o más». Un `LayerNorm` tiene una
+    ganancia por canal inicializada a 1 y su trabajo es reescalar la señal; empujarla hacia cero
+    es apagar el canal, no regularizarlo. Un sesgo desplaza, no escala. Son unos pocos miles de
+    parámetros de 39 millones, y meterlos en el grupo equivocado degrada el entrenamiento en
+    silencio, que es la peor forma.
+    """
+    decay = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
+    no_decay = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
+def autocast_for(cfg, where) -> tuple[Any, bool]:
+    """bf16 en CUDA cuando se pide; un contexto que no hace nada en cualquier otro caso."""
+    use_bf16 = cfg.precision == "bf16" and where.type == "cuda"
+    if not use_bf16:
+        return nullcontext(), False
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16), True
+
+
+def maybe_compile(model, enabled, sample=None, probe=None):
+    """`torch.compile` cuando se pide; un fallo es un aviso, nunca una corrida parada.
+
+    `torch.compile` es perezoso: en Windows sin MSVC (o sin Triton) solo falla cuando la primera
+    pasada llega a Inductor, que es a mitad de la corrida. Forzar esa compilación aquí con un lote
+    de prueba hace que el fallo ocurra donde todavía se puede caer a modo *eager*. La máquina de
+    referencia entrena `small` entero en eager por exactamente esto, a 422 000 tokens por segundo,
+    y lo dice en vez de fingir que la bandera funcionó.
+    """
+    if not enabled:
+        return model
+    try:
+        import torch._dynamo as dynamo
+
+        dynamo.config.suppress_errors = True
+        compiled = torch.compile(model)
+        if probe is not None:
+            probe(compiled)
+        elif sample is not None:
+            _, loss = compiled(sample, sample)
+            if loss is not None:
+                loss.backward()
+        model.zero_grad(set_to_none=True)
+        return compiled
+    except Exception as exc:
+        log.warning("torch.compile no está disponible, se entrena en eager: %s", exc)
+        model.zero_grad(set_to_none=True)
+        return model
+```
+
+Y el planificador, que son seis líneas de las que las tres primeras son lo que separa una corrida
+que converge de una que se queda plana veinte mil pasos:
+
+```python title="src/rukh/train/schedule.py"
+def lr_at(step: int, cfg) -> float:
+    """Rampa lineal hasta `cfg.lr` en `cfg.warmup` pasos, después medio coseno hasta el suelo."""
+    if step < 0:
+        raise ValueError(f"el paso no puede ser negativo, era {step}")
+    floor = cfg.lr * cfg.min_lr_ratio
+    if step < cfg.warmup:
+        return cfg.lr * step / cfg.warmup
+    span = cfg.max_steps - cfg.warmup
+    if span <= 0:
+        return floor
+    progress = min(1.0, (step - cfg.warmup) / span)
+    return floor + 0.5 * (1.0 + math.cos(math.pi * progress)) * (cfg.lr - floor)
+```
+
+Pasado `max_steps` la tasa se queda en el suelo, de modo que una corrida reanudada que se pase
+nunca recibe una tasa negativa ni creciente. Parece una guarda paranoica; es la clase de detalle
+que aparece la primera vez que alguien reanuda con `--max-steps` más bajo que el paso guardado.
+
+Con eso, el bucle es corto:
+
+```python title="src/rukh/train/loop.py"
+for step in range(start_step, cfg.max_steps):
+    lr = set_lr(optimizer, step, cfg)
+    optimizer.zero_grad(set_to_none=True)
+    # Ponderado por tokens y **en la GPU**: una sincronización por paso en vez de una por
+    # micro-lote, y un micro-lote con menos tokens reales pesa menos en la media.
+    loss_sum = torch.zeros((), device=where)
+    real_tokens = torch.zeros((), device=where)
+    for _ in range(cfg.grad_accum):
+        x, y = next(batches)
+        x, y = x.to(where), y.to(where)
+        with autocast:
+            _, loss = runnable(x, y)
+        (loss / cfg.grad_accum).backward()
+        tokens = (y != IGNORE_INDEX).sum()
+        loss_sum += loss.detach().float() * tokens
+        real_tokens += tokens
+    # La norma **global** del gradiente, no la de cada tensor.
+    grad_norm = float(nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip))
+    optimizer.step()
+
+    done = step + 1
+    if done % cfg.log_every == 0:
+        counted = float(real_tokens.item())
+        log_metrics({
+            "train/loss": float(loss_sum.item()) / counted,
+            "lr": lr,
+            "grad_norm": grad_norm,
+            "tokens_per_s": tokens_per_step * steps / elapsed,       # lo que procesó la GPU
+            "real_tokens_per_s": counted * steps / elapsed,          # de lo que aprendió
+        }, step=done)
+    if done % cfg.eval_every == 0:
+        val_loss, top1 = evaluate(runnable, val_loader, cfg.eval_batches, where, autocast)
+        if val_loss < best_val:
+            best_val = val_loss
+            save(out_dir / "best.pt", done)
+    if done % cfg.ckpt_every == 0:
+        final = save(out_dir / f"step-{done}.pt", done)
+```
+
+Tres detalles que se equivocan con facilidad y que cuesta notar:
+
+- **La acumulación de gradiente no es un lote más grande gratis.** `batch_size * grad_accum` son
+  256 secuencias efectivas, y `(loss / grad_accum).backward()` es lo que hace que los gradientes
+  sumados equivalgan a una media y no a una suma. Sin esa división, el tamaño del paso dependería
+  de cuántos micro-lotes se acumulen.
+- **La pérdida se acumula ponderada por tokens**, no como media de medias. Un micro-lote con más
+  relleno no debe pesar lo mismo que uno lleno.
+- **Dos números de rendimiento, porque responden a preguntas distintas.** `tokens_per_s` cuenta
+  todas las posiciones de la ventana (lo que procesó la GPU, comparable entre corridas) y
+  `real_tokens_per_s` solo los objetivos que no son `<pad>` (de lo que aprendió el modelo).
+
+Y el `evaluate`, que es lo que produce las dos series que vas a mirar en MLflow:
+
+```python title="src/rukh/train/loop.py"
+@torch.no_grad()
+def evaluate(model, loader, batches, device, autocast=None) -> tuple[float, float]:
+    """Pérdida de validación y top-1, sobre **un número fijo** de lotes.
+
+    50 lotes de 64 x 200 son 640 000 tokens, y esta medida se satura mucho antes de que haga falta
+    un mes entero de partidas. Esa observación es la que D-062 convirtió en 238 M de tokens de
+    material de entrenamiento, en la cuarta parte del módulo.
+    """
+    model.eval()
+    loss_sum = weighted = hits = counted = 0
+    for index, (x, y) in enumerate(loader):
+        if index >= batches:
+            break
+        x, y = x.to(device), y.to(device)
+        with autocast if autocast is not None else nullcontext():
+            logits, loss = model(x, y)
+        mask = y != IGNORE_INDEX
+        tokens = int(mask.sum())
+        if loss is not None and torch.isfinite(loss) and tokens:
+            loss_sum += loss.float().item() * tokens
+            weighted += tokens
+        hits += int((logits.argmax(dim=-1) == y)[mask].sum())
+        counted += tokens
+    model.train()
+    return (loss_sum / weighted if weighted else math.nan, hits / counted if counted else 0.0)
+```
+
+Falta una pieza para que «si el proceso se corta no se pierde nada» sea verdad y no una intención.
+Un checkpoint no es un fichero de pesos:
+
+```python title="src/rukh/train/checkpoint.py"
+def save_checkpoint(path, *, step, model, optimizer, cfg, model_cfg, vocab_hash=None,
+                    data_manifest_sha=None, git_sha=None, best_val=None, run_id=None, state=None):
+    """Un checkpoint con la procedencia que registra toda corrida de este proyecto."""
+    payload = {
+        "step": step,
+        "model_state": state if state is not None else clean_state(model),
+        "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
+        "rng": rng_state(),            # python, numpy, torch y cuda
+        "cfg": cfg,
+        "model_cfg": model_cfg,
+        "vocab_hash": vocab_hash,      # con qué tokenizador se entrenó
+        "data_manifest_sha": data_manifest_sha,  # con qué partidas
+        "git_sha": git_sha,            # con qué código
+        "best_val": best_val,
+        "run_id": run_id,              # para que la curva de MLflow continúe, no empiece otra
+    }
+    torch.save(payload, path)
+    return path
+```
+
+Sin los tres primeros campos, `--resume` reinicia una corrida en vez de continuarla. Sin los cuatro
+últimos, nadie puede decir seis meses después con qué partidas se entrenó un modelo.
+
+Hay un detalle en `clean_state` que parece contabilidad y no lo es: `lm_head.weight` y
+`tokens.weight` son **el mismo tensor** con dos nombres. Guardar los dos escribe los números dos
+veces y, peor, al cargarlos puede dejar dos copias independientes que a partir de ahí se separan
+durante el entrenamiento. La tabla `TIED_SOURCES` dice cuál de los dos nombres es la copia, para
+que al guardar se quite y al cargar se vuelva a atar.
+
 ### Lab 3 · Entrenar `tiny` en tres minutos
 
 Ahora sí. `tiny` son 6 capas, 256 dimensiones, 4 cabezas y 5 309 952 parámetros; la configuración
@@ -644,6 +1061,42 @@ modelo: estaba midiendo un bug, y "1 %" era lo bastante creíble para un modelo 
 levantar sospechas. Guárdate esa forma de fallar: una métrica baja y plausible es más peligrosa que
 una métrica absurda.
 
+El arreglo es una función, y vale la pena verla porque explica por qué el paso `puzzles` de M1 lee
+el conjunto **con partidas** y no el de puzles a secas: ese lleva el `movetext` de la partida de la
+que salió cada puzle, así que la partida se puede reproducir hasta que el tablero **sea** la
+posición del puzle, y esas jugadas son el prompt.
+
+```python title="src/rukh/data/puzzles.py"
+def rebuild_prefix(movetext: str | None, fen: str) -> Prefix:
+    """Reproduce el SAN de la partida hasta llegar a la posición del puzle."""
+    target = normalize_fen(fen)
+    if target is None:
+        return Prefix("", 0, "bad_fen")
+    if not movetext:
+        return Prefix("", 0, "missing_game")
+    board = chess.Board()
+    moves: list[str] = []
+    if fen4(board) == target:      # un puzle desde la inicial: prefijo vacío y válido
+        return Prefix("", 0, OK)
+    for san in san_tokens(movetext):
+        try:
+            move = board.parse_san(san)
+        except ValueError:
+            return Prefix("", 0, "illegal")
+        moves.append(move.uci())
+        board.push(move)
+        if fen4(board) == target:
+            return Prefix(" ".join(moves), len(moves), OK)
+    return Prefix("", 0, "no_match")
+```
+
+Dos detalles hacen que la comparación funcione. Se compara el **`fen4` normalizado** y no el FEN
+entero, porque el FEN del puzle trae contadores de jugada que la partida reproducida no repite byte
+a byte y comparar FEN completos no coincidiría nunca. Y un puzle cuyo prefijo no se puede
+reconstruir se **descarta contando el motivo** —`no_match`, `illegal`, `missing_game`— en vez de
+quedarse con un prompt vacío, que sería volver a meter el bug original para un subconjunto de las
+filas sin que nada lo dijera.
+
 El informe completo que escribió la ejecución buena, `artifacts/eval/small-greedy/report.md`:
 
 ```markdown
@@ -766,6 +1219,35 @@ Los cuatro se habían metido en la escalera para llegar **por debajo** del suelo
 Con las etiquetas medidas, el mismo checkpoint, las mismas 160 partidas y el mismo ajuste dan
 **1359 Elo (IC 1293-1429)**. El listón de 1200 nunca se falló; la regla estaba torcida y lo estuvo
 durante meses, mirada muchas veces.
+
+La corrección son ocho líneas de constantes, y están escritas con su procedencia al lado porque un
+número medido y uno supuesto se parecen demasiado cuando están en la misma lista:
+
+```python title="src/rukh/eval/elo.py"
+# Los cuatro escalones `skill-*` llevan puntuaciones **medidas**, no las nominales 800/950/1100/1250
+# con las que se escribió el harness. Aquellas suposiciones estaban equivocadas entre 430 y 580 Elo
+# y hundían el ajuste de cada etapa unos 350 puntos.
+#
+# Los números de abajo salen de hacer jugar la escalera contra sí misma a los mismos 0,1 s por
+# jugada de la suite, 40 partidas por pareja con los colores alternados, anclando en `uci-1320`.
+# El método se valida con su propio control: `uci-1500` midió +179 Elo sobre `uci-1320` frente a
+# unos +180 nominales. (`UCI_Elo` sí se comprime más arriba: `uci-1800` midió +215 sobre
+# `uci-1500`, no +300; es una salvedad para los escalones altos.)
+#
+# Ordenados por fuerza medida. Fíjate en lo que enseña ese orden: **ningún escalón baja de 1320**.
+# Los cuatro `skill-*` se metieron en la escalera para llegar por debajo del suelo de `UCI_Elo` y
+# no llegaron nunca.
+DEFAULT_RUNGS = [
+    EloRung(name="uci-1320", elo=1320, uci_elo=1320),
+    EloRung(name="skill-0", elo=1381, skill=0),
+    EloRung(name="skill-1", elo=1467, skill=1),
+    EloRung(name="uci-1500", elo=1500, uci_elo=1500),
+    EloRung(name="skill-2", elo=1589, skill=2),
+    EloRung(name="skill-3", elo=1678, skill=3),
+    EloRung(name="uci-1800", elo=1800, uci_elo=1800),
+    EloRung(name="uci-2000", elo=2000, uci_elo=2000),
+]
+```
 
 La lección que hay que llevarse no es el número. Es que **un banco de pruebas es código sin tests**
 mientras nadie lo mida, y que la señal de alarma estaba publicada en una tabla desde el principio,

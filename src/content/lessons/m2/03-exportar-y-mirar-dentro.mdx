@@ -6,7 +6,7 @@ description:
   secuencias de cuatro caracteres acaba respetando las reglas del tablero.
 module: m2
 order: 3
-duration: 120
+duration: 135
 level: base
 status: vigente
 updated: '2026-09-21'
@@ -116,6 +116,86 @@ la foto, y aquí, jugar las partidas.
 Lo honesto es dejarlo escrito así y no redondear: el listón de `GOAL.md` era ≥ 99,9 % de paridad de
 jugada para las tres variantes, fp32 lo cumple, fp16 se queda a 99,80 % e int8 a 95,40 %. Medir
 el Elo del int8 con su propia tirada de partidas es trabajo para un hito posterior.
+
+Las tres piezas que producen esa salida, porque cada una es una decisión:
+
+```python title="src/rukh/export/onnx.py"
+def quantize_fp16(path: Path) -> Path:
+    """Media precisión: exactamente la mitad de bytes y, aquí, el 99,80 % de las jugadas igual."""
+    model = onnx.load(path.as_posix())
+    converted = float16.convert_float_to_float16(model, keep_io_types=True)
+    target = path.with_name(path.stem + "-fp16.onnx")
+    onnx.save(converted, target.as_posix())
+    return target
+
+
+def quantize_int8(path: Path) -> Path:
+    """int8 dinámico y **solo** sobre `MatMul` y `Gemm`.
+
+    256 niveles y una escala por tensor: un error relativo de en torno al 0,4 % por peso,
+    acumulado a lo largo de doce capas. Los logits se mueven hasta 1,75, que es del tamaño de la
+    diferencia habitual entre la primera y la segunda jugada, y por eso cambia el 4,6 % de las
+    decisiones.
+    """
+    target = path.with_name(path.stem + "-int8.onnx")
+    quantize_dynamic(path.as_posix(), target.as_posix(),
+                     weight_type=QuantType.QInt8, op_types_to_quantize=["MatMul", "Gemm"])
+    return target
+
+
+def verify_dynamic_seq(path: Path, block: int, seq_len: int = 32) -> bool:
+    """**Ejecuta** el fichero a dos longitudes. Un eje declarado es una promesa, no un hecho.
+
+    Si el grafo horneó una longitud, el fallo ocurre en el navegador la primera vez que la partida
+    crece una jugada. Lo que se publica es lo que funcionó, no lo que se pidió.
+    """
+    session = ort.InferenceSession(path.as_posix(), providers=["CPUExecutionProvider"])
+    name = session.get_inputs()[0].name
+    for length in sequence_lengths(seq_len, block):
+        try:
+            session.run(None, {name: np.ones((1, length), dtype=np.int64)})
+        except Exception:
+            return False
+    return True
+
+
+def move_parity(model, onnx_path: Path, prompts) -> tuple[float, float]:
+    """`(fracción de jugadas idénticas, máx |delta logits|)` sobre posiciones reales.
+
+    El criterio es la **jugada**, y el matiz importa: elegir una jugada depende del *orden* de los
+    logits, no de su valor, así que un error numérico grande puede dejar casi todas las decisiones
+    intactas, y uno pequeño puede voltear justo las que estaban ajustadas. Se publican los dos
+    números porque ninguno solo dice lo que pasó.
+    """
+    session = ort.InferenceSession(onnx_path.as_posix(), providers=["CPUExecutionProvider"])
+    name = session.get_inputs()[0].name
+    agree, worst = 0, 0.0
+    for prompt in prompts:
+        with torch.no_grad():
+            reference = model.next_logits(torch.tensor([prompt]))[0].float().numpy()
+        exported = session.run(None, {name: np.asarray([prompt], dtype=np.int64)})[0][0]
+        worst = max(worst, float(np.abs(reference - exported).max()))
+        agree += int(np.argmax(reference) == np.argmax(exported))
+    return agree / len(prompts), worst
+```
+
+Y los metadatos, que son cuatro líneas y evitan una clase entera de problemas:
+
+```python title="src/rukh/export/onnx.py"
+def write_metadata(path: Path, entries: dict[str, str]) -> dict[str, str]:
+    """Graba `rukh_*` dentro del propio fichero.
+
+    Un `.onnx` suelto en un disco tiene que seguir sabiendo decir cuál es su ventana de contexto y
+    qué vocabulario habla. Guardarlo en un JSON al lado funciona hasta que alguien mueve el
+    fichero, y alguien lo va a mover.
+    """
+    model = onnx.load(path.as_posix())
+    for key, value in entries.items():
+        prop = model.metadata_props.add()
+        prop.key, prop.value = key, value
+    onnx.save(model, path.as_posix())
+    return entries
+```
 
 Queda el segundo script del lab: sacar los pesos de atención para la isla de esta página. Y aquí
 aparece el precio de usar la llamada rápida. `F.scaled_dot_product_attention` no devuelve la matriz

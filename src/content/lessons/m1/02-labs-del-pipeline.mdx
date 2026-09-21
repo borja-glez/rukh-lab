@@ -6,7 +6,7 @@ description:
   Cierra con el tokenizador en el navegador y una lectura de diez minutos sobre lo que había antes.'
 module: m1
 order: 2
-duration: 210
+duration: 270
 level: base
 status: vigente
 updated: '2026-09-21'
@@ -218,6 +218,99 @@ ingenuas. El enroque, `O-O`, se escribe en UCI como el movimiento del rey, `e1g1
 un tablero real y no por expresiones regulares: solo el tablero sabe desde qué casilla vino el
 caballo de `Nf3`.
 
+Las dos funciones enteras, que son treinta líneas:
+
+```python title="src/rukh/data/uci.py"
+_COMMENT_RE = re.compile(r"\{[^}]*\}")
+_VARIATION_RE = re.compile(r"\([^()]*\)")
+_NAG_RE = re.compile(r"\$\d+")
+_MOVE_NUMBER_RE = re.compile(r"\b\d+\.(\.\.)?")
+_RESULT_RE = re.compile(r"(1-0|0-1|1/2-1/2|\*)\s*$")
+_ANNOTATION_RE = re.compile(r"[!?]+$")
+
+
+def clean_movetext(movetext: str) -> str:
+    """Quita comentarios, variantes, NAG, números de jugada y el resultado."""
+    text = _COMMENT_RE.sub(" ", movetext)
+    while _VARIATION_RE.search(text):  # las variantes anidan: una pasada no basta
+        text = _VARIATION_RE.sub(" ", text)
+    text = _NAG_RE.sub(" ", text)
+    text = _RESULT_RE.sub(" ", text.strip())
+    text = _MOVE_NUMBER_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
+def san_tokens(movetext: str) -> Iterator[str]:
+    """Los SAN jugables: limpios y sin las anotaciones `!` y `?`."""
+    for token in clean_movetext(movetext).split():
+        san = _ANNOTATION_RE.sub("", token)
+        if san:
+            yield san
+
+
+def san_to_uci(movetext: str) -> tuple[str, int] | None:
+    """Reproduce el SAN sobre un tablero; `None` en cuanto una jugada no es legal."""
+    import chess
+
+    board = chess.Board()
+    moves: list[str] = []
+    for san in san_tokens(movetext):
+        try:
+            move = board.parse_san(san)
+        except ValueError:
+            return None
+        moves.append(move.uci())
+        board.push(move)
+    return " ".join(moves), len(moves)
+```
+
+Tres detalles que no se ven al leer la descripción. El `while` de las variantes está porque los
+paréntesis **anidan** y una expresión regular no recursiva deja los de fuera. Las anotaciones se
+quitan aparte de la limpieza general porque `Nf3!` es una jugada legal con una opinión pegada, no
+una jugada distinta. Y `san_to_uci` devuelve `None` en vez de lanzar una excepción: esto corre
+dentro de un `Pool` de procesos y una excepción por partida corrupta se llevaría por delante el
+lote entero de veinte mil.
+
+El filtro de ≥ 20 plies, el que M0 dejó pendiente, se aplica aquí por la misma razón por la que no
+podía aplicarse allí: contar plies exige haber parseado el `movetext`.
+
+```python title="src/rukh/data/uci.py"
+def convert_rows(rows, min_plies: int, max_plies: int) -> dict[str, object]:
+    """Un lote de filas crudas a columnas de salida, con los conteos del manifiesto.
+
+    A nivel de módulo a propósito: `multiprocessing` con `spawn` —lo que usa Windows— solo puede
+    serializar una función que pueda importar por su nombre.
+    """
+    counts = {"rows": 0, "kept": 0, "illegal": 0, "short": 0, "long": 0}
+    for row in rows:
+        counts["rows"] += 1
+        result = str(row.get("Result"))
+        converted = san_to_uci(str(row.get("movetext", ""))) if result in RESULTS else None
+        if converted is None:
+            counts["illegal"] += 1
+            continue
+        uci, n_plies = converted
+        if n_plies < min_plies:
+            counts["short"] += 1
+            continue
+        if n_plies > max_plies:
+            counts["long"] += 1
+            continue
+        counts["kept"] += 1
+        ...  # se acumulan las columnas: game_id, uci, n_plies, los dos Elo, resultado, eco, mes
+    return {"columns": columns, "counts": counts}
+
+
+def game_id(site: str) -> int:
+    """Id estable de 64 bits: los primeros 8 bytes de `sha256(Site)`.
+
+    Estable entre procesos y entre versiones, que es lo que `hash()` de Python no es. M3 parte
+    entrenamiento y validación por este id, y un reparto que no se puede reproducir no es un
+    reparto.
+    """
+    return int.from_bytes(hashlib.sha256(site.encode()).digest()[:8], "little", signed=True)
+```
+
 ```bash title="Terminal"
 uv run rukh data uci
 ```
@@ -257,6 +350,99 @@ limpieza del `movetext` estaba rompiendo algo, no que los datos vinieran mal.
 </Exercise>
 
 ### Lab 3 · Las tres tokenizaciones y sus estadísticas
+
+Antes del comando, el vocabulario. La primera decisión de modelado del curso cabe en una
+enumeración que no mira ni un dato, y esa es justamente su gracia: dos implementaciones
+independientes —la de Python y la de TypeScript que corre en el navegador— producen la misma tabla
+sin compartir una línea de código, y por eso una fixture de paridad significa algo.
+
+```python title="src/rukh/tokenize/uci_vocab.py"
+FILES = "abcdefgh"
+SPECIALS = ["<pad>", "<bos>", "<eos>", "<mask>", "<unk>", "<1-0>", "<0-1>", "<1/2>"]
+ELO_MIN, ELO_MAX, ELO_STEP = 600, 3200, 100
+
+
+def squares() -> list[str]:
+    """Las 64 casillas en orden por columnas; `squares()[f * 8 + r]` es la columna f, fila r."""
+    return [f"{FILES[f]}{r + 1}" for f in range(8) for r in range(8)]
+
+
+def _reachable(df: int, dr: int) -> bool:
+    """¿Podrían una dama (línea o diagonal) o un caballo cubrir este desplazamiento?"""
+    if df == 0 and dr == 0:
+        return False
+    if df == 0 or dr == 0 or abs(df) == abs(dr):
+        return True
+    return {abs(df), abs(dr)} == {1, 2}
+
+
+def build_moves() -> list[str]:
+    """Las 1 792 cadenas `origendestino`, origen fuera y destino dentro, las dos por columnas."""
+    moves = []
+    for ff in range(8):
+        for fr in range(8):
+            for tf in range(8):
+                for tr in range(8):
+                    if _reachable(tf - ff, tr - fr):
+                        moves.append(f"{FILES[ff]}{fr + 1}{FILES[tf]}{tr + 1}")
+    return moves
+
+
+def build_promotions() -> list[str]:
+    """Las 176: fila 7 a 8 (blancas) y 2 a 1 (negras), desplazamiento de columna <= 1, 4 piezas."""
+    promotions = []
+    for from_rank, to_rank in ((7, 8), (2, 1)):
+        for ff in range(8):
+            for tf in range(8):
+                if abs(tf - ff) <= 1:
+                    for piece in "qrbn":
+                        promotions.append(f"{FILES[ff]}{from_rank}{FILES[tf]}{to_rank}{piece}")
+    return promotions
+
+
+def elo_tokens(side: str) -> list[str]:
+    """`<w0600>` ... `<w3200>` (o `b`): 27 tramos de 100 Elo."""
+    return [f"<{side}{elo:04d}>" for elo in range(ELO_MIN, ELO_MAX + 1, ELO_STEP)]
+
+
+def build_vocab() -> list[str]:
+    """La lista en orden de id: especiales, Elo blancas, Elo negras, jugadas, promociones."""
+    return SPECIALS + elo_tokens("w") + elo_tokens("b") + build_moves() + build_promotions()
+
+
+CONTROL_COUNT = len(SPECIALS) + 2 * len(elo_tokens("w"))  # 62
+```
+
+Ese `CONTROL_COUNT = 62` parece contabilidad y es una decisión de diseño con consecuencias en M3.
+Los tokens que **no** son jugadas son un prefijo del vocabulario por construcción, y solo por eso
+el enmascarado del encoder puede sortear una jugada aleatoria con un `randint(62, vocab_size)` en
+vez de sortear y rechazar hasta acertar.
+
+El truncado de `encode_game` es la otra decisión que el ejercicio 1 de esta página discute y que
+conviene ver escrita:
+
+```python title="src/rukh/tokenize/uci_vocab.py"
+    def encode_game(self, uci, white_elo, black_elo, result, max_len=200) -> list[int]:
+        if result not in RESULT_TOKENS:
+            raise ValueError(f"resultado desconocido {result!r}")
+        ids = [
+            self.bos_id,
+            self.vocab[elo_token(white_elo, "w")],
+            self.vocab[elo_token(black_elo, "b")],
+        ]
+        # Una jugada que no está en la tabla solo puede venir de texto corrupto: todas las jugadas
+        # legales del ajedrez están enumeradas. `<unk>` es la red que evita que una fila mala
+        # tumbe un entrenamiento.
+        ids.extend(self.vocab.get(move, self.unk_id) for move in uci.split())
+        ids.append(self.vocab[RESULT_TOKENS[result]])
+        ids.append(self.eos_id)
+        return ids[:max_len]  # corte seco: sin `<eos>` si no cabía
+```
+
+El corte es un `ids[:max_len]` a secas y es deliberado. Añadir un `<eos>` después del corte sería
+peor que no añadirlo: el modelo aprendería un final **falso**, una partida que «termina» en una
+posición que se seguía jugando. Una secuencia que no acaba no enseña nada sobre finales; una que
+acaba mal enseña algo equivocado.
 
 Ahora sí, la comparación. El mismo comando con tres esquemas y tres banderas: `--pack` escribe el
 flujo de tokens empaquetado de cada esquema en `data/tokens/<esquema>/` (lo que usa el lab 4),
@@ -370,34 +556,126 @@ Lo que salió medido, y por qué zanja la decisión:
 
 `tokenize --pack` ha dejado en `data/tokens/uci/train/` (enero) y `data/tokens/uci/val/`
 (febrero) tres ficheros por carpeta: `tokens.npy` (el flujo `uint16`), `starts.npy` (el offset de
-cada `<bos>`, `int64`) y `meta.json` (partidas, tokens, esquema y hash del vocabulario). `PackedDataset` es la clase que
-los convierte en ejemplos de entrenamiento, y merece la pena leerla entera porque es el contrato
-entre los datos y el modelo.
+cada `<bos>`, `int64`) y `meta.json` (partidas, tokens, esquema y hash del vocabulario).
 
-```python title="src/rukh/tokenize/loader.py (esquema)"
-class PackedDataset(Dataset):
-    def __init__(self, directory: Path, block: int = 200, start_at_game: bool = True):
-        self.tokens = np.load(directory / "tokens.npy", mmap_mode="r")  # nunca en RAM entero
-        self.starts = np.load(directory / "starts.npy")                 # un int64 por partida
+Quien los escribe es el empaquetador, y hay dos cosas suyas que conviene ver antes de leer el
+dataset:
+
+```python title="src/rukh/tokenize/pack.py"
+UNBOUNDED = 1 << 30  # el corte de 200 tokens es del loader, no del pack
+
+def pack_games(sources, encoder, out: Path) -> PackInfo:
+    """Codifica cada partida de `sources`, en orden, en `out/tokens.npy` y `starts.npy`."""
+    raw_path = out / "tokens.bin"
+    starts: list[int] = []
+    n_tokens = 0
+    with raw_path.open("wb") as raw:
+        for source in sources:
+            for batch in pq.ParquetFile(source.path).iter_batches(batch_size=20_000, columns=COLS):
+                buffer: list[int] = []
+                for uci, w_elo, b_elo, result in rows_of(batch):
+                    ids = encoder.encode_game(uci, int(w_elo), int(b_elo), result, UNBOUNDED)
+                    starts.append(n_tokens)
+                    n_tokens += len(ids)
+                    buffer.extend(ids)
+                raw.write(np.asarray(buffer, dtype=np.uint16).tobytes())
+    tokens = np.lib.format.open_memmap(out / "tokens.npy", mode="w+",
+                                       dtype=np.uint16, shape=(n_tokens,))
+    _copy_raw(raw_path, tokens, n_tokens)   # en trozos de 64 MiB
+    tokens.flush(); del tokens; raw_path.unlink()
+    # `starts` se escribe el último porque sus offsets son absolutos sobre la concatenación de
+    # todas las fuentes: no se pueden saber hasta que el flujo entero está en disco.
+    np.save(out / "starts.npy", np.asarray(starts, dtype=np.int64))
+    return PackInfo(n_games=len(starts), n_tokens=n_tokens, scheme=encoder.scheme,
+                    vocab_size=encoder.vocab_size(), vocab_hash=encoder.vocab_hash(),
+                    source="+".join(s.label() for s in sources))
+```
+
+Lo primero es el `UNBOUNDED`: el pack guarda las partidas **enteras**, y el corte a 200 tokens lo
+hace el loader. Así, cambiar la ventana de contexto más adelante no obliga a volver a tokenizar
+seis millones de partidas.
+
+Lo segundo es la memoria. Las partidas se leen por grupos de filas, los ids se van escribiendo a un
+fichero crudo, y solo cuando se sabe la longitud total se copia ese fichero al memmap `.npy` en
+trozos de 64 MiB. Ni las partidas ni el flujo completo están nunca en RAM a la vez, que es lo que
+permite empaquetar 1 681 millones de tokens en un ordenador de escritorio.
+
+Y el `vocab_hash` de `meta.json` no es documentación: es lo que permite que el bucle de M2 rechace
+un pack cuyo vocabulario no es el del modelo, en vez de entrenar tan contento sobre ids que
+significan otra cosa.
+
+`PackedDataset` es la clase que convierte esos ficheros en ejemplos de entrenamiento, y merece la
+pena leerla entera porque es el contrato entre los datos y el modelo.
+
+```python title="src/rukh/tokenize/loader.py"
+IGNORE_INDEX = 0
+"""`<pad>` es el id 0 en todos los esquemas, así que la pérdida usa `ignore_index=0`.
+
+Funciona aquí y **solo** aquí: el objetivo de un flujo empaquetado es el token siguiente, y
+`<pad>` nunca es un token siguiente legítimo. M3 no puede reutilizarlo."""
+
+
+class PackedDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
+    def __init__(self, directory: Path, block: int = 200, start_at_game: bool = True) -> None:
+        if block < 2:
+            raise ValueError("block tiene que ser al menos 2")
+        self.directory = Path(directory)
         self.block = block
+        self.start_at_game = start_at_game
+        self.info = read_pack_info(self.directory)   # meta.json: esquema, tamaño y hash
         self.pad_id = 0
+        self._open()
+
+    def _open(self) -> None:
+        """Mapea los dos arrays. Se llama al construir y otra vez en cada worker."""
+        self.tokens = np.load(self.directory / "tokens.npy", mmap_mode="r")
+        self.starts = np.load(self.directory / "starts.npy", mmap_mode="r")
+
+    def __getstate__(self) -> dict[str, object]:
+        """Le manda las rutas al worker, nunca los arrays."""
+        return {k: v for k, v in self.__dict__.items() if k not in ("tokens", "starts")}
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+        self._open()
 
     def __len__(self) -> int:
-        return len(self.starts)                          # un ejemplo por partida
+        if self.start_at_game:
+            return int(len(self.starts))             # un ejemplo por partida
+        return max(1, int(len(self.tokens)) // self.block) if len(self.tokens) else 0
 
     def window(self, index: int) -> np.ndarray:
-        origin = int(self.starts[index])                 # la ventana empieza en un <bos>
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        origin = int(self.starts[index]) if self.start_at_game else index * self.block
         chunk = np.asarray(self.tokens[origin : origin + self.block + 1], dtype=np.int64)
-        if len(chunk) < self.block + 1:                  # solo al final del flujo
-            chunk = np.concatenate([chunk, np.full(self.block + 1 - len(chunk), self.pad_id)])
+        if len(chunk) < self.block + 1:              # solo al final del flujo
+            chunk = np.concatenate(
+                [chunk, np.full(self.block + 1 - len(chunk), self.pad_id, dtype=np.int64)]
+            )
         return chunk
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         chunk = self.window(index)
         x = torch.from_numpy(chunk[: self.block].copy())
         y = torch.from_numpy(chunk[1 : self.block + 1].copy())
-        y[-1] = self.pad_id                              # la última posición no se entrena
+        y[-1] = self.pad_id                          # la última posición no se entrena
         return x, y
+
+
+def make_loader(dataset, batch_size, seed=0, workers=0, shuffle=True, drop_last=True):
+    """Un `DataLoader` cuyo orden lo decide por completo `seed`."""
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        num_workers=workers,
+        generator=generator,
+        persistent_workers=workers > 0,
+    )
 ```
 
 Léelo con calma, porque cada línea es una decisión de las que hablamos arriba:
@@ -405,6 +683,13 @@ Léelo con calma, porque cada línea es una decisión de las que hablamos arriba
 - `mmap_mode="r"` es el memmap: `tokens.npy` puede medir un GB y `np.load` no lo lee; mapea el
   fichero en el espacio de direcciones y el sistema operativo trae las páginas cuando se tocan. Con
   cuatro workers, los cuatro comparten las mismas páginas físicas.
+- `__getstate__` y `__setstate__` son el arreglo del callout «Los tokens no se copian; el índice
+  sí» de la parte anterior, y aquí se ven. El estado que viaja a un worker es el diccionario de la
+  instancia **sin** los dos arrays; al llegar, `__setstate__` vuelve a mapearlos desde los mismos
+  ficheros. 145 MB por worker pasan a medio kilobyte, y el `UnpicklingError` que cortaba la tubería
+  antes del primer paso desaparece. Fíjate en que `starts` también se abre con `mmap_mode="r"`: la
+  versión que fallaba lo cargaba con un `np.load` normal, y ese era exactamente el objeto que
+  crecía.
 - `__len__` es el número de partidas, no de tokens: un ejemplo por partida y época. Barajar es
   barajar índices de partida, y lo hace el `DataLoader` con su semilla. Con `start_at_game=False`
   el mismo dataset corta el flujo en bloques consecutivos sin alinear: es la alternativa
@@ -421,11 +706,13 @@ Léelo con calma, porque cada línea es una decisión de las que hablamos arriba
   esperan como índices. El `.copy()` es necesario porque un trozo de memmap es de solo lectura y
   `torch.from_numpy` quiere memoria escribible.
 
-`make_loader(dataset, batch_size, seed, workers)` envuelve el dataset en un `DataLoader` con
-`shuffle=True`, `drop_last=True` (el último lote incompleto se descarta para que todos los lotes
-tengan la misma forma) y un `torch.Generator` sembrado con `seed`, que es lo único que decide el
-orden. Dos loaders con la misma semilla devuelven los mismos lotes en el mismo orden: es lo que te
-permite reproducir un entrenamiento y lo que comprueba uno de los tests.
+De `make_loader` hay dos argumentos que no son valores por defecto casuales. `drop_last=True`
+descarta el último lote incompleto, y lo que gana no son las pocas ventanas que tira: gana que
+todos los lotes tengan la misma forma. Un lote corto cambia el tamaño efectivo de ese paso y, con
+`torch.compile`, dispara una recompilación para una forma que aparece una vez por época. Y el
+`torch.Generator` sembrado con `seed` es lo **único** que decide el orden: dos loaders con la misma
+semilla devuelven los mismos lotes en el mismo orden, que es la afirmación de reproducibilidad del
+proyecto y uno de los tests, no una esperanza.
 
 Guarda este script como `labs/m1/loader_check.py` en el repo `rukh` y ejecútalo desde su raíz. El
 `if __name__ == "__main__":` no es decorativo: en Windows los workers del `DataLoader` arrancan con
@@ -488,8 +775,147 @@ tirado a la basura.
 
 ### Lab 5 · Entrenar un BPE y mirar las fusiones
 
-El BPE que usa el esquema `bpe` se entrena con la librería `tokenizers` sobre 200 000 partidas UCI
-de enero. Lo interesante no es entrenarlo (es una llamada) sino mirar qué ha aprendido: la lista de
+Antes del BPE, el esquema que falta de los tres. El de carácter sobre SAN es el que menos sabe de
+ajedrez, y por eso su fichero es el más corto:
+
+```python title="src/rukh/tokenize/san_chars.py"
+ALPHABET = " #+-.0123456789=BKNOQRabcdefghx/"
+SPECIALS = ["<pad>", "<bos>", "<eos>"]
+
+
+class SanCharTokenizer:
+    """Codifica texto como `[<bos>, caracteres..., <eos>]`."""
+
+    def __init__(self) -> None:
+        self.ids = SPECIALS + list(ALPHABET)          # 3 + 32 = 35
+        self.vocab = {token: i for i, token in enumerate(self.ids)}
+
+    def encode(self, text: str) -> list[int]:
+        """Un carácter fuera del alfabeto **lanza**, no se convierte en `<unk>`."""
+        ids = [self.bos_id]
+        for ch in text:
+            try:
+                ids.append(self.vocab[ch])
+            except KeyError:
+                raise ValueError(f"el carácter {ch!r} no está en el alfabeto SAN") from None
+        ids.append(self.eos_id)
+        return ids
+
+
+def uci_to_san(uci: str) -> str:
+    """El movetext numerado (`1.e4 e5 2.Nf3 ...`) de una partida UCI separada por espacios.
+
+    El SAN hay que escribirlo **sobre el tablero al que pertenece**: la misma jugada es `Nf3` o
+    `Ngf3` según dónde esté el otro caballo, y eso solo lo sabe la posición de ese instante. Por
+    eso la partida se reproduce desde la inicial en vez de reconstruirse a base de cadenas, que es
+    la misma razón por la que `san_to_uci` va en el otro sentido a través de un tablero real.
+    """
+    board = chess.Board()
+    out = []
+    for token in uci.split():
+        move = chess.Move.from_uci(token)
+        if move not in board.legal_moves:
+            raise ValueError(f"jugada ilegal {token} en {board.fen()}")
+        san = board.san(move)
+        out.append(f"{board.fullmove_number}.{san}" if board.turn == chess.WHITE else san)
+        board.push(move)
+    return " ".join(out)
+```
+
+Fíjate en que un carácter desconocido **lanza** en vez de convertirse en `<unk>`. El alfabeto es
+cerrado por construcción, así que un carácter fuera de él significa que la reconstrucción del SAN
+está rota, y un `<unk>` silencioso escondería eso detrás de una pérdida un poco peor.
+
+Y este esquema no tiene tokens de Elo: no caben en un alfabeto de 32 símbolos. Es parte de la
+comparación y no un olvido —este esquema **no se puede condicionar** como M4 condiciona el UCI—, y
+es una de esas consecuencias de la elección de tokenizador que no se ven hasta tres módulos
+después.
+
+La teoría de la parte anterior decía que «conviene saber construirla a mano una vez». Son cuarenta
+líneas y aquí están, porque el algoritmo entero es esto y no hay nada más:
+
+```python title="src/rukh/tokenize/bpe.py"
+def learn_merges(texts: Iterable[str], n_merges: int) -> list[tuple[str, str]]:
+    """BPE, el algoritmo original, sobre un corpus de partidas UCI sin espacios.
+
+    Se empieza con cada carácter como token. Se cuenta cuántas veces aparece cada par de tokens
+    **adyacentes** en el corpus; el par más frecuente se fusiona en un token nuevo; se repite. La
+    lista de fusiones, **en orden**, es el modelo.
+    """
+    corpus: Counter[tuple[str, ...]] = Counter(tuple(text) for text in texts if text)
+    merges: list[tuple[str, str]] = []
+    for _ in range(n_merges):
+        pairs: Counter[tuple[str, str]] = Counter()
+        for word, count in corpus.items():
+            for left, right in zip(word, word[1:], strict=False):
+                pairs[(left, right)] += count
+        if not pairs:
+            break
+        best, best_count = pairs.most_common(1)[0]
+        if best_count < 2:  # ya no se repite nada: fusionar sería memorizar
+            break
+        merges.append(best)
+        corpus = Counter({_merge_word(word, best): count for word, count in corpus.items()})
+    return merges
+
+
+def apply_merges(text: str, merges: list[tuple[str, str]]) -> list[str]:
+    """Tokeniza aplicando las fusiones en el orden en que se aprendieron."""
+    ranks = {pair: rank for rank, pair in enumerate(merges)}
+    tokens = list(text)
+    while len(tokens) > 1:
+        candidates = [
+            (ranks[(a, b)], i)
+            for i, (a, b) in enumerate(zip(tokens, tokens[1:], strict=False))
+            if (a, b) in ranks
+        ]
+        if not candidates:
+            break
+        _, index = min(candidates)
+        tokens[index : index + 2] = [tokens[index] + tokens[index + 1]]
+    return tokens
+```
+
+El `min(candidates)` de `apply_merges` es el detalle que separa una implementación correcta de una
+que se le parece. El orden **es** el modelo: aplicar las fusiones como si fueran un conjunto —«une
+cualquier par que esté en la tabla»— da otra segmentación, y peor, porque dejaría correr una fusión
+tardía antes que la temprana sobre la que se construyó.
+
+Ejecútalo sobre unos miles de partidas y verás el resultado del lab reproducido en pequeño: las
+primeras fusiones son casillas, después jugadas, después trozos de apertura.
+
+El BPE que usa el esquema `bpe` de verdad se entrena con la librería `tokenizers` sobre 200 000
+partidas UCI de enero, porque su fichero es el que el gemelo de TypeScript sabe releer:
+
+```python title="src/rukh/tokenize/bpe.py"
+def train_bpe(texts, vocab_size: int = 4096, specials=None) -> Tokenizer:
+    """`WhitespaceSplit` mantiene separadas las partidas; sin normalizador ni prefijos.
+
+    Cada una de esas opciones sería algo que el gemelo del navegador tendría que reproducir, así
+    que no hay ninguna. Y los tokens especiales son los del UCI **con sus mismos ids**, que es lo
+    que permite que un pack de BPE comparta `<pad> = 0`, `<bos> = 1` y `<eos> = 2` con el resto.
+    """
+    tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
+    tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    trainer = trainers.BpeTrainer(
+        vocab_size=vocab_size,
+        special_tokens=list(UciTokenizer.specials if specials is None else specials),
+        show_progress=False,
+    )
+    tokenizer.train_from_iterator(texts, trainer)
+    return tokenizer
+
+
+def bpe_text(uci: str) -> str:
+    """El texto que ve BPE: las jugadas pegadas, sin espacios."""
+    return uci.replace(" ", "")
+```
+
+Ese `bpe_text` es lo que hace posible el hallazgo del lab. Con espacios, el pre-tokenizador cortaría
+por jugada y BPE nunca podría aprender una apertura; sin ellos, puede fusionar a través de las
+fronteras entre jugadas, que es justo de donde sale el token de cuarenta caracteres.
+
+Lo interesante no es entrenarlo (es una llamada) sino mirar qué ha aprendido: la lista de
 fusiones es una radiografía de la frecuencia de las aperturas en el recorte. Guarda este script como
 `labs/m1/bpe_merges.py` en el repo `rukh` y ejecútalo desde su raíz.
 
@@ -604,6 +1030,122 @@ encoder de M3 salen de `positions-eval.parquet` cruzado con `data/uci`; los pare
 única forma en que un modelo que lee secuencias puede usar un par definido por un FEN. `evals` es
 el paso caro y el único que merece la pena saltarse con `uv run rukh pull rukh-positions-eval`; los
 demás se regeneran en minutos, y cada uno deja un `manifest.json` con sus filtros, conteos y hashes.
+
+De esos seis comandos hay tres piezas que conviene leer, porque las tres son decisiones y no
+fontanería.
+
+**La clave con la que se cruza todo.** `fen4` son los cuatro primeros campos del FEN —piezas,
+turno, enroques, al paso— **sin los contadores de jugada**. Quitarlos es lo que hace que la misma
+posición alcanzada por dos partidas distintas colapse en una fila en vez de parecer dos, y es
+además la clave con la que Lichess publica sus evaluaciones, así que sin eso el join del paso
+siguiente no existiría.
+
+```python title="src/rukh/data/positions.py"
+def fen4(board) -> str:
+    """Los cuatro primeros campos, sin los contadores que `python-chess` formatearía."""
+    ep = chess.SQUARE_NAMES[board.ep_square] if board.has_legal_en_passant() else "-"
+    turn = "w" if board.turn else "b"
+    return f"{board.board_fen()} {turn} {board.castling_xfen()} {ep}"
+
+
+def phase(ply: int, n_pieces: int) -> str:
+    """`opening` hasta el ply 10, `middlegame` con 14 piezas o más, si no `endgame`."""
+    if ply <= OPENING_MAX_PLY:
+        return "opening"
+    return "middlegame" if n_pieces >= MIDDLEGAME_MIN_PIECES else "endgame"
+```
+
+`has_legal_en_passant()` y no `ep_square` a secas: la casilla al paso se escribe **solo cuando la
+captura es legal de verdad**, que es la convención de las evaluaciones publicadas. Un `fen4`
+construido de la forma obvia coincide con el de Lichess en casi todas las posiciones y discrepa
+justo en esas, el semi join se las salta en silencio y la cobertura sale unos puntos más baja sin
+que nada diga por qué.
+
+**El join que no descarga los 42 GB.** El callout «el join viaja a los datos» de la parte anterior
+es, en código, esto:
+
+```python title="src/rukh/data/evals.py"
+def fetch_part(cfg, index: int, positions: Path, out_dir: Path) -> tuple[Path, bool]:
+    """Cruza un fichero remoto con nuestras posiciones. `(ruta, descargado)`."""
+    target = part_path(out_dir, index)
+    if target.is_file():
+        return target, False          # una parte ya escrita no se vuelve a pedir
+    tmp = target.with_suffix(".parquet.tmp")
+    con.execute(
+        f"""
+        COPY (
+          SELECT e.fen, e.line, e.depth, e.knodes, e.cp, e.mate
+          FROM read_parquet('{source_for(cfg, index)}') e
+          SEMI JOIN read_parquet('{positions.as_posix()}') p ON e.fen = p.fen4
+        ) TO '{tmp.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """
+    )
+    tmp.replace(target)               # renombrar al final: si existe, es que terminó
+    return target, True
+```
+
+El motor lee solo la columna `fen` de cada grupo de filas, decide cuáles pueden contener una
+coincidencia y se trae únicamente esas. Y fíjate en las dos líneas que hacen que sea reanudable:
+una parte que ya está no se vuelve a pedir, y la escritura va a un `.tmp` que se renombra al
+terminar, de modo que una corrida interrumpida nunca confunde medio fichero con uno hecho. Cuarenta
+y dos gigas por la red es algo que se deja corriendo entre sesiones.
+
+**Los pares, que salen gratis de las líneas múltiples.** Para cada posición con dos líneas o más,
+la primera jugada de la mejor línea es la elegida y la primera de una línea peor en al menos 100
+centipeones es la rechazada:
+
+```python title="src/rukh/data/pairs.py"
+def make_pair(fen: str, pvs, min_delta_cp: int) -> dict | None:
+    """Un par para un FEN, o `None` si ninguna línea es lo bastante peor —o alguna es ilegal."""
+    scored = rank_lines(fen, pvs)               # ordenadas por `scoring.py`, la mejor primera
+    if len(scored) < 2:
+        return None
+    chosen, cp_chosen, best_mover = scored[0]
+    rejected = None
+    for move, white, mover in scored[1:]:
+        # Desde el lado del que mueve: `best_mover - mover` es lo que esa línea regala.
+        if move != chosen and best_mover - mover >= min_delta_cp:
+            rejected = (move, white, mover)
+            break
+    if rejected is None:
+        return None
+    board = chess.Board(f"{fen} 0 1")           # los contadores se rellenan solo para parsear
+    legal = {m.uci() for m in board.legal_moves}
+    if chosen not in legal or rejected[0] not in legal:
+        return None
+    return {"fen": fen, "chosen": chosen, "rejected": rejected[0],
+            "cp_chosen": cp_chosen, "cp_rejected": rejected[1]}
+```
+
+Tres cosas de ahí. El margen se mide **desde el bando que mueve**, y para las negras un `cp` más
+bajo es mejor: equivocarse en eso construye un conjunto en el que todos los pares negros prefieren
+la jugada peor, y la pérdida de DPO lo aprende tan contenta. Las dos jugadas se comprueban legales
+aunque vengan del análisis de un motor, porque la comprobación cuesta microsegundos y su modo de
+fallo es entrenar sobre jugadas imposibles. Y el orden de las líneas viene de un módulo aparte:
+
+```python title="src/rukh/data/scoring.py"
+def score_white(cp: int | None, mate: int | None) -> int | None:
+    """Centipeones desde las blancas; un mate en `n` vale `±(10000 - n)`."""
+    if mate is not None:
+        return MATE_SCORE - mate if mate > 0 else -MATE_SCORE - mate
+    return None if cp is None else int(cp)
+
+
+def line_rank_key(cp, mate, depth, move: str, turn: str):
+    """Clave de orden ascendente: la mejor línea va primera."""
+    sign = mover_sign(turn)
+    white = score_white(cp, mate)
+    if white is None:
+        raise ValueError("una línea sin cp y sin mate no se puede ordenar")
+    mates_for_mover = mate is not None and sign * mate > 0
+    return (not mates_for_mover, -(depth if depth is not None else -1), -sign * white, move)
+```
+
+Cincuenta líneas, y son la razón de que tres conjuntos construidos en tres momentos distintos
+puedan ponerse en la misma tabla. El último término de la clave, la cadena de la jugada, no es
+decoración: sin un orden **total**, dos ejecuciones sobre el mismo fichero pueden elegir «mejor
+línea» distinta cada vez que dos empatan, y un conjunto que no se puede reproducir no es un
+conjunto.
 
 <Exercise n="06" title="Lee un manifiesto antes de fiarte del fichero">
   Abre `data/pairs/manifest.json` y compara `counts.candidates` con la suma de las tres fases. ¿Por

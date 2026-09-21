@@ -6,7 +6,7 @@ description:
   colección regeneradas desde la tabla, la arena y los puzles en la demo, y el cierre de la fase.'
 module: m6
 order: 3
-duration: 150
+duration: 165
 level: medio
 status: vigente
 updated: '2026-09-21'
@@ -215,6 +215,69 @@ dejó anotado) se retiran con `rukh eval drop`, y la tabla que queda es la de la
   no por nevera: que caduque la leche no obliga a tirar el arroz. Antes de M6 la clave era una sola
   y cualquiera de los dos cambios volvía a jugarlo todo; con doce etapas, eso era una tarde.
 </Solution>
+
+#### Lo que escribe una evaluación, y por qué está partido en dos
+
+Una tirada deja dos ficheros por etapa y ninguno de los dos se escribe a mano:
+`artifacts/eval/<stage>/results.json`, que es la medición completa con todas sus partidas y sus
+conteos, y `report.md`, que es la lectura para personas. De los dos sale la fila de
+`artifacts/web/results.json` que llega a la tabla de esta web.
+
+```python title="src/rukh/eval/report.py"
+class StageResult(BaseModel):
+    """Una fila de la tabla única. Los `None` son un valor, no un hueco que rellenar."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: str
+    suite: str
+    checkpoint: str
+    weights_sha256: str
+    """El hash de **los pesos solos**, no el del fichero. El `.pt` que sube al Hub no es byte a
+    byte el que se entrenó —se le quita el estado del optimizador—, así que un hash de fichero
+    diría que son dos modelos distintos y un lector no podría comprobar nada."""
+    parameters: int
+    sampling: dict[str, object]
+    """Con qué temperatura y `top_k` se midió. Un Elo es del **par** modelo y muestreo, así que una
+    fila sin esto no se puede comparar con ninguna otra."""
+    date: str
+    legality_argmax: float | None = None
+    legality_sampled: float | None = None
+    top1: float | None = None
+    top3: float | None = None
+    puzzles: float | None = None
+    elo: float | None = None
+    elo_ci: tuple[float, float] | None = None
+    notes: list[str] = []
+    """Lo que un número necesita para leerse: cuántas partidas se cortaron por contexto, cuántas
+    se adjudicaron, si los peldaños bajos son anclas nominales."""
+```
+
+Que `results.json` y `report.md` salgan del mismo objeto y no uno del otro es lo que impide la
+divergencia clásica: un informe que dice una cosa y una tabla que dice otra porque alguien copió
+un número a mano. Y que los campos que no se midieron sean `None` y no `0.0` es la misma regla de
+M3 con el `-100`: un cero es un valor y entra en la media; un hueco explícito es información.
+
+```python title="src/rukh/publish/cards.py"
+def card_for(result: StageResult, template: str) -> str:
+    """La model card, generada desde `results.json` y `run.json`. Nunca escrita a mano.
+
+    Una card no es documentación: es la **afirmación pública** de qué se publicó y qué se midió, y
+    su prueba es si otra persona puede contradecirla con lo que hay dentro. Generarla desde los
+    ficheros de la medición es lo que garantiza que la afirmación y la medición no se separen.
+    """
+    return Template(template).render(
+        stage=result.stage,
+        checkpoint=result.checkpoint,
+        weights_sha256=result.weights_sha256,
+        sampling=result.sampling,
+        date=result.date,
+        # `n/a` explícito, nunca un número prestado: publicar un adaptador con el Elo de su modelo
+        # base sería publicar el número de otro, y hay un test de eso.
+        metrics={k: ("n/a" if v is None else v) for k, v in result.headline().items()},
+        notes=result.notes,
+    )
+```
 
 ### Lab 3 · Lo que cuesta el int8, en Elo
 

@@ -7,7 +7,7 @@ description:
   la recompensa a propósito.'
 module: m5
 order: 3
-duration: 180
+duration: 205
 level: medio
 status: vigente
 updated: '2026-09-21'
@@ -140,6 +140,75 @@ del flag todo lo demás.
 uv run rukh data onpolicy --config configs/data/onpolicy.yaml --max-positions 500
 ```
 
+Tres funciones, y las tres son la parte del experimento que se puede hacer injusta sin darse
+cuenta:
+
+```python title="src/rukh/data/onpolicy.py"
+def score_move(engine, board, move, depth: int) -> int:
+    """Centipeones **para el bando que juega `move`**, después de jugarla.
+
+    Al motor se le pregunta por la posición a la que lleva la jugada, donde mueve el *rival*, así
+    que la puntuación vuelve desde el punto de vista del rival y hay que darle la vuelta.
+    Equivocarse aquí construye un conjunto que prefiere la peor candidata de cada grupo, y la
+    pérdida de DPO lo aprende sin quejarse.
+    """
+    board.push(move)
+    try:
+        info = engine.analyse(board, chess.engine.Limit(depth=depth))
+        return int(info["score"].pov(not board.turn).score(mate_score=MATE_SCORE))
+    finally:
+        board.pop()
+
+
+def sample_candidates(model, tok, board, history, count, temperature, top_k):
+    """Jugadas legales distintas que el modelo propone aquí, de su propia distribución.
+
+    Las propuestas ilegales se **descartan, no se rescatan**: un par on-policy va de ordenar las
+    jugadas que el modelo *jugaría*, y la demo enmascara las ilegales antes de que lleguen al
+    tablero. Cuántas veces propone una es otra medida, y la suite ya la hace.
+    """
+    cfg = SampleConfig(temperature=temperature, top_k=top_k, mask_illegal=False)
+    generator = model_generator(model, cfg)
+    seen: dict[str, chess.Move] = {}
+    for _ in range(count * 4):   # se sortea de más: los duplicados son el caso común
+        move, _ = pick_move(model, tok, board, history, cfg, generator)
+        if move is not None and move in board.legal_moves:
+            seen.setdefault(move.uci(), move)
+        if len(seen) >= count:
+            break
+    return list(seen.values())
+
+
+def make_pair(engine, board, moves, depth, min_delta_cp) -> dict | None:
+    """Puntuar las candidatas y quedarse con los extremos, si están lo bastante lejos."""
+    if len(moves) < 2:
+        return None
+    scored = sorted(
+        ((score_move(engine, board, move, depth), move) for move in moves), reverse=True
+    )
+    (cp_chosen, chosen), (cp_rejected, rejected) = scored[0], scored[-1]
+    if cp_chosen - cp_rejected < min_delta_cp:
+        return None
+    return {"chosen": chosen.uci(), "rejected": rejected.uci(),
+            "cp_chosen": cp_chosen, "cp_rejected": cp_rejected, "candidates": len(moves)}
+```
+
+Ese `for _ in range(count * 4)` es el ejercicio de abajo escrito en el código: se sortea cuatro
+veces más de lo que hace falta porque los duplicados son el caso común y no la excepción, que es
+justamente la razón de la temperatura 1,0.
+
+Y los dos `return None` son los dos motivos distintos por los que una posición no da par. Menos de
+dos jugadas distintas es **falta de diversidad**; una diferencia por debajo del margen es **falta de
+desacuerdo**, y no es un fallo: es el modelo diciendo que todo lo que estaba considerando ahí era
+más o menos igual de bueno. Fabricar una preferencia con eso sería enseñarle ruido, y tiene la
+misma forma que el grupo plano de GRPO.
+
+El motor va limitado por **profundidad y no por tiempo**, por lo que M6 midió: un Stockfish
+limitado por reloj hace irreproducible la medición, y un conjunto de datos es una cosa que debería
+poder reconstruirse. Y las posiciones son **las mismas** que usan los pares off-policy: mismos
+prefijos, mismo equilibrio por fase, mismas partidas. Lo único que cambia entre los dos conjuntos
+es de dónde salieron las dos jugadas, que es el motivo entero de correr los dos.
+
 <Exercise>
   Mira el `manifest.json` que escribe. ¿Qué fracción de posiciones no produjo par, y por qué dos
   razones distintas? Luego baja `temperature` a 0,3 —la temperatura a la que se leen todos los
@@ -232,6 +301,77 @@ pares fuera de política. Cuatro minutos, desde cero: la parte 2 midió que part
 ```bash title="Terminal"
 uv run rukh train reward --config configs/train/rm.yaml
 ```
+
+El bucle es corto, y lo que añade sobre la pérdida de la parte 1 son dos cosas: la traducción de
+«(prefijo, jugada)» a **la posición a la que lleva la jugada**, que es lo que lee el encoder de M3,
+y un reparto que no miente.
+
+```python title="src/rukh/train/reward.py"
+def position_after(prefix: str, move_uci: str) -> tuple[str, bool] | None:
+    """El FEN después de jugar `move_uci` sobre `prefix`, y si quien movió fue el blanco.
+
+    `None` cuando el prefijo o la jugada no se pueden jugar. Un reward model pregunta por la
+    **consecuencia** de una jugada, así que aquí es donde un par deja de ser dos cadenas y pasa a
+    ser dos tableros.
+    """
+    board = chess.Board()
+    for uci in prefix.split():
+        move = chess.Move.from_uci(uci)
+        if move not in board.legal_moves:
+            return None
+        board.push(move)
+    white_moved = board.turn == chess.WHITE
+    move = chess.Move.from_uci(move_uci)
+    if move not in board.legal_moves:
+        return None
+    board.push(move)
+    return board.fen(), white_moved
+
+
+def margins(model, chosen, rejected, sign, point_of_view: str):
+    """`r(chosen) - r(rejected)`, orientado para que positivo signifique «ganó la preferida».
+
+    Con `point_of_view="white"` el modelo contesta siempre la pregunta de las blancas y el giro
+    vive aquí, en una constante que la pérdida conoce. Con `"mover"` el modelo tiene que deducir
+    del tablero quién acaba de mover y contestar por él, y el signo es siempre +1. Son dos tareas
+    distintas, y la corrida dice cuál entrenó.
+    """
+    difference = model(chosen) - model(rejected)
+    return difference * sign if point_of_view == "white" else difference
+```
+
+El reparto va **por partida y no por par**, con la misma función pura de M3: dos pares de la misma
+partida son dos jugadas separadas por unos pocos plies en la misma posición, así que un modelo que
+memorizó uno tiene casi todo el otro.
+
+Y la razón de que este módulo publique un **desglose por bandas** en vez de un número:
+
+```python title="src/rukh/train/reward.py"
+MATE_GAP = 2000.0
+"""Por encima de esto el par lleva una puntuación de mate, que no es una diferencia que una
+función de evaluación pueda leer."""
+
+BANDS = ((100, 200, "100-200"), (200, 400, "200-400"), (400, 800, "400-800"),
+         (800, MATE_GAP, "800-2000"), (MATE_GAP, float("inf"), "mate"))
+
+
+def band_accuracy(scored, deltas) -> list[RewardBand]:
+    """Acierto según cuánto separó el motor las dos jugadas, con una banda de mate aparte."""
+    margin = np.asarray(scored, dtype=float)
+    gap = np.asarray(deltas, dtype=float)
+    rows = []
+    for low, high, label in BANDS:
+        mask = (gap >= low) & (gap < high)
+        if mask.any():
+            rows.append(RewardBand(band=label, pairs=int(mask.sum()),
+                                   accuracy=float((margin[mask] > 0).mean())))
+    return rows
+```
+
+La banda de mate va separada porque una diferencia de ±10 000 no es una diferencia que una
+evaluación pueda leer: meterla dentro de «800+» halagaría a la banda alta con pares que no son
+evaluaciones. Y el acierto es `margin > 0` y no `>= 0`: un empate cuenta como **fallo**, porque un
+modelo que puntúa dos jugadas exactamente igual no ha expresado ninguna preferencia.
 
 Hay dos corridas de referencia y conviene saber cuál es cuál. La que está en el Hub como
 `chorcat/rukh-rm` es `rm-20260920-223655`, la repetición con la semilla 42 de la config publicada

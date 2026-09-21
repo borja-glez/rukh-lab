@@ -6,7 +6,7 @@ description:
   peft, cuántas partidas harían falta, estilo con adaptadores, Qwen3 con QLoRA y publicar.'
 module: m4
 order: 3
-duration: 150
+duration: 175
 level: medio
 status: vigente
 updated: '2026-09-21'
@@ -190,6 +190,60 @@ elo_bins:
   la fuente (quince partidas de 1200 contra cinco de 2000 dan cinco y cinco); las bandas fuera
   del rango se descartan; el ancho de banda aparece en la fórmula que publica el manifiesto.
 
+El muestreo entero es una consulta, y las tres partes que la componen son las tres decisiones:
+
+```python title="src/rukh/data/elo_bins.py"
+def bin_expression(bin_width: int) -> str:
+    """`bin = media(white_elo, black_elo) // ancho * ancho`."""
+    return f"((white_elo + black_elo) // 2) // {bin_width} * {bin_width}"
+
+
+def sample_bins(sources, target, n_per_bin, seed, bin_width=100, min_bin=None, max_bin=None):
+    """Quedarse con `n_per_bin` partidas de cada banda, elegidas por un hash."""
+    files = ", ".join(f"'{p.as_posix()}'" for p in sources)
+    con.execute(
+        f"""
+        COPY (
+          SELECT * EXCLUDE (rk)
+          FROM (
+            SELECT *,
+                   -- La semilla desplaza el **hash**, no el id: `hash(game_id + seed)`
+                   -- desbordaba BIGINT con los ids del extremo alto del rango.
+                   row_number() OVER (PARTITION BY bin ORDER BY hash(game_id) + {seed}) AS rk
+            FROM (
+              SELECT *, {bin_expression(bin_width)} AS bin
+              FROM read_parquet([{files}], hive_partitioning = false, union_by_name = true)
+            )
+            WHERE {band_filter}
+          )
+          WHERE rk <= {int(n_per_bin)}
+          ORDER BY bin, rk
+        ) TO '{target.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """
+    )
+    rows = con.execute(
+        f"SELECT bin, count(*) FROM read_parquet('{target.as_posix()}') GROUP BY bin ORDER BY bin"
+    ).fetchall()
+    # Contado de lo que se escribió, no de lo que se pidió: es lo que permite que el manifiesto
+    # diga que una banda se quedó corta en vez de dar a entender que todas están llenas.
+    return {str(int(b)): int(n) for b, n in rows}
+```
+
+El `// ancho * ancho` es truncar, no redondear: la misma convención que `elo_bin` en el
+tokenizador, así que una media de 1899 cae en la banda de 1800. Dos redondeos distintos entre el
+corpus y el token de cabecera pondrían una partida en una banda y la etiquetarían con otra, y nada
+lo diría.
+
+`read_parquet([...])` con una **lista** de ficheros es lo que permite que las dos mitades del eje
+vivan en directorios separados y se junten solo aquí, en el único paso cuyo trabajo es enseñar qué
+significa una cabecera. Y `union_by_name = true` está por si los dos corpus se convirtieron con
+versiones distintas del paso `uci` y el orden de las columnas no coincide: unir por posición en ese
+caso da un parquet en el que el Elo de las negras está en la columna del resultado.
+
+Y el conteo final es lo que hace honesta la tabla de la parte anterior: 150 000 partidas en cada
+banda de 1000 a 2200, **146 232** en la de 2400 y **23 191** en la de 2600. El corpus queda plano
+donde puede y se estrecha donde se estrecha el mundo, y el manifiesto lo dice en vez de rellenarlo.
+
 Y el afinado necesita algo que el bucle no tenía: empezar desde unos pesos **sin** heredar el estado
 del optimizador. `--resume` existe para continuar una corrida interrumpida y restaura los momentos
 de Adam, el contador de pasos, el RNG y hasta el run de MLflow; un afinado quiere exactamente lo
@@ -198,9 +252,43 @@ de un coseno de 48 000 pasos ya decaído pelearían contra el warmup que empieza
 volver del café: la mesa está como la dejaste, con las notas de Adam, el contador de pasos y el run
 abierto. `init_from` es empezar en otra empresa: te llevas lo que sabes y nada más.
 
-```python title="src/rukh/train/loop.py"
-initialised_from = load_init_weights(cfg.init_from, model, where)
+```python title="src/rukh/train/checkpoint.py"
+def load_init_weights(init_from: str | None, model: nn.Module, where: torch.device) -> str | None:
+    """Carga **solo los pesos** de `init_from`: donde empieza un afinado.
+
+    Del checkpoint se lee `model_state` y nada más. El optimizador, el contador de pasos y el run
+    de MLflow se ignoran a propósito: esto es donde empieza un afinado, no donde se quedó una
+    corrida.
+    """
+    if init_from is None:
+        return None
+    path = resolve_run(paths.resolve(init_from))
+    if not path.is_file():
+        raise FileNotFoundError(f"checkpoint de init_from no encontrado: {path}")
+    payload = load_checkpoint(path, map_location=where)
+    load_state(model, payload["model_state"])
+    log.info("inicializado desde %s (paso %s), optimizador nuevo", path, payload.get("step", "?"))
+    return path.as_posix()
 ```
+
+```python title="src/rukh/train/loop.py"
+model = MoveDecoder(model_cfg).to(where)
+if resume is not None and cfg.init_from is not None:
+    raise ValueError("--resume continúa una corrida; init_from empieza una: elige")
+# Los pesos se cargan **antes** de poner los adaptadores, porque el checkpoint conoce los nombres
+# de módulo de un decoder normal y envolver los renombra.
+initialised_from = load_init_weights(cfg.init_from, model, where)
+if cfg.lora is not None:
+    if resume is not None:
+        raise ValueError(
+            "--resume no puede continuar una corrida de LoRA: sus checkpoints llevan los pesos "
+            "fundidos, que ya no dicen dónde acababa el adaptador. Vuelve a empezar con init_from."
+        )
+    apply_lora(model, cfg.lora)
+```
+
+El orden de esas tres cosas —cargar, comprobar la contradicción, envolver— no es casual, y las dos
+excepciones están ahí porque las dos combinaciones parecen razonables hasta que se piensan.
 
 - Tests: `init_from` toma los pesos y deja el optimizador a cero, con su propia carpeta, su
   propio contador y su propio run; con `lr = 0` el afinado _es_ el checkpoint del que partió;
@@ -226,12 +314,83 @@ minutos.
 
 ```python title="src/rukh/models/lora.py"
 class LoRALinear(nn.Module):
+    """Un `nn.Linear` congelado más una corrección de rango bajo por cada rodaja adaptada."""
+
+    def __init__(self, base: nn.Linear, r: int, alpha: int, dropout: float, slices) -> None:
+        super().__init__()
+        if not slices:
+            raise ValueError("un LoRALinear necesita al menos una rodaja de salida")
+        self.base = base
+        self.base.weight.requires_grad_(False)
+        if self.base.bias is not None:
+            self.base.bias.requires_grad_(False)
+        self.r = r
+        self.scale = alpha / r
+        self.slices = tuple(slices)
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        # Se construyen **donde ya vive el peso que corrigen**. `apply_lora` corre *después* de
+        # mover el modelo al dispositivo (el bucle carga el checkpoint primero, y cargar necesita
+        # los nombres de módulo de un decoder normal), así que un factor creado en CPU por defecto
+        # se encontraría una activación de CUDA en la primera pasada. Todos los tests de este
+        # fichero corren en CPU, que es donde el fallo es invisible.
+        where = {"device": base.weight.device, "dtype": base.weight.dtype}
+        self.a = nn.ParameterList(
+            nn.Parameter(torch.empty(r, base.in_features, **where)) for _ in range(len(self.slices))
+        )
+        # `B` arranca en **cero exacto**: el modelo adaptado *es* el modelo base en el paso 0.
+        self.b = nn.ParameterList(
+            nn.Parameter(torch.zeros(stop - start, r, **where)) for start, stop in self.slices
+        )
+        for a in self.a:
+            nn.init.kaiming_uniform_(a, a=math.sqrt(5))
+
     def forward(self, x):
         out = self.base(x)
         delta = out.new_zeros(out.shape)
         for (start, stop), a, b in zip(self.slices, self.a, self.b, strict=True):
             delta[..., start:stop] = F.linear(F.linear(self.drop(x), a), b)
         return out + self.scale * delta
+
+    @torch.no_grad()
+    def merged_weight(self):
+        """`W + (alpha / r) B A`, cada corrección escrita en su propia rodaja de salida."""
+        weight = self.base.weight.detach().clone()
+        for (start, stop), a, b in zip(self.slices, self.a, self.b, strict=True):
+            weight[start:stop] += self.scale * (b @ a).to(weight.dtype)
+        return weight
+```
+
+Y el que pone los adaptadores, que es donde se decide qué **no** se entrena:
+
+```python title="src/rukh/models/lora.py"
+def apply_lora(model: nn.Module, cfg: LoraConfig) -> int:
+    """Congela `model`, envuelve las matrices configuradas y devuelve los parámetros entrenables.
+
+    Todo lo que está fuera de los adaptadores se congela, **incluidos los embeddings y la norma
+    final**: una corrida de LoRA que además entrene la tabla de embeddings no es una corrida de
+    LoRA, y el número que devuelve esta función dejaría de significar lo que dice.
+    """
+    cfg.check()
+    for param in model.parameters():
+        param.requires_grad_(False)
+    plan = _target_slices(cfg, model.cfg.d_model, model.cfg.ff)
+    for block in model.blocks:
+        for module_name, slices in plan.items():
+            base = _get_module(block, module_name)
+            if not isinstance(base, nn.Linear):
+                raise TypeError(f"{module_name} es un {type(base).__name__}, no nn.Linear")
+            _set_module(block, module_name, LoRALinear(base, cfg.r, cfg.alpha, cfg.dropout, slices))
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def _target_slices(cfg: LoraConfig, d_model: int, ff: int):
+    """Agrupa los objetivos por el módulo en el que viven, como rangos de salida suyos."""
+    by_module: dict[str, list[tuple[int, int]]] = {}
+    for name in cfg.targets:
+        module_name, lo, hi = TARGETS[name]
+        width = ff if module_name == "mlp.fc" else d_model
+        by_module.setdefault(module_name, []).append((lo * width, hi * width))
+    return {name: tuple(sorted(ranges)) for name, ranges in by_module.items()}
 ```
 
 Los tests son la parte interesante, porque cada uno comprueba una afirmación distinta del método:
@@ -258,6 +417,43 @@ de corrida no puede dejar el modelo incapaz de dar otro paso. Por eso existe `me
 que hace el plegado sobre una copia de los números y deja los envoltorios en su sitio. Lo que sale
 tiene los nombres de módulo de un `MoveDecoder` normal, que es lo que esperan el cargador, el
 exportador y el publicador.
+
+```python title="src/rukh/models/lora.py"
+@torch.no_grad()
+def merge_lora(model: nn.Module) -> int:
+    """Pliega cada adaptador en el peso que corrige y devuelve el `nn.Linear` a su sitio.
+
+    Después de esto el modelo es indistinguible de uno afinado entero: mismos nombres de módulo,
+    mismo state dict, mismo grafo ONNX. Esa es la propiedad que permite publicar un adaptador de
+    1,6 MB y aun así exportarlo, cuantizarlo y servirlo como cualquier otro modelo.
+    """
+    merged = 0
+    for name, adapter in list(lora_modules(model)):
+        base = adapter.base
+        base.weight.copy_(adapter.merged_weight())
+        base.weight.requires_grad_(True)
+        _set_module(model, name, base)
+        merged += 1
+    return merged
+
+
+@torch.no_grad()
+def merged_state_dict(model: nn.Module) -> dict[str, Tensor]:
+    """El state dict que el modelo *tendría* si se plegaran los adaptadores, sin plegarlos."""
+    adapters = dict(lora_modules(model))
+    merged: dict[str, Tensor] = {}
+    for name, tensor in model.state_dict().items():
+        owner, _, leaf = name.rpartition(".")
+        base_owner, _, base_leaf = owner.rpartition(".")
+        if base_leaf == "base" and base_owner in adapters:
+            value = adapters[base_owner].merged_weight() if leaf == "weight" else tensor
+            merged[f"{base_owner}.{leaf}"] = value.detach().cpu()
+            continue
+        if any(name.startswith(f"{p}.{f}.") for p in adapters for f in ("a", "b")):
+            continue  # los factores del adaptador viven en su propio fichero, no aquí
+        merged[name] = tensor.detach().cpu()
+    return merged
+```
 
 ```bash title="Terminal"
 uv run pytest -m unit -q tests/unit/test_lora.py

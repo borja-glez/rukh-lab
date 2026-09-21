@@ -6,7 +6,7 @@ description:
   el afinado por etapas, la curva por número de etiquetas y las dos representaciones de una posición.'
 module: m3
 order: 1
-duration: 120
+duration: 150
 level: base
 status: vigente
 updated: '2026-09-21'
@@ -326,18 +326,113 @@ que no debería existir, y envenena tanto el entrenamiento como la evaluación. 
 una clase calculada por pupitres en vez de por alumnos: los pupitres vacíos cuentan como un cero, y
 la media de los mismos veinte alumnos cambia según el aula que les toque.
 
-En el código, `pool` lee la máscara del propio `idx` cuando no se la pasan:
+En el código, `pool` lee la máscara del propio `idx` cuando no se la pasan. Y aquí está el fichero
+entero, que es el del decoder con el booleano cambiado y tres funciones más:
 
-```python
-mask = self.padding_mask(idx) if attention_mask is None else attention_mask.bool()
-weights = mask.unsqueeze(-1).to(hidden.dtype)
-return (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
+```python title="src/rukh/models/encoder.py"
+PAD_ID = 0
+
+MMM_IGNORE_INDEX = -100
+"""La etiqueta de una posición que la pérdida de MMM tiene que saltarse. **No** el 0 del decoder."""
+
+
+class PositionEncoder(nn.Module):
+    """Encoder bidireccional: `forward` devuelve los estados ocultos `(B, T, d)`."""
+
+    def __init__(self, cfg: EncoderConfig | None = None) -> None:
+        super().__init__()
+        self.cfg = cfg or EncoderConfig()
+        self.tokens = nn.Embedding(self.cfg.tokens, self.cfg.d_model)
+        self.positions = (
+            nn.Embedding(self.cfg.seq, self.cfg.d_model) if self.cfg.pos == "learned" else None
+        )
+        self.drop = nn.Dropout(self.cfg.dropout)
+        self.blocks = nn.ModuleList(
+            layers.Block(self.cfg.d_model, self.cfg.n_head, self.cfg.ff,
+                         self.cfg.dropout, causal=False)     # <- la línea que lo cambia todo
+            for _ in range(self.cfg.n_layer)
+        )
+        self.ln_f = nn.LayerNorm(self.cfg.d_model)
+        self.mlm_head = nn.Linear(self.cfg.d_model, self.cfg.tokens, bias=False)
+        if self.cfg.tie_embeddings and self.cfg.input == "moves":
+            # Solo en `moves`: ahí el embedding y la cabeza describen las mismas 2 030 jugadas.
+            # Con 47 tokens de casillas no compensa y el código no lo hace.
+            self.mlm_head.weight = self.tokens.weight
+        self.apply(layers.init_weights)
+        scale = 0.02 / math.sqrt(2 * self.cfg.n_layer)
+        for name, param in self.named_parameters():
+            if name.endswith("proj.weight"):
+                nn.init.normal_(param, mean=0.0, std=scale)
+
+    @staticmethod
+    def padding_mask(idx):
+        """`True` donde `idx` es un token real, `False` en `<pad>`; forma `(B, T)`."""
+        return idx != PAD_ID
+
+    @staticmethod
+    def _key_mask(attention_mask):
+        """`(B, T)` a la máscara de claves booleana `(B, 1, 1, T)` que espera SDPA."""
+        if attention_mask is None:
+            return None
+        mask = attention_mask.bool()
+        if mask.dim() != 2:
+            raise ValueError(f"attention_mask tiene que ser (B, T), era {tuple(mask.shape)}")
+        if not _tracing() and not bool(mask.any(dim=-1).all()):
+            raise ValueError("cada secuencia necesita al menos un token sin enmascarar")
+        return mask[:, None, None, :]
+
+    def forward(self, idx, attention_mask=None):
+        seq = idx.shape[-1]
+        if seq > self.cfg.seq:
+            raise ValueError(f"secuencia de {seq} tokens, más larga que el bloque {self.cfg.seq}")
+        key_mask = self._key_mask(attention_mask)
+        x = self.tokens(idx)
+        if self.positions is not None:
+            x = x + self.positions(torch.arange(seq, device=idx.device))
+        x = self.drop(x)
+        for block in self.blocks:
+            x = block(x, None, None, key_mask)
+        return self.ln_f(x)
+
+    def masked_lm(self, idx, labels=None, attention_mask=None):
+        """Logits de jugada tapada `(B, T, V)` y, con `labels`, la pérdida escalar."""
+        logits = self.mlm_head(self(idx, attention_mask))
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                labels.reshape(-1),
+                ignore_index=MMM_IGNORE_INDEX,
+            )
+        return logits, loss
+
+    def pool(self, idx, how="mean", attention_mask=None):
+        """Un vector por secuencia, `(B, d_model)`: la representación de la posición."""
+        if how not in ("cls", "mean"):
+            raise ValueError(f"how tiene que ser 'cls' o 'mean', era {how!r}")
+        mask = self.padding_mask(idx) if attention_mask is None else attention_mask.bool()
+        hidden = self(idx, mask)
+        if how == "cls":
+            return hidden[:, 0]
+        weights = mask.unsqueeze(-1).to(hidden.dtype)
+        return (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
 ```
 
-Suma solo los tokens reales y divide por cuántos eran. El `clamp(min=1.0)` evita dividir por cero en
-el caso degenerado de una secuencia entera de relleno, que además está prohibido más arriba: una
-fila completamente enmascarada haría que el softmax de la atención devolviera `NaN`, así que el
-encoder la rechaza con un error explícito en vez de dejar que aparezca un `NaN` tres capas después.
+El `pool` suma solo los tokens reales y divide por cuántos eran. El `clamp(min=1.0)` evita dividir
+por cero en el caso degenerado de una secuencia entera de relleno, que además está prohibido más
+arriba: una fila completamente enmascarada haría que el softmax de la atención devolviera `NaN`,
+así que el encoder la rechaza con un error explícito en vez de dejar que aparezca un `NaN` tres
+capas después.
+
+<Callout kind="hoy" title="Por qué esa comprobación se salta bajo el exportador">
+  `_key_mask` **lee un tensor** para decidir si lanza el error, y una bifurcación que depende de los
+  datos es precisamente lo que una captura de grafo no puede representar. Bajo `torch.export`
+  mandaría la exportación al tracer antiguo de TorchScript; bajo `torch.compile` es peor de una
+  forma más silenciosa: Dynamo no puede demostrar la condición, así que rompe el grafo en **cada**
+  paso enmascarado, lo que son un punto de sincronización y dos medios grafos por paso a cambio de
+  una comprobación que ya pasó. `_tracing()` la desactiva solo durante la captura, y en modo normal
+  el comportamiento no cambia: el grafo exportado es una función pura de su entrada de todos modos.
+</Callout>
 
 "Una representación de la posición" significa exactamente esto: un vector de 384 números del que se
 puede leer, con una transformación lineal, si las blancas están mejor, si la última jugada fue una
@@ -348,11 +443,72 @@ hizo su trabajo. Ese es el experimento, y el pooling es el sitio donde se hace l
 
 Las tres cabezas son **una capa lineal cada una**. No es pereza: es el diseño del experimento.
 
-```python
-class ValueHead(nn.Module):      # un escalar, acotado con tanh
-class BlunderHead(nn.Module):    # un logit, no una probabilidad
-class ResultHead(nn.Module):     # tres clases: blancas, tablas, negras
+```python title="src/rukh/models/heads.py"
+class ValueHead(nn.Module):
+    """Cuánto vale esta posición para las blancas: un escalar en `(-1, 1)`."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model, 1)
+
+    def forward(self, pooled):
+        return torch.tanh(self.proj(pooled)).squeeze(-1)
+
+
+class BlunderHead(nn.Module):
+    """¿La jugada que llevó aquí tiró la partida? Un **logit**, no una probabilidad."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model, 1)
+
+    def forward(self, pooled):
+        return self.proj(pooled).squeeze(-1)
+
+
+class ResultHead(nn.Module):
+    """Cómo acabó la partida: logits sobre blancas / tablas / negras."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model, 3)
+
+    def forward(self, pooled):
+        return self.proj(pooled)
 ```
+
+Y la pérdida conjunta, que es donde está la decisión:
+
+```python title="src/rukh/models/heads.py"
+    def loss(self, outputs, targets) -> tuple[Tensor, dict[str, Tensor]]:
+        """`(total, por cabeza)`; una cabeza sin ninguna fila etiquetada aporta cero."""
+        zero = torch.zeros((), device=outputs["value"].device, dtype=outputs["value"].dtype)
+        value_target = targets["value"].to(outputs["value"].dtype)
+        value_loss = F.mse_loss(outputs["value"], value_target)
+        if self.weights.value_rank:
+            value_loss = value_loss + self.weights.value_rank * pairwise_rank_loss(
+                outputs["value"], value_target
+            )
+        parts = {
+            "value": value_loss,
+            "blunder": zero,
+            "result": F.cross_entropy(outputs["result"], targets["result"].long()),
+        }
+        # Una buena parte de las filas **no tiene etiqueta de error**: hace falta la posición
+        # anterior de la misma partida para saber cuánto se perdió, y la primera jugada no la
+        # tiene. La pérdida corre sobre una máscara y la ausencia es `null`, nunca un 0.
+        mask = targets["blunder_mask"].bool()
+        if bool(mask.any()):
+            parts["blunder"] = F.binary_cross_entropy_with_logits(
+                outputs["blunder"][mask], targets["blunder"][mask].to(outputs["blunder"].dtype)
+            )
+        total = sum((getattr(self.weights, n) * parts[n] for n in HEADS), start=torch.zeros_like(zero))
+        return total, parts
+```
+
+Fíjate en que devuelve las tres partes por separado además del total. Cuando tres cabezas comparten
+tronco, una suma ponderada puede mejorar una tarea a costa de otra y el agregado nunca dice cuál;
+el lab 3 lo enseña con la cabeza de errores empeorando mientras el `val/loss` global mejora.
 
 Si una capa lineal sobre el vector agrupado basta para decir cuánto vale una posición, entonces esa
 información **ya estaba** en el vector, porque una capa lineal no tiene capacidad para inventarla. Si
@@ -499,6 +655,71 @@ de las dos sustituye a la otra, y esa es exactamente la comparación que viene a
   pedirle prestada la casilla a1. Es otra errata del plan corregida contra el código, y otra vez la
   moraleja es la misma: el número que manda es el que está en el spec y el que compila.
 </Callout>
+
+El traductor cabe en dos funciones, y las dos tienen una guarda que merece explicación:
+
+```python title="src/rukh/models/squares.py"
+def build_square_vocab() -> list[str]:
+    """La lista de tokens en orden de id: 47 entradas, fijadas por construcción."""
+    tokens = ["<pad>", "<mask>", "<cls>", "<empty>"]
+    tokens.extend("PNBRQKpnbrqk")
+    tokens.extend(["turn:w", "turn:b"])
+    tokens.extend(f"castle:{rights}" for rights in castling_strings())  # las 16 combinaciones
+    tokens.append("ep:none")
+    tokens.extend(f"ep:{file}" for file in FILES)
+    tokens.extend(f"clock:{index}" for index in range(len(CLOCK_EDGES) + 1))
+    return tokens
+
+
+def _placement_ids(placement: str) -> list[int]:
+    """Los 64 ids de casilla, por columnas, desde el campo de colocación de un FEN.
+
+    Un FEN escribe las filas de la 8 a la 1 y las columnas de la a a la h; el proyecto guarda las
+    casillas por columnas. Equivocarse en esa transposición da un tablero **válido y distinto**,
+    que ninguna comprobación de forma puede detectar: de ahí `tokens_to_fen` y su test de ida y
+    vuelta.
+    """
+    ranks = placement.split("/")
+    if len(ranks) != 8:
+        raise ValueError(f"la colocación de un FEN necesita 8 filas, tenía {len(ranks)}")
+    ids = [EMPTY_ID] * 64
+    for row, rank_text in enumerate(ranks):
+        rank = 7 - row
+        file = 0
+        for char in rank_text:
+            if char.isdigit():
+                file += int(char)
+            elif char in PIECES:
+                if file >= 8:
+                    raise ValueError(f"la fila {rank + 1} de {placement!r} es demasiado larga")
+                ids[file * 8 + rank] = SQUARE_IDS[char]
+                file += 1
+            else:
+                raise ValueError(f"pieza desconocida {char!r} en {placement!r}")
+        if file != 8:
+            raise ValueError(f"la fila {rank + 1} cubre {file} columnas, no 8")
+    return ids
+
+
+def fen_to_tokens(fen: str) -> list[int]:
+    """Los 69 ids de un FEN; se aceptan cuatro campos (`fen4`) o los seis completos.
+
+    Un FEN mal formado lanza. Al encoder no se le puede dar nunca una posición que se ha reparado
+    en silencio hasta convertirla en otra: un tablero equivocado que entrena es peor que una
+    corrida que se para.
+    """
+    fields = fen.split()
+    if len(fields) < 4:
+        raise ValueError(f"un FEN necesita al menos 4 campos, tenía {len(fields)}")
+    placement, turn, castling, ep = fields[:4]
+    if turn not in ("w", "b"):
+        raise ValueError(f"el bando que mueve tiene que ser 'w' o 'b', era {turn!r}")
+    halfmove = int(fields[4]) if len(fields) > 4 else 0
+    ...  # ep:none o la columna, y el tramo de reloj
+    return [CLS_ID, *_placement_ids(placement), SQUARE_IDS[f"turn:{turn}"],
+            _castling_id(castling), SQUARE_IDS[ep_token],
+            SQUARE_IDS[f"clock:{clock_bucket(halfmove)}"]]
+```
 
 Cuál gana es una pregunta empírica, es la que `docs/spec/02` pone como Componente 2 del hito, y
 ahora tiene respuesta. Las hipótesis razonables antes de medir eran que las casillas ganaran en

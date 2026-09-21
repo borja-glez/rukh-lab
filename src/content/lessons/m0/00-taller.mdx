@@ -3,7 +3,7 @@ title: 'Taller: repo, entorno, datos y tablero'
 description: 'Qué vas a construir en trece módulos, cómo se estudia este curso, y el taller del módulo 0: uv con CUDA, Stockfish verificado, MLflow local, el recorte de datos de Lichess con sus filtros explicados y un tablero que solo acepta jugadas legales.'
 module: m0
 order: 0
-duration: 180
+duration: 220
 level: base
 status: vigente
 updated: 2026-09-21
@@ -502,6 +502,228 @@ modelo al que nadie se las ha programado.
     decoder entrenado y la partida deja de ser tan fácil.
   </Solution>
 </Exercise>
+
+## El código del taller
+
+Hasta aquí has visto lo que imprimen cuatro comandos y no lo que hay dentro. Son pocas líneas y
+conviene leerlas, porque las tres decisiones del módulo —qué es un entorno reproducible, quién
+juzga y qué datos entran— viven ahí y no en la prosa.
+
+### `rukh info`: seis líneas que evitan cuarenta minutos perdidos
+
+Lo único que hace es preguntar y ordenar. Lo que arregla es concreto: `cuda: True` es la
+diferencia entre haber instalado el extra `cu128` y el `cpu`, y enterarse de eso después de
+entrenar durante cuarenta y dos minutos es enterarse tarde.
+
+```python title="src/rukh/env.py"
+def find_stockfish() -> Path | None:
+    """`RUKH_STOCKFISH`, después `tools/stockfish/`, después el `PATH`. None si en ningún sitio."""
+    env = os.environ.get("RUKH_STOCKFISH")
+    if env and Path(env).is_file():
+        return Path(env).resolve()
+    for name in ("stockfish.exe", "stockfish"):
+        candidate = paths.resolve("tools/stockfish") / name
+        if candidate.is_file():
+            return candidate.resolve()
+    found = shutil.which("stockfish")
+    return Path(found).resolve() if found else None
+
+
+def info() -> dict[str, object]:
+    """Todo lo que imprime `rukh info`; `--json` lo vuelca tal cual."""
+    try:
+        import torch
+
+        torch_version, cuda = torch.__version__, bool(torch.cuda.is_available())
+        gpu = torch.cuda.get_device_name(0) if cuda else None
+    except Exception:  # un torch que falta es información, no una caída
+        torch_version, cuda, gpu = None, False, None
+    engine = find_stockfish()
+    return {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "torch": torch_version,
+        "cuda": cuda,
+        "gpu": gpu,
+        "stockfish": engine.as_posix() if engine else None,
+        "mlflow_uri": f"sqlite:///{(paths.resolve('mlruns') / 'mlflow.db').as_posix()}",
+        "data_dir": paths.data_dir().as_posix(),
+        "mlruns_dir": paths.resolve("mlruns").as_posix(),
+    }
+```
+
+El orden de búsqueda de Stockfish es parte del contrato, no una comodidad: un repo que trae su
+propio motor tiene que ganarle al que haya instalado la máquina, o dos ordenadores miden con dos
+jueces distintos y las tablas dejan de ser comparables.
+
+### `extra="forbid"`: por qué una errata en un YAML falla
+
+La promesa del ejercicio 2 —«una clave que no existe hace que `rukh` falle antes de tocar la
+red»— es exactamente esta clase y nada más. Todas las configuraciones del proyecto heredan de
+ella.
+
+```python title="src/rukh/config.py"
+class BaseConfig(BaseModel):
+    """Un modelo pydantic que rechaza las claves que no declara."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @classmethod
+    def from_yaml(cls, path: str | Path):
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        if not isinstance(data, dict):
+            raise ValueError(f"{path}: se esperaba un mapa en el nivel superior")
+        return cls.model_validate(data)
+```
+
+Una clave mal escrita que se ignora en silencio es la forma más cara de perder una noche de GPU:
+el entrenamiento arranca, la configuración _parece_ correcta, y el número que produce responde a
+una pregunta que nadie hizo.
+
+### `rukh engine check`: los dos números que sostienen la evaluación
+
+```python title="src/rukh/engine.py"
+def limit_strength(engine, elo: int) -> None:
+    """Pedirle al motor que juegue a `elo`.
+
+    Hacen falta las dos opciones y el orden importa: `UCI_LimitStrength` es lo que enciende el
+    debilitamiento, y `UCI_Elo` a solas se ignora mientras esté apagado. Poner el Elo y olvidar
+    el interruptor es la forma clásica de medir un motor a plena fuerza y publicarlo como un 1500.
+    """
+    engine.configure({"UCI_LimitStrength": True, "UCI_Elo": int(elo)})
+
+
+def check(elo: int = 1400, plies: int = 40, seed: int = 0) -> EngineCheck:
+    path = find_stockfish()
+    if path is None:
+        raise FileNotFoundError("Stockfish no encontrado: scripts/get_stockfish.py o RUKH_STOCKFISH")
+    rng = random.Random(seed)
+    with chess.engine.SimpleEngine.popen_uci(str(path)) as engine:
+        low, high = int(engine.options["UCI_Elo"].min), int(engine.options["UCI_Elo"].max)
+        limit_strength(engine, max(low, min(high, elo)))
+        board, nodes, played = chess.Board(), 0, 0
+        while played < plies and not board.is_game_over():
+            if board.turn == chess.WHITE:
+                info = engine.play(board, chess.engine.Limit(time=0.05), info=chess.engine.INFO_ALL)
+                nodes += int(info.info.get("nodes", 0) or 0)
+                move = info.move
+            else:
+                move = rng.choice(list(board.legal_moves))
+            board.push(move)
+            played += 1
+        return EngineCheck(path=path, name=engine.id.get("name", "unknown"),
+                           uci_elo_min=low, uci_elo_max=high, elo=elo, plies_played=played,
+                           result=board.result(claim_draw=True) if board.is_game_over() else "*",
+                           nodes_hint=nodes)
+```
+
+`uci_elo_min` y `uci_elo_max` no se escriben a mano: se leen de la tabla de opciones que el propio
+motor declara por UCI. Es la diferencia entre saber el suelo de `UCI_Elo` y suponerlo, y M2 cuenta
+lo que cuesta suponerlo.
+
+### El constructor de la consulta
+
+La SQL que imprime el `--dry-run` no se escribe a mano en ningún sitio: se construye aquí, y el
+mismo `where_clause` lo usan el ensayo y la descarga real.
+
+```python title="src/rukh/data/fetch.py"
+def where_clause(cfg: FetchConfig) -> str:
+    """El filtro, construido una vez y usado dos veces: en el ensayo y en cada shard descargado."""
+    conditions = [f"WhiteElo >= {cfg.min_elo} AND BlackElo >= {cfg.min_elo}"]
+    if cfg.max_elo is not None:  # la mitad baja del eje de Elo; la necesita M4
+        conditions.append(f"WhiteElo <= {cfg.max_elo} AND BlackElo <= {cfg.max_elo}")
+    conditions.append(
+        f"TRY_CAST(split_part(TimeControl, '+', 1) AS INTEGER) >= {cfg.min_base_seconds}"
+    )
+    quoted = ", ".join(f"'{t}'" for t in cfg.terminations)
+    conditions.append(f"Termination IN ({quoted})")
+    conditions.append(f"Event NOT ILIKE '{cfg.exclude_event_like}'")
+    return "\n      AND ".join(conditions)
+
+
+def month_query(cfg: FetchConfig, month: str) -> str:
+    year, mm = month.split("-")
+    source = f"hf://datasets/{cfg.dataset}/data/year={year}/month={mm}/*.parquet"
+    return (
+        f"  SELECT *, '{month}' AS month\n"
+        f"  FROM read_parquet('{source}', hive_partitioning = false)\n"
+        f"  WHERE {where_clause(cfg)}"
+    )
+
+
+def build_query(cfg: FetchConfig) -> str:
+    """Un `SELECT` por mes unidos por `UNION ALL`: la consulta entera que imprime el ensayo."""
+    cfg.check()
+    return "\n  UNION ALL\n".join(month_query(cfg, month) for month in cfg.months)
+```
+
+Que el filtro se construya en un sitio y se use en dos no es pulcritud. El ensayo es lo que esta
+lección publica como «estos son los filtros»; si la descarga construyera el suyo, el filtro
+documentado y el aplicado podrían separarse y nadie se enteraría hasta tener un corpus ya
+entrenado encima.
+
+### Dos piezas de una línea que sostienen todo lo demás
+
+`paths.py` existe para que ningún módulo adivine dónde está la raíz del repo. Son diez líneas y
+evitan la clase de bug en la que un script escribe en `data/` y otro lee de `../data/` según desde
+dónde lo lances.
+
+```python title="src/rukh/paths.py"
+def repo_root() -> Path:
+    """La raíz del checkout, o `RUKH_ROOT` cuando está puesta (los tests la ponen)."""
+    env = os.environ.get("RUKH_ROOT")
+    if env:
+        return Path(env).resolve()
+    return Path(__file__).resolve().parents[2]
+
+
+def resolve(path: str | Path) -> Path:
+    """Una ruta absoluta: las relativas se leen contra la raíz del repositorio."""
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else repo_root() / candidate
+```
+
+Y el manifiesto, que es la frase «cada paso deja un `manifest.json` con sus filtros, conteos y
+hashes» convertida en un modelo:
+
+```python title="src/rukh/data/manifest.py"
+class FileHash(BaseModel):
+    """Un fichero materializado con el hash de su contenido y su tamaño."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    bytes: int = Field(ge=0)
+
+
+class Manifest(BaseModel):
+    """El registro de procedencia de la salida de un paso."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dataset: str
+    months: list[str]
+    filters: dict[str, object]   # los parámetros con los que corrió, no los que dice el README
+    counts: dict[str, int]       # filas leídas y conservadas, desglosadas por motivo
+    files: list[FileHash]        # un sha256 por salida
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    rukh_version: str = __version__
+```
+
+Los tres campos del medio hacen el trabajo. `filters` son los parámetros con los que el paso
+**corrió de verdad**; `counts` es cuántas filas entraron y cuántas salieron, desglosado por motivo,
+que es lo que convierte «descartamos 103 251 partidas por cortas» en algo comprobable en vez de
+afirmado; y `files` es un sha256 por salida, que es lo que convierte «el mismo dataset» en una
+afirmación que un test puede tumbar.
+
+<Callout kind="roto" title="El `max_elo` que no existía todavía">
+  Ese `max_elo` no estaba aquí en M0: se añadió en M4, cuando se descubrió que `min_elo: 1800`
+  aplicado a los dos jugadores dejaba **doce tokens de Elo sin un solo gradiente**. Se muestra ya
+  para que la función esté entera, y con él viene la propiedad que un test puede comprobar sin tocar
+  la red: `low.max_elo + 1 == high.min_elo`, es decir, que las dos mitades del eje embaldosen el
+  rango sin solaparse ni dejar hueco.
+</Callout>
 
 ## Qué has aprendido
 

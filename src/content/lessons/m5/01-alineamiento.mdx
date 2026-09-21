@@ -7,7 +7,7 @@ description:
   no es un adorno.'
 module: m5
 order: 1
-duration: 120
+duration: 150
 level: medio
 status: vigente
 updated: '2026-09-21'
@@ -168,6 +168,58 @@ tabla que imprime el lab es la que se usa al revés, que es como se usa de verda
 la diferencia más pequeña que se puede ver es de **48 Elo**; con 400, de **34**; con 50, de **95**.
 Antes de jugar una sola partida ya sabes si tu presupuesto puede contestar tu pregunta.
 
+```python title="src/rukh/eval/match.py"
+def games_for_edge(elo: float, level_z: float = 1.96) -> int:
+    """Cuántas partidas hacen falta para distinguir una ventaja de `elo` de nada.
+
+    La inversa de la pregunta que hace cualquier enfrentamiento, y la razón de ejecutarlo
+    **antes** de pagar las partidas y no después de mirarlas.
+    """
+    if elo == 0:
+        return 0
+    p = 1.0 / (1.0 + 10.0 ** (-elo / 400.0))
+    gap = abs(p - 0.5)
+    return int(math.ceil(level_z**2 * p * (1 - p) / gap**2))
+```
+
+Y el enfrentamiento en sí, cuyas dos guardas son lo que hace que el número signifique algo:
+
+```python title="src/rukh/eval/match.py"
+def run_match(player_a, player_b, openings, games: int = 200, seed: int = 0) -> MatchResult:
+    """Juega `games` partidas entre dos jugadores y devuelve la ventaja de A.
+
+    `openings` son prefijos de un libro sembrado. Cada uno se juega **dos veces**, una con cada
+    color, para que ninguna apertura pueda favorecer a un bando y ningún jugador pueda ganar por
+    haber llevado blancas más veces. Un número impar de partidas se **rechaza** en vez de
+    redondearse en silencio: el reparto de colores no puede salir torcido.
+    """
+    if games % 2:
+        raise ValueError("un enfrentamiento juega cada apertura con los dos colores: número par")
+    if not openings:
+        raise ValueError("un enfrentamiento necesita un libro de aperturas")
+    scores: list[float] = []
+    for index in range(games):
+        board = chess.Board()
+        for uci in openings[(index // 2) % len(openings)].split():
+            board.push(chess.Move.from_uci(uci))
+        a_is_white = index % 2 == 0
+        result = play_game_with(
+            player_a if a_is_white else player_b,
+            _AsOpponent(player_b if a_is_white else player_a),
+            model_color=chess.WHITE if a_is_white else chess.BLACK,
+            board=board,
+        )
+        scores.append(_score_for_a(result.result, a_is_white))
+    score = sum(scores) / len(scores)
+    low, high = bootstrap_score(scores, seed=seed)
+    return MatchResult(games=len(scores), score=score, elo=elo_difference(score),
+                       ci_low=elo_difference(low), ci_high=elo_difference(high), ...)
+```
+
+`_AsOpponent` es un envoltorio de diez líneas y es el arreglo del segundo error del control:
+`Opponent` no tiene `observe` en su protocolo, así que nada le contaba al otro lado qué jugadas se
+habían hecho, y un jugador con estado en esa posición iba a ciegas toda la partida.
+
 ### El control que costó un minuto y valió el hito
 
 Un instrumento nuevo se estrena midiendo algo cuya respuesta ya se sabe. Un modelo contra una copia
@@ -272,6 +324,49 @@ def test_the_loss_only_sees_the_difference():
         assert preference_loss(chosen + shift, rejected + shift) == pytest.approx(float(base))
 ```
 
+Y el modelo en sí son quince líneas, porque es el encoder de M3 con una cabeza escalar encima:
+
+```python title="src/rukh/models/reward.py"
+class RewardModel(nn.Module):
+    """`PositionEncoder` más una cabeza escalar: cómo de buena es esta posición para quien movió.
+
+    La entrada es la posición **después** de la jugada. Se podría construir una recompensa sobre
+    pares `(posición, jugada)` dándole las dos, pero el encoder ya toma un FEN y la posición
+    después de una jugada *es* la consecuencia de esa jugada, que es de lo que va una recompensa.
+    Además así puede puntuar una posición a la que se llegó por cualquier camino, que es lo que
+    GRPO necesita cuando ordena ocho candidatas entre sí.
+
+    La cabeza es **sin acotar**. Un `tanh` dejaría la escala ordenada y además pondría el mismo
+    techo al margen entre una jugada buena y una catastrófica, que es justo la distinción que el
+    modelo está aprendiendo a hacer. A la escala ya la contiene la propia pérdida: llevar el margen
+    al infinito cuesta cada vez más para cada vez menos.
+    """
+
+    def __init__(self, encoder: PositionEncoder, pooling: str = "mean") -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.pooling = pooling
+        self.head = nn.Linear(encoder.cfg.d_model, 1)
+
+    def forward(self, idx, attention_mask=None):
+        return self.head(self.encoder.pool(idx, self.pooling, attention_mask)).squeeze(-1)
+
+
+def preference_loss(chosen, rejected):
+    """Bradley-Terry: `-log σ(r_chosen - r_rejected)`, promediado sobre el lote."""
+    return -F.logsigmoid(chosen - rejected).mean()
+
+
+def preference_accuracy(chosen, rejected) -> float:
+    """Fracción de pares ordenados bien. Un empate cuenta como **fallo**, no como medio acierto.
+
+    `GOAL.md` lee su listón en este número, y un modelo que puntúa dos jugadas exactamente igual no
+    ha expresado ninguna preferencia; redondear eso a medio punto sería halagarlo.
+    """
+    with torch.no_grad():
+        return float((chosen > rejected).float().mean())
+```
+
 ### DPO: la referencia que no hay que entrenar
 
 El camino clásico es entrenar un reward model, y luego usarlo para hacer refuerzo sobre la política
@@ -308,6 +403,49 @@ separado, porque un margen puede crecer con la ordenación todavía mal, y el qu
 segundo. La segunda: `nll_weight`, que es opcional y suele hacer falta. DPO puro sube el margen sin
 mirar si la política sigue sabiendo jugar —el margen dice «`chosen` gana a `rejected`», no dice
 «`chosen` es buena»—, y un poco de pérdida de siguiente token sobre la jugada preferida la ancla.
+
+Antes de la pérdida hay dos funciones cortas, y una de ellas esconde el error silencioso de este
+módulo:
+
+```python title="src/rukh/train/dpo.py"
+def batches(rows, size: int, pad_id: int, shuffle: bool, seed: int):
+    """Rellena cada lote hasta su propio prompt más largo y recuerda dónde acaba cada prompt.
+
+    Los prompts tienen longitudes distintas. Leer los logits en `-1` en vez de en `last` leería el
+    **relleno** de todas las filas más cortas que la más larga: un fallo sin síntoma, porque la
+    pérdida sigue bajando, sobre la posición equivocada.
+    """
+    order = np.arange(len(rows))
+    if shuffle:
+        np.random.default_rng(seed).shuffle(order)
+    for start in range(0, len(order), size):
+        chunk = [rows[int(i)] for i in order[start : start + size]]
+        width = max(len(ids) for ids, _, _ in chunk)
+        tokens = torch.full((len(chunk), width), pad_id, dtype=torch.long)
+        last = torch.empty(len(chunk), dtype=torch.long)
+        for i, (ids, _, _) in enumerate(chunk):
+            tokens[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+            last[i] = len(ids) - 1
+        yield PreferenceBatch(tokens, last, ...)
+
+
+def move_logprobs(model, batch):
+    """Log-probabilidades sobre el vocabulario en la posición que predice la jugada siguiente."""
+    logits, _ = model(batch.tokens)
+    picked = logits[torch.arange(logits.shape[0], device=logits.device), batch.last]
+    return F.log_softmax(picked.float(), dim=-1)
+```
+
+Y una decisión de `encode_pairs` que conviene ver escrita: una fila cuyo prompt no cabe en el
+bloque **se descarta y se cuenta**, nunca se recorta. Recortar el principio de un prefijo le daría
+al modelo una posición que en esa partida no ocurrió.
+
+<Callout kind="roto" title="La referencia también tiene que estar en modo `eval`">
+  La copia congelada no basta con congelarla: hay que ponerla en `eval`. Una referencia que se queda
+  en `train` sigue aplicando dropout, así que el mismo par daría una log-probabilidad de referencia
+  distinta en cada época y `β` estaría midiendo ruido. Es el mismo detalle que el modo `probe` de M3
+  cuida por la misma razón, y las dos veces es invisible en la curva.
+</Callout>
 
 ### On-policy y off-policy: de dónde salen las dos jugadas
 
@@ -352,6 +490,44 @@ encima de la media y no hay a quién subir. El motor ya se ha pagado y el paso e
 `GrpoResult` cuenta los grupos planos aparte: el número dice qué parte del presupuesto se lleva la
 propia confianza del modelo, y no hay manera de saberlo por adelantado.
 
+```python title="src/rukh/train/grpo.py"
+def group_advantages(rewards, eps: float = 1e-4):
+    """`(r - media) / (desviación + eps)`: cómo le fue a cada candidato frente a su propio grupo.
+
+    Normalizar por la dispersión es lo que hace que un grupo de jugadas casi iguales y uno con una
+    barbaridad dentro aporten de forma comparable. Cuando la dispersión es cero las ventajas son
+    cero, que es la respuesta honesta —el grupo no dijo nada— y quien llama descarta el grupo en
+    vez de dejar que `eps` fabrique un gradiente con polvo de coma flotante.
+    """
+    values = torch.tensor(list(rewards), dtype=torch.float)
+    spread = float(values.std(unbiased=False))
+    if spread < eps:
+        return torch.zeros_like(values)
+    return (values - values.mean()) / (spread + eps)
+
+
+def sample_group(logits, legal_ids, size, temperature, top_k, generator=None):
+    """`size` tokens de jugada sacados de la política en una posición.
+
+    El sorteo es **con reemplazo**. El grupo pretende ser una muestra de lo que la política haría
+    de verdad, y una política que jugaría la misma jugada ocho de ocho veces le está diciendo algo
+    cierto sobre sí misma a la pérdida. Quitar duplicados aquí convertiría la línea base en la
+    media de una distribución que nadie sigue.
+    """
+    scaled = logits.float() / temperature
+    if legal_ids is None:
+        mask, width = scaled, scaled.numel()
+    else:
+        mask = torch.full_like(scaled, float("-inf"))
+        index = torch.tensor(list(legal_ids), dtype=torch.long, device=scaled.device)
+        mask[index] = scaled[index]
+        width = index.numel()
+    if top_k is not None and top_k < width:
+        cut = torch.topk(mask, top_k).values[-1]
+        mask = torch.where(mask < cut, torch.full_like(mask, float("-inf")), mask)
+    return torch.multinomial(F.softmax(mask, dim=-1), size, replacement=True, generator=generator)
+```
+
 ### La KL es un término, no un adorno
 
 Una recompensa verificable es exactamente especificable, y por tanto exactamente **hackeable**. Lo
@@ -368,6 +544,122 @@ término de penalización, le pagaría al modelo precisamente en las muestras en
 Sería un radar de velocidad que la mitad de las veces te multa y la otra mitad te ingresa dinero
 por pasarte: en promedio no disuade de nada. Hay un test que lo dispara en las dos direcciones a
 propósito.
+
+Y la pérdida completa, que junta el objetivo y ese castigo:
+
+```python title="src/rukh/train/grpo.py"
+def grpo_loss(policy_logprobs, reference_logprobs, actions, advantages, beta_kl):
+    """El objetivo y la KL, para una completación de un solo token."""
+    chosen_policy = policy_logprobs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+    chosen_reference = reference_logprobs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+    objective = -(advantages * chosen_policy).mean()
+    difference = chosen_reference - chosen_policy
+    kl = (torch.exp(difference) - difference - 1.0).mean()
+    return objective + beta_kl * kl, kl
+```
+
+### La recompensa verificable, escrita
+
+GRPO no necesita un reward _model_: necesita una **función** de recompensa, y el ajedrez es uno de
+los poquísimos sitios donde esa función se puede escribir y comprobar. Nada de lo que sigue se
+aprende, así que nada puede equivocarse como se equivoca una recompensa aprendida: solo puede estar
+**mal diseñada**, que es otro problema y el que vas a mirar en la galería de la última parte.
+
+```python title="src/rukh/train/rewards.py"
+ILLEGAL_MARGIN = 1.0
+"""Cuánto por debajo de cualquier jugada legal puntúa una ilegal.
+
+Un `0.0` liso era la elección obvia y estaba mal, y lo cazó la galería de reward hacking: con los
+pesos por defecto una jugada legal que entra en repetición puntúa `-0,25`, así que un cero para las
+ilegales ponía **lo ilegal por encima de lo legal** justo en las jugadas que el término de
+repetición se escribió para desincentivar. Una puerta que lo que controla puede superar no es una
+puerta."""
+
+
+def legality_gate(board, move) -> bool:
+    """Si la jugada se puede jugar aquí. La puerta detrás de la que están los demás términos."""
+    return move in board.legal_moves
+
+
+def normalised_delta_cp(cp_move, cp_best, scale: float = 200.0) -> float:
+    """`1` para la mejor jugada, `0` para una `scale` centipeones peor o más.
+
+    Recortada por los dos lados: una jugada no puede ser mejor que la mejor, y una catastrófica no
+    es más informativa que una simplemente perdedora —dejarla irse a menos infinito permitiría que
+    una sola barbaridad decidiera la ventaja de todo un grupo.
+    """
+    loss = max(0.0, float(cp_best) - float(cp_move))
+    return max(0.0, 1.0 - loss / scale)
+
+
+def mate_bonus(board, move) -> float:
+    """`1` cuando la jugada da mate, `0` si no. Binario a propósito.
+
+    No «distancia al mate»: un mate más corto no es un resultado mejor, es el mismo resultado antes,
+    y pagar por la diferencia le enseña al modelo a preferir mates vistosos antes que mates seguros.
+    """
+    copy = board.copy(stack=False)
+    copy.push(move)
+    return 1.0 if copy.is_checkmate() else 0.0
+
+
+def repetition_penalty(board, move) -> float:
+    """`1` cuando la jugada entra en repetición. El único término negativo.
+
+    Existe por un fallo observado y no por un principio: un modelo premiado por no perder descubre
+    que dar vueltas nunca pierde. Salta sobre una posición ya vista en esta partida y no sobre la
+    reclamación de tablas por triple repetición: cuando las tablas ya se pueden reclamar, el paseo
+    ya ha ocurrido y la recompensa llega tarde.
+    """
+    copy = board.copy()
+    copy.push(move)
+    return 1.0 if copy.is_repetition(2) else 0.0
+
+
+def reward(board, move, cp_move=None, cp_best=None, weights=None) -> RewardBreakdown:
+    """La recompensa entera de una jugada, con sus términos.
+
+    `cp_move` y `cp_best` vienen de fuera: quien llama decide el presupuesto de análisis una vez,
+    para todo el grupo, en vez de que cada llamada lo decida otra vez. Sin ellos el término de
+    calidad es cero y la recompensa cae a lo que se puede saber sin motor.
+    """
+    weights = weights or RewardWeights()
+    if not legality_gate(board, move):
+        return RewardBreakdown(total=illegal_value(weights), legal=False)
+    quality = 0.0
+    if cp_move is not None and cp_best is not None:
+        quality = normalised_delta_cp(cp_move, cp_best, weights.cp_scale)
+    mate = mate_bonus(board, move)
+    repetition = repetition_penalty(board, move)
+    total = weights.quality * quality + weights.mate * mate - weights.repetition * repetition
+    return RewardBreakdown(total=total, legal=True, quality=quality, mate=mate,
+                           repetition=repetition)
+
+
+def illegal_value(weights=None) -> float:
+    """Lo que puntúa una jugada ilegal: estrictamente por debajo de lo que alcanza una legal.
+
+    Se **deriva de los pesos** en vez de ser una constante, porque una constante es una promesa que
+    deja de ser cierta en silencio la primera vez que alguien sube `repetition`.
+    """
+    return legal_bounds(weights)[0] - ILLEGAL_MARGIN
+
+
+def bounds(weights=None) -> tuple[float, float]:
+    """El intervalo cerrado en el que cae toda recompensa: lo que hace el diseño auditable."""
+    return (illegal_value(weights), legal_bounds(weights)[1])
+```
+
+Cuatro reglas dan forma a todo esto y conviene leerlas como reglas y no como detalles. **La
+legalidad es una puerta, no un término**: sumar un _bonus_ de legalidad a una suma ponderada le
+permite al modelo cambiarla por otra cosa, y el sentido de una recompensa verificable es que hay
+cosas que no se cambian por nada. **Todo está acotado**: una recompensa sin techo es una invitación
+a que el optimizador encuentre la dirección que crece sin límite y se vaya por ahí, y `bounds` está
+para que eso sea comprobable con un test sobre miles de entradas aleatorias. **El signo y la escala
+se fijan a mano**, no con la dispersión del lote: una recompensa que se reescala a sí misma hace
+incomparables dos corridas y esconde el momento en que el modelo deja de mejorar. Y **todas las
+funciones son puras**: tablero dentro, número fuera, sin llamar al motor, que es lo que permite que
+los tests corran en milisegundos y que el presupuesto de análisis se decida en un solo sitio.
 
 Con esto tienes el instrumento y las cuatro piezas de teoría que hacen falta para leer lo que
 salió: el par y su pérdida, DPO y su referencia, las dos fuentes de pares, y GRPO con su línea base

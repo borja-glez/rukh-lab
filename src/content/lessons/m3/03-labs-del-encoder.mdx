@@ -7,7 +7,7 @@ description:
   millones que se publicó y la barra de evaluación en vivo.'
 module: m3
 order: 3
-duration: 150
+duration: 200
 level: base
 status: vigente
 updated: '2026-09-21'
@@ -136,6 +136,53 @@ El `kept` que imprime la tercera parte es una cota superior del 10 % real, porqu
 aleatoria puede caer por casualidad en el mismo token; con un vocabulario de 1 968 jugadas la
 diferencia es despreciable, pero saber por qué el número no es exacto es parte del lab.
 
+La función que el script está comprobando es esta, y son veinte líneas:
+
+```python title="src/rukh/train/mmm.py"
+MOVE_CONTROL_IDS = frozenset(range(CONTROL_COUNT))   # los 62 ids que no son jugadas
+
+
+def apply_masking(batch, cfg, vocab, scheme="moves", generator=None):
+    """Tapa parte de `batch`; devuelve `(inputs, labels)` con la misma forma.
+
+    `labels` lleva el token original donde la posición fue elegida y `MMM_IGNORE_INDEX` en todo lo
+    demás, así que la pérdida puntúa exactamente las posiciones elegidas y nada más.
+    """
+    control = control_ids(scheme)
+    if vocab <= max(control):
+        raise ValueError(f"un vocabulario de {vocab} tokens es todo tokens de control")
+    device = batch.device
+    is_control = torch.isin(batch, torch.tensor(sorted(control), device=device))
+    draw = torch.rand(batch.shape, generator=generator, device=device)
+    selected = (draw < cfg.prob) & ~is_control
+    labels = torch.where(selected, batch, torch.full_like(batch, MMM_IGNORE_INDEX))
+
+    decision = torch.rand(batch.shape, generator=generator, device=device)
+    inputs = batch.clone()
+    inputs[selected & (decision < cfg.mask_ratio)] = mask_id(scheme)
+    random_upto = cfg.mask_ratio + cfg.random_ratio
+    replace = selected & (decision >= cfg.mask_ratio) & (decision < random_upto)
+    if bool(replace.any()):
+        # Se sortea **por encima** del bloque de control: una jugada aleatoria, nunca un Elo ni un
+        # resultado falsos. Esto solo se puede escribir así porque los tokens de control son un
+        # prefijo del vocabulario, que es la decisión de enumeración de M1.
+        low = max(control) + 1
+        noise = torch.randint(low, vocab, (int(replace.sum()),), generator=generator,
+                              device=device, dtype=batch.dtype)
+        inputs[replace] = noise
+    return inputs, labels
+```
+
+Fíjate en que hay **dos sorteos independientes**: uno decide qué posiciones entran (el 15 %) y otro,
+sobre las elegidas, reparte el 80/10/10. Un solo sorteo con tres umbrales sobre el mismo número
+correlacionaría las dos decisiones: las posiciones con el valor más bajo serían siempre las
+enmascaradas, que no es lo mismo que un reparto al azar dentro de las elegidas.
+
+Y el tercer bloque del script del lab es la razón por la que este fichero tiene un test que
+**cuenta** en vez de uno que comprueba formas. Un `ignore_index` mal elegido no lanza ninguna
+excepción: simplemente deja de puntuar un puñado de posiciones, o puntúa algunas que no debía, y la
+curva de pérdida sale preciosa.
+
 Y ahora el preentrenamiento. Doce mil pasos, lotes de 96 secuencias de 200 tokens con acumulación de
 gradiente 3 —288 secuencias efectivas—, `bf16` y `torch.compile`, sobre el mismo flujo empaquetado
 que come el decoder:
@@ -204,11 +251,217 @@ pesar lo mismo que uno donde tapó muchas.
   </Solution>
 </Exercise>
 
+Y el bucle de validación que ese ejercicio pregunta por qué reinicia la semilla:
+
+```python title="src/rukh/train/mmm.py"
+@torch.no_grad()
+def evaluate_mmm(model, loader, batches, cfg, vocab, device, scheme="moves", autocast=None):
+    """Pérdida y top-1 sobre las posiciones tapadas.
+
+    El generador se construye **de nuevo desde `cfg.seed`** en cada llamada, no se arrastra del
+    entrenamiento. Si se arrastrara, cada evaluación taparía posiciones distintas: la pérdida del
+    paso 500 y la del 1 000 se medirían sobre dos tareas diferentes —una puede haber tapado
+    recapturas forzadas y la otra jugadas difíciles de medio juego— y la curva mezclaría el
+    progreso del modelo con la dificultad del sorteo.
+
+    Con la semilla reiniciada, **todas** las evaluaciones de la tirada tapan exactamente las mismas
+    posiciones. Y como la semilla está en la configuración y no en el estado del proceso, también
+    lo hacen las de cualquier otra tirada con la misma semilla: la tarea de evaluación es parte del
+    instrumento de medida, y un instrumento que cambia entre medidas no mide.
+    """
+    model.eval()
+    generator = masking_generator(cfg.seed, device)
+    loss_sum = weighted = hits = counted = 0
+    for index, (x, _) in enumerate(loader):
+        if index >= batches:
+            break
+        inputs, labels = apply_masking(x.to(device), cfg, vocab, scheme, generator)
+        with autocast if autocast is not None else nullcontext():
+            logits, loss = model.masked_lm(inputs, labels)
+        mask = labels != MMM_IGNORE_INDEX
+        tokens = int(mask.sum())
+        if loss is not None and torch.isfinite(loss) and tokens:
+            loss_sum += loss.float().item() * tokens
+            weighted += tokens
+        hits += int((logits.argmax(dim=-1) == labels)[mask].sum())
+        counted += tokens
+    model.train()
+    return (loss_sum / weighted if weighted else math.nan, hits / counted if counted else 0.0)
+```
+
+Y el detalle del bucle de entrenamiento que la lección menciona de pasada: la pérdida se pondera
+por el número de posiciones **tapadas** y no por los tokens del lote, porque un micro-lote donde el
+sorteo tapó pocas jugadas no debe pesar lo mismo que uno donde tapó muchas. La métrica que se
+registra al lado es `masked_tokens_per_s` por la misma razón: `tokens_per_s` contaría también el
+85 % de posiciones que no puntúa nadie.
+
+### La tabla supervisada, antes de afinar nada
+
+Las «438 093 posiciones etiquetadas» de los labs que vienen no existen hasta que alguien las
+construye. Salen de `positions-eval.parquet` —una fila por FEN distinto, con la partida de la que
+vino y el veredicto de Stockfish— y de tres decisiones que esta lección argumenta largo y que
+conviene ver escritas.
+
+```python title="src/rukh/data/labels.py"
+def build_labels(cfg: LabelsConfig, frame=None) -> pl.DataFrame:
+    source = frame if frame is not None else pl.read_parquet(resolve(cfg.positions_eval))
+    rows = (
+        source.select(SOURCE_COLUMNS)
+        .with_columns(
+            score_white=_score_white(),   # la convención de `scoring.py`, no otra
+            mover=pl.when(pl.col("fen").str.split(" ").list.get(1) == "w").then(1).otherwise(-1),
+        )
+        .drop_nulls("score_white")
+        .with_columns(score_mover=pl.col("mover") * pl.col("score_white"))
+    )
+    # El self-join que hace posible la etiqueta de error: la fila del ply N-1 de la misma partida,
+    # alineada con el ply N. Un left join, así que una posición cuyo predecesor falta conserva un
+    # `before_best` nulo y, tres líneas más abajo, un `blunder` nulo.
+    previous = rows.select(
+        pl.col("game_id"),
+        (pl.col("ply") + 1).alias("ply"),
+        pl.col("score_mover").alias("before_best"),
+    )
+    joined = rows.join(previous, on=["game_id", "ply"], how="left").with_columns(
+        # Una **suma** y no una resta: el `score_mover` de aquí es del rival, que es quien mueve
+        # ahora, así que lo que consiguió el que movió es menos eso. antes + aquí = lo que tiró.
+        loss_cp=(pl.col("before_best") + pl.col("score_mover")).cast(pl.Int64)
+    )
+    ...
+    return labelled.with_columns(...)
+```
+
+**La etiqueta de valor está acotada.** `tanh(score / 400)` desde el punto de vista de **las
+blancas**, para que el número sea una propiedad de la posición y no de quien mueva. La cota no es
+pulcritud: un mate vale ±10 000 en la convención del repo, y media docena de mates dominarían un
+error cuadrático mientras el modelo gasta su capacidad clavando posiciones que ya están decididas.
+
+**La etiqueta de error necesita la posición anterior**, y esa es toda la complicación del fichero.
+Se mide desde el lado del que movió: lo que podía haber tenido allí, contra lo que consiguió aquí.
+
+**Y una posición cuyo predecesor no está en la tabla —el primer ply, o un FEN que se dedupó en otra
+partida— no tiene etiqueta de error en absoluto: `null`, nunca `0`.** Etiquetar «no lo sé» como «no
+fue error» es una de las maneras más rápidas de arruinar un clasificador, y con una clase positiva
+del 3,72 % envenenaría la clase mayoritaria con exactamente las filas de las que hay menos
+evidencia.
+
+El reparto es la otra mitad, y su código son cuatro líneas:
+
+```python title="src/rukh/data/labels.py"
+def game_split(game_id: int, val_fraction: float, seed: int) -> str:
+    """De qué lado del reparto cae una partida: función pura de su id y de la semilla."""
+    digest = zlib.crc32(f"{seed}:{game_id}".encode())
+    return "val" if (digest % 1_000_000) / 1_000_000 < val_fraction else "train"
+
+
+def counts(frame: pl.DataFrame) -> dict[str, int]:
+    """Los conteos que hacen visible la tasa base, que es lo que la parte 2 desmonta."""
+    per_split = {name: int(frame.filter(pl.col("split") == name).height) for name in SPLITS}
+    return {
+        "positions": int(frame.height),
+        **per_split,
+        "blunder_labelled": int(frame.drop_nulls("blunder").height),
+        "blunders": int(frame.filter(pl.col("blunder") == 1).height),
+    }
+```
+
+Por `game_id` y nunca por posición, por lo que la parte 2 explica en «Fuga de datos». Y función
+pura del id y de la semilla, un CRC-32 y no `hash()`: Python aleatoriza el hash de las cadenas por
+proceso. Un reparto que no se puede reproducir no es un reparto.
+
+Fíjate en `counts`: publica `blunder_labelled` al lado de `positions`, y esos dos números son los
+denominadores distintos de la parte 2 —10 000 posiciones, 7 453 con etiqueta de error, 3 660
+puntuadas—. Una métrica calculada sobre el denominador equivocado de los tres es otra métrica.
+
+Y una función que deliberadamente **no** es parte de `build_labels`:
+
+```python title="src/rukh/data/labels.py"
+def game_moves(frame: pl.DataFrame, games_dir: str = "data/uci") -> pl.DataFrame:
+    """La fuente de prefijos de `frame`: una fila por **partida**, nunca por posición.
+
+    El esquema `squares` lee un FEN y nada más, y meterle dos meses de partidas haría que el
+    camino barato pagara por el caro. El esquema `moves` llama a esto aparte, y escanea en
+    perezoso con un semi join sobre los `game_id` distintos, así que solo se leen las partidas
+    que llevan alguna etiqueta.
+    """
+    wanted = frame.select(pl.col("game_id").unique()).lazy()
+    return (
+        pl.scan_parquet((resolve(games_dir) / GAMES_GLOB).as_posix())
+        .select("game_id", "uci", "white_elo", "black_elo")
+        .join(wanted, on="game_id", how="semi")
+        .unique(subset=["game_id"], keep="first")
+        .collect()
+    )
+```
+
+Ese `unique(keep="first")` es el asterisco de los +3,5 puntos que el callout de la parte 1 pone al
+final: la tabla está deduplicada por `fen4`, así que el `game_id` de una fila es la partida que
+**primera** llegó a esa posición. El prefijo que se reconstruye con él es _una_ línea que llega
+ahí, no necesariamente la que jugó la partida que puso la etiqueta.
+
 ### Lab 2 · Las tres cabezas con el tronco congelado
 
 Ahora el probe. Cuatro mil pasos, lotes de 256 posiciones, tasa de aprendizaje `1e-3` —mucho más
 alta que la del preentrenamiento, porque solo se están moviendo tres capas lineales— y el encoder
-congelado y en modo `eval`:
+congelado y en modo `eval`.
+
+Los tres modos son dos funciones, y la segunda es la que casi nadie escribe:
+
+```python title="src/rukh/train/heads.py"
+def freeze_encoder(model: MultiHead, mode: Mode, last_n: int = 2) -> int:
+    """Pone `requires_grad` según el modo; devuelve cuántos parámetros quedan entrenables."""
+    for param in model.encoder.parameters():
+        param.requires_grad_(mode == "full")
+    if mode == "last-n":
+        for block in list(model.encoder.blocks)[-last_n:]:
+            for param in block.parameters():
+                param.requires_grad_(True)
+        for param in model.encoder.ln_f.parameters():
+            param.requires_grad_(True)
+    for param in model.head_parameters():
+        param.requires_grad_(True)
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def set_training_mode(model: MultiHead, mode: Mode) -> None:
+    """`train()` en todo y después `eval()` en un encoder congelado.
+
+    **Congelar es más que `requires_grad = False`.** Un módulo que se queda en modo `train` sigue
+    aplicando dropout, así que la misma posición daría un vector distinto en cada época: ruido que
+    las cabezas no pueden aprender a compensar —no es una propiedad de la posición— y que el
+    encoder no puede absorber —no está aprendiendo—.
+    """
+    model.train()
+    if mode == "probe":
+        model.encoder.eval()
+```
+
+Esa segunda función es la respuesta del ejercicio de más abajo escrita en el código, y el mismo
+detalle que M5 vuelve a necesitar con la referencia congelada de DPO. La tercera fuente de
+sorpresas que conviene tener en la cabeza aunque aquí no aplique: en una red con `BatchNorm`,
+congelar los pesos **no** congela las estadísticas móviles, que se actualizan en modo `train` y
+cambian la salida.
+
+Y la curva por etiquetas necesita una tercera, la de los subconjuntos anidados:
+
+```python title="src/rukh/train/heads.py"
+def nested_subsets(game_ids: list[int], seed: int = 0) -> dict[float, np.ndarray]:
+    """Máscaras para la curva: el 10 % dentro del 25 %, dentro del 50 %, dentro del 100 %.
+
+    Con cuatro muestras independientes, un bache en el punto del 50 % podría ser simplemente un
+    sorteo desafortunado, y lo que estarías midiendo es la varianza del muestreo en vez del valor
+    de los datos. Haciendo crecer un único conjunto, cada punto es el anterior más filas nuevas.
+    """
+    keys = np.array([zlib.crc32(f"{seed}:{int(g)}".encode()) for g in game_ids], dtype=np.int64)
+    order = np.argsort(keys, kind="mergesort")
+    out = {}
+    for fraction in (0.10, 0.25, 0.50, 1.00):
+        take = max(1, int(round(fraction * len(order))))
+        mask = np.zeros(len(order), dtype=bool)
+        mask[order[:take]] = True
+        out[fraction] = mask
+    return out
+```
 
 ```bash title="Terminal"
 uv run rukh train heads --config configs/train/encoder-heads-moves.yaml --mode probe

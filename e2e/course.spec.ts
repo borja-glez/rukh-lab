@@ -17,7 +17,7 @@ test.describe('course navigation', () => {
       .click();
     await expect(page).toHaveURL(new RegExp(`${LESSON}$`));
     await expect(page.getByRole('heading', { level: 1 })).toContainText('Taller');
-    await expect(page.locator('.prose h2')).toHaveCount(6);
+    await expect(page.locator('.prose h2')).toHaveCount(7);
   });
 
   test('"Marcar completada" persists after reload and shows on the map', async ({ page }) => {
