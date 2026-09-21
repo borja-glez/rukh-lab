@@ -1,0 +1,300 @@
+---
+title: 'Más datos, no más red: de small a medium-v4'
+description: 'La parte del módulo que no estaba en el plan: por qué small se quedaba corto, qué se probó primero y qué se probó después, la escalera de Elo que estaba mal calibrada y el modelo de 115 millones de parámetros sobre 1 681 millones de tokens del que parten los dos módulos siguientes.'
+module: m2
+order: 4
+duration: 90
+level: base
+status: vigente
+updated: '2026-09-21'
+keywords:
+  - tokens por parámetro
+  - Chinchilla
+  - hueco train/val
+  - Elite Database
+  - escalera de Elo
+  - calibración
+  - medium-v4
+  - reproducibilidad
+artifacts:
+  - kind: model
+    label: chorcat/rukh-medium
+    href: https://huggingface.co/chorcat/rukh-medium
+  - kind: dataset
+    label: chorcat/rukh-games-elite
+    href: https://huggingface.co/datasets/chorcat/rukh-games-elite
+---
+
+Parte 4 de 4 del módulo «El decoder». Viene de «El decoder: exportarlo y mirar dentro» y cierra el
+módulo con el modelo que M4 y M5 van a afinar.
+
+## Qué vas a construir
+
+Al terminar esta parte tendrás `medium-v4`: el decoder de **115 120 128 parámetros** entrenado
+sobre **1 681 millones de tokens**, con 1504 de Elo estimado (IC 95 % 1446-1558) y un 99,8 % de
+jugadas legales sin máscara. Es el modelo del que parten el afinado por Elo y los adaptadores de
+M4 y los tres modelos alineados de M5, y es el que se publica como `chorcat/rukh-medium`.
+
+Pero el objeto de esta parte no es el modelo: es **cómo se llegó a él**, porque el camino
+contradice lo que las tres partes anteriores daban por sentado. M2 cerró diciendo que a `small`
+le faltaba entrenamiento y que el siguiente paso era una red más grande. Las dos cosas estaban
+mal, y lo que las desmintió fue una división y una escalera.
+
+<Callout kind="hoy" title="Punto de partida, si te saltaste algo">
+  Esta parte necesita `data/uci/` (M1) y añade la Lichess Elite Database. Si no quieres esperar la
+  descarga de los 44 meses, `uv run rukh pull rukh-games-elite` deja `data/elite/games.parquet` ya
+  convertido. Y si no quieres pagar las cuatro horas de `medium-v4`, `uv run rukh pull medium-v4`
+  deja `checkpoints/medium-v4/best.pt`, que es exactamente lo que las configs de M4 y M5 leen. Los
+  comandos de abajo son los que se ejecutaron; sus tiempos son los de una RTX 5090.
+</Callout>
+
+## El diagnóstico cabe en una división
+
+La tercera parte terminó con el hueco entre la pérdida de entrenamiento y la de validación de
+`small` creciendo —0,021, 0,046, 0,060— mientras el top-1 se aplanaba. Antes de tocar nada, la
+cuenta que había que hacer:
+
+```text
+data/tokens/uci/train/meta.json:   2 949 514 partidas, 240 068 954 tokens
+parámetros de small:               38 971 392
+tokens únicos por parámetro:       240 M / 39 M = 6,2
+pasadas sobre el corpus:           20 000 pasos × 256 secuencias × 200 tokens = 1 024 M / 240 M = 4,3
+```
+
+Seis tokens por parámetro, cuando la relación que la literatura de escalado da como razonable
+ronda los veinte. Y cuatro pasadas y pico sobre el mismo material. El hueco que crecía no era
+«algo de sobreajuste, normal»: era la firma de **repetir material**, y explica también por qué
+`medium`, con el triple de parámetros y los mismos datos, solo había comprado 84 puntos de Elo con
+los intervalos solapados. Más red sobre el mismo libro recita mejor el libro.
+
+Y había 238 millones de tokens parados: el mes de febrero entero era validación, para un bucle
+que evalúa leyendo 640 000. Esa es la primera palanca, y cuesta cero descargas.
+
+<Callout kind="teoria" title="Tokens únicos por parámetro: la comprobación antes de escalar">
+  Antes de subir de talla, divide. Si los tokens **únicos** por parámetro están muy por debajo de
+  veinte y el hueco train/val crece mientras la métrica se aplana, el material está agotado y la red
+  nueva solo memorizará mejor. Si el hueco es estable y la métrica sube, hay margen en pasos o en
+  capacidad. La división tarda un segundo y ahorra el error más caro de todos.
+</Callout>
+
+## Tres corridas, una palanca cada una
+
+Las tres corridas comparten planificador, semilla y la misma validación congelada: las **100 000
+primeras partidas de 2025-02**, que desde aquí es lo único que no entrena (D-062). Cada una cambia
+una sola cosa respecto a la anterior, para que la diferencia sea atribuible.
+
+**v2: devolver el mes de validación al entrenamiento.** `configs/data/pipeline-v2.yaml` deja
+`val_games: 100000` y manda el resto de febrero al corpus: 240 M → **471 M** tokens únicos, 6,2 →
+12,1 por parámetro. La misma receta de `small`, 28 000 pasos en vez de 20 000.
+
+```bash title="Terminal"
+uv run rukh data tokenize --config configs/data/pipeline-v2.yaml --scheme uci --pack
+uv run rukh train --config configs/train/small-v2.yaml
+```
+
+**v3: cambiar de qué está hecho el corpus.** La Lichess Elite Database publica en
+`database.nikonoel.fr` las partidas de 2500+ contra 2300+, sin bullet, por meses. Veinticuatro meses
+son unos 6,5 millones de partidas, y son a la vez más datos y otra distribución: el corpus de 1800+
+tiene un 3,4 % de partidas con las blancas en 2400 o más, la Elite un 93 %.
+`configs/data/pipeline-v3.yaml` los añade con `extra_train_parquets` y deja la validación donde
+estaba, para que la pérdida siga siendo comparable.
+
+```bash title="Terminal"
+uv run rukh data elite --config configs/data/pipeline-elite44.yaml   # o: uv run rukh pull rukh-games-elite
+uv run rukh data tokenize --config configs/data/pipeline-v3.yaml --scheme uci --pack
+uv run rukh train --config configs/train/small-v3.yaml
+```
+
+(`pipeline-elite44.yaml` descarga los 44 meses que usa la corrida final; v3 se hizo con los
+primeros 24 y la config tokeniza lo que haya en `data/elite/games.parquet`. Si sigues el orden de
+esta página tu v3 llevará 44, que es más de lo que tuvo la de referencia.)
+
+Salida real de las dos, con v1 de M2 al lado. «General» es la validación congelada; «fuerte» es la
+misma pérdida sobre partidas de 2200+:
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Modelo      | Par.  | Tokens únicos | general    | top-1       | fuerte 2200+ | top-1       | hueco train/val |
+| ----------- | ----- | ------------- | ---------- | ----------- | ------------ | ----------- | --------------- |
+| `small` v1  | 39 M  | 240 M         | 1,5197     | 51,20 %     | 1,5391       | 50,84 %     | +0,0603         |
+| `medium` v1 | 115 M | 240 M         | 1,4782     | 52,31 %     | 1,4880       | 52,06 %     | —               |
+| `small` v2  | 39 M  | 471 M         | **1,4703** | **52,49 %** | 1,4652       | 52,69 %     | +0,0242         |
+| `small` v3  | 39 M  | 1 095 M       | 1,4770     | 52,19 %     | **1,4537**   | **53,02 %** | —               |
+
+</div>
+
+Dos lecturas, en el orden en que se hicieron:
+
+1. **Recuperar el mes vale −0,049 nats y el hueco cae a la mitad.** `small` v2, con 39 millones de
+   parámetros, **bate al `medium` de 115 millones** entrenado con los datos viejos. El cuello eran
+   los datos; ahora está medido y no inferido. El tiempo de entrenamiento fue 58 minutos.
+2. **La composición mueve otra cosa que la cantidad.** v3 cede 0,007 en juego promedio —su corpus
+   se parece menos a la validación— y gana 0,012 sobre juego fuerte. Y mueve el eje de Elo: la
+   divergencia entre las distribuciones condicionadas a `<2800>` y a `<1800>` pasa de 0,047 nats
+   en v1 y 0,049 en v2 a **0,115** en v3. Duplicar los datos (v2) no había movido ese eje; cambiar
+   de qué están hechos (v3) sí. Sin élite, el «juega como 1500 / 2000 / 2400» de M4 no tenía de
+   dónde salir.
+
+<Transfer
+  concept="Cantidad y composición del corpus son dos palancas distintas"
+  where="Un modelo de código que ha visto diez veces más Python que Rust; un asistente afinado sobre conversaciones que son un 90 % consultas de soporte"
+>
+  Duplicar los datos y cambiar su mezcla se parecen en el coste y no en el efecto. Lo primero baja
+  la pérdida media; lo segundo mueve lo que el modelo puede hacer en la parte del espacio que antes
+  casi no veía. Cuando una capacidad concreta no aparece, pregunta primero cuánto de eso hay en el
+  corpus, en proporción, antes de preguntar cuánto corpus hay.
+</Transfer>
+
+## La escalera estaba torcida
+
+Mientras se medían esas corridas apareció una contradicción que ningún modelo puede resolver:
+`small` v2 puntuaba 0,725 contra un Stockfish con `UCI_Elo` 1320 y perdía **veinte a cero** contra
+`skill-3`, un rival etiquetado con 1250. Un modelo no puede ganar a uno de 1320 y perder siempre
+contra uno de 1250. Lo que se puede medir es el rival: motor contra motor, 40 partidas por pareja
+a los mismos 0,1 s por jugada, colores alternados, anclado en `uci-1320`.
+
+| Escalón   | Etiqueta que tenía | Medido   | Error |
+| --------- | ------------------ | -------- | ----- |
+| `skill-0` | 800                | **1381** | +581  |
+| `skill-1` | 950                | **1467** | +517  |
+| `skill-2` | 1100               | **1589** | +489  |
+| `skill-3` | 1250               | **1678** | +428  |
+
+Los cuatro escalones por `Skill Level` se habían metido en la escalera para llegar **por debajo**
+del suelo de 1320 de `UCI_Elo`, y se etiquetaron a mano sobre esa suposición. Ninguno de los cuatro
+está por debajo. El método se valida con su propio control: `uci-1500` midió +179 sobre `uci-1320`
+frente a los +180 nominales, así que el procedimiento no está sesgado en el rango en el que
+jugamos. (`UCI_Elo` sí se comprime más arriba: `uci-1800` midió +215 sobre `uci-1500`, no +300; es
+una salvedad para los escalones altos.)
+
+Con las etiquetas medidas, las mismas partidas dan otro número a todo lo publicado hasta ese día:
+
+| Etapa      | Publicado | Corregido | IC 95 %   |
+| ---------- | --------- | --------- | --------- |
+| `small` v1 | 1007      | **1359**  | 1293-1429 |
+| `small` v2 | 1070      | **1407**  | 1344-1462 |
+| `small` v3 | 1095      | **1425**  | 1367-1485 |
+
+**El listón de 1200 nunca se falló.** `small` v1 estaba publicado en Hugging Face con «Elo bar not
+met» y estaba en 1359. Hubo que corregir once model cards, dos planes y las lecciones, explicando
+el porqué y no solo la cifra. Lo relativo no cambia: la corrección sube a todos por igual, y el
+trabajo de datos vale +66 Elo en la escala corregida igual que valía +88 en la torcida.
+
+<Callout kind="roto" title="Un rival etiquetado a mano es una hipótesis, no una medida">
+  Cuatro números escritos en un fichero de configuración sostenían el titular de un módulo entero.
+  Lo que los delató no fue buscar aprobar el criterio, sino una contradicción interna que el modelo
+  no podía producir. La regla que deja: **cualquier escala contra la que midas tiene que haberse
+  medido a sí misma**, y un control con respuesta conocida —aquí, +180 nominales entre dos peldaños—
+  es lo que te dice si el procedimiento sirve.
+</Callout>
+
+## medium-v4: capacidad, cuando por fin está justificada
+
+Con 1 681 millones de tokens únicos —enero, el resto de febrero y **44 meses** de Elite, 18 942 740
+partidas— la división sale a **21 tokens por parámetro para 115 millones**, y `medium` deja de ser
+una red grande sobre un libro pequeño. `configs/train/medium-v4.yaml`: 48 000 pasos, 2,46 mil
+millones de tokens vistos, 1,45 pasadas.
+
+```bash title="Terminal"
+uv run rukh data tokenize --config configs/data/pipeline-v4.yaml --scheme uci --pack
+uv run rukh train --config configs/train/medium-v4.yaml
+uv run rukh eval --model checkpoints/medium-v4/best.pt --config configs/eval/greedy.yaml --stage medium-v4-greedy
+```
+
+Tokenizar tarda cinco minutos y deja 3,3 GB en `data/tokens-v4/uci/`. El entrenamiento duró
+**4 h 3 min** y es el trabajo más largo de la primera fase; se lanza al final de una sesión y se
+recoge en la siguiente. La evaluación canónica —`greedy.yaml`, temperatura 0,05, la cabecera fijada
+en 1800, la escalera corregida— tarda media hora.
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Modelo          | Par.  | Tokens únicos | val/loss   | Elo      | IC 95 %       | legal argmax | top-1       | puzles      |
+| --------------- | ----- | ------------- | ---------- | -------- | ------------- | ------------ | ----------- | ----------- |
+| `small` v1      | 39 M  | 240 M         | 1,5197     | 1359     | 1293-1429     | 99,40 %      | 51,10 %     | 22,07 %     |
+| `medium` v1     | 115 M | 240 M         | 1,4782     | —        | —             | —            | 52,31 %     | —           |
+| `small` v3      | 39 M  | 1 095 M       | 1,4770     | 1425     | 1367-1485     | 99,10 %      | 52,40 %     | 26,73 %     |
+| **`medium-v4`** | 115 M | 1 681 M       | **1,3733** | **1504** | **1446-1558** | **99,80 %**  | **54,40 %** | **37,50 %** |
+
+</div>
+
+Tres cosas de esa fila:
+
+- **No era la arquitectura.** El mismo `medium`, con la misma receta, pasa de 1,4782 con 240 M de
+  tokens repetidos 4,3 veces a 1,3733 con siete veces más material único y 1,46 pasadas.
+- **La legalidad no era una tendencia.** La serie 99,40 → 99,30 → 99,10 % de las tres `small` se
+  había leído como algo a vigilar. Era un modelo de 39 M estirándose sobre un corpus creciente; con
+  capacidad suficiente, fuerza y legalidad suben juntas, y 99,80 % es la más alta del proyecto.
+- **Los puzles son donde más se ve.** De 22,07 % a 37,50 %, un 70 % relativo. Un puzle es la jugada
+  única que gana, no la que jugó un humano, y es la métrica que menos premia imitar.
+
+El reparto de los +145 Elo entre `small` v1 y `medium-v4`, palanca a palanca y en la escala
+corregida: recuperar el mes de validación **+48**, la Elite **+18**, la capacidad ya justificada
+**+79**. El condicionamiento por Elo, cero: esa historia es la de M4.
+
+<Callout kind="entrevista" title="¿Por qué no se escaló el modelo desde el principio?">
+  Porque no había datos para justificarlo, y la prueba está en la tabla: el `medium` original perdió
+  contra un `small` mejor alimentado. La respuesta corta a «¿cuándo escalas?» es «cuando la división
+  de tokens únicos por parámetro te lo permite y el hueco train/val te lo pide». Escalar antes
+  compra memoria, no capacidad.
+</Callout>
+
+## Lo que se publica y lo que se mide después
+
+`chorcat/rukh-small` es **`small` v3** —la mejor `small` de la serie—, y `chorcat/rukh-medium` es
+`medium-v4`. La demo sirve `small` porque 79 MB en fp16 caben en un móvil y 231 no; `medium-v4` es
+para correrlo en local y para lo que viene.
+
+Sus cards llevan los números de la evaluación canónica del día en que se publicaron, y ahí
+aparece un detalle que conviene tener presente al comparar: `small` v3 midió 1425 (1367-1485) el 19
+de septiembre y **1365 (1293-1423)** el 20, con la misma config, la misma semilla y los mismos
+pesos. El rival juega por tiempo y con `UCI_LimitStrength`, que aleatoriza a propósito, así que la
+escalera se repite a sí misma con un suelo de unos 40 puntos (D-107). M5 va a construir un
+instrumento distinto por esto. De momento, la regla: **dos Elo de la escalera se comparan dentro
+de una misma tirada, no entre tiradas.**
+
+<Exercise n="01" title="Haz la división antes de tu siguiente corrida">
+  Toma `meta.json` del corpus con el que entrenaste `small` en la parte 2 y calcula tokens únicos
+  por parámetro y pasadas para esa corrida. Después haz lo mismo para `tiny` (6 000 pasos de 128 × 2
+  × 200 tokens sobre el mismo corpus). ¿Cuál de las dos estaba más lejos de los veinte? ¿Cuál
+  repitió más veces el material?
+  <Solution>
+    `small`: 240 M / 39 M ≈ 6,2 tokens por parámetro y 1 024 M / 240 M ≈ 4,3 pasadas. `tiny`: 240 M
+    / 5,3 M ≈ 45 por parámetro, y 6 000 × 256 × 200 = 307 M tokens vistos, 1,3 pasadas. `tiny`
+    estaba sobrado de datos y corto de red; `small`, al revés. Por eso la palanca correcta para
+    `small` era material y para `tiny` habría sido capacidad —que es, dicho de otro modo, lo que
+    `small` es respecto a `tiny`.
+  </Solution>
+</Exercise>
+
+<Exercise n="02" title="Predice el Elo desde la pérdida, y comprueba cuánto te fías">
+  Con `small` v1 (1,5197 → 1359) y `medium-v4` (1,3733 → 1504) traza una recta pérdida-Elo y predice
+  el Elo de `small` v2 (1,4703). Compáralo con el medido, 1407 (1344-1462). ¿Sirve la recta como
+  criterio de aceptación?
+  <Solution>
+    La pendiente sale de (1504 − 1359) / (1,5197 − 1,3733) ≈ 990 Elo por nat, y la predicción para
+    v2 es 1359 + 990 × 0,0494 ≈ 1408: clavado. Y aun así no sirve como criterio, por dos razones que
+    el módulo ya ha enseñado. La recta se ajustó sobre modelos entrenados con la distribución de la
+    validación, y v3 —con élite— cae fuera de ella (1,4770 predice 1401 y midió 1425). Y la escalera
+    tiene un suelo de reproducibilidad de unos 40 puntos, así que una predicción a diez puntos es
+    más precisa que el instrumento que la contrastaría. Sirve para descartar un experimento en 40
+    minutos; el Elo se mide siempre.
+  </Solution>
+</Exercise>
+
+## Qué has aprendido, cómo se mide
+
+Que la primera pregunta ante un modelo que se queda corto no es cuántos parámetros tiene sino
+cuántos tokens **distintos** ha visto por cada uno, y que el hueco entre entrenamiento y
+validación es el instrumento que responde antes de gastar una GPU. Que cantidad y composición del
+corpus son dos palancas distintas, y que solo la segunda mueve un eje que no estaba en los datos.
+Que una escala contra la que mides tiene que haberse medido a sí misma, y que un control con
+respuesta conocida es lo que te dice si puedes fiarte de ella. Y que escalar la red es la
+decisión correcta exactamente cuando la división lo permite, y la equivocada un momento antes.
+
+Lo medido: `medium-v4`, 1504 de Elo (1446-1558) y 99,80 % de legalidad sin máscara, los dos
+criterios de `GOAL.md` con el intervalo entero por encima; 37,50 % de puzles; y la historia
+completa en D-062 a D-073 del registro de decisiones.
+
+Lo siguiente es M3, el encoder, que va a pasar por la misma corrección: el que se publicó también
+se reentrenó a 39 M sobre este corpus, y la última parte de M3 cuenta qué compró eso y qué no. La
+cheatsheet del módulo está justo debajo.

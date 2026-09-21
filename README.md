@@ -56,6 +56,8 @@ src/content/
   modules/      m0.json … m6.json, a1.json … a6.json  (title, phase, hours, status, summary, outcomes, artifacts, order)
   lessons/      <module>/<nn>-<slug>.mdx              (frontmatter: title, description, module, order, duration,
                                                         level, status, updated, keywords, artifacts?, demo?)
+                                                       a module is several lessons of one to two hours, split
+                                                       along its sections; the cheatsheet hangs off the last one
   glossary/     terms.json                            (id, term, definition, module, aliases)
   cheatsheets/  <module>.json                         (module, items[{q, a}])
 src/data/results.json   the single results table (synced from the ML repo)

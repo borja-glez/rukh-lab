@@ -1,0 +1,688 @@
+---
+title: 'Fine-tuning: los labs'
+description:
+  'Nueve labs con sus comandos: mirar el corpus antes de culpar al modelo, descargar la mitad
+  que faltaba, el corpus plano y el afinado condicionado, LoRA a mano, la envoltura HF y la prueba contra
+  peft, cuántas partidas harían falta, estilo con adaptadores, Qwen3 con QLoRA y publicar.'
+module: m4
+order: 3
+duration: 150
+level: medio
+status: vigente
+updated: '2026-09-21'
+keywords:
+  - fine-tuning
+  - SFT
+  - instruction tuning
+  - condicionamiento
+  - Elo
+  - LoRA
+  - rango
+  - adaptador
+  - peft
+  - PreTrainedModel
+  - QLoRA
+  - cuantización de 4 bits
+  - olvido catastrófico
+  - entropía de aperturas
+  - diversidad
+  - SAN
+  - monotonía
+  - intervalo de confianza
+---
+
+import AdapterSwap from '../../../components/figures/AdapterSwap.astro';
+
+Parte 3 de 3 del módulo «Fine-tuning e instrucción». Viene de «Fine-tuning: cómo se mide y lo que salió» y cierra el módulo.
+
+## Labs
+
+Nueve laboratorios. Los dos primeros son de datos y no tocan el modelo; es donde estaba el fallo
+y es donde hay que empezar.
+
+<Callout kind="hoy" title="Punto de partida, si te saltaste algo">
+  Todo parte de `checkpoints/medium-v4/best.pt` (M2, parte 4) y necesita `data/uci/`, los 44 meses
+  de `data/elite/games.parquet` y el tokenizador. `uv run rukh pull --module m4` lo trae, y también
+  los cinco resultados del módulo por si solo quieres medirlos. El tramo bajo de Elo y su corpus
+  plano se regeneran en minutos con los comandos de cada lab; la secuencia completa, con lo que
+  tardó cada paso, está en `docs/runbooks/afinado-y-adaptadores.md`. Un afinado deja su checkpoint
+  en una carpeta con fecha (`checkpoints/medium-elo-20260920-143756/`); los comandos lo nombran sin
+  ella (`checkpoints/medium-elo/step-3800.pt`) y las dos grafías valen.
+</Callout>
+
+### Lab 1 · Mirar el corpus antes de culpar al modelo
+
+**Objetivo:** encontrar el agujero con una consulta, no con una intuición.
+
+El punto de partida es una afirmación que parecía cerrada: «el condicionamiento por Elo abre el eje
+pero no da fuerza». Antes de aceptarla, cuenta cuántas veces ha visto el modelo cada token de
+cabecera. El flujo empaquetado lo pone fácil, porque el segundo token de cada partida **es** el Elo
+de las blancas:
+
+```python title="labs/m4/header_histogram.py"
+import collections
+import numpy as np
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+tok = UciTokenizer()
+tokens = np.load("data/tokens-v4/uci/train/tokens.npy", mmap_mode="r")
+starts = np.load("data/tokens-v4/uci/train/starts.npy")
+counts = collections.Counter(tokens[starts + 1].tolist())
+for token_id, n in sorted(counts.items()):
+    print(f"{tok.ids[token_id]:>9s}  {n:>9,d}")
+```
+
+Lo que sale del corpus con el que se entrenó el modelo publicado:
+
+```text
+data/tokens-v4/uci/train: 18,942,740 games, 1,681,069,636 tokens
+
+    <w1800>  1,570,327  #############
+    <w1900>  1,539,899  ############
+    <w2000>  1,140,483  #########
+    <w2100>    726,462  ######
+    <w2200>    413,442  ###
+    <w2300>  1,075,847  #########
+    <w2400>  2,513,495  ####################
+    <w2500>  5,969,302  ################################################
+    <w2600>  2,384,084  ###################
+    <w2700>    845,767  #######
+    <w2800>    367,217  ###
+    <w2900>    224,455  ##
+    <w3000>    153,060  #
+    <w3100>     17,107  #
+    <w3200>      1,793  #
+
+headers below <w1800>: 0 of 12 ever seen in this corpus
+```
+
+**Cero de doce.** No hay una sola partida por debajo de 1800 en mil seiscientos ochenta millones de
+tokens. Los doce tokens anteriores existen en el vocabulario, tienen su fila en la tabla de
+embeddings, y esa fila es la que dejó `nn.init.normal_(std=0.02)`.
+
+De paso el histograma enseña otra cosa que no se buscaba: el corpus está dominado por `<w2500>`,
+con **5 969 302 partidas**, casi un tercio del total. Es la Elite Database, que entró entera en P2
+y arrastra la distribución hacia arriba. Un corpus no es plano porque nadie lo aplane.
+
+- Comprueba también el manifiesto del conjunto balanceado de P1
+  (`data/elo-bins/manifest.json`): su bin más bajo es `1800`, que es la misma frase dicha desde
+  otro sitio.
+- Y mira el filtro: `configs/data/lichess-2025-01-02.yaml`, `min_elo: 1800`, aplicado a los dos
+  jugadores.
+
+<Callout kind="mundo-real" title="El histograma de la entrada es el primer sitio, no el último">
+  Cuando una condición, una etiqueta o una clase «no funciona», la primera pregunta no es qué le
+  pasa al modelo: es cuántos ejemplos de eso ha visto. Es una consulta de tres líneas y descarta la
+  explicación más común de todas antes de gastar una GPU en las otras.
+</Callout>
+
+### Lab 2 · Descargar la mitad que faltaba
+
+**Objetivo:** un segundo corpus que se diferencie del primero **solo** en el rango de fuerza, y un
+descargador que sobreviva al anfitrión.
+
+Primero el filtro. `FetchConfig` gana un `max_elo` y el constructor de SQL lo aplica a los dos
+jugadores, por la misma razón que `min_elo`: un 1200 emparejado con un 2400 no es una partida de
+1200, es un desajuste.
+
+```python title="src/rukh/data/fetch.py"
+if cfg.max_elo is not None:
+    conditions.insert(1, f"WhiteElo <= {cfg.max_elo} AND BlackElo <= {cfg.max_elo}")
+```
+
+- Test: con `max_elo` aparecen las dos condiciones; sin él, ninguna; un techo por debajo del
+  suelo es un error de configuración.
+- Test sobre las dos configuraciones que se envían: `low.max_elo + 1 == high.min_elo`, y todo lo
+  demás idéntico. Las dos mitades del eje tienen que **embaldosar** el rango sin solaparse ni
+  dejar hueco, y eso es una propiedad que se puede comprobar en CI sin red.
+
+Después, el descargador. La versión de P1 leía los parquet remotos con DuckDB sobre `hf://` y dejó
+de funcionar: miles de peticiones de rango contra un anfitrión que contesta `429`. Lo que se hace
+ahora es bajar cada shard entero con `huggingface_hub` —que cachea, reanuda y espera bien—,
+filtrarlo en local y borrarlo.
+
+- El filtro se construye **una vez** (`where_clause`) y se usa en dos sitios: la consulta que
+  imprime el ensayo y cada shard descargado. Lo documentado es lo que corre.
+- `limit` para la descarga, no solo el resultado: con 505 547 partidas útiles en el primer
+  shard, 1,2 millones salen de tres en vez de setenta y dos.
+- Un mes ya descargado no se vuelve a descargar, y un mes interrumpido reanuda por el shard en
+  el que se quedó. Los dos casos tienen test.
+- Un fichero de cero bytes —lo que deja un `COPY` que murió a medias— **no** cuenta como mes
+  descargado. Y un filtro que no deja pasar nada es un error, no un parquet vacío: un corpus de
+  cero filas aguas abajo parece un corpus.
+
+```bash title="Terminal"
+uv run rukh data fetch --config configs/data/lichess-low.yaml
+uv run rukh data uci --config configs/data/pipeline-low.yaml
+```
+
+La descarga son tres shards por mes —el tope de 1,2 millones de partidas se llena antes de los
+setenta y dos—, unos diez minutos, y deja `data/raw-low/`; la conversión, cinco minutos más, deja
+`data/uci-low/` con 1 147 074 partidas de enero y 1 145 401 de febrero. La configuración escribe en
+carpetas propias a propósito: `data/uci` sigue significando «lo que entrenó los modelos publicados».
+
+<Callout kind="roto" title="Descargar con `cache_dir` y creer que borras">
+  La primera versión usaba `hf_hub_download(..., cache_dir=...)` y borraba lo que devolvía. La caché
+  del Hub guarda los bytes en `blobs/` y devuelve un enlace en `snapshots/`, así que borrar el
+  enlace no libera nada: la corrida dejó **5,7 GB** de shards detrás después de decir que había
+  limpiado. Con `local_dir` la ruta *es* el fichero y `unlink` significa lo que dice.
+</Callout>
+
+### Lab 3 · El corpus plano y el afinado condicionado
+
+**Objetivo:** un corpus cuya forma sea el experimento, y un afinado que no herede el calendario del
+preentrenamiento.
+
+`EloBinsConfig` pasa de un directorio a una lista de fuentes, y de bins de 100 a un ancho de banda
+configurable con extremos. La lista es lo que permite que las dos mitades del eje vivan aparte en
+disco y se junten **solo aquí**, en el paso cuyo trabajo es enseñar la cabecera.
+
+```yaml title="configs/data/pipeline-low.yaml"
+elo_bins:
+  sources: [data/uci-low, data/uci]
+  bin_width: 200
+  min_bin: 1000
+  max_bin: 2600
+  n_per_bin: 150000
+```
+
+- Test: dos corpus se convierten en un eje; el muestreo sale **plano** por muy sesgada que esté
+  la fuente (quince partidas de 1200 contra cinco de 2000 dan cinco y cinco); las bandas fuera
+  del rango se descartan; el ancho de banda aparece en la fórmula que publica el manifiesto.
+
+Y el afinado necesita algo que el bucle no tenía: empezar desde unos pesos **sin** heredar el estado
+del optimizador. `--resume` existe para continuar una corrida interrumpida y restaura los momentos
+de Adam, el contador de pasos, el RNG y hasta el run de MLflow; un afinado quiere exactamente lo
+contrario, porque es una corrida **nueva**, con sus datos, su tasa y su calendario, y los momentos
+de un coseno de 48 000 pasos ya decaído pelearían contra el warmup que empieza ahora.
+
+```python title="src/rukh/train/loop.py"
+initialised_from = load_init_weights(cfg.init_from, model, where)
+```
+
+- Tests: `init_from` toma los pesos y deja el optimizador a cero, con su propia carpeta, su
+  propio contador y su propio run; con `lr = 0` el afinado _es_ el checkpoint del que partió;
+  `init_from` y `--resume` a la vez son una contradicción y se rechazan.
+
+```bash title="Terminal"
+uv run rukh data elo-bins --config configs/data/pipeline-low.yaml
+uv run rukh data tokenize --config configs/data/pipeline-low.yaml --scheme uci --pack
+uv run rukh train --config configs/train/medium-elo.yaml
+```
+
+Salida real del corpus plano: 150 000 partidas en cada banda de 1000 a 2200, 146 232 en la de 2400
+y 23 191 en la de 2600, porque las dos últimas no tienen con qué llenar la cuota y el manifiesto
+lo dice en vez de rellenarlo. El afinado son 3 800 pasos, **19,5 minutos**, y termina en
+`checkpoints/medium-elo-*/step-3800.pt`; `best.pt` se queda en el paso 200 y el bucle avisa de
+por qué (la parte anterior lo explica). El afinado de maestros es el mismo comando con
+`pipeline-masters.yaml` para tokenizar la Elite y `medium-masters.yaml` para entrenar: 20,7
+minutos.
+
+### Lab 4 · LoRA escrita a mano
+
+**Objetivo:** un adaptador que sea LoRA de verdad, y las pruebas que lo demuestran.
+
+```python title="src/rukh/models/lora.py"
+class LoRALinear(nn.Module):
+    def forward(self, x):
+        out = self.base(x)
+        delta = out.new_zeros(out.shape)
+        for (start, stop), a, b in zip(self.slices, self.a, self.b, strict=True):
+            delta[..., start:stop] = F.linear(F.linear(self.drop(x), a), b)
+        return out + self.scale * delta
+```
+
+Los tests son la parte interesante, porque cada uno comprueba una afirmación distinta del método:
+
+- **Un adaptador sin entrenar es la identidad.** `B` empieza en cero, así que aplicar LoRA no
+  cambia ni un logit hasta que llega un gradiente.
+- **Solo se entrenan los factores.** El recuento que devuelve `apply_lora` coincide con la suma
+  de los parámetros con `requires_grad`, y el conjunto de esos parámetros es exactamente el de
+  las `A` y las `B`.
+- **El recuento es la fórmula de la card.** `n_capas × n_objetivos × 2 × r × d_model`, sin
+  sorpresas.
+- **La proyección fusionada da a cada objetivo su propio subespacio**, y la franja de la clave
+  no se mueve cuando solo se adaptan consulta y valor.
+- **Fundir reproduce exactamente el modelo adaptado.** `W + BA` plegado en el peso da los mismos
+  logits que el envoltorio calculándolo. Es la propiedad que permite publicar un adaptador de
+  1,6 MB y aun así exportarlo, cuantizarlo y servirlo como un modelo cualquiera.
+- **Un modelo fundido tiene el state dict de un decoder normal**, sin `.base.weight` ni `.a.0`.
+- **El adaptador va y vuelve por safetensors** y reproduce los logits en un modelo limpio.
+- **Los gradientes llegan a los factores y a nada más**: la tabla de embeddings sale sin `grad`.
+
+Hay un detalle del guardado que merece su propia función. `merge_lora` **muta**, que es lo que
+quiere una exportación y lo que no quiere un bucle de entrenamiento: un checkpoint escrito a mitad
+de corrida no puede dejar el modelo incapaz de dar otro paso. Por eso existe `merged_state_dict`,
+que hace el plegado sobre una copia de los números y deja los envoltorios en su sitio. Lo que sale
+tiene los nombres de módulo de un `MoveDecoder` normal, que es lo que esperan el cargador, el
+exportador y el publicador.
+
+```bash title="Terminal"
+uv run pytest -m unit -q tests/unit/test_lora.py
+```
+
+Los ocho tests de arriba son ese fichero. Corren en CPU sobre un decoder de juguete en unos
+segundos, y son la definición operativa de «esto es LoRA»: si uno falla, lo que has escrito es
+otra cosa.
+
+### Lab 5 · La envoltura HF y la prueba contra `peft`
+
+**Objetivo:** que el decoder entre en el ecosistema sin dejar de ser el decoder, y usarlo para
+comprobar el laboratorio anterior.
+
+```python title="src/rukh/models/hf.py"
+class RukhForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = RukhConfig
+    base_model_prefix = "decoder"
+    _tied_weights_keys = {"decoder.lm_head.weight": "decoder.tokens.weight"}
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.decoder = MoveDecoder(config.decoder_config())
+        self.post_init()
+```
+
+- Tests de fidelidad: los mismos logits que `MoveDecoder`; los pesos se **comparten**, no se
+  copian; la pérdida es la del decoder; las etiquetas no se vuelven a desplazar; la config va y
+  vuelve por disco.
+- Test de que la config no se confunde con un par encoder-decoder: `GenerationConfig` se
+  construye sin explotar.
+- Y el que cierra el Lab 4: `peft` cuenta los mismos parámetros entrenables, y con la misma `A`
+  copiada de un lado a otro los dos optimizan **el mismo número paso a paso**.
+
+Tres cosas que hay que saber para que `save_pretrained` funcione con este modelo, y que no salen en
+ningún tutorial: declarar `_tied_weights_keys` como un **diccionario** `{copia: origen}`; llamar a
+`post_init()` al final del constructor (sin él no existe `all_tied_weights_keys` y cualquier guardado
+falla con un `AttributeError` sobre un atributo que uno no ha escrito); y no llamar `decoder` a un
+método de la config.
+
+```bash title="Terminal"
+uv sync --extra cu128 --extra hf --group dev
+uv run pytest -m unit -q tests/unit/test_hf_wrapper.py
+uv run python labs/m4/lora_check.py
+```
+
+`peft` y `transformers` viven en el extra `hf`, que el entorno base no instala: el decoder no los
+necesita para nada salvo para esta comparación. `lora_check.py` imprime las cuatro comprobaciones
+de la parte anterior, y la cuarta es la tabla en la que los dos optimizadores dan el mismo número
+paso a paso con `|delta| = 0.00e+00`.
+
+### Lab 6 · ¿Faltan partidas o no hay diferencia?
+
+**Objetivo:** no volver a pagar una noche de Stockfish sin saber antes si serviría de algo.
+
+Dos intervalos solapados se leen igual en el informe y pueden significar cosas opuestas. La escalera
+no mide Elo directamente: mide una **tasa de puntos** —victorias más medio empate, entre partidas—
+y el Elo es una transformación de ella. Una tasa es una proporción, y las proporciones tienen una
+fórmula para esto:
+
+```python title="labs/m4/games_needed.py"
+def needed(p1: float, p2: float) -> float:
+    """Games per condition for the two 95 % intervals to stop touching."""
+    gap = abs(p2 - p1)
+    if gap <= 0:
+        return math.inf
+    spread = math.sqrt(p1 * (1 - p1)) + math.sqrt(p2 * (1 - p2))
+    return (Z * spread / gap) ** 2
+```
+
+El barrido que produce ese `results.json` es la medición cara del módulo: seis condiciones a unos
+26 minutos cada una, y después el control sobre el modelo **sin** afinar en los dos extremos del
+eje, que es lo que impide cantar victoria (la parte anterior cuenta qué contestó).
+
+```bash title="Terminal"
+uv run rukh eval sweep --model checkpoints/medium-elo/step-3800.pt --elos 1200,1500,1800,2000,2100,2400 --config configs/eval/greedy-sweep.yaml --stage medium-elo
+uv run rukh eval sweep --model checkpoints/medium-v4/best.pt --elos 1200,2100 --config configs/eval/greedy-sweep.yaml --stage medium-v4
+```
+
+Sobre el barrido de este hito, pidiéndole solo las condiciones que nombra el criterio:
+
+```
+uv run python labs/m4/games_needed.py --only 1500,2000,2400
+
+  <w1500> -> <w2000>  0.466->0.453  -0.013   no              24,420
+  <w2000> -> <w2400>  0.453->0.569  +0.116   no                 284
+```
+
+- Comprueba que el número de la última columna baja como el **cuadrado** de la diferencia: la mitad
+  de diferencia son cuatro veces más partidas. Por eso una comparación floja es tan cara.
+- Compáralo con las 160 partidas que ya se jugaron: la fila de 284 estaba a una hora de máquina y la
+  de 24 420, a sesenta.
+- El mismo cálculo, al revés, dice cuánta diferencia detecta una tirada: con 160 partidas por
+  condición no se ve nada por debajo de 0,155 de tasa, que son unos **110 puntos de Elo**. Ese es el
+  instrumento, y conviene saber qué no puede ver antes de concluir que no hay nada.
+
+<Callout kind="teoria" title="El resultado negativo hay que ganárselo">
+  «No sale» no es una conclusión mientras no se sepa si el experimento podía verlo. Esta es la
+  diferencia entre decir «el condicionamiento no da fuerza» y decir «el condicionamiento no da
+  fuerza, y con este instrumento habría visto cualquier efecto mayor de 110 Elo». Lo segundo es una
+  medida; lo primero es una impresión con formato de tabla.
+</Callout>
+
+### Lab 7 · Estilo con adaptadores
+
+**Objetivo:** dos adaptadores que cambien algo que se vea, y medir qué cuesta.
+
+El eje de estilo es la primera jugada de las blancas. Es la elección más aburrida posible y es la
+correcta: se ve en la demo. Cargas un adaptador y el modelo abre `1. e4`; cargas el otro y abre
+`1. d4`. Un adaptador que moviera algo real pero invisible sería mejor aprendizaje automático y peor
+enseñanza.
+
+Las rebanadas se cortan con campos **tipados**, no con SQL en un YAML:
+
+```yaml title="configs/data/pipeline-style.yaml"
+styles:
+  - name: e4
+    first_move: e2e4
+    min_elo: 1800
+    n_games: 200000
+```
+
+El `min_elo` no es decorativo: si las partidas de `1. d4` vinieran de jugadores más flojos, «el
+adaptador cambió la apertura» y «el adaptador lo empeoró» serían la misma medición.
+
+- Tests: la rebanada de primera jugada solo contiene partidas que empiezan por ella; el prefijo
+  no se cuela en otra jugada; los prefijos de ECO seleccionan familias; el suelo de Elo filtra;
+  el tope limita; el manifiesto registra el predicado que una card publicada tendrá que citar; y
+  una comilla en un campo no puede salirse del predicado.
+- El entrenamiento reutiliza el bucle del decoder con `lora:` en la config. Los checkpoints
+  guardan los pesos **fundidos** —para que el exportador y el publicador no se enteren de que
+  hubo LoRA— y el adaptador se escribe al lado como su propio fichero pequeño.
+- Un adaptador no se puede reanudar con `--resume`: sus checkpoints llevan pesos fundidos, que
+  ya no dicen dónde acababa el adaptador. El bucle lo rechaza diciéndolo.
+
+```bash title="Terminal"
+uv run rukh data style --config configs/data/pipeline-style.yaml
+uv run rukh data tokenize --config configs/data/pipeline-style-e4.yaml --scheme uci --pack
+uv run rukh data tokenize --config configs/data/pipeline-style-d4.yaml --scheme uci --pack
+uv run rukh train --config configs/train/lora-e4.yaml
+uv run rukh train --config configs/train/lora-d4.yaml
+uv run python labs/m4/lora_spectrum.py --adapter checkpoints/lora-e4
+```
+
+Cada adaptador son 1 500 pasos y unos **siete minutos**, y deja `adapter.safetensors` con
+`adapter_config.json` al lado de sus checkpoints fundidos. `lora_spectrum.py` es la figura de la
+parte anterior: los ocho valores singulares de la corrección, y el noveno a cero exacto.
+
+<AdapterSwap />
+
+Y aquí está la parte del laboratorio que no es entrenar. Un adaptador de 1,6 MB que para llegar al
+navegador necesita 221 MB de ONNX no ha ahorrado nada: el método es barato y el formato se lo come.
+La salida es sacar la corrección de los pesos y meterla en el **grafo**.
+
+```python title="src/rukh/export/adapter.py"
+class AdaptableDecoder(nn.Module):
+    """`forward(idx, lora_a, lora_b)` -> the last step's logits, with the adapter applied."""
+
+    def forward(self, idx: Tensor, lora_a: Tensor, lora_b: Tensor) -> Tensor:
+        for layer, slot in enumerate(self.slots):
+            slot.a = lora_a[layer]
+            slot.b = lora_b[layer]
+        logits, _ = self.model(idx)
+        return logits[:, -1, :]
+```
+
+Los factores viajan apilados por capas —`A` de forma `(capas, rangos, r, d)` y `B` de
+`(capas, rangos, d, r)`— y se exportan con `rukh export --adapter-inputs`. El navegador cambia de
+estilo **subiendo** 1,6 MB, no descargando otro modelo.
+
+- Comprueba lo primero que hay que comprobar: con los factores a **cero**, el grafo da exactamente
+  los mismos logits que la exportación normal. Si no lo diera, el fichero adaptable no podría
+  sustituir al ordinario y habría que publicar los dos.
+- Comprueba lo segundo: con dos adaptadores distintos, las respuestas difieren, y el fichero no se
+  ha tocado entre las dos.
+- Y lo tercero, que es la paridad de siempre: el mismo adaptador cargado en PyTorch y alimentado
+  al grafo tiene que elegir la misma jugada en mil posiciones de validación.
+- Un detalle de implementación que no es cosmético: la corrección se arma con `cat` sobre todo el
+  ancho de salida en vez de escribirse en una rodaja de un tensor de ceros. La asignación por
+  índice exporta como `ScatterND`, que onnxruntime web ejecuta en CPU aunque el resto del grafo vaya
+  por WebGPU.
+
+```bash title="Terminal"
+uv run rukh export --ckpt checkpoints/medium-v4/best.pt --out artifacts/onnx/medium-lora --fp16 --int8 --check-parity --positions 1000 --adapter-inputs --adapter checkpoints/lora-e4
+```
+
+Unos quince minutos, y las tres comprobaciones de arriba salen en la consola con su número: la
+paridad con los factores a cero, la diferencia entre los dos adaptadores y la paridad del adaptador
+cargado en PyTorch frente al grafo sobre mil posiciones.
+
+<Callout kind="roto" title="Un valor por defecto de la especificación que rompió el fp16">
+  El grafo fp32 cargaba perfectamente y el fp16 se negaba: `Type Error: Type (tensor(float16)) of
+  output arg (val_20) of node (node_ConstantOfShape_18) does not match expected type
+  (tensor(float))`. Y el fp32 no lo sirve nadie. La causa: los rangos que nadie adapta son un
+  `ConstantOfShape` de ceros que el exportador escribe **sin** atributo `value`, porque la
+  especificación dice que el valor por defecto es un cero de `float32`. El conversor a fp16 retipa
+  el grafo alrededor y no toca el nodo, así que el fichero declara `float16` donde el nodo sigue
+  produciendo `float32`. La regla que deja: **un parámetro implícito es una dependencia como
+  cualquier otra**, y una herramienta que reescribe tu fichero no la ve. Lo encontró un test de
+  catorce segundos sobre el modelo de juguete; sin él habrían sido cuarenta y cinco minutos de
+  exportación y una demo rota.
+</Callout>
+
+<Callout kind="teoria" title="Dónde vive el factor `alpha / r`">
+  La corrección es `(alpha / r) · B · A`, y ese factor tiene que estar en un sitio y solo en uno. Si
+  vive en el grafo, cualquier adaptador que se le dé tiene que haberse entrenado con el mismo
+  `alpha` y el mismo `r`, y en un búfer plano de `float32` no hay nada contra lo que comprobarlo.
+  Así que vive en el **fichero**: el adaptador que descarga la página lleva `B` ya multiplicado y el
+  grafo multiplica por uno. Un adaptador de cualquier rango es correcto en ese grafo sin que nadie
+  tenga que cuadrar dos números a mano. La regla general: cuando un dato y su interpretación pueden
+  separarse, júntalos en el mismo fichero.
+</Callout>
+
+### Lab 8 · Qwen3 con QLoRA, por el mismo harness
+
+**Objetivo:** que el modelo general y el propio se midan con el mismo metro, y que lo único
+distinto entre ellos sea la representación.
+
+Primero las mismas partidas, escritas como las leería un humano. `rukh.data.pgn_text` reconstruye
+el SAN con python-chess desde el mismo corpus UCI:
+
+```
+[WhiteElo "2015"] [BlackElo "2028"]
+1. e4 c6 2. d4 d5 3. exd5 cxd5 4. Bd3 Nf6 5. h3 Nc6 6. c3 e5 ... 1-0
+```
+
+Dos detalles del formato que parecen menores y no lo son:
+
+- El movetext se **vuelve a jugar** desde la raíz en vez de leerse de la pila de jugadas, porque
+  SAN depende de la posición en la que se escribe: la misma jugada es `Nf3` o `Ngf3` según dónde
+  esté el otro caballo, y solo la posición de ese momento lo sabe.
+- El prompt **nunca termina en espacio**. Un BPE escribe una jugada como `" Nc6"`, con el espacio
+  pegado; un prompt que ya lo lleva empuja al modelo hacia la grafía que casi nunca vio en
+  entrenamiento, y eso saldría en la tabla como un modelo peor en vez de como un prompt peor.
+
+Después el afinado, que es deliberadamente **código de otros**: `transformers` para el modelo,
+`peft` para el adaptador, `trl` para el bucle. El proyecto tiene su propia LoRA y su propio bucle y
+no los necesita aquí; lo que necesita es la experiencia del camino del ecosistema, que es el que un
+lector va a usar de verdad.
+
+- El presupuesto se elige **generoso con Qwen**, no justo con nosotros: `r = 16` sobre las cuatro
+  proyecciones de atención (el doble del rango que usan nuestros adaptadores) y 1 500 pasos de
+  hasta 24 M de tokens de ajedrez, para un modelo que ya sabe hablar. Si aun así pierde por mucho,
+  nadie puede decir que se le dejó sin comer.
+- Cuatro bits se **intenta** y no se exige. Si `bitsandbytes` no carga, la corrida cae a bf16 y lo
+  escribe en su informe, con la razón. Fingir que se demostró QLoRA cuando la cuantización no se
+  usó sería peor que no intentarlo.
+- Y hay un detalle de contabilidad que cambia el titular: `bitsandbytes` guarda dos valores de 4
+  bits por byte, así que `numel()` sobre un peso cuantizado devuelve **la mitad** de los parámetros
+  que representa. Contarlo sin corregir haría que la línea de «solo el 0,1 % es entrenable» saliera
+  el doble de favorable de lo que es.
+
+Y por último la evaluación, que es la parte que hace válida la comparación. `play_game` se partió
+en dos para esto: un protocolo `Player` y un `DecoderPlayer` que es el camino original palabra por
+palabra. El Qwen afinado entra como otro `Player` y juega contra la misma escalera, con los mismos
+rivales, el mismo tiempo por jugada, los mismos colores y la misma adjudicación.
+
+- El protocolo obliga a decir dos cosas a la vez: qué jugada se hace **y** si la propuesta sin
+  máscara era legal. La partida tiene que terminar, así que una propuesta ilegal se rescata con la
+  primera jugada legal, pero el rescate no puede esconder que ocurrió — es la misma regla que
+  `illegal_proposals` en el decoder.
+- El rescate **no vuelve a preguntarle al modelo**. Insistir hasta que conteste algo legal mediría
+  un modelo distinto del que describe la tasa de legalidad.
+
+```bash title="Terminal"
+uv run rukh data pgn-text --config configs/data/pipeline-pgn.yaml
+uv run rukh train qwen --config configs/train/qwen3-pgn.yaml
+uv run rukh eval qwen --adapter checkpoints/qwen3-pgn-qlora --config configs/eval/greedy.yaml --stage qwen3-pgn-qlora
+```
+
+El afinado descarga Qwen3-0.6B del Hub la primera vez (1,5 GB) y corre 1 500 pasos; la evaluación
+por la misma escalera tarda unos 40 minutos, más que la del decoder, porque cada jugada es una
+generación de texto. Si `bitsandbytes` no carga, la corrida cae a bf16 y lo escribe en su `run.json`.
+
+### Lab 9 · Publicar y encender el selector
+
+**Objetivo:** que lo medido salga del disco, y que la demo no prometa más de lo que se midió.
+
+Un adaptador no es un modelo y su repositorio no debe parecerlo. Sin pesos, sin ONNX, sin
+vocabulario: tres ficheros, y una card que empieza por el modelo base y por el comando que lo
+carga, porque sin el checkpoint base exacto el adaptador es un montón de números sin modelo que
+corregir.
+
+```bash title="Terminal"
+uv run rukh eval --model checkpoints/medium-elo/step-3800.pt --config configs/eval/greedy.yaml --stage medium-elo
+uv run rukh export --ckpt checkpoints/medium-elo/step-3800.pt --out artifacts/onnx/medium-elo --fp16 --int8 --check-parity
+uv run rukh publish model --ckpt checkpoints/medium-elo/step-3800.pt --repo chorcat/rukh-medium-elo --stage medium-elo --onnx artifacts/onnx/medium-elo --dry-run
+uv run rukh publish adapter --run checkpoints/lora-e4 --repo chorcat/rukh-lora-e4 --base chorcat/rukh-medium --effect artifacts/publish/effects/lora-e4.json --dry-run
+uv run rukh publish qwen --run checkpoints/qwen3-pgn-qlora --repo chorcat/rukh-qwen3-pgn-qlora --dry-run
+```
+
+Lo mismo para `medium-masters` y para `lora-d4`. Con `--dry-run` la carpeta entera queda en
+`artifacts/publish/` y la card se puede leer antes de subir nada; sin él hace falta `HF_TOKEN`.
+
+- La card publica lo que el adaptador **cambió** y lo que **costó**, que son dos tablas y no una.
+  Lo que cambió: la probabilidad que el modelo le da a `e2e4` desde la posición inicial, leída de
+  la softmax sin muestrear —59,64 % → **99,85 %**— y la entropía de la primera jugada, 1,7695 →
+  **0,0209** bits. Lo que costó: legalidad, top-1 y puzles medidos en los dos, con la misma suite y
+  la misma semilla. Un estilo que cambia la apertura es fácil; un estilo que cambia la apertura **y
+  nada más** es la afirmación que vale, y solo es una afirmación si el «nada más» está medido.
+- Publicar un adaptador con el Elo del modelo base sería publicar el número de otro, así que cuando
+  una medición no existe la card dice «no medido» en vez de tomarla prestada. Hay un test de eso.
+- El recuento de parámetros de la card es la **fórmula** sobre el modelo base real, no el tamaño
+  del fichero del test.
+- Salen cinco ficheros, no tres: los mismos factores dos veces. `adapter.safetensors` es el que lee
+  `load_adapter` en PyTorch; `web/adapter.bin` es el mismo contenido como un búfer plano de
+  `float32` con el `alpha/r` ya aplicado, que es lo que descarga el navegador, y `web/adapter.json`
+  lleva sus formas porque un búfer de números no dice nada de sí mismo. Los dos los escribe la
+  misma función a partir de los mismos tensores, así que no pueden separarse.
+
+Y en la demo, el selector «Elo objetivo» lleva desde P2 en pantalla y desactivado. Encenderlo es
+una línea; lo que hay que decidir es qué ofrece.
+
+```ts title="rukh-web/src/lib/registry.ts"
+export const ELO_TARGETS = [1200, 1500, 1800, 2000, 2100, 2400] as const;
+```
+
+Seis, no veintisiete. El vocabulario tiene veintisiete cabeceras y el modelo contesta a todas,
+pero **un control que el jugador puede mover es la afirmación de que moverlo hace algo**, y esa
+afirmación es tan ancha como el barrido que la respalda. Ofrecer las veintisiete sería prometer
+veintisiete mediciones y tener seis.
+
+- E2E: con una etapa condicionada el selector está activo, sin pista, con exactamente esas seis
+  opciones y empezando en 1800; con las demás, desactivado y con la pista visible.
+- La etapa de prueba condicionada es el mismo grafo de juguete con la bandera puesta, para que el
+  E2E recorra el camino activado sin descargar 221 MB. Lo que se prueba es el cableado que lee la
+  bandera; si los pesos detrás están de verdad condicionados es una pregunta para `rukh eval sweep`
+  y ninguna prueba de navegador podría contestarla.
+
+El selector de **estilo** se enciende igual y se comprueba mejor, porque de este sí puede decir algo
+un navegador. El E2E carga el modelo una vez, lee la distribución que publica para una posición,
+cambia de estilo, la vuelve a leer, y comprueba tres cosas: que cambia; que al quitar el adaptador
+vuelve **el mismo número**, no uno parecido; y que en toda la prueba se ha pedido **un solo**
+`.onnx`. Esa última aserción es el hito entero en una línea.
+
+<Callout kind="mundo-real" title="Una prueba que se lee como la promesa">
+  «Cambiar de estilo no descarga otro modelo» es una frase de marketing hasta que algo la cuenta.
+  `expect(downloads.filter((url) => url.endsWith('.onnx'))).toHaveLength(1)` la convierte en una
+  propiedad que se rompe sola el día que alguien añada un segundo fichero. Cuando una promesa se
+  pueda escribir como una aserción, escríbela: es la diferencia entre documentar una intención y
+  defenderla.
+</Callout>
+
+## Qué has aprendido, cómo se mide
+
+- **El corpus antes que el modelo.** Los doce tokens de Elo por debajo de 1800 nunca habían
+  recibido un gradiente porque `min_elo: 1800` filtraba a **los dos** jugadores, y eso explicaba
+  tres hitos de resultados raros. **Medido** con un `Counter` sobre el segundo token de cada
+  partida empaquetada: 18 942 740 partidas, 1 681 069 636 tokens, **0 de 12** cabeceras por debajo
+  de 1800 vistas alguna vez. No hacía falta ni cargar el modelo.
+- **El eje dejó de ser ruido, y se ve sin jugar una partida.** La entropía analítica de la primera
+  jugada —la softmax tal cual, sin muestreo, sin semilla— pasa a ser **monótona en las seis
+  condiciones**: 1,596 → 1,647 → 1,741 → 1,841 → 1,881 → 1,992 bits. En el modelo viejo había un
+  escalón de **1,17 bits** justo entre `<w1500>` y `<w1800>`, exactamente donde cortaban los datos,
+  y con el signo del ruido: por debajo del suelo estaba _menos_ decidido que en cualquier cabecera
+  que conocía.
+- **El criterio 1 de `GOAL.md` no se cumple, y está medido por qué.** Ni monotonía ni intervalos
+  separados con 160 partidas por condición. Entre `<w1500>` y `<w2000>` la diferencia de tasa de
+  puntos es **−0,013** y harían falta **24 420 partidas por condición** para separarla: no faltan
+  partidas, no hay diferencia. Entre `<w2000>` y `<w2400>` harían falta 284, que sí es un problema
+  de medición.
+- **La explicación obvia del apartado anterior se comprobó y salió que no.** Muestrear la cola en
+  vez de jugar la moda ensancha la brecha en Elo (219 → 270) y ensancha más los intervalos
+  (123 → 195), así que la diferencia pasa de 4,40 σ a 3,85 σ: la medición **empeora**. La causa es
+  que a temperatura 1,0 el modelo pierde unos 400 puntos y cae por debajo del rango para el que la
+  escalera está calibrada. Un tratamiento que saca al sujeto del rango del instrumento no revela el
+  efecto, lo esconde.
+- **Y la escalera no se repite a sí misma.** El mismo modelo, la misma cabecera y la misma semilla,
+  medidos dos veces por caminos distintos: **1498 y 1558**. La semilla fija nuestro muestreo, no el
+  de Stockfish, que juega por tiempo y con `UCI_LimitStrength`. Son 1,18 σ de la diferencia entre
+  dos tiradas de 160 partidas, o sea nada raro — y significa que el suelo de reproducibilidad del
+  instrumento (unos 40 Elo de una sigma) es **mayor** que la distancia entre condiciones contiguas.
+- **Y el control dice que la columna de Elo no distingue las dos causas.** El mismo barrido sobre
+  el modelo **sin** afinar recorre 161 puntos —con los intervalos separados— usando una cabecera
+  que nunca entrenó: un prefijo desconocido le estorba, y estorbarle cuesta eso. Si una métrica
+  sube con el tratamiento, mídela también sin él.
+- **Dónde sí se ve el afinado:** a `<w1200>`, con el mismo Elo que el modelo base, el condicionado
+  escribe **cero** jugadas ilegales contra cuatro de mil, gana 1,6 puntos de top-1, seis décimas de
+  puzles y baja **1,26 bits** de entropía. A `<w2100>` los dos coinciden en las cinco columnas, que
+  es cómo se comprueba que no hubo olvido catastrófico.
+- **LoRA escrita a mano es LoRA.** La misma configuración entrenada con `apply_lora` y con
+  `peft.get_peft_model`, mismos pesos base, misma `A` copiada y mismo optimizador optimizan el
+  mismo número durante seis pasos, con una diferencia de **cero exacto**. Y fundir el adaptador
+  también es exacto, así que un fichero de 1,6 MB se puede exportar, cuantizar y servir como un
+  modelo cualquiera.
+- **Un adaptador de 393 216 números —el 0,34 % del modelo— cambia una decisión por completo y no
+  cuesta nada.** `lora-e4` sube `1. e4` del 59,64 % al **99,85 %** y deja legalidad (99,8 %),
+  top-1 (54,4 → 54,7 %) y puzles (37,5 → 37,8 %) donde estaban. Y con la primera jugada clavada,
+  doscientas auto-partidas de doce plies siguen dando **199 líneas distintas**: el adaptador fijó
+  el primer movimiento y no tocó ninguno de los once siguientes.
+- **Dos métricas con el mismo nombre pueden contradecirse y tener razón las dos.** La entropía de
+  la primera jugada dice «este modelo no varía» (0,021 bits) y la de líneas dice «no repite una
+  partida» (7,634 de 7,644). Miden decisiones distintas; publicar una sola habría dado un titular
+  falso en cualquiera de las dos direcciones.
+- **Un adaptador no tiene por qué costar un modelo entero al desplegarlo.** Exportando el decoder
+  con `A` y `B` como **entradas del grafo**, el navegador cambia de estilo subiendo 1,6 MB en vez
+  de descargar otros 221 MB. Con los factores a cero el fichero es el modelo base exactamente, así
+  que sustituye a la exportación normal en lugar de sumarse a ella, y el E2E lo comprueba pidiendo
+  **un solo** `.onnx` en toda la prueba.
+- **Un parámetro implícito es una dependencia.** El `ConstantOfShape` que el exportador escribe sin
+  atributo `value` se apoya en el valor por defecto de la especificación, y el conversor a fp16
+  retipa el grafo a su alrededor: resultado, el fp32 carga y el fp16 no. Lo encontró un test de
+  catorce segundos sobre un modelo de juguete.
+- **Afinar sobre maestros ensancha el repertorio y estrecha el eje.** `docs/spec/02` predecía «sube
+  el Elo, baja la diversidad»; la diversidad **sube** (1,7695 → 1,8850 bits a `<w1800>`) porque la
+  élite juega más aperturas que el jugador medio, y el Elo sube 79 puntos con los intervalos
+  solapados, que con este instrumento no da para afirmarlo. Y entre `<w2100>` y `<w2400>` el eje casi
+  desaparece: 0,010 bits contra los 0,107 del base.
+- **Un modelo general de 600 M afinado con las mismas partidas pierde 160 partidas de 160.**
+  62,50 % de jugadas legales contra el 99,8 % del decoder, 12,5 % de top-1 contra 54,4 %, 0,9 % de
+  puzles contra 37,5 %. Un tercio de sus respuestas son jugadas bien escritas que la posición no
+  permite, y tres de cada cien no son jugadas. La lección no es «Qwen es malo»: es que cuando la
+  salida tiene una estructura conocida y pequeña, conviene meterla en la **representación** en vez
+  de esperar que el modelo la reaprenda desde texto.
+- **Tests que se quedan:** que un adaptador sin entrenar es la identidad (`B` empieza en cero); que
+  el recuento de parámetros es la fórmula y no una constante; que fundir es exacto; que la
+  equivalencia con `peft` se sostiene paso a paso; que los factores se crean en el dispositivo de
+  los pesos que corrigen —un fallo que catorce pruebas en CPU no podían ver—; que la entropía de
+  una sola línea es `0,0` y no `-0,0`; y que un adaptador cuyos rangos no midan lo mismo se rechaza
+  diciéndolo en vez de apilar algo que no cuadra.
+
+Lo siguiente es M5, donde el modelo deja de imitar y empieza a **preferir**: un modelo de
+recompensa, pares de jugadas puntuadas por el motor, DPO y GRPO. Es también donde se ataca lo que
+este módulo no pudo: la fuerza táctica no sale de la cabecera, y la pregunta de M5 es de dónde sí.
+La envoltura `PreTrainedModel` que has construido aquí es lo que deja esa puerta abierta: con ella,
+`DPOTrainer` y `GRPOTrainer` funcionan sobre tu decoder. M5 terminó escribiendo los dos a mano —una
+completación de una sola jugada colapsa las dos pérdidas a unas pocas líneas— pero esa fue una
+elección, y las elecciones necesitan que las dos opciones existan.
+
+La cheatsheet del módulo, con su pregunta y su respuesta corta, está justo debajo.

@@ -1,0 +1,473 @@
+---
+title: 'El encoder: medir sin engañarse'
+description:
+  Por qué un 96,78 % de exactitud sobre una clase del 3,7 % no significa nada, la heurística
+  de material contra la que se mide, precisión, exhaustividad y F1 en un punto de operación elegido aparte,
+  Pearson y Spearman a la vez, y por qué el reparto de los datos va por partida y no por posición.
+module: m3
+order: 2
+duration: 90
+level: base
+status: vigente
+updated: '2026-09-21'
+keywords:
+  - encoder
+  - bidireccional
+  - masked move modeling
+  - MLM
+  - pooling
+  - probe lineal
+  - fine-tuning
+  - F1
+  - precisión
+  - exhaustividad
+  - correlación
+  - centipeón
+  - línea base
+  - fuga de datos
+  - curva de etiquetas
+  - last-n
+  - olvido catastrófico
+  - ruido entre tiradas
+  - embeddings de posición
+  - clase rara
+  - punto de operación
+  - ROC AUC
+  - tasa base
+---
+
+Parte 2 de 3 del módulo «El encoder». Viene de «El encoder: la línea que lo cambia todo» y sigue en «El encoder: los labs».
+
+## Cómo se mide y contra qué
+
+Al terminar esta sección sabrás leer las cifras que produce `rukh eval encoder`, explicar por qué la
+línea base es deliberadamente mala, elegir un punto de operación sin hacer trampa y decir qué
+significa cada métrica en un problema donde una clase es rara.
+
+Un encoder no juega partidas, así que no se puede medir como al decoder. Se mide por lo que sabe de
+posiciones que no ha visto: la partición de validación del reparto por partidas, que es el **10 %**
+de las partidas (`val_fraction: 0.1`, nunca el 10 % de las posiciones sueltas), y **con la línea
+base medida sobre exactamente las mismas filas**.
+
+Estos son los números reales del hito, para que leas el resto de la sección sabiendo adónde va:
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Criterio de `GOAL.md`               | Listón            | Al cerrar el hito         | Hoy        | ¿Se cumple? |
+| ----------------------------------- | ----------------- | ------------------------- | ---------- | ----------- |
+| F1 de error sobre la heurística     | +5 puntos         | **+9,0** (0,179 vs 0,089) | **+9,7**   | **sí**      |
+| Correlación del valor con Stockfish | ≥ 0,80 (Spearman) | 0,520                     | **0,6665** | **no**      |
+
+</div>
+
+La columna «hoy» existe porque el módulo siguió midiendo después de publicarse, y lo que se
+encontró —que la pérdida optimizaba una cosa distinta de la que puntúa el criterio— está más abajo,
+en «La pérdida no medía lo que el criterio mide». La cifra sube de 0,520 a 0,6665 y **sigue sin
+cumplir**, que es exactamente por lo que la tabla tiene dos columnas y no una reescrita.
+
+Un criterio cumplido y otro no, y las dos cosas se publican con el mismo tamaño de letra. Hay además
+una tercera cifra, `val/blunder_acc = 96,78 %`, que no es ningún criterio y que si se leyera como si
+lo fuera sería la mentira más cómoda del módulo. Empezamos por ella.
+
+### El 96,78 % que no significa nada
+
+Esta es la subsección más transferible del módulo, y no tiene nada que ver con el ajedrez: vale para
+cualquier detector de algo raro que vayas a construir en tu vida —fraude, fallos de máquina,
+diagnósticos, moderación—, que es decir, para casi todos.
+
+**Los errores son el 3,72 % de las filas etiquetadas.** De ahí salen tres consecuencias, en orden de
+gravedad.
+
+**Uno: la exactitud no mide nada.** Un detector que conteste siempre "no hay error" acierta el
+**96,3 %** de las veces sin mirar el tablero. Nuestra cabeza saca 96,78 %. Los cuatro decimales de
+diferencia son todo lo que la exactitud es capaz de decir de un modelo que, como vas a ver, sí ha
+aprendido algo. Cuando una clase es rara, la exactitud mide la tasa base y disfraza de resultado una
+propiedad del conjunto de datos.
+
+**Dos: el F1 en un umbral arbitrario tampoco mide lo que crees.** Esta es la que engaña a gente con
+experiencia. El F1 de esta cabeza en el umbral fijo de 0,5 es **exactamente 0,0000**. Precisión
+cero, exhaustividad cero, cero posiciones marcadas de 3 660. La razón está en una sola línea del
+informe:
+
+```text
+encoder    probability span: 0.0040 to 0.2568 (mean 0.0446)
+```
+
+**La probabilidad más alta que esta cabeza le da a una posición en todo el conjunto es 0,2568.** En
+0,5 no se dispara nunca, así que ese F1 era cero por construcción antes de entrenar nada. Y no es
+que el modelo esté roto: es que un sigmoide entrenado con entropía cruzada sobre una clase del 3,7 %
+aprende, correctamente, que la respuesta esperada casi siempre es "no", y coloca toda su masa de
+probabilidad abajo. Ordena bien las posiciones y las ordena todas por debajo de 0,5. **Un F1 en un
+umbral fijo mide la calibración de un sigmoide que nadie calibró, no la calidad de la
+representación.**
+
+**Tres: elegir el umbral es legítimo, y hay una única forma honesta de hacerlo.** El umbral es un
+hiperparámetro como cualquier otro, y nadie te obliga a dejarlo en el 0,5 que viene de fábrica. Lo
+que no vale es elegirlo mirando las filas que después vas a puntuar, porque entonces el número que
+publicas es el máximo de una búsqueda sobre el propio conjunto de evaluación y no una estimación de
+nada. El procedimiento correcto es:
+
+1. Parte las filas etiquetadas del conjunto retenido en dos mitades, **por `game_id`** y nunca por
+   posición, por la misma razón que el reparto principal (la sección siguiente). Aquí salen 3 793
+   filas / 2 455 partidas en la mitad `tune` y 3 660 filas / 2 368 partidas en la mitad `score`.
+2. En la mitad `tune`, barre el umbral y quédate con el que maximiza F1. Aquí sale **0,128**.
+3. **Publica el F1 medido en la mitad `score`**, que no ha visto ningún umbral. Aquí sale **0,179**.
+
+Y publica también lo que cuesta ese paso, porque es la parte que casi nadie enseña: el mismo umbral
+0,128 da **0,184** en la mitad `tune` donde se eligió y **0,179** en la mitad `score`. Esos cinco
+milésimos son el optimismo que introduce elegir un punto de operación, y son la razón entera de que
+las dos mitades no sean las mismas filas.
+
+<Callout kind="teoria" title="Y las métricas que ningún umbral puede halagar">
+  Junto al F1 ajustado, el informe publica dos cifras que no dependen de ningún umbral, porque son
+  las que de verdad dicen si la representación sabe algo.
+
+**ROC AUC** es la probabilidad de que, cogidos al azar un error y una jugada tranquila, el modelo
+puntúe más alto el error. 0,5 es una moneda. Aquí sale **0,738**: en tres de cada cuatro parejas,
+el orden es el correcto. Ese es el número que dice que la cabeza no está vacía, y es el mismo
+modelo cuyo F1 en 0,5 era cero.
+
+**La precisión media** es el área bajo la curva de precisión-exhaustividad, y su referencia no es
+0,5 sino **la tasa base**: un orden aleatorio saca 0,037. Aquí sale **0,109**, casi el triple.
+Es una cifra fea comparada con el ROC AUC, y no es un error de cálculo: con una clase tan rara,
+el ROC AUC se deja impresionar por lo bien que el modelo ordena los negativos entre sí, mientras
+que la precisión media solo mira si los positivos suben. Cuando las dos discrepan así, la
+pesimista es la que se parece a lo que verá el usuario.
+
+Las dos están implementadas a mano sobre rangos en `src/rukh/eval/`, sin `scipy` ni
+`scikit-learn`: son cuarenta líneas y no merecen una dependencia.
+
+</Callout>
+
+<Callout kind="mundo-real" title="El mismo error, fuera del ajedrez">
+  Un clasificador de fraude con un 0,2 % de transacciones fraudulentas que presume de 99,8 % de
+  exactitud. Un modelo de diagnóstico con una prevalencia del 1 % cuyo F1 se publica en el umbral
+  por defecto de la librería. Un filtro de moderación evaluado en el mismo conjunto en el que se
+  eligió el umbral. Los tres fallos son este mismo, y los tres se detectan con la misma pregunta:
+  **¿cuál es la tasa base, y dónde se eligió el umbral?** Si la respuesta a la segunda es "en las
+  filas que estoy puntuando", el número no es una estimación, es un récord personal.
+</Callout>
+
+### La heurística de material y movilidad
+
+La línea base cabe en una página: peón 1, caballo 3, alfil 3, torre 5, dama 9, rey 0. A eso se le
+suma la movilidad —jugadas legales de las blancas menos las de las negras, a 0,05 peones cada una,
+o sea que veinte jugadas de diferencia valen un peón— y se convierte a la misma escala acotada que
+la etiqueta, `tanh(puntuación / 4)` en peones, que es idéntico a `tanh(cp / 400)` en centipeones.
+Para juzgar una jugada, se juega en un tablero de `python-chess` y se deja que el rival conteste con
+su captura o promoción más rentable, a un solo ply; si el balance de material del que movió cae un
+punto o más, la heurística dice "error".
+
+Es mala a propósito, y eso es una decisión de diseño, no una concesión. Una línea base que ya
+entendiera los sacrificios no sería un suelo: sería un competidor, y el margen dejaría de significar
+"el modelo aprendió algo más que contar piezas". Lo que sí es innegociable es medirla **igual**:
+mismas filas, misma definición de acierto, mismo umbral de 100 centipeones en la etiqueta. Un margen
+medido sobre dos conjuntos distintos no es un margen, es una comparación de anécdotas.
+
+Y hay una asimetría que conviene decir antes de leer el margen, porque no juega a favor del modelo:
+la heurística recibe **la posición anterior y la jugada** —vuelve a jugarla en un tablero para saber
+qué cambió—, mientras que el encoder de casillas solo ve el FEN resultante. Detectar un error sin
+ver de dónde vienes es más difícil que detectarlo viéndolo, así que el margen está medido en contra
+del modelo: si aun así gana, ha aprendido algo que no es contar piezas. Ganó por 5,7 puntos.
+
+Hay una segunda asimetría, y esta va a favor del modelo, así que también se dice: la heurística es
+una regla de sí/no **sin umbral que ajustar**, de modo que no se le dio ninguna mitad `tune` ni se
+barrió nada en su lado. La comparación enfrenta a un modelo en su mejor punto de operación contra
+una regla en el único que tiene. Es una cortesía que recibe el modelo y no la línea base, está
+escrita en el informe para que no sea injusta en silencio, y conviene tenerla en la cabeza al leer
+los +9,0 puntos del esquema de jugadas.
+
+Por cierto, mira las dos filas de la heurística en la tabla de puntos de operación de más arriba:
+precisión 4,7 %, exhaustividad **77,1 %**, 2 359 posiciones marcadas de 3 660. La regla grita
+"error" en dos de cada tres jugadas de la partida. Encuentra casi todos los errores **porque marca
+casi todo**, y de ahí su exhaustividad envidiable y su precisión ridícula. El encoder gana el margen
+por el otro lado: marca 191 posiciones en vez de 2 359 y acierta en el 15,7 % de ellas contra el
+4,7 % de la regla. Dos detectores con F1 de 8,9 % y 17,9 % y con perfiles opuestos, que es
+exactamente por qué el titular lleva la precisión y la exhaustividad al lado y no solo el F1.
+
+### Qué no puede ver
+
+El ejemplo que el propio código lleva escrito en `src/rukh/eval/heuristic.py` es la partida del
+siglo: **Donald Byrne contra Robert Fischer, Nueva York, 1956**, con Fischer de trece años. Después
+de 17.Rf1 (17.Kf1 en notación inglesa), Fischer jugó **17…Ae6** (`g4e6`, _17…Be6_), ofreciendo la
+dama. Es una de las jugadas más famosas de la historia del ajedrez y la partida acaba siendo una
+victoria de las negras.
+
+La heurística mira esa posición, ve que las blancas pueden jugar 18.Axb6 y llevarse una dama por
+nada, calcula una pérdida de nueve puntos de material y **llama error garrafal a 17…Ae6**. No se
+equivoca en la aritmética: se equivoca en todo lo demás, porque un sacrificio posicional es
+literalmente invisible para algo que solo cuenta piezas.
+
+Tiene otras dos cegueras que también están escritas en el módulo en vez de arregladas, y merece la
+pena conocerlas porque explican de dónde salen sus falsos positivos:
+
+- **No ve la recaptura.** La respuesta del rival se busca a un solo ply y solo entre capturas y
+  promociones, así que un cambio igualado cuya recaptura llega dos plies después se lee como una
+  pérdida.
+- **Cobra dos veces una pieza colgada.** Si una pieza ya estaba en el aire antes de mover, cualquier
+  jugada tranquila posterior carga con esa pérdida, porque el "antes" es el material en el tablero y
+  no lo mejor que el jugador podría haber conservado.
+
+Arreglarlas convertiría la línea base en un pequeño motor, y entonces ya no sería una línea base.
+
+### Precisión, exhaustividad y F1 cuando una clase es rara
+
+Con el <Term id="desbalanceo">desbalanceo</Term> ya desmontado, las tres cifras que sí se publican.
+
+La **precisión** responde a "de lo que marqué, cuánto era de verdad": verdaderos positivos entre
+todo lo marcado. Es la que le importa a la demo, porque una barra que grita "error" en jugadas
+correctas se apaga a los cinco minutos. Aquí, **15,7 %**.
+
+La **exhaustividad** responde a "de lo que había, cuánto marqué": verdaderos positivos entre todos
+los errores reales. Es la que le importa a alguien que quiera usar esto para analizar sus partidas,
+porque un error que no se detecta no se aprende. Aquí, **20,8 %**.
+
+Las dos se mueven en contra. Bajar el umbral de decisión captura más errores reales y también más
+falsas alarmas; subirlo hace lo contrario. Elegir el punto de esa curva es una decisión de producto
+—en Rukh el valor de fábrica está en `configs/eval/encoder.yaml` como `threshold: 0.5`, y ya has
+visto lo que ese valor de fábrica le hace a una clase del 3,7 %— y no tiene una respuesta
+matemática. **F1** es la media armónica de las dos, `2·P·R/(P+R)`, y se usa porque castiga el
+desequilibrio: con precisión 1,0 y exhaustividad 0,01, la media aritmética daría un respetable 0,5 y
+la armónica da 0,02, que es la cifra honesta. Aquí, **17,9 %**.
+
+Conviene mirar esos tres números sin adornos: de cada seis posiciones que el modelo marca como
+error, cinco no lo son, y de cada cinco errores reales se le escapan cuatro. Como producto,
+todavía no sirve para nada. Como medida, es **el doble** que una heurística que sí entiende de
+material, sobre las mismas filas y con la posición anterior escondida, y eso es lo que el módulo
+pretendía demostrar. El listón de `GOAL.md` es superar el F1 de la heurística en **cinco puntos** y
+salen **+9,0**: criterio cumplido, con el nivel absoluto dicho en voz alta para que nadie confunda
+"bate a la línea base" con "está listo".
+
+### Pearson y Spearman, y por qué las dos
+
+Para el valor no hay umbral que elegir: es una regresión, y lo que se mide es si el número predicho
+acompaña al real.
+
+**Pearson** mide si los valores se alinean en una recta. Es sensible a la escala: si predices
+sistemáticamente la mitad de lo que hay, Pearson lo nota. **Spearman** es Pearson calculado sobre
+los rangos —las posiciones en el orden, con la media de los rangos para los empates—, así que solo
+mide si el orden coincide y le da igual la escala.
+
+Las dos discrepan exactamente en un caso, y es un caso que aquí va a ocurrir: cuando el modelo
+tiene el **orden** bien y la **escala** mal. Es justo lo que le hace un `tanh` acotado a una
+puntuación en centipeones que no lo está: las posiciones extremas se aplastan contra ±1 y la
+relación deja de ser lineal aunque el ranking sea perfecto. Publicar solo Pearson haría parecer peor
+un modelo que ordena bien; publicar solo Spearman escondería un modelo que ordena bien pero cuya
+barra de evaluación marca 0,3 donde debería marcar 0,8, que en la demo es un fallo visible. Por eso
+van las dos, y por eso `GOAL.md` pide ≥ 0,8, leído sobre Spearman. En el código, Spearman está
+escrito a mano —Pearson sobre rangos medios— porque `scipy` no es una dependencia del proyecto y no
+merece serlo por catorce líneas.
+
+Un detalle de medida antes de los números: las dos correlaciones se calculan contra
+`tanh(cp / 400)`, la escala acotada con la que se entrena la cabeza, y **nunca contra el `cp` en
+bruto**. Un mate forzado vale ±9 999 centipeones, y media docena de filas así decidirían el Pearson
+del conjunto entero. Correlacionar contra la escala en la que se entrena no es hacerlo fácil: es
+correlacionar contra la etiqueta.
+
+#### El criterio de valor no se cumple, y esta es la cifra
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Esquema            |  Spearman |   Pearson | Listón de `GOAL.md` |
+| ------------------ | --------: | --------: | ------------------- |
+| `moves` · `full`   |     0,407 |     0,442 | ≥ 0,80 → **no**     |
+| `moves` · `last-n` | **0,520** |     0,648 | ≥ 0,80 → **no**     |
+| `squares`          |     0,422 | **0,688** | ≥ 0,80 → **no**     |
+
+</div>
+
+**El mejor Spearman publicado es 0,52 y el listón es 0,80.** No está cerca, no es un decimal, no hay
+manera de contarlo como un aprobado raspado: el criterio de valor de `GOAL.md` **no se cumple** y se
+publica sin cumplir, que es lo que el propio `GOAL.md` manda hacer cuando pasa esto.
+
+Antes de seguir, vuelve a la tabla de resultados de arriba y mira la pareja que importa: contra el
+encoder publicado, `squares` tiene **mejor Pearson (0,688 contra 0,648) y peor Spearman (0,422
+contra 0,520)**. Acabas de leer que esas dos medidas se separan exactamente cuando el orden está
+bien y la escala mal, y aquí una entrada gana en escala y pierde en orden.
+
+Eso no es ruido —son dos representaciones distintas, no dos tiradas—, es una **huella dactilar**.
+Estuvo publicada y nadie tiró del hilo. Guárdala: volvemos a ella en cuanto acabe el diagnóstico.
+
+El diagnóstico **del momento** tenía tres piezas y ninguna era "hace falta un modelo más grande":
+
+1. **Cuatro mil pasos de afinado.** Es el presupuesto del módulo, no un punto de convergencia, y ya
+   viste que el preentrenamiento seguía bajando cuando se cortó.
+2. **Cobertura de etiquetas del 9,8 %** —y, atención, la curva dice que esta pieza **no** es la que
+   duele. De los cinco millones de posiciones muestreadas, solo 488 159 recibieron una evaluación de
+   Stockfish al cruzarlas con el conjunto público de evaluaciones, y la cabeza de valor aprende de
+   las 438 093 que sobreviven al reparto. Parecen pocas; el lab 3 las mide, y con el 25 % de ellas
+   el error del valor es el mismo. O sea que el problema no es la **cantidad** de etiquetas sino lo
+   que cada una aporta: etiquetas más informativas, no más etiquetas.
+3. **`tanh(cp/400)` comprime justo donde hay densidad.** La inmensa mayoría de las posiciones de
+   club están entre −100 y +100 centipeones, y ahí el `tanh` las aplasta contra el cero: la señal
+   que la cabeza tiene que aprender a distinguir es minúscula precisamente donde están casi todos
+   los datos. Una escala menos comprimida repartiría mejor el rango útil.
+
+Ese razonamiento está bien hecho y se equivocó. Las tres piezas apuntaban a los datos y a la
+etiqueta; ninguna miró la pérdida.
+
+#### La pérdida no medía lo que el criterio mide
+
+**Una pérdida y una métrica que se describen con las mismas palabras pueden tener mínimos
+distintos.** Esa es la regla, y lo que sigue es cómo se descubrió que este módulo llevaba tiempo
+incumpliéndola.
+
+Vuelve a la huella dactilar. Si una entrada gana en escala y pierde en orden, la pregunta que nadie
+hizo es **qué está minimizando la pérdida**. Y la respuesta estaba en una línea:
+
+```python
+"value": F.mse_loss(outputs["value"], targets["value"])
+```
+
+`F.mse_loss` minimiza la **distancia** entre cada predicción y su etiqueta. `GOAL.md` puntúa con
+Spearman, que solo mira el **orden** y al que la distancia le da exactamente igual. Son dos
+funciones distintas, con mínimos distintos, y en lenguaje corriente se dicen igual —«acertar el
+valor»—, que es por lo que el fallo es invisible.
+
+Una predicción que está lejísimos de todas las etiquetas pero las ordena perfectamente saca un
+Spearman de 1 y un MSE malísimo. Otra que está cerquísima de todas y confunde dos saca un MSE
+excelente y pierde orden. Entrenábamos la segunda y puntuábamos la primera.
+
+Un profesor con **una tarde** para corregir puede quedarse cerca de la nota que cada alumno merece,
+o acertar quién va delante de quién. No da para las dos. Y lo único que se hará con esas notas es
+**ordenar** a los alumnos para una beca: si confunde el primero con el segundo, da igual lo finas
+que fueran las demás. Con presupuesto infinito las dos cosas coinciden; con una tarde, no.
+
+El arreglo es una pérdida que mire pares: por cada dos posiciones del lote, si la etiqueta dice que
+`i` vale más que `j`, la predicción debería ponerlas en ese orden, y el voto pesa según lo lejos que
+estén las etiquetas —distinguir una ganada de una perdida cuenta más que separar dos iguales, que
+es justo donde un evaluador sin búsqueda no tiene nada que hacer—.
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Qué cambia                                 | Pearson    | Spearman   | F1 de error |
+| ------------------------------------------ | ---------- | ---------- | ----------- |
+| nada (`F.mse_loss` sola)                   | 0,6476     | 0,5205     | 0,1804      |
+| **+ término de ordenación**                | 0,6621     | **0,6395** | 0,1774      |
+| + término de ordenación y el triple de red | **0,7261** | **0,6665** | **0,1855**  |
+
+</div>
+
+Dos cosas que leer aquí, y la segunda es la importante.
+
+La primera: **no hubo intercambio**. Se esperaba ceder Pearson para ganar Spearman y subieron los
+dos, así que la pérdida anterior no estaba «optimizando otra cosa legítima», estaba peor alineada
+con la tarea en los dos ejes.
+
+La segunda es una **atribución**: cambiar la pérdida valió **+0,119** de Spearman y triplicar el
+modelo **+0,027**. Cuatro veces más barato mirar qué optimizas que comprar más red. El reflejo de
+subir de talla es el más caro de los disponibles y casi siempre el peor informado.
+
+<Transfer concept="Desalineamiento entre la pérdida sustituta y la métrica de evaluación" where="Un reranker entrenado con entropía cruzada binaria cuando la métrica de producto es nDCG@5.">
+  La regla se puede aplicar el lunes y es de una sola frase: **escribe el criterio de evaluación
+  primero, y después di en voz alta qué función minimiza tu pérdida y si su mínimo es el mismo. Si
+  el criterio es un orden, la pérdida lleva pares.**
+
+Dónde aparece este bug fuera de aquí, literalmente el mismo:
+
+- Un **reranker** entrenado para predecir «relevante sí/no» cuando lo que se despliega es un top-5
+  ordenado.
+- Un **LLM como juez** afinado con MSE para dar una nota de 1 a 5, cuando en producción se le pide
+  «elige la mejor de estas dos».
+- **Embeddings** ajustados contra puntuaciones de similitud cuando la recuperación solo mira qué
+  entra en el top-k y en qué orden.
+
+En los tres casos el número de entrenamiento sube, el del producto no se mueve, y nadie encuentra
+por qué porque los dos se describen con las mismas palabras.
+
+</Transfer>
+
+#### 0,6665 no significa «regular en todas partes»
+
+Con la pérdida arreglada el criterio sigue sin cumplirse: 0,6665 frente a 0,80. La pregunta útil no
+es cuánto falta, es **dónde falla**, y eso se responde cortando la métrica en vez de mirándola
+entera.
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Cómo de decidida está la posición | Posiciones       | Spearman   |
+| --------------------------------- | ---------------- | ---------- |
+| menos de 50 cp (casi igualadas)   | 6 099 (**61 %**) | 0,4625     |
+| 50 a 150 cp                       | 2 775 (28 %)     | 0,5844     |
+| 150 a 400 cp                      | 496 (5 %)        | 0,5196     |
+| más de 400 cp (decididas)         | 626 (6 %)        | **0,8797** |
+
+</div>
+
+**Donde la ventaja está clara el encoder ya pasa el listón.** Lo que hunde la media es el 61 % de
+posiciones casi igualadas, y ordenar dos posiciones que el motor separa por menos de medio peón
+exige ver táctica: una secuencia concreta de capturas que cambia el signo. Una pasada hacia delante
+sin búsqueda no la tiene y no la va a tener por entrenar más.
+
+Las dos lecturas del mismo 0,6665 llevan a acciones opuestas. «Regular en todo» dice _entrena más_.
+«Excelente en lo evidente, casi azar en lo que decide» dice _este enfoque tiene techo: cambia el
+enfoque o cambia el listón_. La segunda es la verdadera, y solo aparece al cortar.
+
+Un médico **sin acceso a analíticas** clava los brazos rotos y con los cansancios acierta poco más
+que a cara o cruz, no por malo sino porque eso no se diagnostica mirando. Su media dice «regular» y
+no describe a nadie. Mandarlo a otro curso no arregla la segunda mitad: hace falta el laboratorio,
+que es otra cosa.
+
+<Transfer concept="Evaluación desagregada por rebanadas" where="Un RAG al 68 % que es 95 % en consultas de un salto y 30 % en comparativas de varios.">
+  Una métrica global es un promedio sobre subpoblaciones que pueden comportarse al revés la una de
+  la otra. Antes de gastar un euro en arreglar un número que no llega, **córtalo por dificultad**:
+  es la medida más informativa y la más barata de repetir de todas las que hay.
+
+Y el diagnóstico cambia la factura. Un RAG al 68 % que acierta el 95 % de las preguntas de un
+salto y el 30 % de las comparativas no se arregla subiendo de modelo; se arregla con un
+planificador que parta la consulta. Un agente con 70 % de éxito que falla toda tarea de más de
+tres llamadas no tiene un problema de prompt, tiene un problema de arquitectura.
+
+</Transfer>
+
+<Callout kind="mundo-real" title="Publicar el número que no sale">
+  La tentación cuando un criterio falla es reescribir el criterio: leer Pearson en vez de Spearman
+  (0,688 suena mucho mejor que 0,520), correlacionar solo sobre las posiciones decididas —donde el
+  encoder saca 0,88—, o cambiar el listón a 0,40 y declarar victoria. Las tres producen un informe
+  verdadero y un resultado falso. El listón se fija **antes** de medir precisamente para que no se
+  pueda mover después, y un criterio que se mueve deja de ser un criterio y pasa a ser una
+  descripción de lo que salió. El coste de publicar un 0,52 contra un 0,80 es una tarde incómoda; el
+  coste de haberlo maquillado es que ninguna cifra del proyecto vuelve a significar nada.
+</Callout>
+
+## Fuga de datos: por qué el reparto va por partida
+
+Al terminar esta sección sabrás reconocer la fuga concreta de este módulo y explicar por qué un
+reparto aleatorio de filas, que en otros problemas es correcto, aquí es una trampa.
+
+Una <Term id="fuga-de-datos">fuga de datos</Term> es cualquier camino por el que información de
+validación llega al entrenamiento. Nunca se manifiesta como un error: los números mejoran, las
+curvas salen bonitas y el problema aparece cuando el modelo sale al mundo.
+
+El reparto obvio de una tabla de un millón de posiciones sería aleatorio por filas: el 90 % a
+entrenamiento, el 10 % a validación. Aquí eso es una fuga, y la razón es esta.
+
+Toma una partida cualquiera y sus posiciones consecutivas, ply 30 y ply 31. La segunda es la primera
+**más una jugada**: treinta y una de las treinta y dos piezas siguen donde estaban, la estructura de
+peones es la misma, el plan es el mismo, la evaluación de Stockfish casi la misma. Si el ply 30 cae
+en entrenamiento y el 31 en validación, el modelo está siendo evaluado sobre una posición que ya
+vio, con un cambio cosmético. Un modelo que memoriza partidas puntúa igual de bien que uno que
+entiende ajedrez, y la métrica de validación —cuyo único trabajo es distinguir esas dos cosas— deja
+de hacerlo. Peor: la fuga es **invisible**. No hay ninguna cifra en el informe que la delate; el
+modelo simplemente parece mejor de lo que es hasta que lo pones en la demo.
+
+La solución es partir por `game_id`: una partida entera va a un lado o al otro, nunca a los dos. En
+el código es una función pura del id y de la semilla —un CRC-32 de `"semilla:partida"` y un módulo—
+y esa pureza no es decorativa: `hash()` de Python cambia entre procesos por el aleatorizador de
+hashes, y un hash de dataframe puede cambiar de versión a versión. Un reparto que no es reproducible
+no es un reparto, es una lotería que vuelves a jugar cada vez que ejecutas el script. El test que lo
+acompaña comprueba que ningún `game_id` aparece en los dos lados.
+
+Y la misma lógica se aplica a la etiqueta de error, que necesita la posición anterior de la misma
+partida: si la posición de la que se calcula el `loss_cp` cayera al otro lado del reparto, estarías
+construyendo la etiqueta de validación con una fila de entrenamiento. Por eso el cruce se hace antes
+de partir, y por eso una posición cuyo predecesor no está en la tabla no recibe la etiqueta 0: recibe
+`null`.
+
+<Callout kind="mundo-real" title="La misma trampa, en otros dominios">
+  Series temporales partidas al azar en vez de por fecha. Historiales médicos del mismo paciente en
+  los dos lados. Fotos de la misma sesión, con la misma iluminación, repartidas por imagen en vez de
+  por sesión. Reseñas del mismo usuario. El patrón siempre es el mismo: **las filas no son
+  independientes y el reparto finge que sí lo son**. La pregunta que hay que hacerse antes de partir
+  cualquier tabla es "¿qué agrupa a estas filas?", y partir por eso.
+</Callout>
