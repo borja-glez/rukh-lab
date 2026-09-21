@@ -99,7 +99,26 @@ el script imprime el Elo que explica el marcador al lado de la etiqueta que la e
 uv run python labs/m6/ladder_check.py --games 40
 ```
 
-⟦LAB1-CALIBRACION⟧
+```text
+anchor uci-1320 (1320) · 40 games per rung · 0.1 s per move
+rung        label   score  measured         IC 95 %   delta
+skill-0      1381   0.588      1381    1276-1488         +0
+skill-1      1467   0.762      1523    1418-1669        +56
+uci-1500     1500   0.725      1488    1381-1621        -12
+skill-2      1589   0.762      1523    1418-1658        -66
+skill-3      1678   0.938      1790    1658-2520       +112
+uci-1800     1800   0.900      1702    1561-1956        -98
+uci-2000     2000   0.950      1832    1679-2520       -168
+2126 s
+control: uci-1500 should read about +180 over the anchor; if it does not, stop here.
+```
+
+El control pasa: `uci-1500` sale a +168 sobre el ancla, donde los autores de Stockfish lo ponen a
++180. Las siete etiquetas caen dentro del intervalo de su medición, así que la escalera de D-070 se
+sostiene; y los intervalos de los tres peldaños altos son enormes (hasta 2520) porque el ancla
+pierde casi todo contra ellos: 40 partidas contra un rival que gana el 95 % no dicen dónde está,
+solo que está lejos. Es la limitación estructural de calibrar con un solo ancla, y el motivo de que
+la escalera use ocho peldaños y no dos.
 
 <Exercise>
   Corre `ladder-time-a` otra vez mientras compilas algo grande en la misma máquina. ¿Cuánto se mueve
@@ -156,7 +175,30 @@ ante una jugada ilegal; aquí se pregunta una vez y se cuenta.
 uv run rukh eval nightly
 ```
 
-⟦LAB2-SALIDA⟧
+```text
+stage                           measure  status     seconds
+tiny-greedy                     decoder  measured     698.1
+small-v3-greedy                 decoder  measured     825.3
+medium-v4-greedy                decoder  measured     866.4
+encoder-v4                      encoder  measured       7.1
+medium-elo                      decoder  measured     864.8
+medium-masters                  decoder  measured     872.7
+lora-e4                         decoder  measured     849.5
+lora-d4                         decoder  measured     913.6
+qwen3-pgn-qlora                 qwen     measured    2506.2
+medium-v4-dpo-onpolicy-greedy   decoder  measured     858.4
+medium-v4-grpo-greedy           decoder  measured     843.4
+karvonen-8l                     karvonen failed         0.1  (ValueError: … holds no model_state to hash)
+seconds:    10106
+```
+
+Dos horas y cuarenta y ocho minutos, unos catorce minutos por etapa de decoder (el encoder tarda
+siete segundos porque no juega), cuarenta y dos para Qwen, y un fallo: el checkpoint de Karvonen
+guarda sus tensores bajo `model` y no bajo `model_state`, y el hash de pesos de D-135 no lo sabía.
+Una línea después, `rukh eval nightly --only karvonen-8l` lo midió en quince minutos. Las dos
+filas que no estaban en el catálogo (`small` v1 y el DPO fuera de política) se volvieron a medir a
+mano el mismo día para que ninguna fila de decoder tuviera otra fecha: 1355 (1297-1420) y 1586
+(1530-1651).
 
 Las dos filas del encoder que llevaban el nombre de su carpeta de corrida (el backlog de P3 lo
 dejó anotado) se retiran con `rukh eval drop`, y la tabla que queda es la de la parte 2.
@@ -187,7 +229,22 @@ también el lado del motor.
 uv run python labs/m6/parity_cost.py --onnx artifacts/onnx/medium-v4 --config configs/eval/ladder-nodes.yaml
 ```
 
-⟦LAB3-SALIDA⟧
+```text
+medium-v4 · 20 games per rung · 8 rungs · 200000 nodes
+
+fp32   parity  1.000  elo 1472 (1415-1527)  160 games  816 s
+fp16   parity  0.999  elo 1535 (1484-1600)  160 games  837 s
+int8   parity  0.951  elo 1524 (1467-1576)  160 games  813 s
+```
+
+El int8 no tiene un coste en Elo medible con 160 partidas: 1524 (1467-1576) frente a 1535
+(1484-1600) del fp16, con los intervalos casi superpuestos. Y la fila que enseña más es la del
+fp32, que es la misma red que el checkpoint y sale 60 puntos por debajo del fp16: no hay ningún
+mecanismo por el que un grafo con paridad del 100 % juegue peor que uno del 99,9 %; es el suelo del
+instrumento otra vez, con el rival por nodos, en la misma tarde. La pregunta que M2 dejó abierta se
+responde así: el 4,9 % de jugadas distintas del int8 cuesta menos de lo que la escalera puede ver
+con este presupuesto, y para verlo haría falta un enfrentamiento directo fp16 contra int8 de varios
+cientos de partidas, que es el ejercicio.
 
 <ParityCost />
 
@@ -328,7 +385,25 @@ la única regla.
 
 ## Lo que deja el módulo
 
-⟦CIERRE⟧
+Tres frases, que son las del módulo y las de la fase.
+
+**Mide el instrumento antes de fiarte de él.** Cuatro escaleras del mismo modelo, dos calibraciones
+y una tabla vieja frente a una nueva dijeron lo mismo: el reloj repite al nivel del ruido de
+muestreo con la máquina parada, los nodos no compran nada, y lo que se mueve es lo que el intervalo
+dice que se puede mover. Sin esa medición, los +72 de `dpo-onpolicy` en un día habrían sido una
+noticia.
+
+**Una tabla es de un día.** Trece filas de decoder con la misma fecha, un comando que las regenera,
+y cada card diciendo sobre qué fichero y con qué muestreo se midió cada número. La que no cumple
+eso no se compara; se retira o se vuelve a medir.
+
+**Lo que no se puede decir es parte del resultado.** Un Elo contra Stockfish limitado no es un Elo
+de Lichess, una paridad no es una fuerza, un baseline medido con otro harness no es un baseline, y
+un lector reproduce el intervalo, no el número. Eso va en cada card y en el vídeo.
+
+Con eso termina la primera fase: un modelo de lenguaje de ajedrez construido desde el corpus hasta
+el navegador, medido, publicado y reproducible módulo a módulo. La segunda empieza donde esta
+acaba: el modelo deja de ser lo único que hay y pasa a ser una herramienta que algo más usa.
 
 <RepoTag tag="p6" at="final" module="M6" />
 
