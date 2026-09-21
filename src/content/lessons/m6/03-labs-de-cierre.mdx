@@ -1,0 +1,335 @@
+---
+title: 'Evaluar: los labs de cierre'
+description:
+  'Siete labs con sus comandos, en el orden en que se hicieron: el suelo del instrumento medido
+  cuatro veces, la tabla entera con un comando, lo que cuesta el int8 en Elo, las cards y la
+  colección regeneradas desde la tabla, la arena y los puzles en la demo, y el cierre de la fase.'
+module: m6
+order: 3
+duration: 150
+level: medio
+status: vigente
+updated: '2026-09-21'
+keywords:
+  - evaluación
+  - nightly
+  - tabla única
+  - límite por nodos
+  - paridad
+  - cuantización
+  - model card
+  - colección
+  - arena
+  - puzles
+  - baseline
+  - reproducibilidad
+artifacts:
+  - kind: report
+    label: Tabla única de resultados
+demo: ?mode=arena
+---
+
+import LadderFloor from '../../../components/figures/LadderFloor.astro';
+import ParityCost from '../../../components/figures/ParityCost.astro';
+
+Parte 3 de 3 del módulo «Evaluar, exportar, publicar». Viene de «Evaluar: lo que salió» y cierra
+el módulo y la primera fase del curso.
+
+## Labs
+
+Siete laboratorios, en el orden en que se hicieron. Ninguno entrena nada. Los dos primeros miden el
+instrumento antes de fiarse de él; el tercero reconstruye la tabla entera con un comando; el cuarto
+responde a la pregunta que M2 dejó abierta; los tres últimos ponen la tabla donde la gente la va a
+leer: en cada card, en la colección y en la demo.
+
+<Callout kind="hoy" title="Punto de partida, si te saltaste algo">
+  Este módulo mide lo que los cinco anteriores dejaron en el Hub. `uv run rukh pull --module m6`
+  trae los doce modelos a las rutas que leen las configs, más las partidas, los puzles y las
+  posiciones de la suite. Hace falta Stockfish (`scripts/get_stockfish.py`). Los comandos son los
+  que se ejecutaron y los tiempos, los de una RTX 5090 con la máquina tranquila; el mapa entero está
+  en `docs/reproducir.md`, sección M6.
+</Callout>
+
+### Lab 1 · El suelo del instrumento, medido cuatro veces
+
+D-107 dejó una hipótesis: la escalera no repite porque el rival juega por tiempo. La forma de
+comprobarla es medir el mismo modelo, con la misma semilla, dos veces por tiempo y dos veces con un
+presupuesto de nodos, y mirar cuánto se separan las dos tiradas de cada régimen. Antes, el
+presupuesto: a 0,1 s por jugada Stockfish explora unos 200 000 nodos en esta máquina, así que
+`elo_nodes: 200000` es el mismo rival en fuerza y otro en comportamiento.
+
+```bash
+uv run rukh eval --model checkpoints/medium-v4/best.pt --config configs/eval/ladder-time.yaml --stage ladder-time-a --no-cache
+uv run rukh eval --model checkpoints/medium-v4/best.pt --config configs/eval/ladder-time.yaml --stage ladder-time-b --no-cache
+uv run rukh eval --model checkpoints/medium-v4/best.pt --config configs/eval/ladder-nodes.yaml --stage ladder-nodes-a --no-cache
+uv run rukh eval --model checkpoints/medium-v4/best.pt --config configs/eval/ladder-nodes.yaml --stage ladder-nodes-b --no-cache
+uv run python labs/m6/ladder_floor_export.py --decision time
+```
+
+Las cuatro tiradas, con 160 partidas cada una y quince minutos de máquina parada entre ellas:
+
+| Tirada           | Límite        | Elo (IC 95 %)    |
+| ---------------- | ------------- | ---------------- |
+| `ladder-time-a`  | 0,1 s         | 1538 (1476-1599) |
+| `ladder-time-b`  | 0,1 s         | 1538 (1486-1594) |
+| `ladder-nodes-a` | 200 000 nodos | 1541 (1485-1596) |
+| `ladder-nodes-b` | 200 000 nodos | 1524 (1457-1584) |
+
+Cero Elo de separación por tiempo, 17 por nodos, y las dos muy por debajo del semiancho del
+intervalo (±55). La hipótesis de D-107 era razonable y estaba mal: el presupuesto de nodos hace
+determinista la **búsqueda**, no al rival, porque `UCI_LimitStrength` aleatoriza a propósito para
+acertar el Elo pedido. Se ve peldaño a peldaño: las dos tiradas por tiempo dan el mismo 1538
+agregado con `uci-1500` a 0,45 y 0,625, y las dos por nodos se separan igual. Lo que D-107 vio,
+1498 frente a 1558, fue una tirada con la máquina cargada o mala suerte a 1,18 σ. Con la máquina
+tranquila, el reloj repite al nivel del ruido de muestreo.
+
+La decisión (D-137) es la que la regla del plan obligaba a tomar con el número delante: los nodos
+no estrechan el suelo, así que el rival sigue por tiempo y no se recalibra la escalera ni cambian
+de escala los Elo publicados. Lo que entra en el runbook es la condición: **nada más en la máquina
+mientras corre una escalera por tiempo**. `elo_nodes` se queda en la suite para quien mida en una
+máquina compartida, y es lo que usa el lab 3, donde el jugador mismo carga la CPU.
+
+<LadderFloor />
+
+Y la calibración, motor contra motor, de los ocho peldaños por reloj: cada peldaño juega
+40 partidas contra el ancla `uci-1320` con colores alternados y una apertura aleatoria por pareja, y
+el script imprime el Elo que explica el marcador al lado de la etiqueta que la escalera lleva.
+
+```bash
+uv run python labs/m6/ladder_check.py --games 40
+```
+
+⟦LAB1-CALIBRACION⟧
+
+<Exercise>
+  Corre `ladder-time-a` otra vez mientras compilas algo grande en la misma máquina. ¿Cuánto se mueve
+  el Elo? ¿Y si lo haces con `ladder-nodes.yaml`? Antes de mirar, escribe cuál de los dos esperas
+  que se mueva y en qué dirección.
+</Exercise>
+
+<Solution>
+  Por tiempo, el rival explora menos nodos cuando la CPU está ocupada y juega peor: el Elo del
+  modelo **sube** sin que el modelo cambie (D-068 midió +13 Elo por carga de CPU en P3). Por nodos,
+  el rival juega exactamente las mismas jugadas ante las mismas posiciones, y lo único que cambia es
+  cuánto tarda la tirada. Es la diferencia entre un instrumento que mide el modelo y uno que mide el
+  modelo más lo que esté haciendo la máquina.
+</Solution>
+
+### Lab 2 · La tabla entera con un comando
+
+Hasta aquí cada módulo había medido lo suyo, el día que lo cerró, con el harness de ese día. La
+tabla única exige otra cosa: todas las etapas, la misma suite, el mismo día. `rukh eval nightly`
+recorre el catálogo de `rukh pull`, trae lo que falte, fusiona cada adaptador LoRA sobre su base,
+mide lo que no está en caché y reescribe `artifacts/web/results.json` y `docs/benchmarks.md`.
+Primero el plan, que no mide nada:
+
+```bash
+uv run rukh eval nightly --dry-run
+```
+
+```text
+stage                           measure  status     seconds  checkpoint
+tiny-greedy                     decoder  planned        0.0  checkpoints/tiny/best.pt
+small-v3-greedy                 decoder  planned        0.0  checkpoints/small-v3/best.pt
+medium-v4-greedy                decoder  planned        0.0  checkpoints/medium-v4/best.pt
+encoder-v4                      encoder  planned        0.0  checkpoints/encoder-heads-v4/step-4000.pt
+medium-elo                      decoder  planned        0.0  checkpoints/medium-elo/step-3800.pt
+medium-masters                  decoder  planned        0.0  checkpoints/medium-masters/step-3800.pt
+lora-e4                         decoder  planned        0.0  checkpoints/lora-e4
+lora-d4                         decoder  planned        0.0  checkpoints/lora-d4
+qwen3-pgn-qlora                 qwen     planned        0.0  checkpoints/qwen3-pgn-qlora
+medium-v4-dpo-onpolicy-greedy   decoder  planned        0.0  checkpoints/medium-v4-dpo-onpolicy/dpo.pt
+medium-v4-grpo-greedy           decoder  planned        0.0  checkpoints/medium-v4-grpo/grpo.pt
+karvonen-8l                     karvonen planned        0.0  checkpoints/karvonen-8l/lichess_8layers_ckpt_no_optimizer.pt
+```
+
+Doce etapas: las diez del proyecto que juegan, el encoder, y dos baselines que no entrenó nadie
+de aquí. El Qwen3 afinado de M4 ya estaba; el de Karvonen es nuevo y merece su párrafo. Es el
+nanoGPT de ajedrez de Adam Karvonen (8 capas, 25,7 M de parámetros, entrenado sobre 16 millones de
+partidas de Lichess en PGN carácter a carácter), reimplementado aquí sin depender de su repositorio
+y puesto en **la misma escalera** que el resto: mismo `play_rungs`, mismos peldaños, misma máscara
+de rescate, mismo criterio de puzles. Se le pregunta en su formato exacto (`;1.e4 e5 2.`) y con una
+regla más estricta que la de su propio harness, que reintenta hasta cinco veces con más temperatura
+ante una jugada ilegal; aquí se pregunta una vez y se cuenta.
+
+```bash
+uv run rukh eval nightly
+```
+
+⟦LAB2-SALIDA⟧
+
+Las dos filas del encoder que llevaban el nombre de su carpeta de corrida (el backlog de P3 lo
+dejó anotado) se retiran con `rukh eval drop`, y la tabla que queda es la de la parte 2.
+
+<Exercise>
+  Cambia una línea de `configs/eval/greedy.yaml` que no afecte a las partidas (por ejemplo
+  `puzzles_use_header`) y vuelve a lanzar el nightly con `--only tiny`. ¿Cuánto tarda? ¿Y si cambias
+  `elo_games`?
+</Exercise>
+
+<Solution>
+  Con la clave de caché partida por familia (D-136), tocar la cabecera de los puzles invalida solo
+  los puzles y las partidas se leen de la caché: segundos de Stockfish, no minutos. Tocar
+  `elo_games` invalida las partidas y conserva los puzles. Antes de M6 la clave era una sola y
+  cualquiera de los dos cambios volvía a jugarlo todo; con doce etapas, eso era una tarde.
+</Solution>
+
+### Lab 3 · Lo que cuesta el int8, en Elo
+
+M2 midió la paridad de las exportaciones y dejó la pregunta abierta: un int8 que elige otra jugada
+una vez de cada veinte, ¿cuánto peor juega? La paridad no lo dice; hay que jugar. `OnnxDecoder`
+pone el grafo ONNX dentro del mismo `DecoderPlayer` que usa el checkpoint, así que las tres
+precisiones pasan por la misma máscara, el mismo muestreo y el mismo rescate. ONNX Runtime juega
+en CPU, y por eso este lab quiere el rival por nodos: por tiempo, un jugador más lento cambiaría
+también el lado del motor.
+
+```bash
+uv run python labs/m6/parity_cost.py --onnx artifacts/onnx/medium-v4 --config configs/eval/ladder-nodes.yaml
+```
+
+⟦LAB3-SALIDA⟧
+
+<ParityCost />
+
+<Exercise>
+  La demo sirve int8 en móvil y fp16 en escritorio. Con la tabla de arriba delante, ¿qué le dirías a
+  alguien que juega en el móvil sobre contra qué está jugando? Escribe la frase que pondrías en la
+  interfaz.
+</Exercise>
+
+<Solution>
+  La frase honesta nombra la etapa y su Elo con intervalo, no «el mismo modelo más pequeño». Si el
+  intervalo del int8 solapa con el del fp16, la frase puede decir que no se ha medido una
+  diferencia; si no solapa, tiene que decir cuánto. Lo que no puede decir es «95 % igual», porque
+  ese número mide la exportación y no la fuerza.
+</Solution>
+
+### Lab 4 · Las cards y la colección, regeneradas desde la tabla
+
+Una card se escribe desde `run.json` y `results.json`; cuando la tabla cambia, todas las cards del
+proyecto están desactualizadas. Republicar 460 MB de pesos para cambiar un párrafo es la
+herramienta equivocada: `rukh publish cards` prepara cada repositorio igual que lo haría su propio
+publicador, en seco, y sube **solo** el `README.md`. Y cada card lleva ahora una sección «In the
+course» con la lección que la construyó, la fila de la tabla, la demo y el comando `rukh pull` que
+la trae.
+
+```bash
+uv run rukh publish cards --dry-run
+```
+
+```text
+chorcat/rukh-tiny                  staged    artifacts/publish/chorcat/rukh-tiny/README.md
+chorcat/rukh-small                 staged    artifacts/publish/chorcat/rukh-small/README.md
+chorcat/rukh-medium                staged    artifacts/publish/chorcat/rukh-medium/README.md
+…
+chorcat/rukh-tokenizer             staged    data/publish/rukh-tokenizer/README.md
+```
+
+La primera vez que se lanzó no salió así. `rukh-tiny` falló: la evaluación registraba el SHA del
+fichero que midió y el fichero que `rukh pull` trae del Hub no es ese byte a byte, porque el
+publicador quita el optimizador y la cabeza atada. Eran los mismos pesos y la guarda no lo sabía.
+La solución es D-135: cada resultado lleva también el SHA de los tensores, y la guarda acepta un
+fichero distinto con los mismos pesos y sigue rechazando unos pesos distintos. Sin la guarda, la
+card de `tiny` habría llevado los números de otro fichero sin que nadie lo notara; con la guarda
+antigua, no se podía publicar nada desde una máquina que no fuera la que entrenó.
+
+```bash
+uv run rukh publish cards
+uv run rukh publish collection
+```
+
+La colección se monta desde el catálogo de `rukh pull`, así que lo que se puede descargar, lo que se
+puede leer y lo que está en la tabla son la misma lista de veintiún repositorios. Es idempotente:
+lanzarla dos veces no cambia nada.
+
+<Exercise>
+  Abre la card de `chorcat/rukh-medium-dpo` y busca tres cosas: sobre qué fichero se midió, con qué
+  muestreo, y qué dice de la legalidad comparada con su base. ¿Falta alguna? ¿Sobra algún número que
+  no esté en la tabla?
+</Exercise>
+
+<Solution>
+  Las tres están, porque la plantilla las exige: el SHA del fichero y el de los pesos, la
+  temperatura y el `top_k` de la etapa, y la fila de legalidad al lado de la de `medium-v4` con la
+  nota del peaje del alineamiento de M5. Si un número de la card no está en `results.json` o en el
+  ledger, es un bug de la plantilla, no una licencia poética: la card es la afirmación pública, y
+  todo lo que afirma tiene que poder contradecirse con lo que hay dentro.
+</Solution>
+
+### Lab 5 · La arena: dos etapas, en tu navegador
+
+La lección de M5 enseñó que para medir una diferencia se mide la diferencia. La demo lo hace ahora
+en el navegador: dos etapas, cada una en su propio worker, juegan partidas por parejas con los
+colores espejados desde una apertura aleatoria con semilla, y el marcador se convierte en una
+diferencia de Elo con su intervalo bootstrap, con la misma aritmética que `rukh eval match`. Al lado
+imprime cuántas partidas haría falta jugar para que una diferencia de ese tamaño se separara del
+cero, para que nadie lea diez partidas como un veredicto.
+
+<DemoEmbed query="?mode=arena&stage=medium-fp16&vs=medium-dpo-fp16" />
+
+<Exercise>
+  Enfrenta `medium-fp16` con `medium-dpo-fp16` durante veinte partidas. Anota la diferencia y el
+  intervalo. ¿Cuántas partidas dice la demo que harían falta? Compáralo con las 400 que jugó M5 y
+  con el +57 (36-79) que publicó.
+</Exercise>
+
+<Solution>
+  Con veinte partidas el intervalo cubre varios cientos de Elo y casi siempre incluye el cero: la
+  demo lo dice y pide del orden de 400 partidas para una diferencia de 50. Eso no es un defecto de
+  la demo, es la aritmética de M5 funcionando delante de ti. Lo que la arena sí enseña con veinte
+  partidas es **cómo** juegan distinto: el DPO abre otras cosas y cambia antes de plan, y eso se ve
+  en el tablero antes de que se vea en el número.
+</Solution>
+
+### Lab 6 · Los puzles, en vivo, contra la fila de la tabla
+
+Los 150 puzles de la demo salen del mismo `split` de test que la suite, con el prefijo real de la
+partida y los Elo de los jugadores, así que el modelo se pregunta exactamente como lo pregunta el
+harness, y el criterio es el mismo: la línea entera, no la primera jugada.
+
+```bash
+uv run python labs/m6/puzzles_export.py     # 50 por tramo, semilla 6, a artifacts/web/puzzles.json
+```
+
+<DemoEmbed query="?mode=puzzles&stage=small-fp16" />
+
+<Exercise>
+  Deja que `small-fp16` resuelva los 150 y compara su tabla por tramos con la fila `small-v3-greedy`
+  de la tabla del proyecto. ¿Coinciden? ¿Deberían coincidir exactamente?
+</Exercise>
+
+<Solution>
+  Se parecen y no coinciden, por tres motivos que conviene tener claros: son 50 puzles por tramo y
+  no 2 000, así que el ruido de muestreo es de varios puntos; la demo muestrea a la temperatura de
+  la interfaz y la fila `-greedy` a 0,05; y el fp16 no es el checkpoint, es una exportación con
+  paridad del 99,9 %. Que salgan a pocos puntos es la comprobación de que la demo y el harness hacen
+  la misma pregunta; que salieran iguales sería sospechoso.
+</Solution>
+
+### Lab 7 · El README maestro y el post
+
+El cierre de la fase son dos textos. El README de `rukh` es el mapa: qué se construyó en cada
+módulo, con qué se midió y dónde está cada cosa (la tabla, el curso, la demo, la colección). El
+post es el guion del vídeo, con las tres cifras que importan y ninguna que no esté en
+`docs/benchmarks.md` o en el ledger. Los dos se escriben después de la tabla y no antes, y esa es
+la única regla.
+
+<Exercise>
+  Escribe en tres frases qué modelo de Rukh recomendarías a alguien que quiere jugar en el móvil, a
+  alguien que quiere el mejor Elo y a alguien que quiere estudiar el repertorio de un maestro. Cada
+  frase con su etapa, su número y su intervalo.
+</Exercise>
+
+<Solution>
+  Las tres respuestas están en la tabla y en la parte 2, y las tres tienen que llevar el intervalo,
+  porque dos de ellas se distinguen de sus vecinas por menos de lo que el instrumento repite. Si te
+  sale una frase sin intervalo, vuelve a la parte 1.
+</Solution>
+
+## Lo que deja el módulo
+
+⟦CIERRE⟧
+
+<RepoTag tag="p6" at="final" module="M6" />
+
+La cheatsheet del módulo, con su pregunta y su respuesta corta, está justo debajo.
