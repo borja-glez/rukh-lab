@@ -11,8 +11,8 @@ import { expect, test } from '@playwright/test';
  * settling onto the group's mean is the step readers reconstruct wrongly.
  */
 const THEORY = '/curso/m5/01-alineamiento/';
-const RESULTS = '/curso/m5/02-lo-que-salio/';
-const LABS = '/curso/m5/03-labs-de-alineamiento/';
+const RESULTS = '/curso/m5/08-lo-que-salio/';
+const LABS = '/curso/m5/09-labs-de-alineamiento/';
 
 const PARTS = {
   [THEORY]: ['fig--noise', 'fig--group'],

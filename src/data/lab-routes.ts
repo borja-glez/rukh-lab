@@ -277,7 +277,7 @@ export const labRoutes: Record<string, LabRoute[]> = {
       gives: 'los repos del Hub y el selector de la demo',
     },
   ],
-  'm5/03-labs-de-alineamiento': [
+  'm5/09-labs-de-alineamiento': [
     {
       lab: 'Lab 1',
       what: '¿Cuántas partidas cuesta la pregunta?',
