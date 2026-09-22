@@ -143,4 +143,43 @@ test.describe('lesson layout', () => {
     expect(prose.width).toBeGreaterThan(820);
     expect(prose.width).toBeLessThan(1100);
   });
+
+  test('the lesson guide folds away, gives the article its width and stays folded', async ({
+    page,
+  }) => {
+    // On a laptop the 260 px guide eats a fifth of the screen. Folding it is the reader's call,
+    // and a reload must land folded without flashing the guide open first.
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto(LESSON);
+    const toggle = page.getByRole('button', { name: 'Ocultar índice' });
+    const lessons = page.getByRole('navigation', { name: 'Lecciones del módulo' });
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(lessons).toBeVisible();
+    const before = (await page.locator('.lesson__main').boundingBox())!;
+
+    await toggle.click();
+    const show = page.getByRole('button', { name: 'Mostrar índice' });
+    await expect(show).toHaveAttribute('aria-expanded', 'false');
+    await expect(lessons).toBeHidden();
+    const after = (await page.locator('.lesson__main').boundingBox())!;
+    expect(after.x).toBeLessThan(before.x - 150);
+    expect(await page.evaluate(() => localStorage.getItem('rukh:guide'))).toBe('hidden');
+
+    await page.reload();
+    expect(await page.evaluate(() => document.documentElement.dataset.guide)).toBe('hidden');
+    await expect(lessons).toBeHidden();
+
+    await show.click();
+    await expect(lessons).toBeVisible();
+    expect(await page.evaluate(() => localStorage.getItem('rukh:guide'))).toBeNull();
+  });
+
+  test('on a phone the guide sits under the article and cannot be folded', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(LESSON);
+    await page.evaluate(() => localStorage.setItem('rukh:guide', 'hidden'));
+    await page.reload();
+    await expect(page.locator('[data-guide-toggle]')).toBeHidden();
+    await expect(page.getByRole('navigation', { name: 'Lecciones del módulo' })).toBeVisible();
+  });
 });
