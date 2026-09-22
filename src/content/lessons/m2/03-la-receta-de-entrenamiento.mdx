@@ -106,9 +106,9 @@ cifra, la larga es la que sirve. En la RTX 5090 (sm_120) bf16 es nativo, así qu
 gratis. Los pesos maestros siguen en fp32 y el optimizador acumula en fp32; bf16 es solo la
 precisión de las operaciones dentro del `autocast`.
 
-## `schedule.py`: veintiocho líneas, y las tres primeras deciden la corrida
+## `schedule.py`: veintiocho líneas, y las tres primeras deciden la ejecución
 
-Empezamos por el fichero más pequeño del módulo, que es además el que separa una corrida que
+Empezamos por el fichero más pequeño del módulo, que es además el que separa una ejecución que
 converge de una que se queda plana veinte mil pasos.
 
 ```python title="src/rukh/train/schedule.py"
@@ -160,7 +160,7 @@ guardas:
 - **`span <= 0` devuelve el suelo.** Ocurre cuando `warmup >= max_steps`, que suena absurdo hasta que
   alguien lanza `--max-steps 300` sobre una configuración con `warmup: 500` para probar algo rápido.
   Sin esa rama, la división por cero. Y pasado `max_steps` el `min(1.0, …)` deja la tasa clavada en
-  el suelo, de modo que una corrida reanudada que se pase nunca recibe una tasa negativa ni
+  el suelo, de modo que una ejecución reanudada que se pase nunca recibe una tasa negativa ni
   creciente.
 
 ```python title="tests/unit/test_schedule.py"
@@ -234,7 +234,7 @@ entrenaría con 6e-4 sin decir nada.
 
 ## `loop.py`: el bucle
 
-Trescientas sesenta y tres líneas, y la mitad son la contabilidad que hace que una corrida sea
+Trescientas sesenta y tres líneas, y la mitad son la contabilidad que hace que una ejecución sea
 reproducible seis meses después. Empezamos por la cabecera, que es un resumen de las decisiones.
 
 ```python title="src/rukh/train/loop.py"
@@ -346,7 +346,7 @@ class TrainConfig(BaseConfig):
 un error. Los valores por defecto son los de `small`. Tres campos que no son obvios:
 
 - **`grad_accum: 4`**, con `batch_size: 64`, son 256 secuencias efectivas. La <Term id="acumulacion-de-gradiente">acumulación de gradiente</Term> no es un lote más grande gratis: es partir el lote que no cabe en la GPU en cuatro pasadas que sí caben.
-- **`unique_run_name: True`** añade una marca de tiempo al nombre. Sin ella, una segunda corrida de
+- **`unique_run_name: True`** añade una marca de tiempo al nombre. Sin ella, una segunda ejecución de
   la misma configuración sobreescribiría los `step-*.pt` de la primera, que son exactamente los que
   lee la isla `TrainingReplay` de este módulo. El docstring del campo lo dice ahí mismo, que es
   donde se lee.
@@ -354,7 +354,7 @@ un error. Los valores por defecto son los de `small`. Tres campos que no son obv
   preset. Es lo que hace que `configs/train/*.yaml` no tenga que crecer un preset por experimento.
 
 Y `decoder()` es la única línea del fichero que toca la forma del modelo: coge el preset (o el
-`model` explícito) y le aplica el `block` de la corrida. El contexto vive en dos sitios porque son
+`model` explícito) y le aplica el `block` de la ejecución. El contexto vive en dos sitios porque son
 dos cosas distintas —la ventana del modelo y la longitud de las ventanas que empaqueta el
 cargador—, y esta línea es la que garantiza que coincidan.
 
@@ -436,7 +436,7 @@ def maybe_compile(
 
 `torch.compile` es perezoso: no compila al llamarlo, compila la primera vez que una pasada llega a
 Inductor. En Windows sin MSVC (o sin Triton) eso significa que el fallo aparece **a mitad de la
-corrida**, cuando ya has invertido media hora. Forzar la compilación aquí con un lote de la forma de
+ejecución**, cuando ya has invertido media hora. Forzar la compilación aquí con un lote de la forma de
 entrenamiento hace que el fallo ocurra donde todavía se puede caer a modo _eager_.
 
 Y la caída es un aviso, no una excepción: `log.warning` y se entrena igual. La máquina de referencia
@@ -541,8 +541,8 @@ def skip_batches(batches: Iterator[Batch], count: int) -> int:
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="182-210" />
 
-`run_dir` decide dónde escribe la corrida y `skip_batches` es la mitad menos obvia de reanudar. Una
-corrida reanudada que empezara otra vez por la primera ventana de la primera época entrenaría dos
+`run_dir` decide dónde escribe la ejecución y `skip_batches` es la mitad menos obvia de reanudar. Una
+ejecución reanudada que empezara otra vez por la primera ventana de la primera época entrenaría dos
 veces sobre las mismas partidas mientras el planificador cree que va por la mitad. Adelantar el flujo
 es barato —las ventanas son rodajas de un memmap— y se registra, porque no es gratis.
 
@@ -654,7 +654,7 @@ este bloque existe para descubrir pronto.
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="268-294" />
 
-Todo lo que hace falta para identificar una corrida seis meses después: la configuración entera, el
+Todo lo que hace falta para identificar una ejecución seis meses después: la configuración entera, el
 hash del vocabulario, el SHA del manifiesto de datos, el dispositivo y el número de parámetros. Y
 `save` es una clausura porque necesita `this_run`, que solo existe dentro del `with`.
 
@@ -762,9 +762,9 @@ def log_metrics(metrics: dict[str, float], step: int) -> None:
 <Src file="src/rukh/train/loop.py" tag="p2" lines="353-363" />
 
 Y el registro, con la regla que se aplica a todo el proyecto: **perder la traza nunca cuesta una
-corrida**. Un MLflow caído, un disco lleno o una métrica `NaN` producen un aviso y el entrenamiento
+ejecución**. Un MLflow caído, un disco lleno o una métrica `NaN` producen un aviso y el entrenamiento
 sigue. El filtro de `NaN` no es cosmético: MLflow rechaza el valor y la excepción, sin el `try`,
-tiraría la corrida en el primer lote raro.
+tiraría la ejecución en el primer lote raro.
 
 ## `checkpoint.py`: qué es un checkpoint y qué no
 
@@ -1199,7 +1199,7 @@ sin `meta.json`, `meta.json` sin la clave, fichero ausente) y un `.pt` cualquier
 checkpoint de Rukh. Ese último mensaje de error se lee más veces de las que parece, porque los pesos
 de Hugging Face también son un `.pt`.
 
-## `tracking.py`: que una corrida reanudada sea una sola curva
+## `tracking.py`: que una ejecución reanudada sea una sola curva
 
 M0 dejó `start_run` escribiendo en la base SQLite local. M2 le añade una cosa, y es la que hace que
 reanudar no parta la gráfica en dos.
@@ -1246,10 +1246,10 @@ siguen valiendo tal cual.
 
 <Src file="src/rukh/tracking.py" tag="p2" lines="85-99" />
 
-Reabrir una corrida existente en vez de crear una nueva. Las dos guardas son la misma idea aplicada
-dos veces: un `run_id` que no se puede reabrir —borrado, o de otra base— cae a una corrida nueva con
-un aviso, y volver a registrar los parámetros de una corrida reabierta es un error de MLflow que
-tampoco puede costar el entrenamiento. Sin ellas, reanudar una corrida cuyo MLflow se borró tira
+Reabrir una ejecución existente en vez de crear una nueva. Las dos guardas son la misma idea aplicada
+dos veces: un `run_id` que no se puede reabrir —borrado, o de otra base— cae a una ejecución nueva con
+un aviso, y volver a registrar los parámetros de una ejecución reabierta es un error de MLflow que
+tampoco puede costar el entrenamiento. Sin ellas, reanudar una ejecución cuyo MLflow se borró tira
 cuarenta minutos de GPU por un problema de contabilidad.
 
 ## Las dos configuraciones
@@ -1290,7 +1290,7 @@ log_every: 10
 El modelo del curso. Veintisiete líneas, y ninguna clave es decorativa: `BaseConfig` rechaza las que
 no reconoce, así que lo que está aquí es exactamente lo que `TrainConfig` sabe leer. Los números son
 los de la receta de arriba; el resto son decisiones de operación: `eval_every: 500` (cuarenta
-evaluaciones en la corrida), `ckpt_every: 1000` (veinte checkpoints, que son los que recorre la isla
+evaluaciones en la ejecución), `ckpt_every: 1000` (veinte checkpoints, que son los que recorre la isla
 de «Exportar a ONNX»), `workers: 4` para que el cargador no sea el cuello de botella y `seed: 42`.
 
 El comentario de la cabecera merece leerse: dice 440 000 tokens/s medidos y «unos 40 minutos, no las
@@ -1333,7 +1333,7 @@ Y el modelo con el que se itera. Compara las dos: **cambian siete claves**. El p
 256 secuencias efectivas, porque un modelo cuatro veces más pequeño cabe entero con lotes del
 doble; la tasa de aprendizaje, 1e-3 en vez de 6e-4, porque un modelo pequeño tolera pasos mayores;
 `max_steps`, `warmup` y `eval_every`. Fíjate en la proporción del warmup: 500 de 6 000 es el 8 % de
-la corrida, frente al 5 % de `small`. Una corrida corta necesita calentar relativamente más, porque
+la ejecución, frente al 5 % de `small`. Una ejecución corta necesita calentar relativamente más, porque
 el riesgo del warmup no es proporcional a los pasos totales sino a lo mal calibrado que está Adam
 en los primeros.
 
@@ -1490,7 +1490,7 @@ Sesenta y dos segundos entre evaluaciones consecutivas, que son 500 pasos: 8 pas
 
 Si el proceso se corta —se reinicia la máquina, se cae el driver—, no se pierde nada:
 `--resume checkpoints/small/step-12000.pt` continúa exactamente donde estaba, con el optimizador,
-los generadores y la misma corrida de MLflow. Esa es la diferencia entre guardar los pesos y guardar
+los generadores y la misma ejecución de MLflow. Esa es la diferencia entre guardar los pesos y guardar
 un checkpoint.
 
 <Exercise n="01" title="Dos entrenamientos de 300 pasos que explican la receta">
@@ -1543,8 +1543,8 @@ cifras no se pueden restar.
 
 El bucle entero y las cinco decisiones de la receta, cada una con lo que se rompe si se cambia. Y
 tres propiedades que no son del modelo sino de la infraestructura, y que valen más que cualquiera de
-ellas: una corrida reanudada es indistinguible de una que no paró, un checkpoint sabe con qué datos
-y con qué código se escribió, y perder la traza nunca cuesta una corrida.
+ellas: una ejecución reanudada es indistinguible de una que no paró, un checkpoint sabe con qué datos
+y con qué código se escribió, y perder la traza nunca cuesta una ejecución.
 
 **Cómo se mide**: `uv run pytest -m unit -q tests/unit/test_schedule.py tests/unit/test_checkpoint.py`
 en verde (nueve tests), `tiny` entrenado en 189 segundos hasta una pérdida de validación de **2,0200**
