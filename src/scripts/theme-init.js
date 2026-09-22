@@ -1,1 +1,1 @@
-try{var t=localStorage.getItem('rukh:theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}catch(e){}
+try{var s=localStorage,d=document.documentElement,t=s.getItem('rukh:theme');if(t==='light'||t==='dark')d.dataset.theme=t;if(s.getItem('rukh:guide')==='hidden')d.dataset.guide='hidden'}catch(e){}

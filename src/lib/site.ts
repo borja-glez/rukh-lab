@@ -11,6 +11,8 @@ export const SITE = {
 } as const;
 
 export const THEME_STORAGE_KEY = 'rukh:theme';
+/** `hidden` when the reader folded the lesson guide away; theme-init.js restores it before paint. */
+export const GUIDE_STORAGE_KEY = 'rukh:guide';
 export const PROGRESS_PREFIX = 'rukh:progress:';
 
 export const themes = ['light', 'dark'] as const;

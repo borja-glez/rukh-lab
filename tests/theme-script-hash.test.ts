@@ -16,10 +16,13 @@ describe('theme bootstrap script', () => {
     expect(hashes).toContain(expected);
   });
 
-  it('is a single line that only touches data-theme from localStorage', () => {
+  it('is a single line that only restores data-theme and data-guide from localStorage', () => {
     const script = readFileSync(resolve(root, 'src/scripts/theme-init.js'), 'utf8').trim();
     expect(script.split('\n')).toHaveLength(1);
-    expect(script).toContain("localStorage.getItem('rukh:theme')");
-    expect(script).toContain('document.documentElement.dataset.theme');
+    expect(script).toContain("getItem('rukh:theme')");
+    expect(script).toContain("getItem('rukh:guide')");
+    expect(script).toContain('dataset.theme');
+    expect(script).toContain('dataset.guide');
+    expect(script).not.toContain('setItem');
   });
 });
