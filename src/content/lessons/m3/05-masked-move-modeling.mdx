@@ -6,7 +6,7 @@ description:
   semilla reiniciada y la configuración de las doce mil pasadas.'
 module: m3
 order: 5
-duration: 180
+duration: 215
 runtime: 16
 level: medio
 status: vigente
@@ -312,7 +312,9 @@ def skip_batches(batches: Iterator[Batch], count: int) -> int:
 <Src file="src/rukh/train/common.py" tag="p3" lines="155-183" />
 
 `run_dir` es la razón de que todas las rutas de checkpoint de este módulo lleven fecha
-(`checkpoints/encoder-mmm-20260919-093554/`) y de que los comandos del curso las escriban sin ella.
+(`checkpoints/encoder-mmm-20260919-093554/`): en las órdenes del curso esa marca aparece como
+`<fecha>`, y en las tuyas va la de tu tirada. Ninguna orden de este módulo resuelve un nombre sin
+fecha.
 El `cfg.run_name or cfg.default_name` es donde entra la propiedad que redefinen las subclases.
 
 ```python title="src/rukh/train/common.py"
@@ -404,6 +406,54 @@ nada.
 
 ## Lo que queda en `loop.py`
 
+El docstring del módulo gana una frase que dice lo que ha pasado —la maquinaria vive en
+`rukh.train.common`, compartida con el bucle del encoder— y los imports adelgazan: `os`, `datetime`,
+`Iterator`, `BaseConfig`, `lr_at`, `load_checkpoint`, `save_checkpoint` y `restore` ya no se usan
+aquí, porque las
+funciones que los necesitaban se han ido a `common.py`.
+
+```python title="src/rukh/train/loop.py"
+"""The decoder's training loop: next-token prediction on a packed stream of move tokens.
+
+The recipe follows ``docs/spec/02`` (component 1): AdamW (0.9/0.95, weight decay 0.1 applied
+only to matrices), learning rate 6e-4 with 1 000 warmup steps and a cosine decay, an effective
+batch of ``batch_size * grad_accum`` sequences, bf16 autocast on CUDA, gradient clipping at 1.0
+and optional ``torch.compile``. Everything the run needs to be reproducible (config, seed, git
+SHA, vocabulary hash, data manifest hash) goes to MLflow and into every checkpoint. All of that
+machinery lives in ``rukh.train.common``, shared with the encoder's masked-move loop; what is
+left here is the part that is specific to predicting the next move.
+
+Resuming is meant to be indistinguishable from never having stopped: the batch stream is wound
+forward past the windows the first half of the run already saw, and the MLflow run id travels in
+the checkpoint so the curve carries on in the same run instead of starting a second one.
+
+Two throughput numbers are logged because they answer different questions: ``tokens_per_s``
+counts every position in the window (what the GPU actually processed, comparable across runs)
+and ``real_tokens_per_s`` counts only the non-``<pad>`` targets (what the model learned from).
+The training loss is accumulated token-weighted rather than as a mean of means, so a
+micro-batch with fewer real tokens does not count as much as a full one.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import time
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Any, Literal
+
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+
+from rukh import paths
+from rukh.models import DecoderConfig, MoveDecoder, preset
+from rukh.tokenize.loader import IGNORE_INDEX, PackedDataset, make_loader
+```
+
+<Src file="src/rukh/train/loop.py" tag="p3" lines="1-37" />
+
 ```python title="src/rukh/train/loop.py"
 from rukh.train.checkpoint import BEST_NAME, read_manifest_sha, read_vocab_hash, step_name
 from rukh.train.common import (
@@ -462,10 +512,154 @@ la misma precaución: el `__all__` reexporta desde `rukh.train.loop` todo lo que
 `common.py`, porque los tests de M2 y su lección importan `pick_device`, `param_groups` o
 `run_dir` de ahí. Un refactor interno no debería obligar a tocar el módulo anterior del curso.
 
-Del cuerpo de `train` desaparecen tres bloques que ahora son llamadas de una línea: el reanudado, la
-elección del autocast y la escritura del checkpoint. Lo único que se queda es lo que sabe de
-jugadas: el `PackedDataset` de M1, `evaluate` con su top-1, y la línea que convierte un lote en una
-pérdida.
+`evaluate` no cambia ni una línea respecto a M2. Del cuerpo de `train` desaparecen tres bloques
+que ahora son llamadas de una línea: el reanudado, la elección del autocast y la escritura del
+checkpoint. Lo único que se queda es lo que sabe de jugadas: el `PackedDataset` de M1, `evaluate`
+con su top-1, y la línea que convierte un lote en una pérdida. Es la función entera, y sustituye a
+la de M2:
+
+```python title="src/rukh/train/loop.py"
+def train(cfg: TrainConfig, resume: Path | None = None, device: str | None = None) -> Path:
+    """Train a ``MoveDecoder`` and return the path of the final checkpoint."""
+    cfg.check()
+    torch.manual_seed(cfg.seed)
+    where = torch.device(device or pick_device())
+    tokens_dir = paths.resolve(cfg.tokens_dir)
+    model_cfg = cfg.decoder()
+
+    train_set = PackedDataset(tokens_dir / "train", block=cfg.block)
+    val_set = PackedDataset(tokens_dir / "val", block=cfg.block)
+    if train_set.info.vocab_size != model_cfg.vocab_size:
+        raise ValueError(
+            f"{tokens_dir / 'train'} has vocab_size {train_set.info.vocab_size}, "
+            f"the model expects {model_cfg.vocab_size}"
+        )
+    train_loader = make_loader(train_set, cfg.batch_size, seed=cfg.seed, workers=cfg.workers)
+    val_loader = make_loader(
+        val_set, cfg.batch_size, seed=cfg.seed, workers=0, shuffle=False, drop_last=False
+    )
+    if not len(train_loader):
+        raise ValueError(f"{tokens_dir / 'train'} has fewer than {cfg.batch_size} windows")
+
+    model = MoveDecoder(model_cfg).to(where)
+    optimizer = torch.optim.AdamW(param_groups(model, cfg.weight_decay), lr=cfg.lr, betas=cfg.betas)
+    start_step = 0
+    best_val = math.inf
+    run_id: str | None = None
+    if resume is not None:
+        start_step, best_val, run_id = load_resume(resume, model, optimizer, where)
+
+    autocast, use_bf16 = autocast_for(cfg, where)
+    warmup = torch.ones((cfg.batch_size, cfg.block), dtype=torch.long, device=where)
+    with autocast:  # compile under the same precision the loop will use
+        runnable = maybe_compile(model, cfg.compile, warmup)
+    runnable.train()
+
+    out_dir = run_dir(cfg, resume)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vocab_hash = read_vocab_hash(tokens_dir / "train")
+    manifest_sha = read_manifest_sha(paths.data_dir() / "raw" / "manifest.json")
+    tokens_per_step = cfg.batch_size * cfg.grad_accum * cfg.block
+    batches = forever(train_loader)
+    skip_batches(batches, start_step * cfg.grad_accum)
+    final = out_dir / step_name(cfg.max_steps)
+
+    from rukh.tracking import start_run
+
+    params = {
+        **cfg.model_dump(mode="json"),
+        "vocab_hash": vocab_hash,
+        "data_manifest_sha": manifest_sha,
+        "device": str(where),
+        "num_params": model.num_params(),
+    }
+    with start_run(out_dir.name, params, tags={"preset": cfg.preset}, run_id=run_id) as run:
+        log.info("run %s in %s on %s", run.info.run_id, out_dir, where)
+        this_run = str(run.info.run_id)
+
+        def save(path: Path, step: int) -> Path:
+            return write_checkpoint(
+                path,
+                step=step,
+                model=model,
+                optimizer=optimizer,
+                cfg=cfg,
+                model_cfg=model_cfg,
+                vocab_hash=vocab_hash,
+                manifest_sha=manifest_sha,
+                best_val=best_val,
+                run_id=this_run,
+            )
+
+        clock = time.perf_counter()
+        for step in range(start_step, cfg.max_steps):
+            lr = set_lr(optimizer, step, cfg)
+            optimizer.zero_grad(set_to_none=True)
+            # Token-weighted, on the device: one synchronisation per step instead of one per
+            # micro-batch, and a micro-batch with fewer real tokens weighs less in the mean.
+            loss_sum = torch.zeros((), device=where)
+            real_tokens = torch.zeros((), device=where)
+            for _ in range(cfg.grad_accum):
+                x, y = next(batches)
+                x, y = x.to(where), y.to(where)
+                with autocast:
+                    _, loss = runnable(x, y)
+                assert loss is not None
+                (loss / cfg.grad_accum).backward()
+                tokens = (y != IGNORE_INDEX).sum()
+                loss_sum += loss.detach().float() * tokens
+                real_tokens += tokens
+            grad_norm = float(nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip))
+            optimizer.step()
+
+            done = step + 1
+            last = done == cfg.max_steps
+            if done % cfg.log_every == 0 or last:
+                counted = float(real_tokens.item())
+                total = float(loss_sum.item()) / counted if counted else math.nan
+                elapsed = max(time.perf_counter() - clock, 1e-9)
+                steps = min(cfg.log_every, done - start_step)
+                log_metrics(
+                    {
+                        "train/loss": total,
+                        "lr": lr,
+                        "grad_norm": grad_norm,
+                        "tokens_per_s": tokens_per_step * steps / elapsed,
+                        "real_tokens_per_s": counted * steps / elapsed,
+                    },
+                    step=done,
+                )
+                clock = time.perf_counter()
+            if done % cfg.eval_every == 0 or last:
+                val_loss, top1 = evaluate(
+                    runnable, val_loader, cfg.eval_batches, where, autocast if use_bf16 else None
+                )
+                log_metrics({"val/loss": val_loss, "val/top1": top1}, step=done)
+                log.info("step %d  val/loss %.4f  val/top1 %.4f", done, val_loss, top1)
+                if not math.isnan(val_loss) and val_loss < best_val:
+                    best_val = val_loss
+                    save(out_dir / BEST_NAME, done)
+                clock = time.perf_counter()
+            if done % cfg.ckpt_every == 0 or last:
+                final = save(out_dir / step_name(done), done)
+                clock = time.perf_counter()
+    return final
+```
+
+<Src file="src/rukh/train/loop.py" tag="p3" lines="125-249" />
+
+Léela buscando lo que ya no está. `load_resume(resume, model, optimizer, where)` devuelve en una
+tupla los tres datos que el bucle necesita para seguir —paso, mejor pérdida e id de MLflow— y
+esconde la restauración de pesos, optimizador y generadores. `autocast_for` decide el contexto de
+precisión y si hay bf16, y `run_dir(cfg, resume)` elige la carpeta: la de siempre al reanudar y, si no,
+una nueva, con fecha salvo que `unique_run_name` esté apagado. `save` es un cierre sobre `write_checkpoint` que fija todo lo que no cambia
+entre dos guardados, de modo que las dos llamadas del final (`best.pt` y `step-*.pt`) solo dicen
+dónde y en qué paso.
+
+Lo que queda es lo que ningún otro bucle comparte: comprobar que el pack tiene el mismo
+`vocab_size` que el modelo, construir un `MoveDecoder`, y la suma de la pérdida ponderada por tokens
+reales, porque en el decoder el `<pad>` del final de una partida no puntúa. El bucle del encoder de
+más abajo tiene la misma forma con otra línea de pérdida, y esa simetría es el objetivo del refactor.
 
 <Callout kind="ejecuta" title="El bucle del decoder, después del refactor">
   `common.py` y el `loop.py` recortado sustituyen a medio bucle de M2. Antes de escribir una línea
@@ -1212,6 +1406,97 @@ tasa de aprendizaje que se vuelve texto.
 
 ## La orden
 
+En M2, `train` era un comando suelto, `@app.command("train")`. Ahora hay dos cosas que entrenar, y
+la forma natural en Typer de colgar `rukh train encoder` es convertir `train` en un **grupo**: un
+`typer.Typer` propio, montado en la aplicación con `add_typer`. Va al principio de `cli.py`, justo
+después de `publish_app`:
+
+```python title="src/rukh/cli.py"
+train_app = typer.Typer(
+    help="Train a model: the decoder by default, a subcommand for the encoder.",
+    invoke_without_command=True,
+)
+app.add_typer(train_app, name="train")
+```
+
+<Src file="src/rukh/cli.py" tag="p3" lines="30-34" />
+
+`invoke_without_command=True` es la mitad del truco: un grupo de Typer, por defecto, exige un
+subcomando, y `rukh train --config …` se quedaría sin decoder. A `eval` le pasará lo mismo en la
+lección 7, cuando gane `rukh eval encoder`, y allí se repite la jugada con un `eval_app`.
+
+La otra mitad está en el comando del decoder. Deja de ser `@app.command("train")` y pasa a ser el
+**callback** del grupo, la función que Typer ejecuta siempre que se invoca `rukh train`, con
+subcomando o sin él:
+
+```python title="src/rukh/cli.py"
+@train_app.callback(invoke_without_command=True)
+def train_cmd(
+    ctx: typer.Context,
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config", exists=True, dir_okay=False, readable=True, help="Training YAML config."
+        ),
+    ] = None,
+    model_preset: Annotated[
+        str | None, typer.Option("--preset", help="Override the preset: tiny, small or medium.")
+    ] = None,
+    resume: Annotated[
+        Path | None,
+        typer.Option(
+            "--resume", exists=True, dir_okay=False, readable=True, help="Checkpoint to continue."
+        ),
+    ] = None,
+    max_steps: Annotated[
+        int | None, typer.Option("--max-steps", help="Override max_steps from the config.")
+    ] = None,
+) -> None:
+    """Train a MoveDecoder from a packed token stream, logging the run to MLflow.
+
+    ``rukh train --config ...`` is the decoder, exactly as it always was; the subcommands train
+    the other models (``rukh train encoder``).
+    """
+    from rukh.config import load_yaml
+    from rukh.models import PRESETS
+    from rukh.train import TrainConfig, train
+
+    if ctx.invoked_subcommand is not None:
+        return
+    if config is None:
+        typer.echo("error: --config is required (see rukh train --help)", err=True)
+        raise typer.Exit(code=2)
+    cfg = load_yaml(config, TrainConfig)
+    if model_preset is not None:
+        if model_preset not in PRESETS:
+            typer.echo(f"error: --preset must be one of {', '.join(PRESETS)}", err=True)
+            raise typer.Exit(code=2)
+        cfg = cfg.model_copy(update={"preset": model_preset, "model": None})
+    if max_steps is not None:
+        cfg = cfg.model_copy(update={"max_steps": max_steps})
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    try:
+        checkpoint = train(cfg, resume=resume)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"preset:     {cfg.preset}")
+    typer.echo(f"steps:      {cfg.max_steps}")
+    typer.echo(f"checkpoint: {checkpoint}")
+```
+
+<Src file="src/rukh/cli.py" tag="p3" lines="336-388" />
+
+Tres cambios respecto a M2, y los tres salen de que ahora es un callback. El `ctx: typer.Context`
+dice si detrás venía un subcomando: si alguien escribió `rukh train encoder …`, el callback se
+ejecuta primero y tiene que salir sin hacer nada (`ctx.invoked_subcommand is not None`). `--config`
+pasa de obligatorio a `None` por defecto, porque si fuera obligatoria en el callback, `rukh train
+encoder --config …` fallaría pidiendo un `--config` para el grupo. Y como ya no es Typer quien exige
+la opción, lo hace el propio comando: sin subcomando y sin `--config`, un mensaje y el código de
+salida 2, el mismo que devolvería Typer. El resto del cuerpo es el de M2 sin tocar.
+
+Con el grupo y el callback puestos, el subcomando del encoder se cuelga de `train_app`:
+
 ```python title="src/rukh/cli.py"
 @train_app.command("encoder")
 def train_encoder_cmd(
@@ -1256,15 +1541,35 @@ def train_encoder_cmd(
 
 <Src file="src/rukh/cli.py" tag="p3" lines="391-429" />
 
-`rukh train encoder` es un **subcomando** de `train`, mientras que el decoder sigue siendo
-`rukh train --config …` sin subcomando. Eso se consigue con `@train_app.callback(invoke_without_command=True)`
-en el comando del decoder, y no es una excentricidad: cambiar la grafía del decoder habría roto
-todos los comandos de M2 que están escritos en el curso, en el README y en el registro de decisiones.
-Un módulo nuevo no rompe la interfaz del anterior.
+Así `rukh train encoder` es un **subcomando** de `train`, mientras que el decoder sigue siendo
+`rukh train --config …` sin subcomando. Hacerlo con el callback no es una excentricidad: la
+alternativa limpia, `rukh train decoder`, habría roto todos los comandos de M2 que están escritos en
+el curso, en el README y en el registro de decisiones. Un módulo nuevo no rompe la interfaz del
+anterior.
 
 El resumen que imprime al acabar repite la receta del enmascarado —`15% at 80%/10%/10%`— en vez de
 solo la ruta del checkpoint. Es información que ya está en la configuración y en MLflow, y aun así
 vale la pena tenerla en el terminal: cuando pegues la salida en un cuaderno, la receta va pegada.
+
+<Callout kind="ejecuta" title="El grupo `train`, sin entrenar nada">
+  El entrenamiento del encoder todavía no arranca: `train_mmm` y `MmmConfig` se importan de
+  `rukh.train`, y el `__init__.py` que los exporta llega en la lección siguiente. Pero la forma de la
+  orden ya se puede comprobar, porque la ayuda no ejecuta el cuerpo del comando:
+
+```sh
+uv run rukh train --help
+uv run rukh train encoder --help
+uv run rukh train
+```
+
+La primera tiene que enseñar las opciones del decoder de siempre (`--config`, `--preset`,
+`--resume`, `--max-steps`) y, debajo, una sección de comandos con `encoder`. La segunda, `--config`
+marcada como obligatoria, `--resume` y `--max-steps`. La tercera imprime
+`error: --config is required (see rukh train --help)` y sale con código 2: es el callback, sin
+subcomando y sin configuración. Si en vez de eso Typer dice que falta un comando, te falta
+`invoke_without_command=True` en `train_app` o en el `@train_app.callback`.
+
+</Callout>
 
 ## Los tests del enmascarado
 
