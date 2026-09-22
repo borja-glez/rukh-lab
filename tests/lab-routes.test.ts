@@ -36,9 +36,12 @@ describe('lab routes', () => {
     const table = mdx.indexOf('<LabRoutes');
     expect(table).toBeGreaterThan(-1);
     /* Where the labs are headings, the table goes above the first one. Where they are not --
-       m2/04 numbers training runs, not labs -- it goes above the first command. */
+       a lesson that numbers training runs -- it goes above the first command the reader is told
+       to run, which starts its own line inside a block. Prose quoting `uv run rukh train` to say
+       what a file does is not an instruction, and matching it anywhere made the rule fire on a
+       sentence that happened to name the command. */
     const first =
-      labHeadings(mdx).length > 0 ? mdx.search(/^#{2,3} Lab /m) : mdx.indexOf('uv run rukh train');
+      labHeadings(mdx).length > 0 ? mdx.search(/^#{2,3} Lab /m) : mdx.search(/^uv run rukh /m);
     expect(table).toBeLessThan(first);
   });
 

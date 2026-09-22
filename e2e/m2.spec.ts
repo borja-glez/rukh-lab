@@ -2,13 +2,16 @@ import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 /**
- * M2 is four lessons. The theory opens it, the training and the measurement follow, the two
- * islands live in the third part, and the fourth is the corpus work that produced `medium-v4`.
+ * M2 is eleven lessons: the theory, eight of code, the labs, and the corpus work that produced
+ * `medium-v4`. This spec walks the four pages that carry something only a browser can check: the
+ * opening, the first code lesson it links to, the export lesson where both islands live, and the
+ * last lesson, which is the one the cheatsheet hangs off.
  */
 const THEORY = '/curso/m2/01-el-decoder/';
-const TRAINING = '/curso/m2/02-entrenar-y-medir/';
-const INSIDE = '/curso/m2/03-exportar-y-mirar-dentro/';
-const DATA = '/curso/m2/04-mas-datos-no-mas-red/';
+const DECODER = '/curso/m2/02-el-decoder-a-mano/';
+const INSIDE = '/curso/m2/07-exportar-a-onnx/';
+const LABS = '/curso/m2/10-labs-del-decoder/';
+const DATA = '/curso/m2/11-mas-datos-no-mas-red/';
 
 function directive(csp: string, name: string): string | undefined {
   return csp
@@ -37,7 +40,7 @@ async function stateOf(island: Locator): Promise<'pending' | 'ready'> {
 }
 
 test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
-  test('the four parts chain in order and only the last one carries the cheatsheet', async ({
+  test('the module chains in order and only the last lesson carries the cheatsheet', async ({
     page,
   }) => {
     await page.goto(THEORY);
@@ -47,19 +50,16 @@ test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
     await expect(page.locator('.cheat')).toHaveCount(0);
 
     await page.locator('.lesson__nav-link--next').click();
-    await expect(page).toHaveURL(new RegExp(`${TRAINING}$`));
-    await expect(page.locator('.prose h2', { hasText: 'Cómo se mide' }).first()).toBeVisible();
-    /* The four labs of this part are exercises with a solution each. */
-    expect(await page.locator('.prose details').count()).toBeGreaterThanOrEqual(4);
+    await expect(page).toHaveURL(new RegExp(`${DECODER}$`));
     await expect(page.locator('.cheat')).toHaveCount(0);
 
-    await page.locator('.lesson__nav-link--next').click();
-    await expect(page).toHaveURL(new RegExp(`${INSIDE}$`));
-    await expect(page.locator('.prose h2').first()).toContainText('Lab 5');
+    await page.goto(LABS);
+    await expect(page.locator('.prose h2', { hasText: 'Lab 1' }).first()).toBeVisible();
+    /* Each lab closes with an exercise that has a solution to unfold. */
+    expect(await page.locator('.prose details').count()).toBeGreaterThanOrEqual(3);
     await expect(page.locator('.cheat')).toHaveCount(0);
 
-    await page.locator('.lesson__nav-link--next').click();
-    await expect(page).toHaveURL(new RegExp(`${DATA}$`));
+    await page.goto(DATA);
     await expect(page.locator('.prose h2', { hasText: 'escalera' }).first()).toBeVisible();
     await expect(page.locator('.cheat')).toHaveCount(1);
   });
@@ -117,7 +117,7 @@ test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
     await expect(island).not.toHaveAttribute('data-step', before as string);
   });
 
-  for (const lesson of [THEORY, TRAINING, INSIDE, DATA]) {
+  for (const lesson of [THEORY, DECODER, INSIDE, LABS, DATA]) {
     test(`axe: no serious or critical violations on ${lesson}`, async ({ page }) => {
       await page.goto(lesson);
       if (lesson === INSIDE) {

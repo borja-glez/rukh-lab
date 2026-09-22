@@ -1,0 +1,1355 @@
+---
+title: 'Jugar en el navegador'
+description:
+  'El otro lado del `.onnx`: un worker que posee la sesión de ONNX Runtime y serializa cada llamada,
+  un contrato que el fichero tiene que cumplir antes de que se le deje jugar, una descarga que mueve
+  la barra de verdad, y WebGPU con su respaldo en WASM bajo aislamiento de origen cruzado.'
+module: m2
+order: 8
+duration: 180
+level: medio
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - WebGPU
+  - WASM
+  - web worker
+  - ONNX Runtime
+  - Cache API
+  - COOP
+  - COEP
+  - contrato del modelo
+artifacts:
+  - kind: demo
+    label: Demo v1
+    href: https://rukh.borjaglez.com
+  - kind: repo
+    label: borja-glez/rukh-web
+    href: https://github.com/borja-glez/rukh-web
+demo: ?stage=small-fp16
+---
+
+## Qué vas a construir
+
+La mitad de la demo que toca el modelo: 784 líneas de TypeScript en `rukh-web` que descargan el `.onnx` de Hugging Face, lo meten en una sesión de <Term id="onnx">ONNX</Term> Runtime dentro de un <Term id="web-worker">web worker</Term>, comprueban que el fichero es el que dice ser y contestan los logits de la siguiente jugada sin bloquear el tablero.
+
+Todo el código de esta lección es del repositorio `rukh-web`, en el commit `e228cca`, que es el que
+cerró el hito: «verificar el contrato del modelo y transmitir el progreso de la descarga». El
+tablero, el muestreador del navegador y la interfaz quedan enlazados y no pegados, porque ni tocan
+el modelo ni enseñan nada que no sea Preact; lo que sigue es exactamente la frontera entre el
+proyecto de ML y la web.
+
+<Callout kind="hoy" title="Por qué esta lección está en el módulo del decoder">
+  Porque el contrato del modelo no es una propiedad del navegador: es la continuación de la
+  exportación. `rukh_vocab_size` y `rukh_block` se escriben en el `.onnx` en la lección anterior, y
+  aquí descubres que **ORT Web no los expone**, así que el navegador tiene que comprobar lo mismo
+  por otros dos caminos. Esa asimetría entre lo que se escribe y lo que se puede leer es el tipo de
+  cosa que solo aparece cuando llevas el modelo hasta el final.
+</Callout>
+
+## El protocolo: lo que el worker y la página se dicen
+
+{/* prettier-ignore */}
+```ts title="src/lib/worker-protocol.ts"
+// Messages exchanged with `src/workers/decoder.worker.ts`. Both sides import this module, so a
+// change to a payload breaks the build on the side that did not follow.
+//
+// The flow is always the same: `init` (download + session) answers with `progress`* and then
+// `ready` or `error`; `logits` answers with `logits` or `error`; `dispose` answers with
+// `disposed`. Every request carries an `id` the answer echoes, so the client can correlate
+// replies even though the worker already serialises the work.
+
+/** ONNX Runtime Web version; `scripts/copy-assets.mjs` copies that release into `public/ort/`. */
+export const ORT_VERSION = '1.30.0';
+
+/** Where the self-hosted ORT runtime (`.wasm` + loader) is served from. */
+export const ORT_BASE = `/ort/${ORT_VERSION}/`;
+
+/**
+ * Cache API bucket for downloaded models. The suffix is bumped whenever what is stored (or how
+ * it is keyed) changes, so an old browser cache is never read with new expectations.
+ */
+export const MODEL_CACHE = 'rukh-models-v1';
+```
+
+<Src file="src/lib/worker-protocol.ts" repo="rukh-web" tag="e228cca" lines="1-19" />
+
+El primer párrafo es la regla de diseño: **los dos lados importan este módulo**, así que un cambio
+en un mensaje rompe la compilación del lado que no lo siguió. Un protocolo entre dos ficheros que no
+comparten tipos es un protocolo que se desincroniza en silencio.
+
+`ORT_VERSION` fija la versión del runtime y `ORT_BASE` dice de dónde se sirve: `public/ort/1.30.0/`,
+que `scripts/copy-assets.mjs` rellena en el build. **Nada se pide a un CDN**, y no solo por gusto:
+la política de seguridad de contenidos de la página no lo permitiría.
+
+`MODEL_CACHE = 'rukh-models-v1'` lleva el sufijo de versión por la razón que dice su comentario: el
+día que cambie **qué** se guarda o **cómo** se indexa, se sube a `v2` y ninguna caché vieja se lee
+con expectativas nuevas.
+
+{/* prettier-ignore */}
+```ts title="src/lib/worker-protocol.ts"
+export type Backend = 'webgpu' | 'wasm';
+
+export interface InitRequest {
+  type: 'init';
+  id: number;
+  /** Registry stage id, only used for diagnostics and the cache log. */
+  stage: string;
+  /** Absolute or same-origin URL of the `.onnx` file. */
+  url: string;
+  /** Expected size in bytes; used for the progress bar when there is no `content-length`. */
+  sizeBytes: number;
+  /** Context window the stage was trained with (`DecoderConfig.block`), from the registry. */
+  block: number;
+  /** Vocabulary size the caller's tokenizer has; the model's output width must match it. */
+  vocab: number;
+}
+
+export interface LogitsRequest {
+  type: 'logits';
+  id: number;
+  /** Token ids of the prompt, already cropped to the context by the caller. */
+  ids: number[];
+}
+
+export interface DisposeRequest {
+  type: 'dispose';
+  id: number;
+}
+
+export type WorkerRequest = InitRequest | LogitsRequest | DisposeRequest;
+```
+
+<Src file="src/lib/worker-protocol.ts" repo="rukh-web" tag="e228cca" lines="21-50" />
+
+Las tres peticiones. `InitRequest` es la interesante, porque lleva **dos** números que el fichero no
+puede contar por sí mismo: `block`, la ventana de contexto con la que se entrenó la etapa, y
+`vocab`, el tamaño del vocabulario del tokenizador de quien llama. Los dos vienen del registro, no
+del `.onnx`, y el comentario de cada campo dice por qué.
+
+`sizeBytes` es la estimación del registro y solo se usa cuando la respuesta no trae un
+`content-length` utilizable, que es lo que pasa cuando el Hub redirige a su CDN.
+
+{/* prettier-ignore */}
+```ts title="src/lib/worker-protocol.ts"
+export interface ProgressMessage {
+  type: 'progress';
+  id: number;
+  loaded: number;
+  total: number;
+}
+
+export interface ReadyMessage {
+  type: 'ready';
+  id: number;
+  backend: Backend;
+  /** Why WebGPU was not used, when `backend` is `wasm` and a reason is known. */
+  fallbackReason?: string;
+  loadMs: number;
+  /** The contract the session was checked against; `buildPrompt` crops to `block`. */
+  block: number;
+  vocab: number;
+}
+
+export interface LogitsMessage {
+  type: 'logits';
+  id: number;
+  data: Float32Array;
+  inferMs: number;
+}
+
+export interface DisposedMessage {
+  type: 'disposed';
+  id: number;
+}
+
+export interface ErrorMessage {
+  type: 'error';
+  id: number;
+  message: string;
+}
+
+export type WorkerResponse =
+  ProgressMessage | ReadyMessage | LogitsMessage | DisposedMessage | ErrorMessage;
+```
+
+<Src file="src/lib/worker-protocol.ts" repo="rukh-web" tag="e228cca" lines="52-90" />
+
+{/* prettier-ignore */}
+```ts title="src/lib/worker-protocol.ts"
+const RESPONSE_TYPES = ['progress', 'ready', 'logits', 'disposed', 'error'] as const;
+
+/**
+ * Narrows whatever arrived through `postMessage` to a known response, or `null`. The worker is
+ * ours, but the message channel is not typed at runtime and a stray message must not crash the
+ * page.
+ */
+export function asResponse(data: unknown): WorkerResponse | null {
+  if (typeof data !== 'object' || data === null) return null;
+  const message = data as { type?: unknown; id?: unknown };
+  if (typeof message.id !== 'number') return null;
+  const type = message.type;
+  if (typeof type !== 'string') return null;
+  if (!(RESPONSE_TYPES as readonly string[]).includes(type)) return null;
+  return data as WorkerResponse;
+}
+```
+
+<Src file="src/lib/worker-protocol.ts" repo="rukh-web" tag="e228cca" lines="92-107" />
+
+`asResponse` es una función de siete líneas que merece un párrafo. El worker es nuestro, pero el
+canal de `postMessage` **no está tipado en tiempo de ejecución**: cualquier extensión del navegador,
+cualquier otro script del mismo contexto, puede mandar un mensaje. Un mensaje inesperado no puede
+tirar la página, así que se estrecha a un tipo conocido o se devuelve `null` y se ignora. Es la
+misma disciplina que un `extra="forbid"` de pydantic, en el otro extremo del proyecto.
+
+{/* prettier-ignore */}
+```ts title="src/lib/worker-protocol.ts"
+/** Percentage (0-100) of a progress message; `total` of 0 reports 0 rather than `NaN`. */
+export function progressPercent(message: Pick<ProgressMessage, 'loaded' | 'total'>): number {
+  if (message.total <= 0) return 0;
+  return Math.min(100, Math.round((message.loaded / message.total) * 100));
+}
+
+/** Bytes as MB with one decimal, the unit the consent step and the progress bar speak. */
+export function megabytes(bytes: number): number {
+  return Math.round((bytes / 1_000_000) * 10) / 10;
+}
+```
+
+<Src file="src/lib/worker-protocol.ts" repo="rukh-web" tag="e228cca" lines="109-118" />
+
+Diez líneas de aritmética con dos decisiones dentro: un `total` de cero reporta 0 y no `NaN`, y el
+porcentaje se acota a 100 para que una descarga que se pase de la estimación no imprima 114 %. Los
+megabytes son decimales (`/ 1 000 000`) y no binarios, porque es la unidad en la que el Hub anuncia
+los ficheros y la que el jugador va a comparar.
+
+## El contrato: qué se le exige a un fichero antes de dejarle jugar
+
+{/* prettier-ignore */}
+```ts title="src/lib/contract.ts"
+// What the demo demands of a model file before it is allowed to play, and the checks that prove
+// it. A downloaded `.onnx` is just bytes: nothing stops a stale cache entry, a half-renamed Hub
+// file or a model trained with another vocabulary from loading cleanly and then answering with a
+// logits vector that means something else. Every id the sampler reads out of that vector would be
+// a different move, so the game would look plausible and be nonsense.
+//
+// Two things have to hold and both are checked:
+//
+//   * the **width** of the output equals the tokenizer's vocabulary (2030 UCI tokens). ORT Web
+//     does not expose `metadata_props`, so the `rukh_vocab_size` the exporter writes into the file
+//     is unreachable from the browser; what is reachable is the output shape ORT reports
+//     (`outputMetadata`) and, failing that, the length of the first real answer;
+//   * the **context** (`block`) the prompt is cropped to. Nothing in the session says it, so it
+//     comes from the registry entry and travels back to the main thread in `ready`, which is what
+//     keeps `buildPrompt` from hardcoding 200.
+//
+// The messages are in Spanish on purpose: they end up in the model panel, in front of a player.
+```
+
+<Src file="src/lib/contract.ts" repo="rukh-web" tag="e228cca" lines="1-17" />
+
+Esta cabecera es el corazón de la lección. Un `.onnx` descargado **son bytes**: nada impide que una
+entrada de caché vieja, un fichero medio renombrado en el Hub o un modelo entrenado con otro
+vocabulario se carguen limpiamente y contesten con un vector de logits que significa otra cosa. Cada
+id que el muestreador leyera de ese vector sería **una jugada distinta**, así que la partida
+parecería plausible y sería un sinsentido. Ese es el fallo peor de todo el módulo: no revienta, no
+avisa y no se ve.
+
+Dos cosas tienen que cumplirse y las dos se comprueban:
+
+- **La anchura de la salida** tiene que ser el vocabulario del tokenizador (2 030 tokens UCI). Y
+  aquí está la asimetría: el exportador de la lección anterior escribe `rukh_vocab_size` dentro del
+  fichero, pero **ORT Web no expone `metadata_props`**, así que desde el navegador ese dato es
+  inalcanzable. Lo que sí es alcanzable es la forma que ORT declara de la salida
+  (`outputMetadata`) y, si esa es simbólica, la longitud de la primera respuesta real.
+- **El contexto** (`block`) al que se recorta el prompt. Nada en la sesión lo dice, así que viene de
+  la entrada del registro y vuelve al hilo principal en el mensaje `ready`. Es lo que impide que el
+  constructor del prompt lleve un 200 escrito a mano.
+
+Y la última línea de la cabecera es una decisión de producto: **los mensajes están en español a
+propósito**, porque acaban en el panel del modelo, delante de un jugador. Es el único código del
+proyecto que no habla inglés, y está justificado donde se decide.
+
+{/* prettier-ignore */}
+```ts title="src/lib/contract.ts"
+/** The contract a loaded session is playing under. */
+export interface ModelContract {
+  /** Context window in tokens (`DecoderConfig.block`); the prompt is cropped to it. */
+  block: number;
+  /** Width of the logits vector, which must equal the tokenizer's vocabulary size. */
+  vocab: number;
+}
+
+/** The part of ORT's `InferenceSession.ValueMetadata` this check needs. */
+export interface OutputMetadata {
+  name: string;
+  isTensor?: boolean;
+  /** Dimensions; a string entry is a symbolic axis (`batch`, `sequence`). */
+  shape?: readonly (number | string)[];
+}
+
+/** The part of `InferenceSession` this check needs, so the tests can hand it a plain object. */
+export interface SessionLike {
+  readonly outputNames: readonly string[];
+  readonly outputMetadata?: readonly OutputMetadata[];
+}
+
+/** Smallest context that can still hold the three header tokens plus one move. */
+export const MIN_BLOCK = 4;
+
+export const DECLARED_SOURCE = 'la forma declarada en el fichero';
+export const RUN_SOURCE = 'la primera respuesta del modelo';
+```
+
+<Src file="src/lib/contract.ts" repo="rukh-web" tag="e228cca" lines="19-45" />
+
+`SessionLike` y `OutputMetadata` son la parte de la API de ORT que esta comprobación usa, escrita
+como interfaces propias. Eso hace que los tests le puedan pasar un objeto plano de dos campos en vez
+de construir una sesión de verdad, que es la diferencia entre un test de milisegundos y un test que
+descarga 28 MB de WASM.
+
+`MIN_BLOCK = 4` es el contexto más pequeño que todavía cabe: los tres tokens de cabecera más una
+jugada.
+
+{/* prettier-ignore */}
+```ts title="src/lib/contract.ts"
+/**
+ * The fixed last dimension of the model's only output, or `null` when ORT reports it as symbolic
+ * (or reports nothing at all, which is what the WASM backend does for some graphs).
+ */
+export function declaredVocab(session: SessionLike): number | null {
+  const name = session.outputNames[0];
+  const meta = session.outputMetadata?.find((entry) => entry.name === name);
+  const shape = meta?.shape;
+  if (!shape || shape.length === 0) return null;
+  const last = shape[shape.length - 1];
+  return typeof last === 'number' && Number.isInteger(last) && last > 0 ? last : null;
+}
+```
+
+<Src file="src/lib/contract.ts" repo="rukh-web" tag="e228cca" lines="47-58" />
+
+La anchura declarada, o `null`. Fíjate en la cadena de comprobaciones: que haya metadatos, que la
+forma no esté vacía, y que la última dimensión sea un **entero positivo**. Una forma simbólica trae
+una cadena ahí (`'vocab'`, o el nombre que el exportador le pusiera), y el backend de WASM
+directamente no reporta forma para algunos grafos. Los tres casos devuelven `null`, que significa
+«todavía no se sabe», no «está mal».
+
+{/* prettier-ignore */}
+```ts title="src/lib/contract.ts"
+/** Throws with a message a player can read when the logits are not the tokenizer's width. */
+export function assertVocab(width: number, expected: number, source: string): void {
+  if (width === expected) return;
+  throw new Error(
+    `El modelo no encaja con el tokenizador: ${source} da ${width} valores y el vocabulario UCI ` +
+      `tiene ${expected}. No se juega con este fichero; borra los modelos descargados y vuelve a ` +
+      `intentarlo.`,
+  );
+}
+```
+
+<Src file="src/lib/contract.ts" repo="rukh-web" tag="e228cca" lines="60-68" />
+
+El mensaje de error, que es lo que va a leer una persona: dice **de dónde** sale el número que no
+cuadra, los dos números, y qué hacer (borrar los modelos descargados y reintentar). Un
+`Error('vocab mismatch')` habría sido exactamente igual de correcto y completamente inútil.
+
+{/* prettier-ignore */}
+```ts title="src/lib/contract.ts"
+/**
+ * The contract of a freshly created session: `block` from the registry (nothing in the session
+ * knows it) and `vocab` from the declared output shape when ORT gives a fixed one, checked against
+ * the tokenizer right away. When the shape is symbolic the width is still unknown here and
+ * `assertVocab` runs on the first `run` instead — see `decoder.worker.ts`.
+ */
+export function readContract(
+  session: SessionLike,
+  expectedVocab: number,
+  block: number,
+): ModelContract {
+  if (!Number.isInteger(block) || block < MIN_BLOCK) {
+    throw new Error(`El contexto declarado para esta etapa (${block}) no es utilizable.`);
+  }
+  const declared = declaredVocab(session);
+  if (declared !== null) assertVocab(declared, expectedVocab, DECLARED_SOURCE);
+  return { block, vocab: declared ?? expectedVocab };
+}
+```
+
+<Src file="src/lib/contract.ts" repo="rukh-web" tag="e228cca" lines="70-87" />
+
+Y el ensamblaje. El `block` se valida contra el mínimo —un registro con un `block` absurdo es un
+error de programación y se caza aquí— y la anchura se comprueba **si se puede**. Si la forma era
+simbólica, `vocab` se queda con lo que dijo el registro y la comprobación de verdad ocurre en la
+primera respuesta, dentro del worker. Dos caminos para una sola garantía, porque ninguno de los dos
+está disponible siempre.
+
+## La descarga: que la barra se mueva
+
+{/* prettier-ignore */}
+```ts title="src/lib/download.ts"
+// Downloading the model bytes, with the progress bar actually moving while they arrive.
+//
+// The obvious version — `await cache.put(url, response.clone())` before reading the body — does
+// not work: `put` only resolves once the clone's body has been consumed, and a cloned body is fed
+// by the same underlying stream, so the browser buffers the whole file (twice: the clone and the
+// copy the cache keeps) before the first progress message is ever sent. On an 80 MB fp16 export
+// that is a minute of a bar sitting at zero. So the body is streamed first and the cache entry is
+// written from the bytes afterwards, which also means a download that fails half-way leaves
+// nothing behind.
+//
+// Everything the browser provides is injected, so the whole thing is testable without a browser.
+```
+
+<Src file="src/lib/download.ts" repo="rukh-web" tag="e228cca" lines="1-11" />
+
+Once líneas de comentario que valen la lección entera, y es un error que casi todo el mundo comete.
+La versión obvia —`await cache.put(url, response.clone())` antes de leer el cuerpo— **no funciona**:
+`put` solo resuelve cuando el cuerpo del clon se ha consumido, y un cuerpo clonado se alimenta del
+mismo flujo subyacente, así que el navegador almacena el fichero entero (dos veces: el clon y la
+copia que guarda la caché) antes de enviar el primer mensaje de progreso. En una exportación fp16 de
+80 MB eso es un minuto de barra parada en cero.
+
+Así que el cuerpo se transmite primero y la entrada de caché se escribe después, desde los bytes. Y
+eso tiene un segundo efecto, gratis: una descarga que falla a mitad **no deja nada** en la caché.
+
+{/* prettier-ignore */}
+```ts title="src/lib/download.ts"
+/** What `downloadModel` needs from its environment. */
+export interface DownloadDeps {
+  fetch: typeof globalThis.fetch;
+  /** `caches`, or undefined where the Cache API is not available (the model is just refetched). */
+  caches?: CacheStorage;
+  /** Name of the Cache API bucket the weights are stored in. */
+  cacheName: string;
+  /** Called after every chunk; `total` is the best estimate available at that moment. */
+  onProgress: (loaded: number, total: number) => void;
+}
+```
+
+<Src file="src/lib/download.ts" repo="rukh-web" tag="e228cca" lines="13-22" />
+
+{/* prettier-ignore */}
+```ts title="src/lib/download.ts"
+/** Joins the chunks a stream produced into one buffer. */
+function concat(chunks: readonly Uint8Array[], length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+```
+
+<Src file="src/lib/download.ts" repo="rukh-web" tag="e228cca" lines="24-33" />
+
+Todo lo que el navegador aporta se inyecta —`fetch`, `caches`, el nombre del bucket, el callback de
+progreso—, así que la función entera se prueba sin navegador. `concat` es la unión de los trozos en
+un búfer del tamaño exacto, que es lo que un `Blob` haría por ti a cambio de no saber cuánto ocupa.
+
+{/* prettier-ignore */}
+```ts title="src/lib/download.ts"
+/**
+ * The model bytes, from the Cache API when they are already there and from the network otherwise,
+ * reporting progress as the body streams in. `sizeBytes` is the registry's estimate and is only
+ * used when the response has no usable `content-length` (a Hub redirect to a CDN sometimes omits
+ * it); a `loaded` that overshoots it wins, so the bar never reports more than 100 %.
+ */
+export async function downloadModel(
+  url: string,
+  sizeBytes: number,
+  deps: DownloadDeps,
+): Promise<Uint8Array> {
+  const cache = await deps.caches?.open(deps.cacheName).catch(() => null);
+  const cached = await cache?.match(url).catch(() => undefined);
+  const response = cached ?? (await deps.fetch(url, { mode: 'cors', credentials: 'omit' }));
+  if (!response.ok) {
+    throw new Error(`no se pudo descargar el modelo (${response.status})`);
+  }
+
+  const declared = Number(response.headers.get('content-length') ?? '0');
+  const total = declared > 0 ? declared : sizeBytes;
+
+  const body = response.body;
+  if (!body) {
+    // No stream (an old browser, or a fake in a test): one shot, one progress message.
+    const buffer = new Uint8Array(await response.arrayBuffer());
+    deps.onProgress(buffer.byteLength, buffer.byteLength);
+    return buffer;
+  }
+```
+
+<Src file="src/lib/download.ts" repo="rukh-web" tag="e228cca" lines="35-62" />
+
+La ruta rápida y la de respaldo. La caché se consulta con `?.catch(() => null)`: un almacenamiento
+bloqueado —una ventana privada, un usuario con las cookies de sitio desactivadas— no puede impedir
+jugar, solo hace que el modelo se vuelva a descargar.
+
+`total` es el `content-length` cuando lo hay y la estimación del registro cuando no. Y si no hay
+`body` —un navegador antiguo, o un falso en un test— se lee de golpe y se envía **un solo** mensaje
+de progreso, que es la degradación honesta: la barra salta de 0 a 100 en vez de mentir.
+
+{/* prettier-ignore */}
+```ts title="src/lib/download.ts"
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let loaded = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.byteLength;
+    deps.onProgress(loaded, Math.max(total, loaded));
+  }
+  const bytes = concat(chunks, loaded);
+  // The chunks are now a second copy of the whole model: drop them before anyone awaits again.
+  chunks.length = 0;
+  deps.onProgress(loaded, loaded);
+
+  // Only now, with the whole file in hand and the bar at 100 %, is the cache written.
+  if (!cached && cache) {
+    // `bytes.buffer` is the freshly allocated buffer `concat` made, so handing it over is a
+    // move, not a copy; `Response` reads it synchronously here.
+    await cache
+      .put(
+        url,
+        new Response(bytes.buffer as ArrayBuffer, {
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': String(bytes.byteLength),
+          },
+        }),
+      )
+      .catch(() => undefined);
+  }
+  return bytes;
+}
+```
+
+<Src file="src/lib/download.ts" repo="rukh-web" tag="e228cca" lines="64-96" />
+
+El bucle del lector, con tres detalles:
+
+- **`Math.max(total, loaded)`** en cada mensaje: si la descarga se pasa de la estimación, el total
+  crece con ella y el porcentaje nunca supera el 100 %.
+- **`chunks.length = 0`** en cuanto los trozos se han unido. En ese instante hay **dos copias del
+  modelo entero** en memoria, la lista de trozos y el búfer; en un móvil con 80 MB de fp16, soltar
+  una antes del siguiente `await` es la diferencia entre jugar y que el navegador mate la pestaña.
+- **La caché se escribe al final**, con el fichero completo y la barra ya al 100 %, y se le entrega
+  `bytes.buffer` —el búfer recién asignado por `concat`— así que es una cesión y no una copia.
+
+El `.catch(() => undefined)` del `put` es la misma idea que el de la lectura: no poder guardar es un
+inconveniente, no un fallo.
+
+## El worker: quien posee la sesión
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+// Dedicated worker that owns the ONNX Runtime session: it downloads the model (streaming the
+// progress back), keeps it in the Cache API and answers `logits` requests with the last step's
+// logits. The main thread never touches ORT, so a 28 MB WASM runtime and a 40 MB model never
+// block the board.
+//
+// Two serialisation rules come from ORT itself and are not negotiable: sessions are created one
+// at a time and `run` calls never overlap (the JSEP/asyncify build cannot re-enter an async
+// call). Both go through `serial`, a single promise chain — the download included, so two `init`
+// messages in flight cannot end up fetching twice and racing to install their session.
+//
+// The file is never trusted: `readContract` checks the declared output width against the
+// tokenizer's vocabulary as soon as the session exists, and `assertVocab` checks the real width
+// of every answer. See `src/lib/contract.ts` for why.
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="e228cca" lines="1-13" />
+
+Trece líneas y tres reglas. El worker **posee** la sesión: el hilo principal nunca toca ORT, así que
+un runtime de WASM de 28 MB y un modelo de 40 no bloquean el tablero.
+
+Las otras dos vienen de ORT y no son negociables: las sesiones se crean de una en una y las llamadas
+a `run` no se solapan, porque la compilación JSEP/asyncify no puede reentrar en una llamada
+asíncrona. Y el fichero no se fía de sí mismo: el contrato se comprueba al crear la sesión y la
+anchura real de **cada respuesta** se comprueba también.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+import * as ort from 'onnxruntime-web/webgpu';
+import { RUN_SOURCE, assertVocab, readContract, type ModelContract } from '../lib/contract';
+import { downloadModel } from '../lib/download';
+import {
+  MODEL_CACHE,
+  ORT_BASE,
+  type Backend,
+  type WorkerRequest,
+  type WorkerResponse,
+} from '../lib/worker-protocol';
+
+/** The worker global, typed with just what this file uses (avoids pulling in the webworker lib). */
+interface WorkerScope {
+  postMessage(message: WorkerResponse, transfer?: Transferable[]): void;
+  addEventListener(type: 'message', listener: (event: MessageEvent) => void): void;
+}
+
+const ctx = self as unknown as WorkerScope;
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="e228cca" lines="14-31" />
+
+`WorkerScope` es la misma idea que `SessionLike`: tipar solo lo que se usa en vez de arrastrar la
+biblioteca `webworker` entera al proyecto.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+// Self-hosted runtime: `public/ort/<version>/` is filled by `scripts/copy-assets.mjs` so the
+// page never reaches a CDN (the CSP would not allow it either).
+ort.env.wasm.wasmPaths = ORT_BASE;
+// One thread, always. WASM is only the fallback here (WebGPU is the fast path and this decoder
+// is 40 MB), and asking for more threads under cross-origin isolation makes ORT reach for the
+// threaded/proxy artefacts that `scripts/copy-assets.mjs` deliberately does not publish. Keeping
+// it at one means the runtime needs exactly the two files we do publish, isolated or not.
+ort.env.wasm.numThreads = 1;
+// No proxy worker either: it would be a third artefact (`ort-wasm-proxy-worker`) and this code
+// already runs off the main thread, which is the only thing the proxy buys.
+ort.env.wasm.proxy = false;
+ort.env.logLevel = 'error';
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="e228cca" lines="33-44" />
+
+Cuatro ajustes de ORT y cuatro párrafos de comentario, que es la proporción correcta cuando cada
+línea es una decisión de despliegue.
+
+`numThreads = 1` **siempre**. <Term id="wasm">WASM</Term> aquí es solo el respaldo —<Term id="webgpu">WebGPU</Term> es el camino rápido— y pedir más
+hilos bajo aislamiento de origen cruzado hace que ORT vaya a buscar los artefactos con hilos y con
+proxy que `copy-assets.mjs` **deliberadamente no publica**. Con un hilo, el runtime necesita
+exactamente los dos ficheros que sí se publican, aislado o no. Y `proxy = false` por lo mismo: sería
+un tercer artefacto, y lo único que compra el proxy —salir del hilo principal— ya lo tenemos por
+estar en un worker.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+let session: ort.InferenceSession | null = null;
+/** Block and vocabulary the live session was accepted under; null while there is no session. */
+let contract: ModelContract | null = null;
+
+/** The single chain every ORT call is queued on: no two sessions or runs are ever in flight. */
+let chain: Promise<unknown> = Promise.resolve();
+
+function serial<T>(work: () => Promise<T>): Promise<T> {
+  const next = chain.then(work, work);
+  chain = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
+}
+
+function reply(message: WorkerResponse, transfer?: Transferable[]): void {
+  ctx.postMessage(message, transfer);
+}
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="e228cca" lines="46-64" />
+
+La cadena de promesas. `serial` encola cada trabajo detrás del anterior, y el `chain.then(work,
+work)` con la misma función en las dos ramas es lo que hace que un fallo no rompa la cadena: el
+siguiente trabajo se ejecuta igual. El `chain` que se guarda es una versión que se queda en
+`undefined` en los dos casos, para no propagar el rechazo a quien no lo pidió.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+/** `downloadModel` wired to this worker's globals, reporting progress back to the main thread. */
+function fetchModel(id: number, url: string, sizeBytes: number): Promise<Uint8Array> {
+  return downloadModel(url, sizeBytes, {
+    fetch: globalThis.fetch.bind(globalThis),
+    caches: typeof caches === 'undefined' ? undefined : caches,
+    cacheName: MODEL_CACHE,
+    onProgress: (loaded, total) => reply({ type: 'progress', id, loaded, total }),
+  });
+}
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="e228cca" lines="66-74" />
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+/** The WebGPU adapter, or the reason there is none. Never throws. */
+async function webgpuAdapter(): Promise<{ adapter: unknown } | { reason: string }> {
+  const gpu = (globalThis as { navigator?: { gpu?: { requestAdapter(): Promise<unknown> } } })
+    .navigator?.gpu;
+  if (!gpu) return { reason: 'este navegador no expone WebGPU' };
+  try {
+    const adapter = await gpu.requestAdapter();
+    if (!adapter) return { reason: 'WebGPU no ha ofrecido ningún adaptador' };
+    return { adapter };
+  } catch (cause) {
+    return { reason: `WebGPU ha fallado al pedir el adaptador: ${describe(cause)}` };
+  }
+}
+
+function describe(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="e228cca" lines="76-92" />
+
+La detección de WebGPU **nunca lanza**: devuelve el adaptador o **el motivo** de que no lo haya. Ese
+motivo acaba impreso bajo la insignia del panel, así que una partida lenta en WASM nunca es un
+misterio. Tres motivos distintos —no hay `navigator.gpu`, no hay adaptador, la petición falló— y los
+tres se escriben en español.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+/**
+ * WebGPU whenever `requestAdapter()` hands out an adapter; WASM only when it does not, or when
+ * creating the session on WebGPU throws. Both fallbacks carry the reason, which the panel shows
+ * under the badge so a slow game on WASM is never a mystery.
+ */
+async function createSession(
+  bytes: Uint8Array,
+): Promise<{ session: ort.InferenceSession; backend: Backend; reason: string | null }> {
+  const options: ort.InferenceSession.SessionOptions = {
+    graphOptimizationLevel: 'all',
+    executionMode: 'sequential',
+  };
+  const probe = await webgpuAdapter();
+  let reason = 'reason' in probe ? probe.reason : null;
+  if (!reason) {
+    try {
+      const created = await ort.InferenceSession.create(bytes, {
+        ...options,
+        executionProviders: ['webgpu'],
+      });
+      return { session: created, backend: 'webgpu', reason: null };
+    } catch (cause) {
+      // An adapter that cannot compile the graph is a normal outcome, not a bug: say so and
+      // carry on with WASM.
+      reason = `WebGPU no ha podido crear la sesión: ${describe(cause)}`;
+    }
+  }
+  const created = await ort.InferenceSession.create(bytes, {
+    ...options,
+    executionProviders: ['wasm'],
+  });
+  return { session: created, backend: 'wasm', reason };
+}
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="e228cca" lines="94-126" />
+
+WebGPU cuando `requestAdapter()` da un adaptador; WASM cuando no, **o cuando crear la sesión sobre
+WebGPU lanza**. Ese segundo caso es el que el comentario llama «un resultado normal, no un error»:
+hay adaptadores que no compilan el grafo, y la respuesta correcta es decirlo y seguir, no fallar.
+
+`executionMode: 'sequential'` acompaña a la regla de no solapar llamadas, y
+`graphOptimizationLevel: 'all'` es gratis: ORT optimiza el grafo una vez, al crear la sesión.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+/**
+ * Downloads the weights and hands them to ORT. The buffer is a local of this frame on purpose:
+ * when it returns, the only copy of the model still alive is the one inside the session, instead
+ * of 80 MB sitting next to it for as long as the worker lives.
+ */
+async function loadSession(request: Extract<WorkerRequest, { type: 'init' }>) {
+  const bytes = await fetchModel(request.id, request.url, request.sizeBytes);
+  return createSession(bytes);
+}
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="e228cca" lines="128-136" />
+
+Nueve líneas y un comentario que enseña algo de gestión de memoria que no es obvio: el búfer es una
+**variable local de este marco de pila a propósito**. Cuando la función vuelve, la única copia del
+modelo que sigue viva es la que está dentro de la sesión, en vez de 80 MB sentados al lado durante
+todo lo que dure el worker.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+async function init(request: Extract<WorkerRequest, { type: 'init' }>): Promise<void> {
+  const started = performance.now();
+  // The download runs inside the chain too: outside it, a second `init` would start its own fetch
+  // while the first was still tearing the old session down, and both would race to install one.
+  const ready = await serial(async () => {
+    await session?.release();
+    session = null;
+    contract = null;
+    const created = await loadSession(request);
+    const checked = readContract(created.session, request.vocab, request.block);
+    session = created.session;
+    contract = checked;
+    return { backend: created.backend, reason: created.reason, contract: checked };
+  });
+  reply({
+    type: 'ready',
+    id: request.id,
+    backend: ready.backend,
+    fallbackReason: ready.reason ?? undefined,
+    loadMs: Math.round(performance.now() - started),
+    block: ready.contract.block,
+    vocab: ready.contract.vocab,
+  });
+}
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="e228cca" lines="138-161" />
+
+`init`, y el comentario de la línea 140 es el detalle fino: **la descarga va dentro de la cadena**.
+Fuera de ella, un segundo `init` empezaría su propia descarga mientras el primero todavía estaba
+liberando la sesión vieja, y los dos correrían a instalar la suya. Dentro, el segundo espera.
+
+El orden importa: se libera la sesión anterior, se ponen `session` y `contract` a `null`, se carga la
+nueva, **se comprueba el contrato** y solo entonces se asignan. Si el contrato falla, el worker se
+queda sin sesión en vez de con una sesión que no cumple.
+
+Y el `ready` devuelve `block` y `vocab`: el contrato viaja al hilo principal, que es lo que hace que
+el constructor del prompt no tenga un 200 escrito dentro.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+async function logits(request: Extract<WorkerRequest, { type: 'logits' }>): Promise<void> {
+  const data = await serial(async () => {
+    const current = session;
+    const live = contract;
+    if (!current || !live) throw new Error('el modelo todavía no está cargado');
+    const ids = BigInt64Array.from(request.ids, (id) => BigInt(id));
+    const feeds: Record<string, ort.Tensor> = {
+      [current.inputNames[0]]: new ort.Tensor('int64', ids, [1, request.ids.length]),
+    };
+    const started = performance.now();
+    const output = await current.run(feeds);
+    const inferMs = performance.now() - started;
+    const tensor = output[current.outputNames[0]];
+    const raw = tensor.data;
+    if (!(raw instanceof Float32Array)) {
+      throw new Error(`la salida del modelo no es float32 (${tensor.type})`);
+    }
+    // The declared shape is often symbolic, so the real width is only knowable here. A model
+    // whose logits are not the tokenizer's vocabulary would map every id to a different move.
+    assertVocab(raw.length, live.vocab, RUN_SOURCE);
+    // Copy out of the ORT arena: the tensor's buffer may be reused by the next run.
+    return { values: raw.slice(), inferMs };
+  });
+  reply({ type: 'logits', id: request.id, data: data.values, inferMs: data.inferMs }, [
+    data.values.buffer,
+  ]);
+}
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="e228cca" lines="163-189" />
+
+La inferencia. `BigInt64Array.from(request.ids, (id) => BigInt(id))` es el peaje de que el modelo
+espere `int64`: en JavaScript eso son `BigInt`, y hay que convertir uno a uno.
+
+`current.inputNames[0]` y `current.outputNames[0]` en vez de `'idx'` y `'logits'` escritos a mano:
+el nombre de la entrada lo decidió el exportador y leerlo de la sesión es lo que hace que un cambio
+de exportador no rompa la demo.
+
+Y las tres últimas cosas son las que hacen que esto sea código de producción y no un ejemplo:
+
+1. **Se comprueba que la salida es `Float32Array`.** Un grafo fp16 mal convertido devolvería otro
+   tipo y los logits serían basura silenciosa.
+2. **`assertVocab(raw.length, live.vocab, RUN_SOURCE)`**: la anchura real, en cada respuesta. Es el
+   segundo de los dos caminos del contrato, el que funciona cuando la forma declarada era simbólica.
+3. **`raw.slice()`** copia fuera de la arena de ORT. El comentario lo dice: el búfer del tensor
+   **puede reutilizarse en la siguiente ejecución**, así que devolverlo tal cual es un error que se
+   manifiesta como jugadas raras a partir de la segunda.
+
+El `postMessage` transfiere el búfer en vez de copiarlo (el segundo argumento), así que los 8 KB de
+logits cruzan sin duplicarse.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+async function dispose(request: Extract<WorkerRequest, { type: 'dispose' }>): Promise<void> {
+  await serial(async () => {
+    await session?.release();
+    session = null;
+    contract = null;
+  });
+  reply({ type: 'disposed', id: request.id });
+}
+
+ctx.addEventListener('message', (event: MessageEvent) => {
+  const request = event.data as WorkerRequest;
+  const run = async () => {
+    switch (request.type) {
+      case 'init':
+        return init(request);
+      case 'logits':
+        return logits(request);
+      case 'dispose':
+        return dispose(request);
+      default:
+        return undefined;
+    }
+  };
+  void run().catch((error: unknown) => {
+    reply({
+      type: 'error',
+      id: request.id,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  });
+});
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="e228cca" lines="191-221" />
+
+`dispose` libera y contesta; el despachador convierte cualquier excepción en un mensaje `error` con
+el mismo `id`, así que **toda** petición recibe exactamente una respuesta. Sin ese `catch`, una
+petición fallida dejaría una promesa colgada para siempre en el hilo principal.
+
+## El cliente: la mitad del hilo principal
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder-client.ts"
+// Main-thread side of the decoder worker. The `new Worker(new URL(...), { type: 'module' })`
+// literal lives here, at the call site, because that is the only shape Vite recognises to emit
+// the worker as its own chunk (`tests/worker-chunk.test.ts` guards it).
+import {
+  asResponse,
+  type Backend,
+  type InitRequest,
+  type ProgressMessage,
+  type ReadyMessage,
+  type WorkerRequest,
+} from '../lib/worker-protocol';
+```
+
+<Src file="src/workers/decoder-client.ts" repo="rukh-web" tag="e228cca" lines="1-11" />
+
+Ese comentario de tres líneas ahorra una tarde. El literal `new Worker(new URL('./decoder.worker.ts',
+import.meta.url), { type: 'module' })` tiene que estar **en el sitio donde se usa**, porque es la
+única forma que Vite reconoce para emitir el worker como su propio fragmento. Extraerlo a una función
+auxiliar «para que quede más limpio» hace que el worker no se empaquete y la demo falle en producción
+y no en desarrollo. Y hay un test (`tests/worker-chunk.test.ts`) que lo vigila.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder-client.ts"
+export interface LoadReport {
+  backend: Backend;
+  /** Why WebGPU was not used, when it was not. */
+  fallbackReason?: string;
+  loadMs: number;
+  /** Context window the session was accepted under; `buildPrompt` crops the prompt to it. */
+  block: number;
+  /** Width of the logits the model answers with, already checked against the tokenizer. */
+  vocab: number;
+}
+
+/** What `init` needs to know about a stage; the worker's `id` is added by `send`. */
+export type LoadRequest = Omit<InitRequest, 'type' | 'id'>;
+
+export interface LogitsReport {
+  data: Float32Array;
+  inferMs: number;
+}
+
+export interface Decoder {
+  /** Downloads (or reads from the cache) the model, creates the session and checks its contract. */
+  init(request: LoadRequest, onProgress?: (progress: ProgressMessage) => void): Promise<LoadReport>;
+  /** Logits of the last step for a prompt already cropped to the context window. */
+  logits(ids: number[]): Promise<LogitsReport>;
+  /** Releases the session and terminates the worker; the handle is unusable afterwards. */
+  dispose(): Promise<void>;
+}
+```
+
+<Src file="src/workers/decoder-client.ts" repo="rukh-web" tag="e228cca" lines="13-39" />
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder-client.ts"
+/** `Omit` over a union collapses it, so the distribution is written out explicitly. */
+type Unidentified<T> = T extends WorkerRequest ? Omit<T, 'id'> : never;
+
+interface Pending {
+  resolve: (value: never) => void;
+  reject: (error: Error) => void;
+  onProgress?: (progress: ProgressMessage) => void;
+}
+```
+
+<Src file="src/workers/decoder-client.ts" repo="rukh-web" tag="e228cca" lines="41-48" />
+
+`Unidentified<T>` con su comentario es TypeScript de verdad: `Omit` sobre una unión la colapsa —te
+quedas con los campos comunes— así que la distribución se escribe a mano con un condicional. Es el
+tipo de detalle que, mal hecho, deja pasar un mensaje sin `type`.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder-client.ts"
+export function createDecoder(): Decoder {
+  const worker = new Worker(new URL('./decoder.worker.ts', import.meta.url), { type: 'module' });
+  const pending = new Map<number, Pending>();
+  let nextId = 1;
+  let terminated = false;
+
+  const fail = (error: Error) => {
+    for (const entry of pending.values()) entry.reject(error);
+    pending.clear();
+  };
+
+  worker.addEventListener('message', (event: MessageEvent) => {
+    const message = asResponse(event.data);
+    if (!message) return;
+    const entry = pending.get(message.id);
+    if (!entry) return;
+    if (message.type === 'progress') {
+      entry.onProgress?.(message);
+      return;
+    }
+    pending.delete(message.id);
+    if (message.type === 'error') {
+      entry.reject(new Error(message.message));
+      return;
+    }
+    (entry.resolve as (value: unknown) => void)(message);
+  });
+
+  worker.addEventListener('error', (event: ErrorEvent) => {
+    fail(new Error(event.message || 'el worker del modelo ha fallado'));
+  });
+
+  function send<T>(
+    request: Unidentified<WorkerRequest>,
+    onProgress?: (progress: ProgressMessage) => void,
+  ): Promise<T> {
+    if (terminated) return Promise.reject(new Error('el worker del modelo ya se ha cerrado'));
+    const id = nextId++;
+    return new Promise<T>((resolve, reject) => {
+      pending.set(id, { resolve: resolve as (value: never) => void, reject, onProgress });
+      worker.postMessage({ ...request, id } as WorkerRequest);
+    });
+  }
+```
+
+<Src file="src/workers/decoder-client.ts" repo="rukh-web" tag="e228cca" lines="50-92" />
+
+El patrón de correlación: un `Map` de peticiones pendientes por `id`, y cada respuesta busca la
+suya. `progress` **no** resuelve la promesa —invoca el callback y sigue esperando—, y `error` la
+rechaza. El `worker.addEventListener('error', …)` rechaza **todas** las pendientes, porque un worker
+que se ha caído no va a contestar ninguna.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder-client.ts"
+  return {
+    async init(request, onProgress) {
+      const ready = await send<ReadyMessage>({ type: 'init', ...request }, onProgress);
+      return {
+        backend: ready.backend,
+        fallbackReason: ready.fallbackReason,
+        loadMs: ready.loadMs,
+        block: ready.block,
+        vocab: ready.vocab,
+      };
+    },
+    async logits(ids) {
+      const answer = await send<{ data: Float32Array; inferMs: number }>({ type: 'logits', ids });
+      return { data: answer.data, inferMs: answer.inferMs };
+    },
+    async dispose() {
+      if (terminated) return;
+      try {
+        await send<unknown>({ type: 'dispose' });
+      } catch {
+        /* the worker may already be gone; terminating below is enough */
+      }
+      terminated = true;
+      fail(new Error('el worker del modelo se ha cerrado'));
+      worker.terminate();
+    },
+  };
+}
+```
+
+<Src file="src/workers/decoder-client.ts" repo="rukh-web" tag="e228cca" lines="94-121" />
+
+Y `dispose` tiene la única forma correcta de cerrar: pedir al worker que libere, tragarse el fallo si
+ya no está, marcar el handle como terminado, rechazar lo que quedara pendiente y **después**
+terminar el worker. Al revés —`terminate()` primero— dejaría la sesión de ORT sin liberar y las
+promesas pendientes colgadas.
+
+## El registro: de dónde sale cada fichero
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+export type StageKind = 'mock' | 'onnx';
+
+export interface Stage {
+  id: string;
+  label: string;
+  kind: StageKind;
+  /** Download size in MB, shown in the consent step. 0 for stages that download nothing. */
+  sizeMb: number;
+  /** Hugging Face repo id, for `kind: 'onnx'` stages served from the Hub. */
+  repo?: string;
+  /** Path of the ONNX file inside the repo. */
+  file?: string;
+  /** Same-origin URL that replaces `repo`/`file` (only the toy model used by the E2E suite). */
+  url?: string;
+  /** True once the stage is trained with the Elo conditioning tokens (M4). */
+  eloConditioned?: boolean;
+  /**
+   * Context window the stage was trained with (`DecoderConfig.block`). It lives here because ORT
+   * Web does not expose the `rukh_block` metadata the exporter writes into the file, so the only
+   * place the browser can learn it is the registry; `DEFAULT_BLOCK` when a stage omits it.
+   */
+  block?: number;
+}
+
+/** `DecoderConfig.block` of every model published so far. */
+export const DEFAULT_BLOCK = 200;
+
+/** The context window a stage plays with. */
+export function stageBlock(stage: Stage): number {
+  return stage.block ?? DEFAULT_BLOCK;
+}
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="e228cca" lines="1-31" />
+
+`block` vive aquí, y el comentario dice exactamente por qué: ORT Web no expone el `rukh_block` que el
+exportador escribe, así que el único sitio donde el navegador puede aprenderlo es el registro. Es la
+misma asimetría del contrato, vista desde el otro lado.
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+/**
+ * Download sizes in MB. **Provisional**: they are the plan's estimates for the fp16 and int8
+ * exports and the controller updates them here, in this one place, after the real export
+ * (`rukh export ... --fp16 --int8`) reports the file sizes. They only drive the consent copy and
+ * the progress bar fallback, never the download itself.
+ */
+export const STAGE_SIZE_MB = {
+  'tiny-int8': 6,
+  'small-fp16': 80,
+  'small-int8': 40,
+} as const;
+
+/** Licence of every published Rukh model; shown before anything is downloaded. */
+export const MODEL_LICENSE = 'Apache-2.0';
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="e228cca" lines="33-46" />
+
+Los tamaños son **provisionales y lo dicen**: son las estimaciones del plan, y el controlador los
+actualiza aquí, en un solo sitio, cuando la exportación real reporta los bytes. Compara con lo que
+midió la lección anterior: 80 MB estimados frente a 78,8 medidos para el fp16, y 40 frente a 43,5
+para el int8. La estimación del int8 se quedó corta, y por eso `download.ts` acota el porcentaje a 100.
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+export const STAGES: Stage[] = [
+  { id: 'mock', label: 'Primera jugada legal', kind: 'mock', sizeMb: 0 },
+  {
+    id: 'tiny-int8',
+    label: 'Rukh tiny (int8)',
+    kind: 'onnx',
+    repo: 'chorcat/rukh-tiny',
+    file: 'onnx/model-int8.onnx',
+    sizeMb: STAGE_SIZE_MB['tiny-int8'],
+    block: DEFAULT_BLOCK,
+  },
+  {
+    id: 'small-fp16',
+    label: 'Rukh small (fp16)',
+    kind: 'onnx',
+    repo: 'chorcat/rukh-small',
+    file: 'onnx/model-fp16.onnx',
+    sizeMb: STAGE_SIZE_MB['small-fp16'],
+    block: DEFAULT_BLOCK,
+  },
+  {
+    id: 'small-int8',
+    label: 'Rukh small (int8)',
+    kind: 'onnx',
+    repo: 'chorcat/rukh-small',
+    file: 'onnx/model-int8.onnx',
+    sizeMb: STAGE_SIZE_MB['small-int8'],
+    block: DEFAULT_BLOCK,
+  },
+];
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="e228cca" lines="49-78" />
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+/**
+ * Toy decoder committed under `public/test/`: one layer, `d_model=8`, and the real contract
+ * (`idx (B, T)` int64 -> `logits (B, 2030)` with `block` 200), exported by the very function that
+ * writes the published models (`rukh.export.export_onnx`, dynamo exporter, `rukh_*` metadata). It
+ * is not in `STAGES` (nothing offers it in the selector); only `?stage=test` reaches it, which is
+ * how the E2E suite exercises the real worker path — contract check included — without
+ * downloading 40 MB from the Hub.
+ */
+export const TEST_STAGE: Stage = {
+  id: 'test',
+  label: 'ONNX de juguete (pruebas)',
+  kind: 'onnx',
+  sizeMb: 0.2,
+  url: '/test/toy-decoder.onnx',
+  block: DEFAULT_BLOCK,
+};
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="e228cca" lines="80-95" />
+
+El modelo de juguete es una idea que vale copiar. Es un decoder de una capa y `d_model=8`, con **el
+contrato de verdad** (`idx (B, T)` int64 → `logits (B, 2030)`, `block` 200), exportado por la misma
+función que escribe los modelos publicados. Pesa 200 KB, está versionado en `public/test/` y no
+aparece en el selector: solo se llega a él con `?stage=test`. Con eso, la suite E2E ejercita el
+camino real del worker —comprobación del contrato incluida— sin descargar 40 MB del Hub en cada
+ejecución de la CI.
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+export function findStage(id: string): Stage | undefined {
+  if (id === TEST_STAGE.id) return TEST_STAGE;
+  return STAGES.find((stage) => stage.id === id);
+}
+
+/** Hub URL of a stage, or its own `url` when it is served from this origin. */
+export function modelUrl(stage: Stage): string {
+  if (stage.url) return stage.url;
+  if (!stage.repo || !stage.file) {
+    throw new Error(`stage ${stage.id} has no model file`);
+  }
+  return `https://huggingface.co/${stage.repo}/resolve/main/${stage.file}`;
+}
+
+/** The stages the selector offers: the registry plus `current` when it is not part of it. */
+export function selectableStages(current: string): Stage[] {
+  const extra = STAGES.some((stage) => stage.id === current) ? undefined : findStage(current);
+  return extra ? [...STAGES, extra] : STAGES;
+}
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="e228cca" lines="97-115" />
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+export interface Conditions {
+  /** `navigator.connection?.saveData`. */
+  saveData?: boolean;
+  /** True on a phone-sized or coarse-pointer device. */
+  mobile?: boolean;
+}
+
+/**
+ * Stage selected when the page is opened without `?stage=`: the 40 MB int8 export on mobile or
+ * with data saver on, the 80 MB fp16 one elsewhere.
+ */
+export function defaultStageId(conditions: Conditions = {}): string {
+  return conditions.saveData || conditions.mobile ? 'small-int8' : 'small-fp16';
+}
+
+/** `defaultStageId` reading the browser it runs in; falls back to the desktop choice. */
+export function detectConditions(): Conditions {
+  if (typeof navigator === 'undefined') return {};
+  const connection = (navigator as Navigator & { connection?: { saveData?: boolean } }).connection;
+  const mobile =
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(max-width: 820px), (pointer: coarse)').matches
+      : false;
+  return { saveData: connection?.saveData === true, mobile };
+}
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="e228cca" lines="117-141" />
+
+La etapa por defecto depende del dispositivo: el int8 de 40 MB en un móvil o con el ahorro de datos
+encendido, el fp16 de 80 en el resto. Y ahí está la consecuencia incómoda de la lección anterior:
+**la decisión que ahorra 38 MB es la que cambia el 4,6 % de las jugadas**, y quien juega desde un
+teléfono lo hace contra una variante del modelo que la tabla única no mide. El código toma la
+decisión correcta para que la demo funcione; el curso tiene la obligación de decir lo que cuesta.
+
+`detectConditions` tiene un `typeof navigator === 'undefined'` porque este módulo también se importa
+al renderizar en el servidor, donde no hay navegador.
+
+## COOP, COEP y por qué el WASM multihilo no llega gratis
+
+```text title="nginx/security-headers.conf"
+# Included in every location: nginx does not inherit add_header into a block that declares
+# its own add_header, so each location pulls the full set from here.
+#
+# The page-level CSP (script/style hashes) lives in the <meta> tag generated by Astro;
+# frame-ancestors cannot be set from <meta>, so it is added as a header.
+add_header Content-Security-Policy "frame-ancestors 'none'" always;
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
+# Cross-origin isolation: required for multi-threaded WASM (onnxruntime-web, P2).
+add_header Cross-Origin-Opener-Policy "same-origin" always;
+add_header Cross-Origin-Embedder-Policy "require-corp" always;
+```
+
+<Src file="nginx/security-headers.conf" repo="rukh-web" tag="e228cca" lines="1-13" />
+
+Trece líneas de cabeceras, y las dos últimas son las de esta lección.
+`Cross-Origin-Opener-Policy: same-origin` y `Cross-Origin-Embedder-Policy: require-corp` son el <Term id="aislamiento-de-origen-cruzado">aislamiento de origen cruzado</Term>, el requisito que el navegador impone para dar acceso a `SharedArrayBuffer`, que es lo que necesita el WASM multihilo.
+
+Y aquí está la ironía que el worker ya ha resuelto: **la demo pide el aislamiento y después usa un
+solo hilo**. El aislamiento está porque es lo correcto para una página que ejecuta 40 MB de modelo, y
+`numThreads = 1` está porque pedir hilos hace que ORT busque artefactos que no publicamos. Las dos
+decisiones son coherentes: el aislamiento no obliga a usar hilos, y tenerlo puesto significa que el
+día que el respaldo de WASM sea el camino principal no hay que cambiar el despliegue.
+
+El comentario de la primera línea es una trampa de nginx que conviene saberse: **nginx no hereda
+`add_header` en un bloque que declara su propio `add_header`**, así que cada `location` tiene que
+volver a incluir el fichero entero. Es la clase de detalle que hace que una cabecera de seguridad
+esté puesta en la portada y ausente en `/ort/`, que es justo donde hacía falta.
+
+`nginx/default.conf` queda enlazado y no pegado —son setenta líneas de rutas y cachés que no tocan
+el modelo—, pero hay una que merece leerse allí: el tipo MIME de `.mjs`. El `mime.types` de nginx
+tiene entrada para `js` y no para `mjs`, así que el cargador de ORT que va junto al `.wasm` salía
+como `application/octet-stream`; con `X-Content-Type-Options: nosniff` el navegador se niega a
+evaluarlo, el `import()` dinámico del worker falla y la sesión nunca se crea. Un fallo que solo
+ocurre en producción, causado por una tabla de tipos MIME.
+
+<Exercise n="01" title="¿Qué pasa si el contrato no comprueba nada?">
+  Imagina que `readContract` devuelve siempre `{ block, vocab: expectedVocab }` sin comprobar la
+  anchura, y que `assertVocab` desaparece del `run`. Cargas por error un `.onnx` de un modelo con
+  vocabulario 1 968 —el de M1 sin los tokens de Elo— en una demo cuyo tokenizador tiene 2 030. ¿Qué
+  ve el jugador? ¿Y por qué es peor que un error?
+
+  <Solution>
+    El modelo contesta 1 968 logits. El muestreador del navegador construye su máscara de legalidad
+    con ids de un vocabulario de 2 030, así que los índices de los 62 tokens que faltan quedan fuera
+    del vector —en el mejor caso, un `undefined` que se convierte en `NaN`— y, lo que es peor, **los
+    1 968 que sí están significan otra cosa**: el desplazamiento de los tokens especiales mueve
+    todas las jugadas. El jugador ve un modelo que propone jugadas legales (la máscara las fuerza)
+    pero elegidas al azar entre las legales, porque el orden que le llega no tiene relación con la
+    posición.
+
+Es peor que un error porque **parece que funciona**. La partida avanza, las jugadas son legales, el
+tablero se mueve. Nadie va a abrir la consola: van a concluir que el modelo del curso juega fatal.
+El contrato convierte eso en un mensaje que dice qué fichero borrar, y ese cambio —de «juega mal» a
+«este fichero no encaja»— es el valor entero de las ochenta y siete líneas de `contract.ts`.
+
+  </Solution>
+</Exercise>
+
+<DemoEmbed
+  query="?stage=small-fp16"
+  title="La demo con el fp16 por WebGPU"
+  note="Abre el panel del modelo y mira la insignia del backend: si dice WASM, debajo está el motivo. La primera carga descarga 78,8 MB y los guarda en la Cache API; la segunda es instantánea."
+/>
+
+## Qué has aprendido
+
+Cómo se lleva un `.onnx` de 79 MB a una pestaña y se juega contra él, y las cuatro cosas que hay que
+hacer bien para que eso no sea un desastre silencioso: serializar todo lo que toca ORT, transmitir el
+cuerpo antes de escribir la caché, comprobar el contrato por los dos caminos disponibles, y decir
+siempre **por qué** se está usando el respaldo.
+
+**Cómo se mide**: la demo carga y juega en WebGPU cuando el navegador lo ofrece y en WASM cuando no,
+con el motivo a la vista; la barra de progreso se mueve desde el primer trozo; un fichero con otra
+anchura de salida se rechaza con un mensaje en español; y `?stage=test` ejercita el camino completo
+con un modelo de 200 KB versionado en el repositorio.
+
+Lo siguiente es publicar: los pesos en `safetensors`, los tres ONNX, el vocabulario y una model card
+generada de las métricas que se midieron y no escrita a mano.

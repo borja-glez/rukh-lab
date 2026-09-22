@@ -95,49 +95,65 @@ export const labRoutes: Record<string, LabRoute[]> = {
       skip: 'rukh pull --module m2 trae los cuatro caros',
     },
   ],
-  'm2/02-entrenar-y-medir': [
+  'm2/03-la-receta-de-entrenamiento': [
     {
-      lab: 'Lab 1',
-      what: 'MoveDecoder a mano, y contar sus parámetros',
-      route: 'imprescindible',
-      clock: 'segundos',
-      gives: 'el desglose por bloque, que cuadra con el total',
-    },
-    {
-      lab: 'Lab 2',
-      what: 'Dibujar la máscara causal y demostrar que funciona',
-      route: 'imprescindible',
-      clock: 'segundos',
-      gives: 'la prueba de que el futuro no entra',
-    },
-    {
-      lab: 'Lab 3',
-      what: 'Entrenar tiny de principio a fin',
+      lab: 'tiny',
+      what: 'Entrenar tiny de principio a fin, para ver el bucle entero funcionar',
       route: 'con-gpu',
       clock: '3 min de entrenamiento + ~10 de suite rápida',
       gives: 'checkpoints/tiny/best.pt, artifacts/eval/tiny/',
       skip: 'rukh pull tiny',
     },
     {
-      lab: 'Lab 4',
-      what: 'small entero, y la evaluación completa',
+      lab: 'small',
+      what: 'small entero, el primer modelo que juega por encima de 1200 Elo',
       route: 'con-gpu',
       clock: '42 min + ~30 de las 160 partidas',
       gives: 'checkpoints/small/best.pt y su fila en results.json',
       skip: 'rukh pull small',
     },
   ],
-  'm2/03-exportar-y-mirar-dentro': [
+  'm2/07-exportar-a-onnx': [
     {
-      lab: 'Lab 5',
-      what: 'Exportar a ONNX con paridad, y los datos de las islas',
+      lab: 'Exportar a ONNX',
+      what: 'Los tres ONNX con su comprobación de paridad, y los JSON de las dos islas',
       route: 'con-gpu',
       clock: '~12 min de exportación + minutos de los dos scripts',
       gives: 'model{,-fp16,-int8}.onnx, parity.json, attention.json',
       skip: 'los tres ONNX están publicados en chorcat/rukh-small',
     },
   ],
-  'm2/04-mas-datos-no-mas-red': [
+  'm2/10-labs-del-decoder': [
+    {
+      lab: 'Lab 1',
+      what: 'Contar los parámetros del decoder contra la fórmula cerrada',
+      route: 'imprescindible',
+      clock: 'segundos',
+      gives: 'el desglose por bloque, que cuadra con el total',
+    },
+    {
+      lab: 'Lab 2',
+      what: 'Dibujar la máscara causal y demostrar que el futuro no entra',
+      route: 'imprescindible',
+      clock: 'segundos',
+      gives: 'una diferencia de cero exacto entre la salida completa y la truncada',
+    },
+    {
+      lab: 'Lab 3',
+      what: 'Sacar los 96 mapas de atención de una partida corta',
+      route: 'observar',
+      clock: '—',
+      gives: 'artifacts/web/m2/attention.json, que dibuja la isla de la lección 7',
+    },
+    {
+      lab: 'Lab 4',
+      what: 'Exportar la repetición del entrenamiento checkpoint a checkpoint desde MLflow',
+      route: 'observar',
+      clock: '—',
+      gives: 'artifacts/web/m2/training-replay.json',
+    },
+  ],
+  'm2/11-mas-datos-no-mas-red': [
     {
       lab: 'Corrida v2',
       what: 'Más datos con la misma red pequeña',

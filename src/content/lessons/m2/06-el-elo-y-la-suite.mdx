@@ -1,0 +1,2180 @@
+---
+title: 'El Elo y la suite'
+description:
+  'Ajustar un Elo por Newton sin SciPy, ponerle un intervalo por bootstrap, detectar la separación
+  que produciría un intervalo de anchura cero, y ensamblarlo todo en el comando que escribe una fila
+  de la tabla única. Con la tirada real de `small` y la escalera torcida que la invalidó.'
+module: m2
+order: 6
+duration: 295
+runtime: 40
+level: avanzado
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - Elo
+  - bootstrap
+  - intervalo de confianza
+  - Newton
+  - separación
+  - adjudicación
+  - Stockfish
+  - suite
+artifacts:
+  - kind: report
+    label: artifacts/eval/small-greedy/report.md
+    href: https://github.com/borja-glez/rukh/tree/p2
+---
+
+## Qué vas a construir
+
+`rukh eval`: un comando que produce **una fila de la tabla única** del curso. Debajo hay 1 220
+líneas —`elo.py`, `suite.py`, `report.py` y el `__init__.py` del paquete— y la parte estadística más
+delicada del proyecto: cómo
+se convierte «ganó 8 de 20 contra Stockfish a 1500» en un número con un intervalo de confianza que
+no miente.
+
+Al final de la lección tendrás la fila de `small` y, con ella, la lección más cara del módulo: **un
+banco de pruebas es código sin tests mientras nadie lo mida**, y el de este proyecto estuvo mal
+calibrado durante meses a la vista de todos.
+
+## Teoría justa: de partidas a un número
+
+El modelo juega contra Stockfish en ocho escalones —cuatro por `Skill Level` (por debajo de 1320,
+que es el suelo de `UCI_Elo`) y cuatro por `UCI_Elo` en 1320, 1500, 1800 y 2000— con ambos colores y
+con máscara de legalidad. Después se ajusta el número que mejor explica esos resultados. La fórmula
+es la logística de <Term id="elo">Elo</Term> de toda la vida:
+
+```text
+P(puntuación) = 1 / (1 + 10 ** ((elo_rival − elo_modelo) / 400))
+```
+
+Se lee así: 400 puntos de diferencia son una probabilidad de ganar de 10 a 1; 0 puntos, 50 %. El
+ajuste es encontrar el `elo_modelo` que hace más verosímiles los resultados observados, y se
+resuelve por Newton en un par de líneas, sin SciPy. Con `c = ln(10)/400 = 0,005756`, el gradiente
+de la log-verosimilitud es `c · Σ(s − p)` y la curvatura `−c² · Σ p(1−p)`, así que cada paso es
+`Σ(s − p) / (c · Σ p(1−p))`. Las tablas entran como puntuación 0,5.
+
+**Y ahora la parte que casi nadie cuenta.** La misma curvatura que resuelve el ajuste da la
+varianza del resultado: `1 / (c² · Σ p(1−p))`. Haz el número para el caso más favorable, un
+rival contra el que rindes al 50 % en todas las partidas (`p(1−p) = 0,25` por partida, que es el
+máximo posible: cuanto más lejos del 50 %, menos informa cada partida). La tirada de `small` que
+verás abajo jugó **20 partidas contra cada uno de los ocho escalones, 160 en total**, y la tabla es
+esta:
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Partidas                    | `Σ p(1−p)` a p = 0,5 | Varianza | σ (Elo) | IC 95 % |
+| --------------------------- | -------------------- | -------- | ------- | ------- |
+| 20 (un escalón)             | 5                    | 6 036    | 78      | ±152    |
+| 100                         | 25                   | 1 207    | 35      | ±68     |
+| **160 (la tirada: 20 × 8)** | 40                   | 754      | **27**  | **±54** |
+| 800 (`full.yaml` entero)    | 200                  | 151      | 12      | ±24     |
+| 1 000                       | 250                  | 121      | 11      | ±22     |
+
+</div>
+
+En la práctica el harness no usa esa fórmula sino un **<Term id="bootstrap">bootstrap</Term>
+percentil**: remuestrea con reemplazo las partidas jugadas, reajusta el Elo en cada remuestreo y se
+queda con los percentiles 2,5 y 97,5. Da un intervalo parecido sin suponer que la verosimilitud es
+gaussiana, y las tablas —que reducen la varianza— quedan contadas tal como ocurrieron.
+
+Y ahora compara la tabla con lo medido: las 160 partidas de `small` dan **1359 con IC 1293-1429**,
+es decir **±68**, no ±54. La diferencia es que la tabla supone el 50 % en todos los escalones, y el
+modelo real puntúa 0,05 contra unos y 0,5 contra otros; `Σ p(1−p)` se queda por debajo de 40 y el
+intervalo se ensancha. **La fórmula da el suelo del ruido; el bootstrap da el ruido que hay.**
+
+Una encuesta electoral a 100 personas sale con un margen de ±10 puntos, y nadie serio titula
+«sube dos puntos» con ella; a 1 000 personas el margen baja a ±3, y para bajarlo a ±1 harían
+falta 10 000, porque la precisión va con la raíz del tamaño de la muestra. La escalera de
+Stockfish es esa encuesta: 160 partidas son la de 100 personas, y el ±68 es el «±10» que va
+impreso al lado de cada cifra de Elo de este curso.
+
+La conclusión práctica: **con 20 partidas por escalón no puedes presumir de 10 puntos de Elo**.
+Ni de 30, ni de 50. La mejora que el Elo-conditioning o el DPO produzcan en M4 y M5 tiene que
+superar el ancho del intervalo para que signifique algo, y si no lo supera, lo honesto es escribir
+«no medimos una diferencia» en vez de «mejoró un poco». Es exactamente el mismo error que cometen
+los benchmarks de LLM que celebran medio punto en una evaluación de 200 ejemplos.
+
+<Callout kind="entrevista" title="¿Por qué los rivales por debajo de 1320 no son Elo de verdad?">
+  Porque `UCI_Elo` de Stockfish no baja de 1320; para escalones más bajos se usa `Skill Level`, que
+  es otro mecanismo (introduce errores deliberados) y cuya equivalencia en Elo es una convención, no
+  una medida. Los escalones bajos existen porque un modelo débil que pierde todas las partidas no da
+  información: la verosimilitud es monótona y el ajuste se escapa a menos infinito. Si el Elo final
+  se apoya sobre todo en esos escalones, hay que decirlo en la model card. Un número sin sus
+  supuestos es propaganda.
+</Callout>
+
+## `elo.py`: el ajuste
+
+```python title="src/rukh/eval/elo.py"
+"""Elo against Stockfish: play the rungs, then fit the rating that explains the results.
+
+Rungs are Stockfish at ``UCI_Elo`` 1320/1500/1800/2000 (1320 is the engine's floor) plus four
+``Skill Level`` rungs below it, so a weak model still has opponents it can score against: with
+only losses there is nothing for the fit to latch onto. Both colours are played at every rung.
+
+The fit is the standard logistic (Elo) model with one free parameter,
+
+    P(score) = 1 / (1 + 10 ** ((opponent - elo) / 400)),
+
+maximised by Newton's method: with ``c = ln(10) / 400`` the gradient is ``c * sum(s - p)`` and
+the Hessian ``-c**2 * sum(p * (1 - p))``, so each step is ``sum(s - p) / (c * sum(p * (1 - p)))``.
+Draws enter as a score of 0.5, which is the usual quasi-likelihood treatment. The 95 % interval
+is a percentile bootstrap over the game results, fitted in a single vectorised pass so a
+thousand resamples cost milliseconds and no SciPy is needed.
+
+Two honesty notes are built into the numbers rather than left to the reader:
+
+* a game cut short by the context limit is **adjudicated** (shallow engine analysis of the final
+  position, or the material count when no engine is around) instead of being booked as a draw,
+  because half a point per cut game biases the fit towards the middle of the rungs;
+* when every game is a win (or every game is a loss) the likelihood has no maximum inside the
+  range of opponents and the bootstrap collapses to a zero-width interval. That is reported as
+  ``separated`` with a one-sided likelihood bound instead of a symmetric interval that would be
+  a lie.
+"""
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="1-26" />
+
+Tres párrafos de especificación y dos «notas de honestidad» que, dice el docstring, «están
+construidas dentro de los números en vez de dejadas al lector». Las dos aparecen en el código más
+abajo: la adjudicación de las partidas cortadas y la detección de la separación.
+
+```python title="src/rukh/eval/elo.py"
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+
+import chess
+import numpy as np
+from pydantic import BaseModel, ConfigDict, model_validator
+
+from rukh.config import BaseConfig
+from rukh.eval.cache import EvalCache
+from rukh.infer import GameResult, SampleConfig, StockfishOpponent, adjudicate, play_game
+from rukh.models import MoveDecoder
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+LOG10_400 = math.log(10.0) / 400.0
+SUITE = "elo"
+MAX_STEP = 400.0
+SLACK = 1000.0
+"""How far outside the range of opponents the fit is allowed to wander (separation guard)."""
+BOUND_SLACK = 4000.0
+"""Search range of the one-sided bound when the results are separated."""
+MOVE_TIME = 0.1
+"""Seconds per move for the engine; below this ``UCI_Elo`` means very little (D-025)."""
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="28-51" />
+
+`SLACK` y `MAX_STEP` parecen constantes de relleno y son guardas contra dos formas de publicar un
+número falso; las verás en acción en `_fit_batch`. `MOVE_TIME = 0.1` lleva su advertencia al lado:
+a 0,1 segundos por jugada, `UCI_Elo` está muy por debajo del régimen para el que se calibró. Es una
+decisión de presupuesto —800 partidas a un segundo por jugada son horas— y lo que la hace aceptable
+es que esté **escrita en las notas del informe** y no solo en el código.
+
+```python title="src/rukh/eval/elo.py"
+class EloRung(BaseConfig):
+    """One Stockfish setting and the rating it is assumed to play at."""
+
+    name: str
+    elo: int
+    uci_elo: int | None = None
+    skill: int | None = None
+
+    @model_validator(mode="after")
+    def _check(self) -> EloRung:
+        if (self.uci_elo is None) == (self.skill is None):
+            raise ValueError(f"rung {self.name}: set exactly one of uci_elo and skill")
+        return self
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="54-66" />
+
+Un escalón es un ajuste de Stockfish más el Elo al que **se supone** que juega. El validador exige
+exactamente uno de `uci_elo` y `skill`: son dos mecanismos distintos y un escalón que tuviera los
+dos sería ambiguo. Fíjate en el nombre del campo, `elo`, sin adjetivo: el código no distingue entre
+un Elo medido y uno supuesto, y esa indistinción es el error que esta lección termina destapando.
+
+```python title="src/rukh/eval/elo.py"
+# ``Skill Level`` ratings are nominal anchors for the rungs below the engine's 1320 floor: they
+# are not measured strengths, so a model whose fit leans on them is reported with that caveat.
+DEFAULT_RUNGS: list[EloRung] = [
+    EloRung(name="skill-0", elo=800, skill=0),
+    EloRung(name="skill-1", elo=950, skill=1),
+    EloRung(name="skill-2", elo=1100, skill=2),
+    EloRung(name="skill-3", elo=1250, skill=3),
+    EloRung(name="uci-1320", elo=1320, uci_elo=1320),
+    EloRung(name="uci-1500", elo=1500, uci_elo=1500),
+    EloRung(name="uci-1800", elo=1800, uci_elo=1800),
+    EloRung(name="uci-2000", elo=2000, uci_elo=2000),
+]
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="69-80" />
+
+Los ocho escalones, con el comentario que lo dice todo: «los ratings de `Skill Level` son anclas
+nominales para los escalones por debajo del suelo de 1320 del motor: no son fuerzas medidas, así
+que un modelo cuyo ajuste se apoye en ellos se informa con esa advertencia». La advertencia está;
+lo que falta es la medida, y eso cuesta 350 puntos de Elo al final de la lección.
+
+```python title="src/rukh/eval/elo.py"
+class GameRecord(BaseModel):
+    """One played game, from the model's point of view."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rung: str
+    opponent_elo: int
+    index: int
+    model_white: bool
+    result: str
+    score: float
+    plies: int
+    illegal_proposals: int
+    cut: bool = False
+    """The game ran out of context instead of ending on the board."""
+    adjudicated: str | None = None
+    """How a cut game was decided (``engine depth 8``, ``material count``), or None."""
+
+    def item_id(self) -> str:
+        return f"{self.rung}:{self.index}"
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="83-102" />
+
+```python title="src/rukh/eval/elo.py"
+class RungResult(BaseModel):
+    """Aggregated results at one rung."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    opponent_elo: int
+    games: int
+    wins: int
+    draws: int
+    losses: int
+    score: float
+    """Average score in [0, 1]."""
+    cut: int = 0
+    """Games that hit the context limit instead of ending on the board."""
+    adjudicated: int = 0
+    """Cut games whose result was decided by adjudication."""
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="105-121" />
+
+```python title="src/rukh/eval/elo.py"
+class EloResult(BaseModel):
+    """The fitted rating with its interval (or one-sided bound), plus the rung breakdown."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    elo: float
+    ci_low: float | None = None
+    ci_high: float | None = None
+    games: int
+    score: float
+    rungs: list[RungResult]
+    cut: int = 0
+    adjudicated: int = 0
+    separated: bool = False
+    """Every game was a win (or every one a loss): the fit is not identified."""
+    elo_lower: float | None = None
+    """One-sided 95 % lower bound; set when the model won every game."""
+    elo_upper: float | None = None
+    """One-sided 95 % upper bound; set when the model lost every game."""
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="124-142" />
+
+Los tres modelos de resultado, y lo que enseñan es qué se considera digno de contar. `GameRecord`
+guarda **por partida** si se cortó y cómo se adjudicó; `RungResult` agrega por escalón con las
+victorias, tablas y derrotas por separado en vez de solo la puntuación media; y `EloResult` tiene
+tres campos mutuamente excluyentes para el intervalo —`ci_low`/`ci_high`, `elo_lower`,
+`elo_upper`— porque hay tres situaciones distintas y meterlas en dos números sería mentir en una de
+ellas.
+
+```python title="src/rukh/eval/elo.py"
+def score_of(result: str, model_white: bool) -> float:
+    """Score of a finished game from the model's point of view.
+
+    A cut game (``*``) that could not be adjudicated is the only case left at 0.5 by default;
+    ``play_rung`` adjudicates cut games before calling this, so that branch is a fallback.
+    """
+    if result == "1-0":
+        return 1.0 if model_white else 0.0
+    if result == "0-1":
+        return 0.0 if model_white else 1.0
+    return 0.5
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="145-155" />
+
+Once líneas y un comentario que vale por un test: el 0,5 del final es para las tablas **y** para la
+partida cortada que no se pudo adjudicar, y esa segunda rama es un respaldo que en la práctica no se
+usa porque `play_rung` adjudica antes de puntuar.
+
+```python title="src/rukh/eval/elo.py"
+def _fit_batch(opponents: np.ndarray, scores: np.ndarray, iterations: int = 60) -> np.ndarray:
+    """Newton's method on ``(B, n)`` batches of results; returns one rating per row."""
+    opponents = np.asarray(opponents, dtype=np.float64)
+    scores = np.asarray(scores, dtype=np.float64)
+    low = opponents.min(axis=1) - SLACK
+    high = opponents.max(axis=1) + SLACK
+    elo = opponents.mean(axis=1)
+    for _ in range(iterations):
+        p = 1.0 / (1.0 + np.exp(-LOG10_400 * (elo[:, None] - opponents)))
+        gradient = (scores - p).sum(axis=1)
+        curvature = (p * (1.0 - p)).sum(axis=1)
+        safe = np.maximum(curvature, 1e-12)
+        step = np.where(curvature > 1e-12, gradient / (LOG10_400 * safe), 0.0)
+        step = np.clip(step, -MAX_STEP, MAX_STEP)
+        elo = np.clip(elo + step, low, high)
+        if np.max(np.abs(step)) < 1e-6:
+            break
+    return elo
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="158-175" />
+
+El corazón del ajuste, y está **vectorizado sobre un lote de filas**. No es prematura optimización:
+es lo que hace que mil remuestreos de bootstrap cuesten milisegundos en vez de un minuto, y por eso
+el intervalo se publica siempre en vez de «cuando da tiempo».
+
+Los dos recortes no son cosméticos:
+
+- **`MAX_STEP`** impide que una curvatura casi plana —que ocurre cuando el modelo pierde o gana casi
+  todas las partidas— tire la estimación al otro extremo del universo en un solo paso de Newton.
+- **`SLACK`** acota la respuesta al rango de rivales más mil puntos. Es lo que convierte una muestra
+  separada en un valor que se puede **reconocer** como separado, en vez de en un infinito que acaba
+  en una tabla.
+
+Y el `np.where(curvature > 1e-12, …, 0.0)` evita la división por cero de una muestra en la que todas
+las probabilidades están pegadas a 0 o a 1.
+
+```python title="src/rukh/eval/elo.py"
+def fit_elo(opponents: Sequence[float], scores: Sequence[float]) -> float:
+    """Maximum-likelihood rating for one set of games."""
+    if not len(opponents):
+        raise ValueError("cannot fit an Elo without games")
+    return float(_fit_batch(np.asarray([opponents]), np.asarray([scores]))[0])
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="178-182" />
+
+```python title="src/rukh/eval/elo.py"
+def bootstrap_ci(
+    opponents: Sequence[float],
+    scores: Sequence[float],
+    samples: int = 1_000,
+    seed: int = 0,
+    level: float = 0.95,
+) -> tuple[float, float]:
+    """Percentile bootstrap interval over the games themselves (one fit per resample)."""
+    opponents = np.asarray(opponents, dtype=np.float64)
+    scores = np.asarray(scores, dtype=np.float64)
+    n = len(opponents)
+    if n == 0:
+        raise ValueError("cannot bootstrap without games")
+    rng = np.random.default_rng(seed)
+    index = rng.integers(0, n, size=(samples, n))
+    fitted = _fit_batch(opponents[index], scores[index])
+    tail = (1.0 - level) / 2.0 * 100.0
+    return float(np.percentile(fitted, tail)), float(np.percentile(fitted, 100.0 - tail))
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="185-202" />
+
+El bootstrap: se remuestrean **las partidas mismas**, con reemplazo, mil veces, y se reajusta el Elo
+en cada remuestreo. `rng.integers(0, n, size=(samples, n))` construye los mil remuestreos de golpe
+como una matriz de índices, y `_fit_batch` los ajusta los mil a la vez. Los percentiles 2,5 y 97,5
+de esa distribución son el intervalo.
+
+Lo que **no** cubre ese intervalo: el sesgo del instrumento. Cubre el ruido de muestreo de haber
+jugado estas partidas y no otras. Si los escalones están mal etiquetados, los mil remuestreos están
+igual de mal etiquetados y el intervalo no se entera. Guárdate la frase, porque es la que explica el
+final de la lección.
+
+```python title="src/rukh/eval/elo.py"
+def separation(scores: Sequence[float]) -> str | None:
+    """``"wins"``, ``"losses"`` or None: whether every game went the same way.
+
+    With no counter-example the likelihood keeps rising as the rating goes to infinity, the fit
+    stops at the clamp and every bootstrap resample returns that same clamp, which is where the
+    zero-width "95 % CI" came from.
+    """
+    values = np.asarray(scores, dtype=np.float64)
+    if values.size == 0:
+        return None
+    if np.all(values >= 1.0):
+        return "wins"
+    if np.all(values <= 0.0):
+        return "losses"
+    return None
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="205-219" />
+
+La separación. Si todas las partidas fueron en la misma dirección no hay un contraejemplo que
+detenga la verosimilitud: sigue subiendo mientras el Elo crece, el ajuste se para en el recorte de
+`SLACK` y **todos** los remuestreos devuelven ese mismo recorte. De ahí salía el «IC del 95 %» de
+anchura cero que el docstring del fichero menciona: un intervalo que parece precisísimo y que en
+realidad significa «no hay información».
+
+```python title="src/rukh/eval/elo.py"
+def one_sided_bound(
+    opponents: Sequence[float], scores: Sequence[float], level: float = 0.95, lower: bool = True
+) -> float:
+    """Likelihood bound for separated results: the rating at which the run stops being plausible.
+
+    For an all-win run the bound is the lowest rating under which winning every game still has
+    probability ``1 - level``; for an all-loss run it is the highest rating under which losing
+    every game does. Solved by bisection on a monotone log-likelihood, so no SciPy is needed.
+    """
+    rungs = np.asarray(opponents, dtype=np.float64)
+    if rungs.size == 0:
+        raise ValueError("cannot bound an Elo without games")
+    target = math.log(1.0 - level)
+
+    def loglik(elo: float) -> float:
+        p = 1.0 / (1.0 + np.exp(-LOG10_400 * (elo - rungs)))
+        p = np.clip(p if lower else 1.0 - p, 1e-300, 1.0)
+        return float(np.sum(np.log(p)))
+
+    low = float(rungs.min()) - BOUND_SLACK
+    high = float(rungs.max()) + BOUND_SLACK
+    # ``loglik`` rises with the rating when bounding from below and falls when bounding from
+    # above; bisect for the crossing of ``target`` either way.
+    for _ in range(200):
+        middle = 0.5 * (low + high)
+        if (loglik(middle) < target) == lower:
+            low = middle
+        else:
+            high = middle
+    return 0.5 * (low + high)
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="222-251" />
+
+Y la alternativa honesta. Cuando los resultados están separados no se publica un intervalo
+simétrico: se publica una **cota de un solo lado**, el rating por debajo del cual ganar todas las
+partidas ya no sería plausible. Se resuelve por bisección sobre una log-verosimilitud monótona, 200
+iteraciones, sin SciPy.
+
+El `np.clip(p, 1e-300, 1.0)` antes del logaritmo es el detalle que evita un `-inf` cuando la
+probabilidad se hace indistinguible de cero, que con exponentes de 4 000 puntos de Elo ocurre
+enseguida.
+
+```python title="src/rukh/eval/elo.py"
+def summarize_rungs(records: Sequence[GameRecord]) -> list[RungResult]:
+    """Wins, draws, losses and average score per rung, ordered by opponent rating."""
+    by_rung: dict[str, list[GameRecord]] = {}
+    for record in records:
+        by_rung.setdefault(record.rung, []).append(record)
+    results = [
+        RungResult(
+            name=name,
+            opponent_elo=games[0].opponent_elo,
+            games=len(games),
+            wins=sum(g.score == 1.0 for g in games),
+            draws=sum(g.score == 0.5 for g in games),
+            losses=sum(g.score == 0.0 for g in games),
+            score=sum(g.score for g in games) / len(games),
+            cut=sum(g.cut for g in games),
+            adjudicated=sum(g.adjudicated is not None for g in games),
+        )
+        for name, games in by_rung.items()
+    ]
+    return sorted(results, key=lambda r: (r.opponent_elo, r.name))
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="254-273" />
+
+```python title="src/rukh/eval/elo.py"
+def estimate(
+    records: Sequence[GameRecord], samples: int = 1_000, seed: int = 0, level: float = 0.95
+) -> EloResult:
+    """Fit the rating and its interval (or its one-sided bound) from played games."""
+    if not records:
+        raise ValueError("cannot estimate an Elo without games")
+    opponents = [float(record.opponent_elo) for record in records]
+    scores = [record.score for record in records]
+    elo = fit_elo(opponents, scores)
+    rungs = summarize_rungs(records)
+    result = EloResult(
+        elo=elo,
+        games=len(records),
+        score=float(np.mean(scores)),
+        rungs=rungs,
+        cut=sum(rung.cut for rung in rungs),
+        adjudicated=sum(rung.adjudicated for rung in rungs),
+    )
+    apart = separation(scores)
+    if apart is None:
+        result.ci_low, result.ci_high = bootstrap_ci(
+            opponents, scores, samples=samples, seed=seed, level=level
+        )
+        return result
+    result.separated = True
+    bound = one_sided_bound(opponents, scores, level=level, lower=apart == "wins")
+    if apart == "wins":
+        result.elo_lower = bound
+    else:
+        result.elo_upper = bound
+    return result
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="276-306" />
+
+`estimate` es el ensamblaje: ajusta, agrega por escalón, y entonces **decide qué clase de
+incertidumbre publicar**. Si hay contraejemplos, bootstrap; si no, la cota de un lado y el campo
+`separated` en `True`. Las dos ramas terminan devolviendo el mismo tipo, así que el informe no tiene
+que preguntar qué pasó: lee los campos que haya.
+
+```python title="src/rukh/eval/elo.py"
+def record_of(
+    outcome: GameResult,
+    rung: EloRung,
+    index: int,
+    model_white: bool,
+    engine: chess.engine.SimpleEngine | None = None,
+) -> GameRecord:
+    """One played game as a record, adjudicating it first when it was cut short."""
+    result = outcome.result
+    how: str | None = None
+    if outcome.cut:
+        result, how = adjudicate(outcome.fen, engine=engine)
+    return GameRecord(
+        rung=rung.name,
+        opponent_elo=rung.elo,
+        index=index,
+        model_white=model_white,
+        result=result,
+        score=score_of(result, model_white),
+        plies=outcome.plies,
+        illegal_proposals=outcome.illegal_proposals,
+        cut=outcome.cut,
+        adjudicated=how,
+    )
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="309-332" />
+
+Aquí está la primera nota de honestidad, en dos líneas: si la partida se cortó, **se adjudica antes
+de puntuarla**. Anotar una partida cortada como tablas le regala medio punto al bando que iba
+perdiendo, y con un modelo que se queda sin contexto en las partidas largas ese sesgo apunta siempre
+para el mismo lado. Y el registro guarda **cómo** se adjudicó, así que el informe puede decir cuántas
+de las 160 partidas no terminaron en el tablero.
+
+```python title="src/rukh/eval/elo.py"
+def play_rung(
+    model: MoveDecoder,
+    tok: UciTokenizer,
+    rung: EloRung,
+    games: int,
+    cfg: SampleConfig,
+    move_time: float = MOVE_TIME,
+    max_plies: int | None = None,
+    cache: EvalCache | None = None,
+) -> list[GameRecord]:
+    """Play ``games`` games against one rung, alternating colours, reusing cached games.
+
+    A game that ends with ``*`` (the context ran out) is adjudicated with the rung's own engine
+    before it is scored, so it enters the fit as a win, a loss or a draw on the merits of the
+    final position.
+    """
+    records: list[GameRecord] = []
+    for index in range(games):
+        cached = cache.get(SUITE, f"{rung.name}:{index}") if cache is not None else None
+        if cached is not None:
+            records.append(GameRecord.model_validate(cached))
+    done = {record.index for record in records}
+    missing = [index for index in range(games) if index not in done]
+    if not missing:
+        return sorted(records, key=lambda r: r.index)
+
+    opponent = StockfishOpponent(elo=rung.uci_elo or 1320, skill=rung.skill, move_time=move_time)
+    try:
+        for index in missing:
+            model_white = index % 2 == 0
+            outcome = play_game(
+                model,
+                tok,
+                opponent,
+                cfg.model_copy(update={"seed": None if cfg.seed is None else cfg.seed + index}),
+                model_color=chess.WHITE if model_white else chess.BLACK,
+                max_plies=max_plies,
+            )
+            record = record_of(outcome, rung, index, model_white, engine=opponent.engine)
+            if cache is not None:
+                cache.put(SUITE, record.item_id(), record.model_dump())
+            records.append(record)
+    finally:
+        opponent.close()
+    return sorted(records, key=lambda r: r.index)
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="335-379" />
+
+Jugar un escalón. Cuatro decisiones:
+
+1. **La caché se consulta primero, partida a partida**, y solo se arranca Stockfish si falta alguna.
+   Repetir una suite entera después de añadir un escalón cuesta ese escalón.
+2. **Los colores se alternan** con `index % 2 == 0`. Jugar solo con blancas mediría el modelo y la
+   ventaja de salida a la vez.
+3. **La semilla avanza con el índice** (`cfg.seed + index`). Con la misma semilla en las veinte
+   partidas, el muestreador daría la misma partida veinte veces contra un motor determinista.
+4. **El motor se cierra en un `finally`**, y el mismo motor se le pasa a `record_of` para adjudicar:
+   abrir un segundo Stockfish solo para juzgar la posición final sería un proceso más por escalón.
+
+```python title="src/rukh/eval/elo.py"
+def play_rungs(
+    model: MoveDecoder,
+    tok: UciTokenizer,
+    rungs: Sequence[EloRung],
+    games: int,
+    cfg: SampleConfig,
+    move_time: float = MOVE_TIME,
+    max_plies: int | None = None,
+    cache: EvalCache | None = None,
+) -> list[GameRecord]:
+    """Play every rung and return all the game records."""
+    records: list[GameRecord] = []
+    for rung in rungs:
+        records.extend(
+            play_rung(
+                model,
+                tok,
+                rung,
+                games,
+                cfg,
+                move_time=move_time,
+                max_plies=max_plies,
+                cache=cache,
+            )
+        )
+    return records
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p2" lines="382-407" />
+
+## `suite.py`: ensamblarlo todo
+
+```python title="src/rukh/eval/suite.py"
+"""The evaluation suite: one command that produces one row of the results table.
+
+``run_suite`` loads a checkpoint, measures legality, next-move accuracy, puzzles and Elo, and
+hands the result to ``report``. Every part is optional at run time: a missing validation
+parquet, a missing puzzle parquet or a missing Stockfish binary becomes a note in the report
+instead of a crash, because a partial evaluation that says what it could not measure is more
+useful than no evaluation at all.
+
+The suite runs on the same device the model was trained on (``pick_device`` by default, so CUDA
+when it is there): a harness pinned to the CPU turns ten thousand forward passes and a few
+hundred games into hours. The device that was used is recorded in the report.
+"""
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="1-12" />
+
+Dos principios en doce líneas. **Nada es obligatorio en tiempo de ejecución**: un parquet que falta,
+unos puzles que faltan o un Stockfish que no está se convierten en una nota del informe en vez de en
+una excepción, porque una evaluación parcial que dice lo que no pudo medir es más útil que ninguna.
+Y **la suite corre donde se entrenó**: un harness clavado a la CPU convierte diez mil pasadas y unos
+cientos de partidas en horas.
+
+```python title="src/rukh/eval/suite.py"
+from __future__ import annotations
+
+import json
+import logging
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from rukh import paths
+from rukh.config import BaseConfig
+from rukh.eval.accuracy import AccuracyResult, accuracy
+from rukh.eval.cache import EvalCache, config_sha, file_sha
+from rukh.eval.elo import DEFAULT_RUNGS, EloResult, EloRung, estimate, play_rungs
+from rukh.eval.legality import LegalityResult, legality, sample_positions
+from rukh.eval.puzzles import PuzzleResult, load_puzzles, model_source, run_puzzles
+from rukh.eval.report import ReportPaths, write_report
+from rukh.infer import SampleConfig
+from rukh.models import DecoderConfig
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+log = logging.getLogger(__name__)
+
+SUITES = ("full", "quick")
+HUB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$")
+HUB_WEIGHTS = ("model.safetensors", "pytorch_model.bin")
+ELO_CAVEAT = (
+    "the Elo interval covers sampling noise only: the four ``skill-*`` rungs are nominal "
+    "``Skill Level`` anchors rather than measured ratings, and Stockfish plays at {move_time:g} s "
+    "per move, far below any setting ``UCI_Elo`` is calibrated for"
+)
+LEGALITY_DEFINITIONS = (
+    "legality_argmax is the share of validation positions where the single most likely token is "
+    "a legal move (no temperature, no top-k, no mask): this is the >= 99 % bar of GOAL.md. "
+    "legality_sampled draws the token the way the demo does (temperature {temperature:g}"
+    "{top_k}) and is always the lower of the two."
+)
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="14-52" />
+
+Las dos constantes de texto del final —`ELO_CAVEAT` y `LEGALITY_DEFINITIONS`— son las advertencias
+que acaban impresas en el informe y en la model card. Que vivan aquí, junto al código que las mide,
+y no en una plantilla, es lo que hace que no se desincronicen del número al que acompañan.
+
+```python title="src/rukh/eval/suite.py"
+class EvalConfig(BaseConfig):
+    """What a suite measures and where it reads and writes."""
+
+    stage: str | None = None
+    """Name of the row in the results table; defaults to the checkpoint's run directory."""
+    games: str = "data/uci/year=2025/month=02/games.parquet"
+    puzzles: str = "data/puzzles/puzzles.parquet"
+    puzzle_split: str = "test"
+    legality_positions: int = 10_000
+    accuracy_positions: int = 10_000
+    position_pool: int = 50_000
+    puzzles_per_band: int = 2_000
+    elo_games: int = 100
+    elo_rungs: list[EloRung] = Field(default_factory=lambda: list(DEFAULT_RUNGS))
+    elo_move_time: float = 0.1
+    elo_max_plies: int | None = None
+    bootstrap: int = 1_000
+    temperature: float = 0.6
+    top_k: int | None = 20
+    block: int = 200
+    seed: int = 42
+    out_dir: str = "artifacts/eval"
+    web_results: str | None = "artifacts/web/results.json"
+    cache_db: str = "artifacts/eval/cache.sqlite"
+    device: str | None = None
+    """Where the model runs; ``None`` means ``rukh.train.pick_device()`` (CUDA when present)."""
+    track: bool = True
+    """Log the suite to the local MLflow store (the model card reads those metrics back)."""
+
+    def cache_fields(self) -> dict[str, Any]:
+        """The settings that change what a cached game or puzzle means."""
+        return {
+            "temperature": self.temperature,
+            "top_k": self.top_k,
+            "elo_move_time": self.elo_move_time,
+            "elo_max_plies": self.elo_max_plies,
+            "elo_games": self.elo_games,
+            "rungs": [rung.model_dump(mode="json") for rung in self.elo_rungs],
+            "seed": self.seed,
+            "block": self.block,
+        }
+
+    def sampling(self) -> SampleConfig:
+        """The sampler the Elo games use: masked, seeded, as the demo plays."""
+        return SampleConfig(
+            temperature=self.temperature,
+            top_k=self.top_k,
+            mask_illegal=True,
+            seed=self.seed,
+        )
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="55-104" />
+
+`EvalConfig` es la suite entera. Dos métodos hacen el trabajo fino:
+
+- **`cache_fields`** enumera exactamente lo que cambia el significado de una partida o de un puzle
+  guardado: temperatura, top-k, tiempo por jugada, límite de plies, número de partidas, definición
+  de los escalones, semilla y bloque. Es la lista que la lección anterior explicaba desde el lado de
+  la caché, escrita aquí desde el lado de quien sabe qué significa cada cosa.
+- **`sampling`** construye el muestreador de las partidas de Elo: **enmascarado**, con semilla, y con
+  la temperatura y el top-k de la suite. Enmascarado porque una partida tiene que ser jugable; la
+  legalidad se mide aparte y sin máscara.
+
+```python title="src/rukh/eval/suite.py"
+class SuiteResult(BaseModel):
+    """Everything one evaluation produced; serialised verbatim as ``results.json``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: str
+    suite: str
+    checkpoint: str
+    model_sha: str
+    params: int
+    date: str
+    device: str = "cpu"
+    run_id: str | None = None
+    legality_argmax: LegalityResult | None = None
+    """The headline legality rate: the most likely token, unmasked."""
+    legality_sampled: LegalityResult | None = None
+    """Legality of a token drawn the way the demo draws it (temperature and top-k)."""
+    accuracy: AccuracyResult | None = None
+    puzzles: PuzzleResult | None = None
+    elo: EloResult | None = None
+    delta_cp: float | None = None
+    """Mean centipawn loss; measured by a later milestone, ``null`` until then."""
+    diversity: float | None = None
+    """Opening entropy over self-play games; measured by a later milestone."""
+    notes: list[str] = []
+    config: dict[str, Any] = {}
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="107-132" />
+
+`SuiteResult` se serializa tal cual como `results.json`, así que cada campo es una decisión sobre qué
+se publica. `delta_cp` y `diversity` están declarados y valen `None`: son métricas de un hito
+posterior, y **un hueco explícito es información; un cero inventado, no**.
+
+```python title="src/rukh/eval/suite.py"
+def config_path(suite: str) -> Path:
+    """Where the YAML of a named suite lives inside the source tree."""
+    if suite not in SUITES:
+        raise ValueError(f"unknown suite {suite!r}; expected one of {', '.join(SUITES)}")
+    return paths.package_root() / "configs" / "eval" / f"{suite}.yaml"
+
+
+def load_suite(suite: str, config: Path | None = None) -> EvalConfig:
+    """Load the suite config: an explicit path wins over the named one."""
+    from rukh.config import load_yaml
+
+    return load_yaml(config if config is not None else config_path(suite), EvalConfig)
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="135-146" />
+
+```python title="src/rukh/eval/suite.py"
+def _positions(cfg: EvalConfig, tok: UciTokenizer, notes: list[str]) -> list[Any]:
+    games = paths.resolve(cfg.games)
+    if not games.is_file():
+        notes.append(f"validation games not found at {games}: legality and accuracy skipped")
+        return []
+    return sample_positions(
+        games,
+        max(cfg.legality_positions, cfg.accuracy_positions),
+        tok,
+        seed=cfg.seed,
+        pool=cfg.position_pool,
+        block=cfg.block,
+    )
+
+
+def _elo(
+    model: Any, tok: UciTokenizer, cfg: EvalConfig, cache: EvalCache | None, notes: list[str]
+) -> EloResult | None:
+    from rukh.engine import EngineNotFound
+
+    try:
+        records = play_rungs(
+            model,
+            tok,
+            cfg.elo_rungs,
+            cfg.elo_games,
+            cfg.sampling(),
+            move_time=cfg.elo_move_time,
+            max_plies=cfg.elo_max_plies,
+            cache=cache,
+        )
+    except EngineNotFound as exc:
+        notes.append(f"Elo skipped: {exc}")
+        return None
+    if not records:
+        notes.append("Elo skipped: no games were played")
+        return None
+    return estimate(records, samples=cfg.bootstrap, seed=cfg.seed)
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="149-186" />
+
+```python title="src/rukh/eval/suite.py"
+def _metrics(result: SuiteResult) -> dict[str, float]:
+    """Flat metrics for MLflow (only what was actually measured)."""
+    metrics: dict[str, float] = {}
+    if result.legality_argmax is not None:
+        metrics["legality_argmax"] = result.legality_argmax.rate
+    if result.legality_sampled is not None:
+        metrics["legality_sampled"] = result.legality_sampled.rate
+    if result.accuracy is not None:
+        metrics["top1"] = result.accuracy.top1
+        metrics["top3"] = result.accuracy.top3
+        for band in result.accuracy.bands:
+            metrics[f"top1/{band.band}"] = band.top1
+            metrics[f"top3/{band.band}"] = band.top3
+    if result.puzzles is not None:
+        metrics["puzzles"] = result.puzzles.rate
+        for band in result.puzzles.bands:
+            metrics[f"puzzles/{band.band}"] = band.rate
+    if result.elo is not None:
+        metrics["elo"] = result.elo.elo
+        if result.elo.ci_low is not None and result.elo.ci_high is not None:
+            metrics["elo_ci_low"] = result.elo.ci_low
+            metrics["elo_ci_high"] = result.elo.ci_high
+        if result.elo.elo_lower is not None:
+            metrics["elo_lower_bound"] = result.elo.elo_lower
+        if result.elo.elo_upper is not None:
+            metrics["elo_upper_bound"] = result.elo.elo_upper
+    return metrics
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="189-215" />
+
+`_positions` saca **una sola** muestra, del tamaño del mayor de los dos usos, y después la suite
+recorta: legalidad usa las primeras `legality_positions` y exactitud las primeras
+`accuracy_positions`. Las dos métricas comparten prefijos, que es lo que hace que se puedan leer
+juntas.
+
+`_metrics` solo aplana **lo que se midió**. Un `None` no se convierte en un cero: simplemente no
+aparece en MLflow, y eso es lo que permite mirar la serie histórica de una métrica sin que los hitos
+en los que no existía la hundan.
+
+```python title="src/rukh/eval/suite.py"
+def is_hub_id(spec: str) -> bool:
+    """Whether ``spec`` looks like a Hub repository id (``owner/name``) rather than a path."""
+    text = str(spec)
+    if Path(text).expanduser().is_file() or text.endswith(".pt"):
+        return False
+    return HUB_ID.fullmatch(text) is not None
+
+
+def hub_checkpoint(repo_id: str, out_dir: Path | None = None) -> Path:
+    """Download a published model and write it back as a checkpoint the harness can read.
+
+    A Hub repository holds ``config.json`` and ``model.safetensors`` (or the torch pickle when
+    safetensors was not installed at publication time), not a training checkpoint, so the two are
+    folded into the ``{model_state, model_cfg, step}`` payload every other entry point expects.
+    Nothing here runs while the command line is being parsed: a Hub id is validated by its shape.
+    """
+    import torch
+    from huggingface_hub import hf_hub_download
+
+    directory = out_dir if out_dir is not None else paths.resolve("artifacts/hub")
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / (repo_id.replace("/", "__") + ".pt")
+    config = json.loads(Path(hf_hub_download(repo_id, "config.json")).read_text(encoding="utf-8"))
+    state: dict[str, Any] = {}
+    for name in HUB_WEIGHTS:
+        try:
+            weights = Path(hf_hub_download(repo_id, name))
+        except Exception as exc:  # noqa: BLE001 - a missing file only means "try the next one"
+            log.debug("%s has no %s (%s)", repo_id, name, exc)
+            continue
+        if name.endswith(".safetensors"):
+            from safetensors.torch import load_file
+
+            state = dict(load_file(str(weights)))
+        else:
+            state = dict(torch.load(weights, map_location="cpu", weights_only=True))
+        break
+    if not state:
+        raise FileNotFoundError(f"{repo_id} holds none of {', '.join(HUB_WEIGHTS)}")
+    model_cfg = {key: value for key, value in config.items() if key in DecoderConfig.model_fields}
+    torch.save(
+        {
+            "step": int(config.get("step") or 0),
+            "model_state": state,
+            "opt_state": None,
+            "cfg": {},
+            "model_cfg": model_cfg,
+            "vocab_hash": config.get("vocab_hash"),
+            "data_manifest_sha": config.get("data_manifest_sha"),
+            "git_sha": config.get("git_sha"),
+            "best_val": None,
+        },
+        target,
+    )
+    return target
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="218-272" />
+
+Cincuenta y cinco líneas para evaluar un modelo **publicado en el Hub** y no solo un checkpoint
+local. Un repositorio del Hub tiene `config.json` y `model.safetensors`, no un checkpoint de
+entrenamiento, así que los dos se pliegan en el payload que el resto del proyecto espera.
+
+Y el detalle de diseño: `is_hub_id` decide **por la forma de la cadena**, sin tocar la red. Una CLI
+que hiciera una petición HTTP para saber si «--model foo/bar» es una ruta tardaría un segundo en
+decirte que te falta un fichero.
+
+```python title="src/rukh/eval/suite.py"
+def resolve_model(spec: str | Path) -> Path:
+    """A checkpoint path from either a local file or a Hub id (downloaded on demand)."""
+    text = str(spec)
+    if is_hub_id(text):
+        return hub_checkpoint(text)
+    path = Path(text)
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} is neither a checkpoint nor a Hub id (owner/name)")
+    return path
+
+
+def _legality_note(cfg: EvalConfig) -> str:
+    top_k = "" if cfg.top_k is None else f", top-k {cfg.top_k}"
+    return LEGALITY_DEFINITIONS.format(temperature=cfg.temperature, top_k=top_k)
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="275-288" />
+
+```python title="src/rukh/eval/suite.py"
+def evaluate(
+    ckpt: Path | str,
+    cfg: EvalConfig,
+    suite: str = "full",
+    use_cache: bool = True,
+    device: str | None = None,
+) -> SuiteResult:
+    """Measure one checkpoint; missing inputs become notes, never exceptions."""
+    from rukh.train import load_model, pick_device
+
+    ckpt = resolve_model(ckpt)
+    where = device or cfg.device or pick_device()
+    model, _payload = load_model(ckpt, map_location=where)
+    model = model.to(where).eval()
+    log.info("evaluating %s on %s", ckpt, where)
+    tok = UciTokenizer()
+    notes: list[str] = [_legality_note(cfg)]
+    cache = EvalCache(
+        paths.resolve(cfg.cache_db) if use_cache else None,
+        file_sha(ckpt),
+        enabled=use_cache,
+        config_sha=config_sha(cfg.cache_fields()),
+    )
+    try:
+        positions = _positions(cfg, tok, notes)
+        for_legality = positions[: cfg.legality_positions]
+        result = SuiteResult(
+            stage=cfg.stage or ckpt.parent.name,
+            suite=suite,
+            checkpoint=ckpt.as_posix(),
+            model_sha=cache.model_sha,
+            params=model.num_params(non_embedding=False),
+            date=datetime.now(UTC).date().isoformat(),
+            device=str(where),
+            legality_argmax=(
+                legality(model, tok, for_legality, cfg.sampling(), mode="argmax")
+                if positions
+                else None
+            ),
+            legality_sampled=(
+                legality(model, tok, for_legality, cfg.sampling(), mode="sampled")
+                if positions
+                else None
+            ),
+            accuracy=(
+                accuracy(model, tok, positions[: cfg.accuracy_positions]) if positions else None
+            ),
+            notes=notes,
+            config=cfg.model_dump(mode="json"),
+        )
+        puzzle_path = paths.resolve(cfg.puzzles)
+        if puzzle_path.is_file():
+            items = load_puzzles(
+                puzzle_path, cfg.puzzles_per_band, seed=cfg.seed, split=cfg.puzzle_split
+            )
+            result.puzzles = run_puzzles(model_source(model, tok), tok, items, cache=cache)
+        else:
+            notes.append(f"puzzles not found at {puzzle_path}: puzzle suite skipped")
+        result.elo = _elo(model, tok, cfg, cache, notes)
+        _elo_notes(result.elo, cfg, notes)
+        result.notes = notes  # pydantic copied the list at construction time
+    finally:
+        cache.close()
+    return result
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="291-354" />
+
+La función que ordena las cuatro medidas. Lo que hay que leer es cuántas veces aparece `if positions`
+o `if puzzle_path.is_file()`: cada pieza se salta sola y deja una nota. Y `legality` se llama **dos
+veces con `for_legality`**, la misma lista, una por modo: las dos tasas sobre las mismas posiciones,
+que es lo que hace que restarlas signifique algo.
+
+El `finally: cache.close()` cierra SQLite aunque la evaluación reviente a mitad, y con el `commit`
+por escritura de la lección anterior eso significa que todo lo que llevara hecho se conserva.
+
+<Callout kind="roto" title="`result.notes = notes` al final no es redundante">
+  Pydantic **copia** la lista al construir el modelo, así que las notas que `_positions`, los puzles
+  y `_elo` fueron añadiendo después de la construcción se quedaban fuera. El comentario del código
+  lo dice en cinco palabras. Es un fallo que no rompe nada: simplemente publica un informe sin la
+  mitad de sus advertencias, que es exactamente el tipo de error que este módulo intenta enseñarte a
+  temer.
+</Callout>
+
+```python title="src/rukh/eval/suite.py"
+def _elo_notes(elo: EloResult | None, cfg: EvalConfig, notes: list[str]) -> None:
+    """Everything the Elo number has to be read with, in words."""
+    if elo is None:
+        return
+    notes.append(ELO_CAVEAT.format(move_time=cfg.elo_move_time))
+    if elo.cut:
+        notes.append(
+            f"{elo.cut} of {elo.games} games hit the context limit and were adjudicated "
+            f"({elo.adjudicated} of them) instead of being scored as draws"
+        )
+    if elo.separated:
+        notes.append(
+            "every game went the same way, so the rating is not identified: the report gives a "
+            "one-sided bound instead of a 95 % interval"
+        )
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="357-371" />
+
+Todo lo que el número de Elo tiene que llevar pegado, en palabras: la advertencia de los escalones
+nominales y del tiempo por jugada, cuántas partidas se cortaron y se adjudicaron, y —si los
+resultados estaban separados— que lo que se publica es una cota y no un intervalo.
+
+```python title="src/rukh/eval/suite.py"
+def track_result(result: SuiteResult, cfg: EvalConfig) -> str | None:
+    """Log the suite to the local MLflow store and return the run id."""
+    import mlflow
+
+    from rukh.tracking import start_run
+
+    with start_run(
+        f"eval-{result.stage}",
+        {"suite": result.suite, "checkpoint": result.checkpoint, **cfg.model_dump(mode="json")},
+        tags={"kind": "eval", "stage": result.stage, "model_sha": result.model_sha},
+    ) as run:
+        metrics = _metrics(result)
+        if metrics:
+            mlflow.log_metrics(metrics)
+        return str(run.info.run_id)
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="374-388" />
+
+```python title="src/rukh/eval/suite.py"
+def run_suite(
+    ckpt: Path | str,
+    cfg: EvalConfig,
+    suite: str = "full",
+    use_cache: bool = True,
+    device: str | None = None,
+) -> tuple[SuiteResult, ReportPaths]:
+    """Evaluate, track and report: the whole of ``rukh eval`` in one call."""
+    result = evaluate(ckpt, cfg, suite=suite, use_cache=use_cache, device=device)
+    if cfg.track:
+        result.run_id = track_result(result, cfg)
+    report = write_report(
+        result,
+        paths.resolve(cfg.out_dir),
+        paths.resolve(cfg.web_results) if cfg.web_results else None,
+    )
+    return result, report
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p2" lines="391-407" />
+
+## `report.py`: una fila para la web, un informe para leer
+
+```python title="src/rukh/eval/report.py"
+"""Reporting: ``report.md`` and ``results.json`` per model, one shared row for the web.
+
+Every stage of the course (base, tiny, small, masters, Elo-conditioned, LoRA, DPO, GRPO, the
+external baselines) ends up as one row of the single table of ``docs/spec/02`` §"Componente 5".
+``artifacts/web/results.json`` is that table: the course site and the demo read it, so writing a
+row is an upsert keyed by ``stage`` rather than an append, and a metric that has not been
+measured yet (``delta_cp``, ``diversity``) is written as ``null`` instead of being invented.
+
+Two numbers carry their definition with them rather than a footnote somewhere else: legality is
+written twice (``argmax``, the headline, and ``sampled``, the demo's own setting), and an Elo
+whose games were all wins or all losses is printed as a one-sided bound, in words, instead of a
+zero-width "95 % CI".
+"""
+```
+
+<Src file="src/rukh/eval/report.py" tag="p2" lines="1-13" />
+
+`artifacts/web/results.json` es **la tabla única** del curso: una fila por etapa, desde la línea base
+hasta el GRPO de M5. Por eso escribir una fila es un _upsert_ por `stage` y no un `append`: volver a
+evaluar `small` sustituye su fila en vez de añadir una segunda.
+
+```python title="src/rukh/eval/report.py"
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from pydantic import BaseModel, ConfigDict
+
+from rukh.eval.elo import EloResult
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from rukh.eval.suite import SuiteResult
+
+REPORT_NAME = "report.md"
+RESULTS_NAME = "results.json"
+```
+
+<Src file="src/rukh/eval/report.py" tag="p2" lines="15-30" />
+
+```python title="src/rukh/eval/report.py"
+class WebRow(BaseModel):
+    """One row of the single results table, exactly as the web reads it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: str
+    params: int
+    legality: float | None = None
+    """Legality of the most likely token: the headline definition."""
+    legality_sampled: float | None = None
+    """Legality of a token drawn with the suite's temperature and top-k."""
+    top1: float | None = None
+    top3: float | None = None
+    top1_by_band: dict[str, float] = {}
+    top3_by_band: dict[str, float] = {}
+    puzzles: dict[str, float] = {}
+    elo: float | None = None
+    elo_ci: list[float] | None = None
+    """95 % bootstrap interval, or ``null`` when the results were separated."""
+    elo_lower: float | None = None
+    elo_upper: float | None = None
+    elo_separated: bool = False
+    delta_cp: float | None = None
+    diversity: float | None = None
+    date: str
+    run_id: str | None = None
+```
+
+<Src file="src/rukh/eval/report.py" tag="p2" lines="33-58" />
+
+```python title="src/rukh/eval/report.py"
+def row_of(result: SuiteResult) -> WebRow:
+    """The table row a finished suite produces."""
+    elo = result.elo
+    interval = (
+        [elo.ci_low, elo.ci_high]
+        if elo is not None and elo.ci_low is not None and elo.ci_high is not None
+        else None
+    )
+    accuracy = result.accuracy
+    return WebRow(
+        stage=result.stage,
+        params=result.params,
+        legality=result.legality_argmax.rate if result.legality_argmax else None,
+        legality_sampled=result.legality_sampled.rate if result.legality_sampled else None,
+        top1=accuracy.top1 if accuracy else None,
+        top3=accuracy.top3 if accuracy else None,
+        top1_by_band={band.band: band.top1 for band in accuracy.bands} if accuracy else {},
+        top3_by_band={band.band: band.top3 for band in accuracy.bands} if accuracy else {},
+        puzzles=result.puzzles.by_band() if result.puzzles else {},
+        elo=elo.elo if elo else None,
+        elo_ci=interval,
+        elo_lower=elo.elo_lower if elo else None,
+        elo_upper=elo.elo_upper if elo else None,
+        elo_separated=bool(elo.separated) if elo else False,
+        delta_cp=result.delta_cp,
+        diversity=result.diversity,
+        date=result.date,
+        run_id=result.run_id,
+    )
+```
+
+<Src file="src/rukh/eval/report.py" tag="p2" lines="61-89" />
+
+`WebRow` es el contrato con la web, y `row_of` la traducción. Fíjate en que `legality` —a secas— es
+la del **argmax**: el nombre corto se lo lleva la definición del titular, y la otra va con apellido.
+Es una decisión de nomenclatura que evita que alguien lea la columna equivocada dentro de seis
+meses.
+
+```python title="src/rukh/eval/report.py"
+def upsert_row(path: Path, row: WebRow) -> list[dict[str, Any]]:
+    """Insert or replace ``row`` in the shared results file and return every row."""
+    path = Path(path)
+    rows: list[dict[str, Any]] = []
+    if path.is_file():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            payload = {}
+        found = payload.get("rows") if isinstance(payload, dict) else payload
+        if isinstance(found, list):
+            rows = [item for item in found if isinstance(item, dict)]
+    new = row.model_dump()
+    rows = [item for item in rows if item.get("stage") != row.stage]
+    rows.append(new)
+    rows.sort(key=lambda item: str(item.get("stage")))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = {"updated_at": datetime.now(UTC).isoformat(timespec="seconds"), "rows": rows}
+    path.write_text(
+        json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n"
+    )
+    return rows
+```
+
+<Src file="src/rukh/eval/report.py" tag="p2" lines="92-113" />
+
+El _upsert_: leer lo que haya, quitar la fila de esta etapa, añadir la nueva, ordenar por etapa y
+escribir. El `try/except ValueError` alrededor del `json.loads` hace que un fichero corrupto se
+reemplace en vez de tirar la evaluación que acabas de pagar en horas de partidas. Y el
+`newline="\n"` de la escritura es lo que impide que el fichero cambie de CRLF a LF según quién lo
+generó, que en Windows es un diff de 200 líneas por nada.
+
+```python title="src/rukh/eval/report.py"
+def _percent(value: float | None) -> str:
+    return "n/a" if value is None else f"{value * 100:.1f} %"
+
+
+def elo_line(elo: EloResult | None) -> str:
+    """The Elo cell: a point estimate with an interval, or with a one-sided bound."""
+    if elo is None:
+        return "n/a"
+    if not elo.separated and elo.ci_low is not None and elo.ci_high is not None:
+        return f"{elo.elo:.0f} (95 % CI {elo.ci_low:.0f}-{elo.ci_high:.0f})"
+    if elo.elo_lower is not None:
+        return f"> {elo.elo_lower:.0f} (one-sided 95 % bound; every game won)"
+    if elo.elo_upper is not None:
+        return f"< {elo.elo_upper:.0f} (one-sided 95 % bound; every game lost)"
+    return f"{elo.elo:.0f} (no interval)"
+```
+
+<Src file="src/rukh/eval/report.py" tag="p2" lines="116-130" />
+
+`elo_line` es donde se ven las tres situaciones de la lección: intervalo, cota inferior («ganó todas
+las partidas»), cota superior («las perdió todas»). En palabras, dentro de la celda, y no en una
+leyenda al pie que nadie lee.
+
+```python title="src/rukh/eval/report.py"
+def render_markdown(result: SuiteResult) -> str:
+    """The human-readable report: headline numbers first, then every breakdown."""
+    argmax = result.legality_argmax.rate if result.legality_argmax else None
+    sampled = result.legality_sampled.rate if result.legality_sampled else None
+    sampling = result.legality_sampled
+    drawn = (
+        ""
+        if sampling is None or sampling.temperature is None
+        else f" (T={sampling.temperature:g}"
+        + ("" if sampling.top_k is None else f", top-k {sampling.top_k}")
+        + ")"
+    )
+    lines: list[str] = [
+        f"# Evaluation of `{result.stage}`",
+        "",
+        f"- Suite: `{result.suite}`",
+        f"- Checkpoint: `{result.checkpoint}`",
+        f"- Weights SHA-256: `{result.model_sha}`",
+        f"- Parameters: {result.params:,}",
+        f"- Device: `{result.device}`",
+        f"- Date: {result.date}",
+        f"- MLflow run: {result.run_id or 'not tracked'}",
+        "",
+        "## Headline",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| Legality without the mask, argmax | {_percent(argmax)} |",
+        f"| Legality without the mask, sampled{drawn} | {_percent(sampled)} |",
+        f"| Top-1 next move | {_percent(result.accuracy.top1 if result.accuracy else None)} |",
+        f"| Top-3 next move | {_percent(result.accuracy.top3 if result.accuracy else None)} |",
+        f"| Puzzles solved | {_percent(result.puzzles.rate if result.puzzles else None)} |",
+        f"| Estimated Elo | {elo_line(result.elo)} |",
+    ]
+    delta_cp = "n/a" if result.delta_cp is None else f"{result.delta_cp:.1f}"
+    diversity = "n/a" if result.diversity is None else f"{result.diversity:.3f}"
+    lines.extend(
+        [
+            f"| Mean centipawn loss | {delta_cp} |",
+            f"| Opening diversity | {diversity} |",
+            "",
+        ]
+    )
+```
+
+<Src file="src/rukh/eval/report.py" tag="p2" lines="133-175" />
+
+```python title="src/rukh/eval/report.py"
+    if result.legality_argmax is not None or result.legality_sampled is not None:
+        lines.extend(
+            [
+                "## Legality",
+                "",
+                "Two rates, because they answer different questions. **argmax** is the share of "
+                "validation positions whose single most likely token is a legal move, with no "
+                "temperature, no top-k and no mask: it is a property of the weights and it is "
+                "the definition behind the \u2265 99 % bar of `GOAL.md`. **sampled** draws the "
+                "token exactly as the demo does" + drawn.strip() + ", so it is what a player "
+                "would meet with the mask switched off, and it is always the lower of the two.",
+                "",
+                "| Definition | Positions | Legal | Rate |",
+                "|---|---:|---:|---:|",
+            ]
+        )
+        for measured in (result.legality_argmax, result.legality_sampled):
+            if measured is not None:
+                lines.append(
+                    f"| {measured.mode} | {measured.positions} | {measured.legal} | "
+                    f"{_percent(measured.rate)} |"
+                )
+        lines.append("")
+```
+
+<Src file="src/rukh/eval/report.py" tag="p2" lines="177-199" />
+
+```python title="src/rukh/eval/report.py"
+    if result.accuracy is not None and result.accuracy.bands:
+        lines.extend(
+            [
+                "## Next-move accuracy by Elo band",
+                "",
+                "| Band | Positions | Top-1 | Top-3 |",
+                "|---|---:|---:|---:|",
+            ]
+        )
+        lines.extend(
+            f"| {band.band} | {band.positions} | {_percent(band.top1)} | {_percent(band.top3)} |"
+            for band in result.accuracy.bands
+        )
+        lines.append("")
+    if result.puzzles is not None and result.puzzles.bands:
+        lines.extend(
+            [
+                "## Puzzles by difficulty band",
+                "",
+                "| Band | Attempted | Solved | Rate |",
+                "|---|---:|---:|---:|",
+            ]
+        )
+        lines.extend(
+            f"| {band.band} | {band.attempted} | {band.solved} | {_percent(band.rate)} |"
+            for band in result.puzzles.bands
+        )
+        lines.append("")
+```
+
+<Src file="src/rukh/eval/report.py" tag="p2" lines="200-227" />
+
+```python title="src/rukh/eval/report.py"
+    if result.elo is not None:
+        lines.extend(["## Games against Stockfish", ""])
+        if result.elo.rungs:
+            lines.extend(
+                [
+                    "| Rung | Opponent Elo | Games | W | D | L | Score | Cut | Adjudicated |",
+                    "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+                ]
+            )
+            lines.extend(
+                f"| {rung.name} | {rung.opponent_elo} | {rung.games} | {rung.wins} | "
+                f"{rung.draws} | {rung.losses} | {rung.score:.3f} | {rung.cut} | "
+                f"{rung.adjudicated} |"
+                for rung in result.elo.rungs
+            )
+            lines.append("")
+        lines.extend(
+            [
+                f"{result.elo.cut} of {result.elo.games} games hit the context limit; "
+                f"{result.elo.adjudicated} of those were adjudicated on the final position "
+                "(shallow engine analysis, or the material count when no engine was available) "
+                "rather than scored as draws.",
+                "",
+            ]
+        )
+        if result.elo.separated:
+            lines.extend(
+                [
+                    "Every game went the same way, so the logistic fit has no maximum inside the "
+                    "range of opponents and a bootstrap interval would be zero wide. The table "
+                    "gives a one-sided 95 % likelihood bound instead: the rating is on that side "
+                    "of the bound, and the games say nothing about how far.",
+                    "",
+                ]
+            )
+    if result.notes:
+        lines.extend(["## Notes", ""])
+        lines.extend(f"- {note}" for note in result.notes)
+        lines.append("")
+    return "\n".join(lines)
+```
+
+<Src file="src/rukh/eval/report.py" tag="p2" lines="228-267" />
+
+```python title="src/rukh/eval/report.py"
+class ReportPaths(BaseModel):
+    """Where a report landed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    markdown: str
+    results: str
+    web: str | None = None
+
+
+def write_report(
+    result: SuiteResult, out_dir: Path, web_results: Path | None = None
+) -> ReportPaths:
+    """Write ``report.md`` and ``results.json`` and upsert the shared web row."""
+    directory = Path(out_dir) / result.stage
+    directory.mkdir(parents=True, exist_ok=True)
+    markdown = directory / REPORT_NAME
+    markdown.write_text(render_markdown(result), encoding="utf-8", newline="\n")
+    results = directory / RESULTS_NAME
+    results.write_text(
+        result.model_dump_json(indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    web: str | None = None
+    if web_results is not None:
+        upsert_row(Path(web_results), row_of(result))
+        web = Path(web_results).as_posix()
+    return ReportPaths(markdown=markdown.as_posix(), results=results.as_posix(), web=web)
+```
+
+<Src file="src/rukh/eval/report.py" tag="p2" lines="270-298" />
+
+Ciento sesenta líneas de construir cadenas, y lo único que merece comentario es qué se ha decidido
+imprimir siempre. La tabla de titulares lleva las ocho métricas aunque cinco sean `n/a`; la sección
+de legalidad lleva **su definición en prosa** cada vez, con la temperatura y el top-k reales
+interpolados; y la de partidas dice cuántas se cortaron y cuántas se adjudicaron incluso cuando son
+cero. Un informe que omite las secciones vacías obliga a recordar qué debería haber; uno que las
+imprime con `n/a` se lee solo.
+
+## El paquete y las dos suites
+
+```python title="src/rukh/eval/__init__.py"
+"""Evaluation harness: legality, next-move accuracy, puzzles, Elo, cache and reporting."""
+
+from rukh.eval.accuracy import AccuracyResult, BandAccuracy, accuracy, elo_band
+from rukh.eval.cache import EvalCache, config_sha, file_sha
+from rukh.eval.elo import (
+    DEFAULT_RUNGS,
+    EloResult,
+    EloRung,
+    GameRecord,
+    RungResult,
+    bootstrap_ci,
+    estimate,
+    fit_elo,
+    one_sided_bound,
+    play_rung,
+    play_rungs,
+    record_of,
+    score_of,
+    separation,
+)
+from rukh.eval.legality import (
+    LegalityResult,
+    Position,
+    board_of,
+    legality,
+    position_at,
+    sample_positions,
+)
+from rukh.eval.puzzles import (
+    PuzzleAttempt,
+    PuzzleItem,
+    PuzzleResult,
+    load_puzzles,
+    model_source,
+    run_puzzles,
+    solve_puzzle,
+)
+from rukh.eval.report import (
+    ReportPaths,
+    WebRow,
+    elo_line,
+    render_markdown,
+    row_of,
+    upsert_row,
+    write_report,
+)
+from rukh.eval.suite import (
+    EvalConfig,
+    SuiteResult,
+    evaluate,
+    hub_checkpoint,
+    is_hub_id,
+    load_suite,
+    resolve_model,
+    run_suite,
+)
+```
+
+<Src file="src/rukh/eval/__init__.py" tag="p2" lines="1-56" />
+
+```python title="src/rukh/eval/__init__.py"
+__all__ = [
+    "DEFAULT_RUNGS",
+    "AccuracyResult",
+    "BandAccuracy",
+    "EloResult",
+    "EloRung",
+    "EvalCache",
+    "EvalConfig",
+    "GameRecord",
+    "LegalityResult",
+    "Position",
+    "PuzzleAttempt",
+    "PuzzleItem",
+    "PuzzleResult",
+    "ReportPaths",
+    "RungResult",
+    "SuiteResult",
+    "WebRow",
+    "accuracy",
+    "board_of",
+    "bootstrap_ci",
+    "config_sha",
+    "elo_band",
+    "elo_line",
+    "estimate",
+    "evaluate",
+    "file_sha",
+    "fit_elo",
+    "hub_checkpoint",
+    "is_hub_id",
+    "legality",
+    "load_puzzles",
+    "load_suite",
+    "model_source",
+    "one_sided_bound",
+    "play_rung",
+    "play_rungs",
+    "position_at",
+    "record_of",
+    "render_markdown",
+    "resolve_model",
+    "row_of",
+    "run_puzzles",
+    "run_suite",
+    "sample_positions",
+    "score_of",
+    "separation",
+    "solve_puzzle",
+    "upsert_row",
+    "write_report",
+]
+```
+
+<Src file="src/rukh/eval/__init__.py" tag="p2" lines="58-108" />
+
+Cien líneas de reexportes y una sola decisión: que el nombre público sea `rukh.eval`. Nada fuera del
+paquete importa `rukh.eval.legality`, salvo los tests, que necesitan el objeto módulo para
+sustituirle una función.
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/full.yaml"
+# Full evaluation suite (docs/spec/02, component 5): the numbers that go in the results table.
+# Hours of Stockfish games; the SQLite cache makes a re-run cheap.
+games: data/uci/year=2025/month=02/games.parquet
+puzzles: data/puzzles/puzzles.parquet
+puzzle_split: test
+legality_positions: 10000
+accuracy_positions: 10000
+position_pool: 50000
+puzzles_per_band: 2000
+elo_games: 100
+# 0.1 s per move: below that `UCI_Elo` is not calibrated at all (D-025).
+elo_move_time: 0.1
+bootstrap: 1000
+temperature: 0.6
+top_k: 20
+block: 200
+seed: 42
+out_dir: artifacts/eval
+web_results: artifacts/web/results.json
+cache_db: artifacts/eval/cache.sqlite
+# device: null -> CUDA when it is available (rukh.train.pick_device)
+track: true
+```
+
+<Src file="configs/eval/full.yaml" tag="p2" lines="1-22" />
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/quick.yaml"
+# Quick suite: the same metrics with a tenth of the work, for iterating on `tiny`.
+# The numbers it produces are noisy on purpose; the table is written from `full`.
+games: data/uci/year=2025/month=02/games.parquet
+puzzles: data/puzzles/puzzles.parquet
+puzzle_split: test
+legality_positions: 1000
+accuracy_positions: 1000
+position_pool: 20000
+puzzles_per_band: 200
+elo_games: 20
+# 0.1 s per move: below that `UCI_Elo` is not calibrated at all (D-025).
+elo_move_time: 0.1
+bootstrap: 500
+temperature: 0.6
+top_k: 20
+block: 200
+seed: 42
+out_dir: artifacts/eval
+web_results: artifacts/web/results.json
+cache_db: artifacts/eval/cache.sqlite
+# device: null -> CUDA when it is available (rukh.train.pick_device)
+track: true
+```
+
+<Src file="configs/eval/quick.yaml" tag="p2" lines="1-22" />
+
+Las dos suites, veintidós líneas cada una, y solo cambian cinco claves: `legality_positions` y
+`accuracy_positions` (10 000 → 1 000), `position_pool` (50 000 → 20 000), `puzzles_per_band`
+(2 000 → 200), `elo_games` (100 → 20) y `bootstrap` (1 000 → 500). El comentario de `quick.yaml` es
+lo que evita el malentendido: **los números que produce son ruidosos a propósito, y la tabla se
+escribe desde `full`**.
+
+Cuenta las partidas: `full.yaml` pide 100 por escalón, ocho escalones, **800 partidas**. A 0,1
+segundos por jugada y unas cien jugadas por partida, eso son horas, y es la razón de que la caché
+exista.
+
+## El comando
+
+```python title="src/rukh/cli.py"
+@app.command("eval")
+def eval_cmd(
+    model: Annotated[
+        str,
+        typer.Option("--model", help="Checkpoint path or Hub id (owner/name) to evaluate."),
+    ],
+    suite: Annotated[str, typer.Option("--suite", help="Suite name: full or quick.")] = "full",
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config", exists=True, dir_okay=False, readable=True, help="Suite YAML override."
+        ),
+    ] = None,
+    stage: Annotated[
+        str | None, typer.Option("--stage", help="Row name in the results table.")
+    ] = None,
+    no_cache: Annotated[
+        bool, typer.Option("--no-cache", help="Recompute every game and puzzle.")
+    ] = False,
+    device: Annotated[
+        str | None,
+        typer.Option("--device", help="Where to run: cuda, cpu... (default: the training device)."),
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the result as JSON only.")] = False,
+) -> None:
+    """Measure legality, next-move accuracy, puzzles and Elo, and write the report."""
+    from rukh.eval import load_suite, run_suite
+    from rukh.eval.report import elo_line
+    from rukh.eval.suite import SUITES, is_hub_id
+
+    if suite not in SUITES:
+        typer.echo(f"error: --suite must be one of {', '.join(SUITES)}", err=True)
+        raise typer.Exit(code=2)
+    if not Path(model).is_file() and not is_hub_id(model):
+        typer.echo(
+            f"error: --model {model!r} is neither an existing checkpoint nor a Hub id "
+            "of the form owner/name",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    cfg = load_suite(suite, config)
+    if stage is not None:
+        cfg = cfg.model_copy(update={"stage": stage})
+    result, report = run_suite(model, cfg, suite=suite, use_cache=not no_cache, device=device)
+    if as_json:
+        typer.echo(result.model_dump_json(indent=2))
+        return
+    typer.echo(f"stage:    {result.stage} ({result.params:,} parameters)")
+    typer.echo(f"suite:    {result.suite}{' (cache off)' if no_cache else ''} on {result.device}")
+    if result.legality_argmax:
+        typer.echo(f"legality: {result.legality_argmax.rate:.4f} argmax, unmasked")
+    if result.legality_sampled:
+        typer.echo(f"          {result.legality_sampled.rate:.4f} sampled, unmasked")
+    if result.accuracy:
+        typer.echo(f"accuracy: top1 {result.accuracy.top1:.4f}  top3 {result.accuracy.top3:.4f}")
+    if result.puzzles:
+        typer.echo(f"puzzles:  {result.puzzles.rate:.4f} solved")
+    if result.elo:
+        typer.echo(f"elo:      {elo_line(result.elo)} over {result.elo.games} games")
+    for note in result.notes:
+        typer.echo(f"note:     {note}")
+    typer.echo(f"report:   {report.markdown}")
+    typer.echo(f"results:  {report.results}")
+    if report.web:
+        typer.echo(f"table:    {report.web}")
+```
+
+<Src file="src/rukh/cli.py" tag="p2" lines="431-496" />
+
+`--model` acepta una ruta **o** un identificador del Hub, y la validación de la forma ocurre antes de
+cargar nada. `--stage` nombra la fila de la tabla, que es lo que permite evaluar los mismos pesos
+con dos muestreos distintos y que salgan dos filas comparables. `--no-cache` es para medir el
+harness. Y las notas se imprimen en la consola además de escribirse en el informe: son las
+advertencias, y una advertencia que solo está en un fichero que nadie abre no es una advertencia.
+
+## Lo que midió `small`
+
+Primero, la suite rápida sobre `tiny`, que es el contraejemplo del módulo.
+
+```bash title="Terminal"
+uv run rukh eval --model checkpoints/tiny/best.pt --suite quick
+```
+
+El informe que escribió esa ejecución, `artifacts/eval/tiny/report.md`, real y sin recortar:
+
+```markdown
+# Evaluation of `tiny`
+
+- Suite: `quick`
+- Checkpoint: `checkpoints/tiny-20260919-061533/best.pt`
+- Weights SHA-256: `4591cf8cca0b91b38fc3c4969c7bbf18aa5d3b4b79b36558727b981c24df281a`
+- Parameters: 5,309,952
+- Device: `cuda`
+- Date: 2026-09-19
+- MLflow run: b1836b7e8934483693df84ff2f090a3d
+
+## Headline
+
+| Metric                                               | Value                 |
+| ---------------------------------------------------- | --------------------- |
+| Legality without the mask, argmax                    | 94.5 %                |
+| Legality without the mask, sampled (T=0.6, top-k 20) | 93.8 %                |
+| Top-1 next move                                      | 40.3 %                |
+| Top-3 next move                                      | 67.1 %                |
+| Puzzles solved                                       | n/a                   |
+| Estimated Elo                                        | 64 (95 % CI -200-292) |
+| Mean centipawn loss                                  | n/a                   |
+| Opening diversity                                    | n/a                   |
+
+## Legality
+
+Two rates, because they answer different questions. **argmax** is the share of validation positions whose single most likely token is a legal move, with no temperature, no top-k and no mask: it is a property of the weights and it is the definition behind the milestone's ≥ 99 % bar. **sampled** draws the token exactly as the demo does(T=0.6, top-k 20), so it is what a player would meet with the mask switched off, and it is always the lower of the two.
+
+| Definition | Positions | Legal |   Rate |
+| ---------- | --------: | ----: | -----: |
+| argmax     |      1000 |   945 | 94.5 % |
+| sampled    |      1000 |   938 | 93.8 % |
+
+## Next-move accuracy by Elo band
+
+| Band      | Positions |  Top-1 |  Top-3 |
+| --------- | --------: | -----: | -----: |
+| 1800-2000 |       543 | 38.9 % | 66.1 % |
+| 2000-2200 |       328 | 45.4 % | 71.0 % |
+| 2200-2400 |        97 | 33.0 % | 59.8 % |
+| 2400-2600 |        28 | 32.1 % | 64.3 % |
+| 2600+     |         4 | 50.0 % | 75.0 % |
+
+## Games against Stockfish
+
+| Rung     | Opponent Elo | Games |   W |   D |   L | Score | Cut | Adjudicated |
+| -------- | -----------: | ----: | --: | --: | --: | ----: | --: | ----------: |
+| skill-0  |          800 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+| skill-1  |          950 |    20 |   0 |   1 |  19 | 0.025 |   0 |           0 |
+| skill-2  |         1100 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+| skill-3  |         1250 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+| uci-1320 |         1320 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+| uci-1500 |         1500 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+| uci-1800 |         1800 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+| uci-2000 |         2000 |    20 |   0 |   0 |  20 | 0.000 |   0 |           0 |
+
+0 of 160 games hit the context limit; 0 of those were adjudicated on the final position (shallow engine analysis, or the material count when no engine was available) rather than scored as draws.
+
+## Notes
+
+- legality_argmax is the share of validation positions where the single most likely token is a legal move (no temperature, no top-k, no mask): this is the milestone's >= 99 % bar. legality_sampled draws the token the way the demo does (temperature 0.6, top-k 20) and is always the lower of the two.
+- puzzles not found at …\rukh\data\puzzles\puzzles.parquet: puzzle suite skipped
+- the Elo interval covers sampling noise only: the four `skill-*` rungs are nominal `Skill Level` anchors rather than measured ratings, and Stockfish plays at 0.1 s per move, far below any setting `UCI_Elo` is calibrated for
+```
+
+Léelo entero. En tres minutos de GPU, `tiny` aprende bastante: la pérdida de validación baja de 4,59
+a 2,02, el top-1 llega al **40,3 %** y el **94,5 %** de sus argmax son jugadas legales. Es muchísimo
+para un modelo que no ha visto un tablero en su vida. Y es del todo insuficiente: el listón del hito
+es ≥ 99 %, y 94,5 % significa que una de cada dieciocho jugadas propuestas es imposible en la
+posición. Contra Stockfish el resultado es demoledor: **cero victorias en 160 partidas**, unas
+tablas sueltas contra el escalón más bajo, y un Elo estimado de **64 con un intervalo del 95 % que va
+de −200 a 292**, es decir, un intervalo tan ancho que lo único que dice es «no gana nunca».
+
+Fíjate en la última línea de las notas de la suite rápida: los puzles se saltaron porque el parquet
+no estaba en disco, así que esa fila sale `n/a` en vez de cero. Es el comportamiento del docstring de
+`suite.py`, visto en funcionamiento.
+
+`tiny` existe para eso: para que cuando `small` dé 99,4 % de legalidad sepas de dónde viene y cuánto
+costó cada punto. Y para descubrir un fallo de tubería en tres minutos en vez de en cuarenta.
+
+### `small`, la suite completa
+
+```bash title="Terminal"
+uv run rukh eval --model checkpoints/small/best.pt --suite full --stage small-greedy
+```
+
+Salida real de la ejecución de referencia (RTX 5090):
+
+```text
+2026-09-19 10:00:22,143  evaluating checkpoints\small-20260919-062911\best.pt on cuda
+stage:    small-greedy (38,971,392 parameters)
+suite:    full on cuda
+legality: 0.9940 argmax, unmasked
+          0.9940 sampled, unmasked
+accuracy: top1 0.5110  top3 0.7940
+puzzles:  0.0107 solved
+elo:      1007 (95 % CI 920-1101) over 160 games
+report:   …/rukh/artifacts/eval/small-greedy/report.md
+results:  …/rukh/artifacts/eval/small-greedy/results.json
+table:    …/rukh/artifacts/web/results.json
+```
+
+Cuatro cosas de esa salida antes de mirar los números.
+
+**`stage: small-greedy` no es otro modelo**: son los mismos pesos evaluados con el muestreo casi
+determinista (temperatura 0,05, top-k 1). La misma suite sobre el mismo `best.pt` con el muestreo de
+la demo (temperatura 0,6, top-k 20) es la fila `small` de la tabla única, y da **1181 de Elo** en vez
+de 1359. Los dos números están publicados porque miden cosas distintas: uno es la fuerza del modelo,
+el otro es la fuerza con la que juega la demo. **La temperatura vale unos 180 puntos de Elo**, más
+que cualquier decisión de arquitectura de este módulo. Y fíjate en lo que eso hace con el criterio:
+los mismos pesos cumplen el listón de 1200 jugando a lo seguro y no lo cumplen jugando como la demo.
+Un Elo nunca es del fichero que te descargas; es del par modelo+muestreo, y una tabla que compare
+etapas tiene que fijar el muestreo antes de comparar nada.
+
+**`over 160 games`, no 800.** `configs/eval/full.yaml` pide `elo_games: 100` y
+`legality_positions: 10000`; esta tirada midió 1 000 posiciones y 20 partidas por escalón, así que no
+se lanzó con el fichero tal cual sino con una copia recortada por `--config`. Es la diferencia entre
+el ±54 del suelo teórico y el ±68 real, y es lo que hay que mirar antes de comparar dos filas de la
+tabla: **dos evaluaciones solo se comparan si la configuración es la misma**, y el `config` entero
+viaja dentro de `results.json` precisamente para poder comprobarlo.
+
+**`puzzles: 0.0107` es el handicap de la lección 5, no un resultado.** En `p2` el prompt de un puzle
+es la línea del puzle con una cabecera de 1800 fija, una forma que el modelo no vio nunca; M3
+reconstruye el prefijo real de la partida y los **mismos pesos** resuelven el **22,1 %**. El informe
+de abajo es el de la tirada corregida, y por eso su sección de puzles dice `Prompt: game-prefix`, una
+línea que el `report.py` de `p2` todavía no imprime.
+
+**`legality sampled` igual que `argmax`**, cosa que la teoría dice que no puede pasar… salvo con
+temperatura 0,05 y top-k 1, que es argmax con otro nombre. La igualdad no es un fallo: es la etapa
+`greedy` funcionando.
+
+El informe de la tirada con los puzles ya arreglados:
+
+```markdown
+# Evaluation of `small-greedy`
+
+- Suite: `full`
+- Checkpoint: `checkpoints/small-20260919-062911/best.pt`
+- Weights SHA-256: `7130d64ac1c409332dfd9b753281b38a7b0b434103eb1908533942e30c243f4e`
+- Parameters: 38,971,392
+- Device: `cuda`
+- Date: 2026-09-19
+- MLflow run: not tracked
+
+## Headline
+
+| Metric                                               | Value                   |
+| ---------------------------------------------------- | ----------------------- |
+| Legality without the mask, argmax                    | 99.4 %                  |
+| Legality without the mask, sampled (T=0.05, top-k 1) | 99.4 %                  |
+| Top-1 next move                                      | 51.1 %                  |
+| Top-3 next move                                      | 79.4 %                  |
+| Puzzles solved                                       | 22.1 %                  |
+| Estimated Elo                                        | 1007 (95 % CI 920-1101) |
+| Mean centipawn loss                                  | n/a                     |
+| Opening diversity                                    | n/a                     |
+
+## Legality
+
+| Definition | Positions | Legal |   Rate |
+| ---------- | --------: | ----: | -----: |
+| argmax     |      1000 |   994 | 99.4 % |
+| sampled    |      1000 |   994 | 99.4 % |
+
+## Next-move accuracy by Elo band
+
+| Band      | Positions |  Top-1 |   Top-3 |
+| --------- | --------: | -----: | ------: |
+| 1800-2000 |       543 | 49.9 % |  78.5 % |
+| 2000-2200 |       328 | 52.7 % |  79.9 % |
+| 2200-2400 |        97 | 52.6 % |  82.5 % |
+| 2400-2600 |        28 | 50.0 % |  78.6 % |
+| 2600+     |         4 | 50.0 % | 100.0 % |
+
+## Puzzles by difficulty band
+
+Prompt: game-prefix.
+
+| Band      | Attempted | Solved |   Rate |
+| --------- | --------: | -----: | -----: |
+| 1000-1500 |      2000 |    694 | 34.7 % |
+| 1500-2000 |      2000 |    423 | 21.1 % |
+| 2000+     |      2000 |    207 | 10.3 % |
+
+## Games against Stockfish
+
+| Rung     | Opponent Elo | Games |   W |   D |   L | Score | Cut | Adjudicated |
+| -------- | -----------: | ----: | --: | --: | --: | ----: | --: | ----------: |
+| skill-0  |          800 |    20 |  10 |   1 |   9 | 0.525 |   2 |           2 |
+| skill-1  |          950 |    20 |   8 |   2 |  10 | 0.450 |   0 |           0 |
+| skill-2  |         1100 |    20 |   2 |   0 |  18 | 0.100 |   0 |           0 |
+| skill-3  |         1250 |    20 |   1 |   0 |  19 | 0.050 |   0 |           0 |
+| uci-1320 |         1320 |    20 |  10 |   1 |   9 | 0.525 |   1 |           1 |
+| uci-1500 |         1500 |    20 |   4 |   1 |  15 | 0.225 |   0 |           0 |
+| uci-1800 |         1800 |    20 |   4 |   0 |  16 | 0.200 |   1 |           1 |
+| uci-2000 |         2000 |    20 |   0 |   2 |  18 | 0.050 |   0 |           0 |
+
+4 of 160 games hit the context limit; 4 of those were adjudicated on the final position (shallow engine analysis, or the material count when no engine was available) rather than scored as draws.
+```
+
+Qué dice, sin adornos:
+
+- **Legalidad 99,4 % por argmax.** El listón del hito es ≥ 99 % y **se cumple**. 994 de 1 000
+  posiciones de validación tienen como token más probable una jugada legal, sin máscara, sin
+  temperatura y sin top-k. Es la métrica de comprensión del módulo.
+- **Top-1 51,1 % y top-3 79,4 %.** El modelo acierta la jugada humana una de cada dos veces, y la
+  tiene entre sus tres primeras cuatro de cada cinco. Por tramo de Elo apenas se mueve (49,9 % en
+  1800-2000, 52,7 % en 2000-2200), lo cual tiene sentido: imita la media del corpus, y el corpus es
+  sobre todo 1800-2000.
+- **Puzles 22,1 %**, con la pendiente que se espera: 34,7 % en 1000-1500, 21,1 % en 1500-2000 y
+  10,3 % en 2000+. Resolver un puzle exige acertar **toda** la secuencia, así que es una métrica
+  dura, y esa caída por dificultad es la señal de que mide algo real.
+- **Elo 1007, IC 95 % 920-1101.** El objetivo del hito para `small` es ≥ 1200, así que esta cifra
+  decía que faltaban casi doscientos puntos.
+
+## La escalera estaba torcida
+
+**Esa cifra de Elo era falsa, y la propia tabla de partidas llevaba la pista dentro.** El modelo
+puntúa 0,525 contra `skill-0` y contra `uci-1320`, se hunde a 0,100 contra `skill-2` y a 0,050 contra
+`skill-3`, y vuelve a marcar 0,225 contra `uci-1500`. Esa no monotonía es imposible si los ocho
+escalones están en una misma escala: los cuatro `skill-*` son valores nominales de `Skill Level`
+—etiquetas que pusimos a mano, las que has leído en `DEFAULT_RUNGS`— y no ratings medidos.
+
+Ninguna medición del modelo puede resolverlo, porque el modelo es justo lo que se está midiendo.
+Motor contra motor sí: se hicieron jugar los escalones entre ellos, 40 partidas por pareja, a los
+mismos 0,1 s por jugada.
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Escalón   | Etiqueta que tenía | Medido   | Error |
+| --------- | ------------------ | -------- | ----- |
+| `skill-0` | 800                | **1381** | +581  |
+| `skill-1` | 950                | **1467** | +517  |
+| `skill-2` | 1100               | **1589** | +489  |
+| `skill-3` | 1250               | **1678** | +428  |
+
+</div>
+
+Los cuatro se habían metido en la escalera para llegar **por debajo** del suelo de 1320 de
+`UCI_Elo`, y ninguno llega. Con las etiquetas medidas, el mismo checkpoint, las mismas 160 partidas
+y el mismo ajuste dan **1359 Elo (IC 1293-1429)**. El listón de 1200 nunca se falló; la regla estaba
+torcida y lo estuvo durante meses, mirada muchas veces.
+
+La corrección es cambiar cuatro números de `DEFAULT_RUNGS`, y no está en `p2`: llegó con la etiqueta
+`p3-elo-1200`, que es la que M3 usa. El bloque de arriba es el de `p2` **a propósito**, porque el
+error es parte de la lección.
+
+Y hay un detalle del arreglo que vale más que el arreglo: `uci-1500` midió **+179** Elo sobre
+`uci-1320` cuando lo nominal son +180. Ese no era un dato bonito, era **el control**. Si el
+procedimiento hubiera estado sesgado, ese número habría fallado y no habría forma de fiarse del
+resto. De ahí sale la regla: **un banco de pruebas necesita al menos un punto cuya respuesta
+conoces de antemano, y se comprueba cada vez que se toca.** (`UCI_Elo` sí se comprime más arriba:
+`uci-1800` midió +215 sobre `uci-1500`, no +300; es una salvedad para los escalones altos, no para
+el rango en el que jugamos.)
+
+El intervalo del 95 % nunca habría avisado: solo cubre el ruido de muestreo de 160 partidas, y el
+sesgo del banco de pruebas no está dentro de él. Es la frase que dejamos apuntada en `bootstrap_ci`.
+
+<Transfer concept="Validez del instrumento, y por qué un sesgo sistemático respeta lo relativo" where="Una rúbrica de LLM-como-juez donde «3 = aceptable» lo definiste tú y nunca se calibró.">
+  El error fue tratar un número que escribiste tú como si lo hubieras medido. Las etiquetas
+  800/950/1100/1250 salían de una suposición sobre los niveles del motor que nadie comprobó nunca.
+  Lo mismo, sin tablero:
+
+- Una rúbrica de juez donde las notas las definiste tú y no se contrastaron con juicios humanos.
+- Una evaluación de RAG cuyas respuestas correctas las escribió el mismo modelo que evalúas.
+- Un umbral de latencia medido con un reloj que deriva.
+
+Y la asimetría que hay que llevarse, porque es lo que decide qué hay que rehacer: un sesgo
+sistemático **mata lo absoluto y respeta lo relativo**.
+
+Imagina una cinta métrica en la que el dueño anterior repasó a boli cuatro de las marcas, y las
+puso mal. Todo lo que has medido con ella está equivocado en centímetros. Pero si con esa misma
+cinta mediste tres estanterías y anotaste cuál era la más alta, ese orden sigue siendo correcto:
+el error se fue en la misma dirección en las tres. Aquí pasó eso: los cuatro modelos subieron por
+igual, las comparaciones entre ellos aguantaron y solo hubo que corregir las cifras publicadas. Si
+el sesgo hubiera dependido del modelo —una cinta que se estira más cuanto más larga es la
+estantería— no se habría salvado nada.
+
+</Transfer>
+
+## Los tests del harness
+
+Cuatro ficheros, 823 líneas, y no se pegan aquí: son tests de ensamblaje —que la suite se salte lo
+que falta, que el informe imprima lo que hay, que un puzle se resuelva entero— y su valor está en
+existir más que en leerse. Los contratos que **sí** hay que leer línea a línea están en las lecciones
+anteriores. Lo que garantiza cada uno:
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Fichero                                                                                                         | Líneas | Qué garantiza                                                                                                                        |
+| --------------------------------------------------------------------------------------------------------------- | -----: | ------------------------------------------------------------------------------------------------------------------------------------ |
+| [`tests/unit/test_elo.py`](https://github.com/borja-glez/rukh/blob/p2/tests/unit/test_elo.py)                   |    280 | Que el ajuste recupera un Elo conocido, que el bootstrap da un intervalo que lo contiene, y que una tirada separada sale con su cota |
+| [`tests/unit/test_eval_suite.py`](https://github.com/borja-glez/rukh/blob/p2/tests/unit/test_eval_suite.py)     |    181 | Que un parquet ausente, unos puzles ausentes o un Stockfish ausente producen notas y no excepciones                                  |
+| [`tests/unit/test_report.py`](https://github.com/borja-glez/rukh/blob/p2/tests/unit/test_report.py)             |    188 | Que el _upsert_ sustituye la fila de una etapa en vez de duplicarla, y que la celda de Elo dice cuál de las tres situaciones es      |
+| [`tests/unit/test_eval_puzzles.py`](https://github.com/borja-glez/rukh/blob/p2/tests/unit/test_eval_puzzles.py) |    154 | Que un puzle solo cuenta resuelto con la línea entera, y que `correct` registra hasta dónde llegó                                    |
+
+</div>
+
+<Exercise n="01" title="¿Cuántas partidas necesitas para creerte una mejora de 40 Elo?">
+  Usando la fórmula de la varianza de la primera sección —`var = 1 / (c² · Σ p(1−p))` con
+  `c = 0,005756`— calcula cuántas partidas con resultados cercanos al 50 % hacen falta para que la
+  desviación típica del Elo baje a 20 puntos. Después: si comparas dos modelos, ¿basta con que sus
+  intervalos del 95 % no se solapen?
+
+  <Solution>
+    Con `p = 0,5`, `Σ p(1−p) = 0,25·n`, así que `var = 1 / (0,005756² · 0,25 n) = 1 / (8,28e-6 · n)`.
+    Para una desviación de 20 hace falta `var = 400`, es decir `n = 1 / (8,28e-6 · 400) ≈ 302`
+    partidas. Para 10 puntos harían falta unas 1 208: la precisión va con la raíz, así que **dividir
+    el error por dos cuesta cuatro veces más partidas**. La tirada real jugó 160, con una desviación
+    de unos 27 puntos en el mejor caso; `full.yaml` entero jugaría 800 y bajaría a unos 12.
+
+Y no, los intervalos que no se solapan no son el criterio correcto: es una prueba demasiado
+conservadora (dos intervalos pueden solaparse y la diferencia ser significativa). Lo correcto es
+estimar el intervalo **de la diferencia**. Y, mucho mejor que cualquiera de las dos cosas,
+enfrentar los dos modelos directamente entre sí: comparar A y B contra un tercero acumula el error
+de dos estimaciones, mientras que el emparejamiento directo mide lo que te importa. Es la misma
+razón por la que las listas de motores se construyen con torneos y no con puntuaciones
+independientes, y es lo que M5 acaba construyendo.
+
+  </Solution>
+</Exercise>
+
+<Exercise n="02" title="Provoca una separación y mira qué publica el informe">
+  Evalúa `tiny` contra un único escalón imposible: copia `configs/eval/quick.yaml`, déjale un solo
+  `elo_rungs` con `uci-2000` y baja `elo_games` a 6. `tiny` perderá las seis. ¿Qué imprime la celda
+  de Elo del informe y qué campos trae `results.json`?
+
+  <Solution>
+    `separation` devuelve `"losses"`, así que `estimate` no llama al bootstrap: pone
+    `separated: true` y calcula `one_sided_bound(..., lower=False)`. `elo_line` imprime
+    `< <cifra> (one-sided 95 % bound; every game lost)` y el informe añade el párrafo que explica
+    que la verosimilitud no tiene máximo dentro del rango de rivales. En `results.json`, `ci_low` y
+    `ci_high` son `null`, `elo_upper` trae la cota y `elo_separated` es `true`; `WebRow.elo_ci`
+    también queda `null`, que es lo que la tabla de la web necesita para no dibujar un intervalo
+    inexistente.
+
+Lo que hay que llevarse: sin esa rama, el bootstrap habría devuelto mil veces el mismo recorte de
+`SLACK` y el informe habría publicado un intervalo de **anchura cero**, que es la forma más
+convincente que tiene un número de mentir.
+
+  </Solution>
+</Exercise>
+
+## Qué has aprendido
+
+Cómo se convierte un puñado de partidas en un número con su incertidumbre, y las tres formas de que
+ese número mienta: una partida cortada apuntada como tablas, una tirada separada con un intervalo
+simétrico, y una escalera de rivales cuyas etiquetas nadie midió. Las dos primeras están resueltas
+en el código; la tercera costó 350 puntos y se arregló un hito después.
+
+**Cómo se mide**: `uv run rukh eval --model checkpoints/small/best.pt --suite full` escribe
+`report.md`, `results.json` y una fila en `artifacts/web/results.json`. Para `small`: legalidad
+**99,4 %** por argmax (listón ≥ 99 %, cumplido), top-1 **51,1 %**, top-3 **79,4 %**, puzles **22,1 %**
+con el prompt arreglado, y **1359 de Elo (IC 1293-1429)** con los escalones medidos.
+
+Lo siguiente es sacar el modelo de PyTorch: ONNX, dos cuantizaciones y una prueba de paridad que
+mide si el fichero que descarga el navegador elige la misma jugada.
