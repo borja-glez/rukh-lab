@@ -1,0 +1,1747 @@
+---
+title: 'Diversidad y barridos: dos veredictos en vez de uno'
+description:
+  'eval/diversity.py —la entropía de aperturas que llevaba tres hitos saliendo n/a, en dos números
+  que fallan de maneras distintas— y eval/sweep.py —la suite corrida una vez por condición con un
+  solo número cambiado—, más la recalibración de la escalera de Stockfish, el force_header que hace
+  legible la tabla y las nueve configuraciones de evaluación del hito.'
+module: m4
+order: 7
+duration: 215
+runtime: 180
+level: avanzado
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - entropía de aperturas
+  - diversidad
+  - monotonía
+  - intervalo de confianza
+  - Elo
+  - bootstrap
+  - potencia estadística
+---
+
+Lección 7 de 10 del módulo «Fine-tuning e instrucción». Viene de «Adaptadores y publicación» y sigue
+en «El selector en la demo».
+
+## Qué vas a construir
+
+Los dos instrumentos con los que se mide este hito y sin los cuales sus conclusiones no se podrían
+afirmar.
+
+`src/rukh/eval/diversity.py` mide cuántas partidas distintas está dispuesto a jugar un modelo, con
+dos números que contestan preguntas distintas y fallan de maneras distintas.
+`src/rukh/eval/sweep.py` corre la suite entera **una vez por condición** cambiando un solo número, y
+emite **dos** veredictos: si las estimaciones suben y si los intervalos se separan.
+
+Por el camino, la escalera de Stockfish se recalibra —y eso mueve el Elo de todas las etapas
+publicadas—, y aparece una bandera, `force_header`, que existe para una sola medición y sin la cual
+la tabla del barrido sería ambigua justo en lo que no puede ser ambigua.
+
+## Cómo se mide y contra qué
+
+Al terminar esta sección sabrás por qué el criterio de este hito son dos afirmaciones y no una, qué
+mide cada columna del barrido, y qué métrica del spec llevaba tres hitos saliendo `n/a` y por qué
+hacía falta ahora.
+
+### «Monótono» y «separado» no son lo mismo
+
+El plan del hito pide para P4: _Elo por condición monótono (1500 < 2000 < 2400 con IC)_. Esa frase
+esconde dos afirmaciones distintas y hay que medirlas por separado, porque una es barata y la otra es
+la que vale.
+
+**Monótono** quiere decir que las estimaciones puntuales suben con la condición. Es fácil de
+conseguir por casualidad: con tres números y ruido, la probabilidad de que salgan ordenados por azar
+es una de seis.
+
+**Separado** quiere decir que los <Term id="intervalo-de-confianza">intervalos de confianza</Term>
+consecutivos no se solapan. Eso ya no pasa por casualidad: es la afirmación de que la diferencia
+sobrevive al ruido de la medición.
+
+Tres equipos con 40, 41 y 42 puntos en una clasificación que se mide con ±3 de error están
+ordenados —eso es un hecho— y no se sabe cuál es mejor —eso es lo que importa—. Monótono es el
+orden; separado es que el orden signifique algo.
+
+Y hay una tercera pregunta que solo aparece cuando la segunda sale que no, que es lo que le pasó a
+este hito: **si no están separados, ¿es porque faltan partidas o porque no hay diferencia?** Las dos
+se escriben igual en el informe y no se parecen en nada. Se contesta con aritmética, no con más
+máquina, y el lab 6 la contesta con los números delante.
+
+El proyecto ya se quemó con esto. En el hito anterior, una prueba de 32 partidas dio 0,703 contra
+0,609 a favor de `<2600>` frente a `<1800>` y pareció una victoria del condicionamiento. Con 160
+partidas se cayó: 1058 frente a 1095, con los intervalos casi superpuestos. La conclusión hubo que
+retirarla.
+
+### Un solo número cambia entre filas
+
+El barrido corre la misma suite una vez por condición: mismos rivales de Stockfish, mismas
+posiciones de validación, mismos puzles, misma semilla, misma temperatura. Lo único que cambia son
+los dos tokens de cabecera. Cualquier cosa que difiera entre filas es la condición, y eso es lo que
+hace que la tabla se pueda leer.
+
+Hay un detalle que casi arruina esa propiedad y que conviene contar porque es el tipo de error que
+se publica sin que nadie lo note. Los puzles del conjunto llevan **el Elo real** de los jugadores de
+la partida de la que salieron, y `start_history` los usa cuando están. Correcto para medir puzles;
+desastroso para un barrido: la columna de puzles habría salido **idéntica en las seis filas**, que
+es indistinguible de la evidencia de que la condición no hace nada. De ahí `force_header`.
+
+### ¿Juega peor o juega ilegal?
+
+La <Term id="legalidad">legalidad</Term> sin máscara vuelve al barrido como columna propia, y no es
+decorativa. Si el modelo condicionado a 1200 empeora, hay dos maneras muy distintas de empeorar:
+elegir jugadas legales peores —que es lo que hace un humano débil— o proponer jugadas que no
+existen —que es lo que hace un modelo que ha dejado de entender el tablero—.
+
+La primera sería un dial que funciona. La segunda sería un dial roto con aspecto de funcionar,
+porque la máscara de legalidad de la demo esconde las jugadas ilegales y el jugador solo vería que
+el rival es más flojo. Medir las dos cosas por separado es lo que distingue «aprendió a imitar a un
+1200» de «se le deshizo el modelo al leer un token que apenas ha visto».
+
+### Entropía de aperturas: la métrica que llevaba tres hitos vacía
+
+El spec de diseño del proyecto lista, desde el primer día, una columna de diversidad: _entropía de
+las aperturas jugadas en 200 partidas propias_. Ha salido `n/a` en todos los informes del proyecto,
+porque hasta ahora ninguna afirmación la necesitaba.
+
+Este módulo la necesita. El spec predice del afinado con maestros que _sube el Elo y baja la
+diversidad_, y esa frase tiene dos mitades: una tabla que solo mide la primera no puede comprobarla.
+
+## `diversity.py`: dos números y una razón
+
+```python title="src/rukh/eval/diversity.py"
+"""Opening diversity: how many different games the model is willing to play.
+
+``docs/spec/02`` lists it in the evaluation table -- "entropy of the openings played in 200 games
+of its own" -- and it has been ``n/a`` in every report so far. M4 needs it, because the claim the
+masters fine-tune makes is precisely a trade: *the Elo goes up and the diversity goes down*. A
+number that only measures the first half of that sentence cannot check it.
+
+Two numbers, because they answer different questions and fail in different ways.
+
+**The line entropy** plays ``games`` openings of the model against itself and measures the
+entropy of the distribution of distinct opening lines. It is the metric the spec asks for and it
+depends on the sampling: read at the deterministic setting the demo plays at, a decoder produces
+one single line and the entropy is exactly zero, which is true but says more about the sampler
+than about the weights. So it is reported together with the temperature it was read at, like
+every other number in this project (D-047).
+
+**The first-move entropy** is analytic: the entropy of the model's own distribution over the
+twenty legal first moves, with no sampling at all. It is a property of the weights, it has no
+variance between runs, and it is the one to compare across stages. A model that has been
+fine-tuned onto a narrow repertoire collapses it whatever the temperature.
+
+Self-play is batched: every game advances one ply at a time, all of them in one forward pass, so
+200 games of 12 plies are 12 passes of batch 200 rather than 2 400 passes of batch 1.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import Counter
+from typing import TYPE_CHECKING
+
+import chess
+import torch
+from pydantic import BaseModel, ConfigDict, Field
+
+from rukh.eval.legality import header
+from rukh.infer.sampler import SampleConfig, legal_token_ids, prompt_ids
+
+if TYPE_CHECKING:
+    from rukh.models import MoveDecoder
+    from rukh.tokenize.uci_vocab import UciTokenizer
+
+__all__ = [
+    "DiversityResult",
+    "first_move_distribution",
+    "first_move_entropy",
+    "opening_diversity",
+    "shannon_entropy",
+]
+```
+
+<Src file="src/rukh/eval/diversity.py" tag="p4" lines="1-49" />
+
+El docstring dice por qué hay dos números y no uno.
+
+**La entropía de líneas** juega N aperturas del modelo contra sí mismo y mide la entropía de Shannon
+de la distribución de líneas distintas. Es la métrica que pide el spec y **depende del muestreo**:
+leída al ajuste casi determinista con el que se comparan todas las etapas, cualquier decoder juega
+una sola partida y saca exactamente 0. Eso es verdad y dice más del muestreador que de los pesos, así
+que se lee a su propia temperatura y siempre se publica con ella al lado.
+
+**La entropía de la primera jugada** es analítica: la distribución del propio modelo sobre las
+veinte primeras jugadas legales, renormalizada, sin muestreo de ninguna clase. No tiene varianza
+entre tiradas, es una propiedad de los pesos, y es la que se puede comparar entre etapas tal cual.
+
+Y el último párrafo es la decisión de implementación: las auto-partidas van **en lote**. Las N
+avanzan un ply a la vez, todas en la misma pasada, así que 200 aperturas de 12 plies son 12 pasadas
+de lote 200 en vez de 2 400 pasadas de lote 1.
+
+```python title="src/rukh/eval/diversity.py"
+OPENING_PLIES = 12
+"""Six moves a side: long enough to have left the book, short enough that two games sharing it
+really are the same opening."""
+
+
+class DiversityResult(BaseModel):
+    """What ``opening_diversity`` measured, with the sampling it was measured at."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    games: int
+    plies: int
+    distinct_lines: int
+    entropy_bits: float
+    """Entropy of the distribution over opening lines, in bits."""
+    max_entropy_bits: float
+    """``log2(games)``: what the entropy would be if every game opened differently."""
+    normalised: float = Field(ge=0.0, le=1.0)
+    """``entropy_bits / max_entropy_bits``: 1 is a different opening every game, 0 is always
+    the same one. It is what makes two runs with different ``games`` comparable."""
+    first_move_entropy_bits: float
+    """Entropy of the model's distribution over the legal first moves; no sampling involved."""
+    temperature: float
+    top_k: int | None
+    top_lines: list[tuple[str, int]]
+    """The most played lines and how often, for the report; a collapsed model shows it here."""
+```
+
+<Src file="src/rukh/eval/diversity.py" tag="p4" lines="51-76" />
+
+`OPENING_PLIES = 12` con su docstring: seis jugadas por bando, lo bastante largo para haber salido
+del libro y lo bastante corto para que dos partidas que la comparten sean de verdad la misma
+apertura. Cualquiera de los dos extremos rompe la medición —a dos plies todo el mundo juega lo
+mismo, a cuarenta nadie repite nada—.
+
+`normalised` es el campo que hace comparables dos tiradas con distinto número de partidas: la
+entropía dividida por su techo, `log2(games)`. Sin él, «4,2 bits» significa cosas distintas con 200
+partidas que con 1 000.
+
+```python title="src/rukh/eval/diversity.py"
+def shannon_entropy(counts: dict[str, int] | Counter[str]) -> float:
+    """Entropy of a distribution given as counts, in bits. Empty or single-valued gives 0."""
+    total = sum(counts.values())
+    if total <= 0:
+        return 0.0
+    bits = -sum((n / total) * math.log2(n / total) for n in counts.values() if n > 0)
+    # A single outcome gives `-1 * log2(1)`, which is negative zero and renders as "-0.000".
+    return 0.0 if bits == 0 else bits
+```
+
+<Src file="src/rukh/eval/diversity.py" tag="p4" lines="79-86" />
+
+Ocho líneas de entropía de Shannon, y el comentario es el detalle que se ve en un informe: un solo
+resultado da `-1 · log2(1)`, que es **cero negativo** en coma flotante y se imprime como `-0.000`.
+Nadie confunde `-0.000` con un error del código y todo el mundo lo lee dos veces.
+
+```python title="src/rukh/eval/diversity.py"
+@torch.no_grad()
+def first_move_distribution(
+    model: MoveDecoder, tok: UciTokenizer, header_elo: int = 1800
+) -> dict[str, float]:
+    """The model's own probability for each of the twenty legal first moves, renormalised.
+
+    No temperature, no top-k, no sampling: the softmax as the weights produce it. That makes it
+    the right instrument for measuring what a style adapter *did* -- the share it moved towards
+    ``e2e4`` is a property of the weights, with no seed in it and no variance between runs, which
+    self-play openings could not give without playing hundreds of games to average the noise out.
+    """
+    board = chess.Board()
+    device = next(model.parameters()).device
+    idx = torch.tensor([header(tok, header_elo, header_elo)], dtype=torch.long, device=device)
+    logits = model.next_logits(idx)[0].float()
+    legal = legal_token_ids(board, tok)
+    kept = logits[torch.tensor(legal, dtype=torch.long, device=device)]
+    probs = torch.softmax(kept, dim=-1)
+    return {tok.ids[token]: float(p) for token, p in zip(legal, probs.tolist(), strict=True)}
+
+
+def first_move_entropy(model: MoveDecoder, tok: UciTokenizer, header_elo: int = 1800) -> float:
+    """Entropy in bits of the model's own distribution over the legal first moves.
+
+    No temperature, no top-k, no sampling: the softmax as the weights produce it, restricted to
+    the twenty legal moves and renormalised. The ceiling is ``log2(20) = 4.32`` bits for a model
+    that has no opinion at all; a strong human-imitating model sits well below that, and one
+    fine-tuned onto a single repertoire collapses towards zero.
+    """
+    probs = [p for p in first_move_distribution(model, tok, header_elo).values() if p > 0]
+    return float(-sum(p * math.log2(p) for p in probs))
+```
+
+<Src file="src/rukh/eval/diversity.py" tag="p4" lines="89-119" />
+
+Estas dos funciones son la medición más barata y más limpia del módulo: una pasada hacia delante
+sobre tres tokens y una softmax sobre veinte logits. No hay temperatura, ni top-k, ni semilla.
+
+Su docstring dice para qué sirve exactamente eso: es el instrumento correcto para medir qué
+**hizo** un adaptador de estilo, porque la proporción que movió hacia `e2e4` es una propiedad de los
+pesos. Contar aperturas de auto-partidas contestaría a la misma pregunta con ruido encima, y para
+llegar a la misma precisión habría que jugar cientos de partidas.
+
+El techo de `first_move_entropy` es `log2(20) = 4,32` bits para un modelo sin ninguna opinión. Un bit
+es una pregunta de sí o no: 1,6 bits dicen que con algo menos de dos preguntas binarias bien
+elegidas —«¿es de peón de rey?», «¿es `1. e4`?»— adivinas la primera jugada del modelo.
+
+```python title="src/rukh/eval/diversity.py"
+@torch.no_grad()
+def opening_diversity(
+    model: MoveDecoder,
+    tok: UciTokenizer,
+    games: int = 200,
+    plies: int = OPENING_PLIES,
+    sampling: SampleConfig | None = None,
+    header_elo: int = 1800,
+    seed: int = 42,
+) -> DiversityResult:
+    """Play ``games`` openings of the model against itself and measure how varied they are."""
+    cfg = sampling or SampleConfig()
+    device = next(model.parameters()).device
+    generator = torch.Generator(device=device).manual_seed(seed)
+    start = header(tok, header_elo, header_elo)
+
+    boards = [chess.Board() for _ in range(games)]
+    histories = [list(start) for _ in range(games)]
+    lines: list[list[str]] = [[] for _ in range(games)]
+    alive = list(range(games))
+
+    for _ in range(plies):
+        if not alive:
+            break
+        batch = [prompt_ids(histories[i], model.cfg.block) for i in alive]
+        # Every live game is at the same ply, so the batch is rectangular and needs no padding.
+        # That is worth an assertion rather than a pad: this model has *learned* position
+        # embeddings, so padding on the left would shift every real token to a position it was
+        # never trained at, and padding on the right would leave the last column holding a
+        # `<pad>` for the shorter rows. Both read the wrong distribution, silently.
+        width = len(batch[0])
+        if any(len(ids) != width for ids in batch):
+            raise RuntimeError("self-play games fell out of step; the batch cannot be padded")
+        padded = torch.tensor(batch, dtype=torch.long, device=device)
+        logits = model(padded)[0][:, -1, :].float()
+```
+
+<Src file="src/rukh/eval/diversity.py" tag="p4" lines="122-156" />
+
+El bucle de auto-partidas, y el comentario del medio es el que merece las cuatro líneas que ocupa.
+
+Todas las partidas vivas están en el **mismo ply**, así que el lote es rectangular por construcción y
+no necesita relleno. Y eso no es una comodidad: es una afirmación que hay que comprobar, porque este
+modelo tiene posiciones **aprendidas**.
+
+Rellenar por la izquierda desplazaría cada token real a una posición en la que nunca se entrenó.
+Rellenar por la derecha dejaría un `<pad>` en la columna que predice. Las dos leen la distribución
+equivocada **en silencio**. Por eso el código prefiere fallar: un `RuntimeError` en vez de un relleno.
+
+<Callout kind="roto" title="Un relleno que no da error y da otro modelo">
+  Las posiciones aprendidas son la razón. Un modelo con RoPE o con posiciones relativas toleraría un
+  relleno por la izquierda porque para él la posición absoluta no significa nada; el decoder de este
+  curso tiene una tabla de embeddings de posición entrenada, y el token de la casilla 7 leído en la
+  casilla 12 es un token distinto. El síntoma sería una entropía de aperturas ligeramente rara y
+  ninguna excepción. La regla que deja: cuando una optimización de lotes depende de una propiedad
+  del modelo, comprueba la propiedad en vez de confiar en ella.
+</Callout>
+
+```python title="src/rukh/eval/diversity.py"
+        still: list[int] = []
+        for row, index in enumerate(alive):
+            board = boards[index]
+            legal = legal_token_ids(board, tok)
+            if not legal:
+                continue
+            filtered = _mask(logits[row], legal, cfg)
+            probs = torch.softmax(filtered, dim=-1)
+            if cfg.temperature == 0:
+                token = int(torch.argmax(filtered))
+            else:
+                token = int(torch.multinomial(probs, 1, generator=generator))
+            uci = tok.ids[token]
+            move = chess.Move.from_uci(uci)
+            board.push(move)
+            histories[index].append(token)
+            lines[index].append(uci)
+            if not board.is_game_over():
+                still.append(index)
+        alive = still
+
+    counts = Counter(" ".join(line) for line in lines if line)
+    entropy = shannon_entropy(counts)
+    ceiling = math.log2(games) if games > 1 else 0.0
+    return DiversityResult(
+        games=games,
+        plies=plies,
+        distinct_lines=len(counts),
+        entropy_bits=entropy,
+        max_entropy_bits=ceiling,
+        normalised=min(entropy / ceiling, 1.0) if ceiling > 0 else 0.0,
+        first_move_entropy_bits=first_move_entropy(model, tok, header_elo),
+        temperature=cfg.temperature,
+        top_k=cfg.top_k,
+        top_lines=counts.most_common(5),
+    )
+```
+
+<Src file="src/rukh/eval/diversity.py" tag="p4" lines="158-193" />
+
+El resto del bucle es el muestreo por fila y la contabilidad. `alive`/`still` es lo que retira las
+partidas terminadas sin romper la propiedad rectangular: una partida que acaba en mate al ply 8 sale
+del lote, y las demás siguen en el mismo ply.
+
+`top_lines=counts.most_common(5)` es para el informe, y es lo que hace visible un modelo colapsado:
+cinco líneas con 40 partidas cada una se lee de un golpe donde «entropía 2,3 bits» no.
+
+```python title="src/rukh/eval/diversity.py"
+def _mask(logits: torch.Tensor, legal: list[int], cfg: SampleConfig) -> torch.Tensor:
+    """The legality mask, the temperature and the top-k of ``SampleConfig``, on one row.
+
+    Always masked, whatever ``cfg.mask_illegal`` says: this measures which *openings* the model
+    chooses, and an illegal token is not an opening. Legality has its own metric.
+    """
+    out = logits.clone()
+    keep = torch.zeros_like(out, dtype=torch.bool)
+    keep[torch.tensor(legal, dtype=torch.long, device=out.device)] = True
+    out = out.masked_fill(~keep, float("-inf"))
+    if cfg.temperature > 0:
+        out = out / cfg.temperature
+    if cfg.top_k is not None:
+        k = min(cfg.top_k, len(legal))
+        threshold = torch.topk(out, k).values[-1]
+        out = out.masked_fill(out < threshold, float("-inf"))
+    return out
+```
+
+<Src file="src/rukh/eval/diversity.py" tag="p4" lines="196-212" />
+
+Y la máscara, con su decisión en el docstring: **siempre enmascara**, diga lo que diga
+`cfg.mask_illegal`. Esto mide qué **aperturas** elige el modelo, y un token ilegal no es una apertura.
+La legalidad tiene su propia métrica y no debe contaminar esta.
+
+```python title="src/rukh/eval/report.py"
+def _diversity_section(detail: DiversityResult | None) -> list[str]:
+    """How varied the model's own openings are, and the two numbers that say it.
+
+    Split in two because they fail differently. The line entropy depends on the sampler -- at the
+    near-deterministic setting the stages are compared at, every decoder plays one opening and
+    scores 0 -- so it is read at its own temperature and always reported with it. The first-move
+    entropy has no sampler in it at all: it is the model's own distribution over the twenty legal
+    first moves, so it is the one to compare across stages.
+    """
+    if detail is None:
+        return []
+    top_k = "none" if detail.top_k is None else str(detail.top_k)
+    lines = [
+        "## Opening diversity",
+        "",
+        f"{detail.games} self-play openings of {detail.plies} plies, drawn at temperature "
+        f"{detail.temperature} with top-k {top_k}. **Not** the suite's sampling: at the "
+        "near-deterministic setting every stage plays one single opening and scores 0, which "
+        "measures the sampler and not the weights (D-047).",
+        "",
+        "| Metric | Value |",
+        "|---|---:|",
+        f"| Distinct opening lines | {detail.distinct_lines} of {detail.games} |",
+        f"| Line entropy | {detail.entropy_bits:.3f} bits of {detail.max_entropy_bits:.3f} |",
+        f"| Normalised | {detail.normalised:.3f} |",
+        f"| First-move entropy (no sampling) | {detail.first_move_entropy_bits:.3f} bits |",
+        "",
+        "Most played lines:",
+        "",
+        "| Line | Games |",
+        "|---|---:|",
+    ]
+    lines.extend(f"| `{line}` | {count} |" for line, count in detail.top_lines)
+    lines.append("")
+    return lines
+```
+
+<Src file="src/rukh/eval/report.py" tag="p4" lines="146-180" />
+
+Y la sección del informe, donde lo que importa es la frase que va **dentro** del Markdown generado:
+«**Not** the suite's sampling: at the near-deterministic setting every stage plays one single opening
+and scores 0, which measures the sampler and not the weights». Un número publicado sin la condición
+en la que se leyó invita a compararlo con otro leído de otra manera.
+
+<Callout kind="roto" title="Lo que una métrica de diversidad no mide">
+  La entropía de aperturas dice si el modelo varía, no si varía **bien**. Un modelo que juegue
+  veinte primeras jugadas distintas al azar saca una entropía magnífica y es peor que uno que juega
+  siempre `1. e4`. Por eso viaja siempre junto al Elo y nunca sola: la pareja «más fuerte y menos
+  variado» es un resultado, y «más variado» a secas no es ninguno.
+</Callout>
+
+## `sweep.py`: la suite una vez por condición
+
+```python title="src/rukh/eval/sweep.py"
+"""Measure one model once per Elo header: does asking it to play weaker actually work?
+
+``GOAL.md`` asks P4 for a monotonic Elo by condition -- 1500 < 2000 < 2400, with intervals -- and
+nothing in the harness could answer that, because ``header_elo`` was one number in a config and a
+suite run produced one row. This runs the very same suite once per condition, changing that
+number and **nothing else**: same opponents, same positions, same puzzles, same seed, same
+temperature. Anything that differs between the rows is the header.
+
+Two claims are checked separately and reported separately, because they are not the same claim.
+A **monotonic** sweep is one whose point estimates go up with the condition; a **separated** one
+is a sweep whose consecutive confidence intervals do not overlap. Point estimates rise by chance
+all the time -- that is exactly how D-069 first read a 32-game trial as a win for `<2600>` and
+had to take it back at 160 games -- so the sweep prints both and the milestone is judged on the
+second.
+
+The cache makes this much cheaper than it sounds: a game is keyed by the weights, the config and
+the header, so re-running a sweep after adding one condition only plays the new one.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from pydantic import BaseModel, ConfigDict
+
+from rukh import paths
+from rukh.eval.suite import EvalConfig, run_suite
+
+if TYPE_CHECKING:
+    from rukh.eval.suite import SuiteResult
+
+log = logging.getLogger(__name__)
+
+__all__ = ["SweepResult", "SweepRow", "elo_summary", "run_sweep", "sweep_row", "write_sweep"]
+
+WEB_FILE = "artifacts/web/elo-conditioning.json"
+```
+
+<Src file="src/rukh/eval/sweep.py" tag="p4" lines="1-39" />
+
+El docstring cuenta de dónde sale el fichero: el plan del hito pedía un Elo monótono por condición y
+**nada en el harness podía contestar a eso**, porque `header_elo` era un número en una configuración
+y una corrida de la suite producía una fila.
+
+El último párrafo es lo que hace que esto sea asequible: la caché indexa cada partida por los pesos,
+la configuración y la cabecera, así que volver a correr un barrido después de añadir una condición
+solo juega la nueva. Seis condiciones a 26 minutos son dos horas y media la primera vez y veintiséis
+minutos la segunda.
+
+```python title="src/rukh/eval/sweep.py"
+class SweepRow(BaseModel):
+    """One condition: what the model does when it is told to play at this rating."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    header_elo: int
+    elo: float | None = None
+    elo_ci: list[float] | None = None
+    elo_lower: float | None = None
+    elo_upper: float | None = None
+    score: float | None = None
+    """Points per game over the whole ladder; the raw number the Elo is fitted from."""
+    legality: float | None = None
+    """Asked to play badly, does it play badly or does it play *illegally*? Not the same thing,
+    and the difference is the whole question of whether the header is understood."""
+    top1: float | None = None
+    puzzles: float | None = None
+    first_move_entropy: float | None = None
+    stage: str
+```
+
+<Src file="src/rukh/eval/sweep.py" tag="p4" lines="42-60" />
+
+Una fila por condición, con seis columnas. `score` está ahí aunque el Elo se derive de él, y es lo
+que el lab 6 lee: la aritmética de partidas necesarias trabaja sobre la **tasa de puntos**, no sobre
+el Elo, porque una tasa es una proporción y tiene una fórmula para su error típico.
+
+El docstring de `legality` es la pregunta del apartado anterior dicha en dos líneas: «¿juega mal o
+juega **ilegalmente**? No es lo mismo, y la diferencia es la pregunta entera de si la cabecera se
+entiende».
+
+```python title="src/rukh/eval/sweep.py"
+class SweepResult(BaseModel):
+    """The whole sweep and the two verdicts it supports."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: str
+    checkpoint: str
+    params: int
+    date: str
+    rows: list[SweepRow]
+    monotonic: bool
+    """The point estimates rise with the condition. Cheap, and not on its own evidence."""
+    separated: bool
+    """No two consecutive intervals overlap. This is the one the acceptance bar is read on."""
+    span: float | None = None
+    """Elo between the weakest and the strongest condition: how much the dial is worth."""
+
+    def table(self) -> str:
+        """The sweep as a Markdown table, in the shape the ledger and the lesson quote."""
+        lines = [
+            "| Asked for | Elo | 95 % CI | legal argmax | top-1 | puzzles | first-move entropy |",
+            "|---|---:|---|---:|---:|---:|---:|",
+        ]
+        for row in self.rows:
+            ci = _ci_text(row)
+            legality = "n/a" if row.legality is None else f"{row.legality * 100:.2f} %"
+            top1 = "n/a" if row.top1 is None else f"{row.top1 * 100:.2f} %"
+            puzzles = "n/a" if row.puzzles is None else f"{row.puzzles * 100:.2f} %"
+            entropy = (
+                "n/a" if row.first_move_entropy is None else f"{row.first_move_entropy:.3f} bits"
+            )
+            elo = "n/a" if row.elo is None else f"{row.elo:.0f}"
+            lines.append(
+                f"| `<w{row.header_elo:04d}>` | {elo} | {ci} | {legality} | {top1} | "
+                f"{puzzles} | {entropy} |"
+            )
+        return "\n".join(lines)
+```
+
+<Src file="src/rukh/eval/sweep.py" tag="p4" lines="63-99" />
+
+Los dos veredictos como **dos campos**, con sus docstrings diciendo cuál vale: `monotonic` es barato
+y no es evidencia por sí solo; `separated` es el que se lee el criterio de aceptación.
+
+`span` es la tercera cifra que hace falta para leer la tabla: cuánto Elo hay entre la condición más
+débil y la más fuerte, o sea cuánto vale el dial.
+
+Y `table()` devuelve el Markdown con la forma exacta en la que lo citan el registro del proyecto y
+esta lección. Que el objeto sepa imprimirse es lo que impide que el informe y la lección deriven.
+
+```python title="src/rukh/eval/sweep.py"
+def _ci_text(row: SweepRow) -> str:
+    if row.elo_ci:
+        return f"{row.elo_ci[0]:.0f}-{row.elo_ci[1]:.0f}"
+    if row.elo_lower is not None:
+        return f"> {row.elo_lower:.0f}"
+    if row.elo_upper is not None:
+        return f"< {row.elo_upper:.0f}"
+    return "n/a"
+
+
+def sweep_row(header_elo: int, result: SuiteResult) -> SweepRow:
+    """Pull the columns of one condition out of a full suite result."""
+    elo = result.elo
+    return SweepRow(
+        header_elo=header_elo,
+        elo=elo.elo if elo else None,
+        elo_ci=[elo.ci_low, elo.ci_high] if elo and not elo.separated else None,
+        elo_lower=elo.elo_lower if elo else None,
+        elo_upper=elo.elo_upper if elo else None,
+        score=elo.score if elo else None,
+        legality=result.legality_argmax.rate if result.legality_argmax else None,
+        top1=result.accuracy.top1 if result.accuracy else None,
+        puzzles=result.puzzles.rate if result.puzzles else None,
+        first_move_entropy=(
+            result.diversity_detail.first_move_entropy_bits if result.diversity_detail else None
+        ),
+        stage=result.stage,
+    )
+```
+
+<Src file="src/rukh/eval/sweep.py" tag="p4" lines="102-129" />
+
+`_ci_text` maneja las tres formas que puede tener un intervalo: los dos extremos, una cota inferior
+—se ganaron todas las partidas— o una cota superior —se perdieron todas—. Qwen produjo la tercera.
+
+`sweep_row` saca las columnas de un resultado de suite entero. El `elo_ci` solo se rellena cuando
+`not elo.separated`, que es la convención del proyecto: un resultado con cota no tiene intervalo, y
+poner uno inventado sería peor que no poner nada.
+
+```python title="src/rukh/eval/sweep.py"
+def is_monotonic(rows: list[SweepRow]) -> bool:
+    """Whether the point estimates rise with the condition, ignoring rows without an Elo."""
+    measured = [row.elo for row in rows if row.elo is not None]
+    return all(a < b for a, b in zip(measured, measured[1:], strict=False))
+
+
+def is_separated(rows: list[SweepRow]) -> bool:
+    """Whether every consecutive pair of intervals is disjoint, in the right order.
+
+    A one-sided bound (every game won or every game lost) counts as separated only when the
+    bound itself proves it, which is the honest reading of "the interval does not overlap".
+    """
+    usable = [row for row in rows if row.elo is not None]
+    if len(usable) < 2:
+        return False
+    for low, high in zip(usable, usable[1:], strict=False):
+        top_of_low = low.elo_ci[1] if low.elo_ci else low.elo_upper
+        bottom_of_high = high.elo_ci[0] if high.elo_ci else high.elo_lower
+        if top_of_low is None or bottom_of_high is None:
+            return False
+        if top_of_low >= bottom_of_high:
+            return False
+    return True
+```
+
+<Src file="src/rukh/eval/sweep.py" tag="p4" lines="132-154" />
+
+Las dos funciones que dan los dos veredictos, y son cortas a propósito: lo que hacen tiene que poder
+leerse de un tirón, porque de ellas depende si un hito se declara cumplido.
+
+`is_monotonic` es un `all(a < b for a, b in zip(...))` sobre las estimaciones puntuales, saltándose
+las filas sin Elo.
+
+`is_separated` compara el techo de cada intervalo con el suelo del siguiente, y tiene dos guardas que
+importan. `len(usable) < 2` devuelve **falso**, no verdadero: una sola condición no está separada de
+nada, y devolver `True` por vacuidad convertiría un barrido roto en un criterio cumplido. Y una cota
+de una cola cuenta como separada solo cuando la cota misma lo demuestra, que es la lectura honesta de
+«el intervalo no se solapa».
+
+```python title="src/rukh/eval/sweep.py"
+def run_sweep(
+    ckpt: Path | str,
+    cfg: EvalConfig,
+    elos: list[int],
+    suite: str = "full",
+    use_cache: bool = True,
+    device: str | None = None,
+    stage: str | None = None,
+) -> SweepResult:
+    """Run the suite once per condition and collect the rows into one verdict."""
+    if len(elos) < 2:
+        raise ValueError("a sweep needs at least two conditions to compare")
+    if sorted(elos) != elos:
+        raise ValueError(f"conditions must be given in increasing order, got {elos}")
+    base_stage = stage or cfg.stage or Path(ckpt).parent.name
+    rows: list[SweepRow] = []
+    last: SuiteResult | None = None
+    for header_elo in elos:
+        name = f"{base_stage}@{header_elo}"
+        log.info("condition %s of %s: %s", len(rows) + 1, len(elos), name)
+        per_condition = cfg.model_copy(update={"header_elo": header_elo, "stage": name})
+        result, _ = run_suite(ckpt, per_condition, suite=suite, use_cache=use_cache, device=device)
+        rows.append(sweep_row(header_elo, result))
+        last = result
+    assert last is not None
+    measured = [row.elo for row in rows if row.elo is not None]
+    return SweepResult(
+        stage=base_stage,
+        checkpoint=Path(ckpt).as_posix(),
+        params=last.params,
+        date=last.date,
+        rows=rows,
+        monotonic=is_monotonic(rows),
+        separated=is_separated(rows),
+        span=(max(measured) - min(measured)) if len(measured) >= 2 else None,
+    )
+```
+
+<Src file="src/rukh/eval/sweep.py" tag="p4" lines="157-192" />
+
+`run_sweep` tiene dos validaciones antes de gastar una hora de máquina: al menos dos condiciones, y
+**en orden creciente**. La segunda parece pedantería y no lo es: `is_monotonic` compara filas
+consecutivas en el orden en que llegan, así que una lista desordenada daría un veredicto sobre otra
+pregunta.
+
+`cfg.model_copy(update={"header_elo": ..., "stage": name})` es lo que garantiza que entre filas
+cambie **una** cosa: se copia la configuración entera y se tocan dos campos, uno de los cuales solo
+es el nombre bajo el que se guarda. Construir seis configuraciones a mano habría dejado la puerta
+abierta a que dos se diferenciaran en algo más.
+
+El nombre de cada etapa es `<stage>@<elo>`, que es lo que separa las cachés por condición.
+
+```python title="src/rukh/eval/sweep.py"
+def write_sweep(result: SweepResult, out_dir: Path | str, web: Path | str | None = None) -> Path:
+    """Write the sweep's table and JSON, and the file the course reads."""
+    directory = Path(out_dir) / f"{result.stage}-elo-sweep"
+    directory.mkdir(parents=True, exist_ok=True)
+    markdown = directory / "report.md"
+    markdown.write_text(_render(result), encoding="utf-8", newline="\n")
+    payload = json.loads(result.model_dump_json())
+    (directory / "results.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n"
+    )
+    if web is not None:
+        target = paths.resolve(str(web))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+    return markdown
+
+
+def _render(result: SweepResult) -> str:
+    verdict = "monotonic" if result.monotonic else "**not** monotonic"
+    separation = "separated" if result.separated else "**not** separated"
+    span = "n/a" if result.span is None else f"{result.span:.0f} Elo"
+    return "\n".join(
+        [
+            f"# Elo by condition of `{result.stage}`",
+            "",
+            f"- Checkpoint: `{result.checkpoint}`",
+            f"- Parameters: {result.params:,}",
+            f"- Date: {result.date}",
+            "",
+            "Every row is the same suite with one number changed: the `<wXXXX> <bXXXX>` header "
+            "the model is prompted with. Same opponents, same positions, same puzzles, same "
+            "seed, same temperature.",
+            "",
+            result.table(),
+            "",
+            "## Verdict",
+            "",
+            f"- Point estimates: {verdict}.",
+            f"- Confidence intervals: {separation}.",
+            f"- Span between the weakest and the strongest condition: {span}.",
+            "",
+            "The two are not the same claim. Point estimates rise by chance often enough that a "
+            "monotonic row of numbers is not evidence on its own; the acceptance bar of `GOAL.md` "
+            "is read on the intervals.",
+            "",
+        ]
+    )
+```
+
+<Src file="src/rukh/eval/sweep.py" tag="p4" lines="195-245" />
+
+La escritura, con el mismo `results.json` en dos sitios cuando hace falta: el directorio del informe
+y el fichero que lee el curso.
+
+Y `_render` acaba con el párrafo que es la lección del fichero, escrito **en el informe**: «los dos
+no son la misma afirmación. Las estimaciones puntuales suben por casualidad lo bastante a menudo como
+para que una fila de números monótona no sea evidencia por sí sola; el criterio de aceptación se lee
+en los intervalos».
+
+```python title="src/rukh/eval/sweep.py"
+def elo_summary(rows: list[SweepRow]) -> str:
+    """One line per condition for the CLI."""
+    lines = [
+        f"<w{row.header_elo:04d}>: "
+        + ("n/a" if row.elo is None else f"{row.elo:.0f} ({_ci_text(row)})")
+        for row in rows
+    ]
+    return "\n".join(lines)
+```
+
+<Src file="src/rukh/eval/sweep.py" tag="p4" lines="248-255" />
+
+Y una línea por condición para la consola, que es lo que se mira mientras corre.
+
+<Callout kind="entrevista" title="Tu métrica sube en las tres condiciones. ¿Ya está?">
+  No. La pregunta siguiente es siempre cuál es el ruido de la medición, y la respuesta honesta
+  empieza midiéndolo: intervalos por <Term id="bootstrap">bootstrap</Term>, o dos tiradas con
+  semillas distintas y la diferencia entre ellas. Una ordenación de tres números sin barras de error
+  es una anécdota con formato de tabla. La versión avanzada de la respuesta añade que el ruido tiene
+  estructura —aquí, los mismos rivales y las mismas aperturas en todas las filas— y que por eso
+  conviene cambiar **una** cosa entre condiciones y no dos.
+</Callout>
+
+## `force_header`: la bandera que existe para una sola medición
+
+```python title="src/rukh/eval/legality.py"
+def sample_positions(
+    games: Path,
+    n: int,
+    tok: UciTokenizer,
+    seed: int = 0,
+    pool: int = 50_000,
+    block: int = 200,
+    header_elo: int | None = None,
+) -> list[Position]:
+    """Sample ``n`` prefixes from a UCI games parquet, one per game, at a random ply.
+
+    Only the first ``pool`` rows are read (a validation month is millions of games and the
+    harness never needs more than a few tens of thousands); which of them are used, and at which
+    ply, is decided by ``seed``.
+
+    ``header_elo`` replaces the ratings the game really had. It is off by default, because the
+    honest way to score next-move accuracy is to show the model the header the game actually
+    carried. It is on for the Elo sweep, and for the same reason the puzzles need it: every
+    position is prompted with the *condition* being tested, so "asked to play at 1200, does it
+    play worse or does it play illegally?" becomes a question the table can answer. Without it
+    those two columns are identical in every row -- true, and indistinguishable from evidence
+    that the condition does nothing.
+    """
+```
+
+<Src file="src/rukh/eval/legality.py" tag="p4" lines="109-131" />
+
+El parámetro es `int | None` y está **apagado por defecto**, con el motivo escrito: la manera honesta
+de puntuar la exactitud de la jugada siguiente es mostrarle al modelo la cabecera que la partida de
+verdad llevaba. Cambiarla es lo correcto solo para el barrido, y solo porque ahí la pregunta es otra.
+
+```python title="src/rukh/eval/puzzles.py"
+def start_history(
+    tok: UciTokenizer,
+    item: PuzzleItem,
+    header_elo: int = HEADER_ELO,
+    force_header: bool = False,
+) -> list[int]:
+    """The ids the model sees before its first move: header, then the real game if there is one.
+
+    The header is the ``<bos> <wXXXX> <bXXXX>`` of ``rukh.infer.sampler.prompt_ids``, with the
+    players' own ratings when the parquet carries them; ``header_elo`` stands in otherwise.
+
+    ``force_header`` overrides the real ratings, and exists for exactly one measurement: the Elo
+    sweep of M4, which asks the same model to play at several strengths and needs *every* column
+    to answer that question. Almost all puzzles carry their players' ratings, so without this the
+    puzzle rate would be identical in every row of the sweep and would look like evidence that
+    the condition does nothing.
+    """
+    if force_header:
+        white = black = header_elo
+    else:
+        white = item.white_elo if item.white_elo is not None else header_elo
+        black = item.black_elo if item.black_elo is not None else header_elo
+    history = header(tok, white, black)
+    history.extend(tok.vocab.get(uci, tok.unk_id) for uci in item.prefix)
+    return history
+```
+
+<Src file="src/rukh/eval/puzzles.py" tag="p4" lines="102-126" />
+
+Lo mismo en los puzles, y aquí el docstring dice el número que convierte el detalle en un problema:
+**casi todos** los puzles llevan el Elo de sus jugadores, así que sin esta bandera la tasa de puzles
+saldría idéntica en todas las filas del barrido y parecería evidencia de que la condición no hace
+nada.
+
+```python title="src/rukh/eval/puzzles.py"
+    items: Sequence[PuzzleItem],
+    cache: EvalCache | None = None,
+    header_elo: int = HEADER_ELO,
+    force_header: bool = False,
+) -> PuzzleResult:
+    """Attempt every puzzle, reusing the cached attempts of a previous run of the same weights."""
+    attempts: list[PuzzleAttempt] = []
+    for item in items:
+        # A puzzle whose parquet carries the players' own ratings ignores ``header_elo``, so its
+        # key stays as it was; one that falls back to the header is a different attempt per
+        # header and must not read back the 1800 run's answer.
+        uses_header = force_header or item.white_elo is None or item.black_elo is None
+        key = item.puzzle_id
+        if uses_header and header_elo != HEADER_ELO:
+            key = f"{key}:e{header_elo}"
+        cached = cache.get(SUITE, key) if cache is not None else None
+        if cached is not None:
+            attempt = PuzzleAttempt.model_validate(cached)
+            # An attempt played with the other prompt answers a different question.
+            if attempt.prompt_style == item.prompt_style:
+                attempts.append(attempt)
+                continue
+        attempt = solve_puzzle(source, tok, item, header_elo=header_elo, force_header=force_header)
+        if cache is not None:
+            cache.put(SUITE, key, attempt.model_dump())
+        attempts.append(attempt)
+    return summarize(attempts)
+```
+
+<Src file="src/rukh/eval/puzzles.py" tag="p4" lines="196-222" />
+
+Y el cambio en la caché, que es la parte que se olvida. Un puzle que usa la cabecera es **un intento
+distinto por cabecera** y no debe leerse de vuelta la respuesta de la corrida a 1800. La clave lleva
+el sufijo `:e<elo>` solo cuando la cabecera no es la de por defecto, lo que mantiene direccionable
+todo lo que se cacheó antes de que esto existiera.
+
+Es el mismo patrón que `GameRecord.item_id`, en el módulo de al lado:
+
+```python title="src/rukh/eval/elo.py"
+    def item_id(self) -> str:
+        """Cache key. The header is only in it when it is not the default.
+
+        Without the header a run at ``<2600>`` would silently read back the games played at
+        ``<1800>``: same rung, same index, completely different game. Leaving the default out
+        keeps every game cached before this existed addressable.
+        """
+        suffix = "" if self.header_elo == 1800 else f":e{self.header_elo}"
+        return f"{self.rung}:{self.index}{suffix}"
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p4" lines="122-130" />
+
+Nueve líneas de las que seis son el docstring, y el docstring es el fallo que evitan: sin la cabecera
+en la clave, una corrida a `<2600>` leería en silencio las partidas jugadas a `<1800>` —mismo peldaño,
+mismo índice, partida completamente distinta—.
+
+<Transfer
+  concept="La clave de caché tiene que incluir todo lo que cambia la respuesta"
+  where="Cualquier memoización, un CDN, un build incremental, una consulta cacheada por usuario."
+>
+  Una caché con una clave incompleta no es una caché lenta: es una caché **que miente**, y miente en
+  la dirección peor, devolviendo respuestas plausibles a preguntas que no se le hicieron. El truco
+  de compatibilidad de estas dos funciones —dejar fuera de la clave el valor por defecto— es la
+  manera de añadir una dimensión nueva sin invalidar lo que ya está guardado, y funciona exactamente
+  mientras el valor por defecto no cambie. El día que cambie, hay que invalidar todo.
+</Transfer>
+
+## La escalera recalibrada
+
+```python title="src/rukh/eval/elo.py"
+# The four ``Skill Level`` rungs carry **measured** ratings, not the nominal 800/950/1100/1250 they
+# were given when the harness was written. Those guesses were wrong by 430 to 580 Elo and dragged
+# every stage's fit down by about 350 points: the contradiction that exposed them was a model
+# scoring 0.725 against a 1320-rated engine while losing 20-0 to one labelled 1250.
+#
+# The numbers below come from playing the ladder against itself at the suite's own 0.1 s per move,
+# 40 games per pair with colours alternated, anchored on ``uci-1320`` (D-070). The method validates
+# on its own control: ``uci-1500`` measured +179 Elo over ``uci-1320`` against a nominal +180.
+# ``UCI_Elo`` does compress higher up -- ``uci-1800`` measured +215 over ``uci-1500``, not +300 --
+# which is a caveat for the top rungs and not for the range these models play in.
+# Ordered by measured strength. Note what that ordering shows: **no rung is below 1320**. The
+# four ``skill-*`` opponents were put in the ladder to reach under the engine's ``UCI_Elo`` floor
+# and they never did, which is why every stage measured lower than it plays.
+DEFAULT_RUNGS: list[EloRung] = [
+    EloRung(name="uci-1320", elo=1320, uci_elo=1320),
+    EloRung(name="skill-0", elo=1381, skill=0),
+    EloRung(name="skill-1", elo=1467, skill=1),
+    EloRung(name="uci-1500", elo=1500, uci_elo=1500),
+    EloRung(name="skill-2", elo=1589, skill=2),
+    EloRung(name="skill-3", elo=1678, skill=3),
+    EloRung(name="uci-1800", elo=1800, uci_elo=1800),
+    EloRung(name="uci-2000", elo=2000, uci_elo=2000),
+]
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p4" lines="77-99" />
+
+Veintitrés líneas de las que trece son comentario, y es el comentario más consecuente del hito: los
+cuatro peldaños de `Skill Level` llevaban valoraciones **nominales** —800, 950, 1100, 1250— que eran
+inventadas, y estaban equivocadas entre 430 y 580 puntos. Eso arrastraba el ajuste de **todas** las
+etapas unos 350 puntos hacia abajo.
+
+Lo que lo destapó es una contradicción, y vale la pena tenerla en la cabeza como forma de encontrar
+errores de calibración: un modelo puntuando 0,725 contra un motor valorado en 1320 mientras perdía
+20-0 contra uno etiquetado 1250. Las dos cosas no pueden ser verdad, así que una etiqueta está mal.
+
+La medición nueva es la escalera **contra sí misma**: 40 partidas por pareja, colores alternados, al
+mismo 0,1 s por jugada de la suite, ancladas en `uci-1320`. Y el método valida sobre su propio
+control: `uci-1500` midió +179 Elo sobre `uci-1320` contra un nominal de +180.
+
+Y la última frase del comentario es el resultado que no se buscaba: **ningún peldaño está por debajo
+de 1320**. Los cuatro `skill-*` se pusieron en la escalera para llegar por debajo del suelo de
+`UCI_Elo` del motor y nunca lo hicieron, que es por qué todas las etapas medían más flojo de lo que
+juegan.
+
+<Callout kind="mundo-real" title="Recalibrar el instrumento invalida las medidas anteriores">
+  Esto es lo que hace caro corregir una escalera y lo que obliga a hacerlo pronto. Cada Elo
+  publicado antes de este cambio salió de un ajuste con cuatro anclas mal puestas, así que todos se
+  retiran y se vuelven a medir. Es la razón de que la tabla del proyecto lleve una fecha por fila y
+  de que las filas antiguas se borren en vez de dejarse «por comparación»: dos números de
+  instrumentos distintos puestos en la misma columna son una invitación a restarlos.
+</Callout>
+
+```python title="src/rukh/eval/elo.py"
+def play_rung(
+    model: MoveDecoder | None,
+    tok: UciTokenizer,
+    rung: EloRung,
+    games: int,
+    cfg: SampleConfig,
+    move_time: float = MOVE_TIME,
+    max_plies: int | None = None,
+    cache: EvalCache | None = None,
+    header_elo: int = 1800,
+    player: Player | None = None,
+) -> list[GameRecord]:
+    """Play ``games`` games against one rung, alternating colours, reusing cached games.
+
+    A game that ends with ``*`` (the context ran out) is adjudicated with the rung's own engine
+    before it is scored, so it enters the fit as a win, a loss or a draw on the merits of the
+    final position.
+
+    ``player`` replaces the decoder, and it is how M4 puts a general language model on this exact
+    ladder -- same opponents, same move time, same colours, same adjudication. A comparison whose
+    two halves went through different code is not a comparison. When it is given, ``model`` is
+    unused and may be ``None``; the seed still varies per game, but a player that cannot be
+    seeded simply ignores it.
+    """
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p4" lines="365-388" />
+
+Y el otro cambio de `elo.py`: `play_rung` acepta un `player` en vez de un modelo. Es lo que permite
+que el Qwen de la lección 5 juegue en **esta** escalera —mismos rivales, mismo tiempo por jugada,
+mismos colores, misma adjudicación—. El docstring lo dice: una comparación cuyas dos mitades pasaran
+por código distinto no es una comparación.
+
+## Las banderas nuevas de la suite
+
+```python title="src/rukh/eval/suite.py"
+    accuracy_positions: int = 10_000
+    position_pool: int = 50_000
+    puzzles_per_band: int = 2_000
+    force_header: bool = False
+    """Prompt everything with ``header_elo`` instead of the ratings the game really had.
+
+    Off everywhere except the Elo sweep, where it is what makes the table readable. Validation
+    positions carry their own players' ratings and almost every puzzle carries its game's, so
+    with it off the legality, the accuracy and the puzzle rate come out **identical in every row**
+    of a sweep: correct by their own definition, and indistinguishable from evidence that the
+    condition does nothing. The Elo games never had this problem -- they are played from the
+    starting position and the header is the only thing that says who is playing."""
+    header_elo: int = 1_800
+    """The Elo the model is asked to play at (``<wXXXX> <bXXXX>``).
+
+    It was hardcoded to 1800 while the corpus was 1800+ Lichess and the choice cost nothing. With
+    over half the corpus at 2400+ (D-064) it is a real knob: asking a model trained on masters to
+    imitate an 1800 is asking it for its weaker mode, so the header belongs in the suite config
+    and in the cache key rather than in a default argument.
+    """
+    elo_games: int = 100
+    elo_rungs: list[EloRung] = Field(default_factory=lambda: list(DEFAULT_RUNGS))
+    elo_move_time: float = 0.1
+    elo_max_plies: int | None = None
+    bootstrap: int = 1_000
+    diversity_games: int = 200
+    """Self-play openings for the diversity metric; 0 switches it off."""
+    diversity_plies: int = 12
+    diversity_temperature: float = 1.0
+    """Read at its own temperature, not the suite's. The suite plays near-deterministically so
+    that stages are comparable (D-047), and at that setting a decoder plays one single opening
+    and the entropy is 0 for every model alike. Diversity only says something where there is a
+    choice to make, so it gets the temperature that leaves one."""
+    diversity_top_k: int | None = 20
+    """And its own top-k, for the same reason and a sharper one: the suite reads at ``top_k: 1``,
+    which is argmax whatever the temperature says. Overriding the temperature alone would look
+    like a diversity measurement and be a second copy of the deterministic one."""
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p4" lines="85-121" />
+
+Cinco campos nuevos, y los cuatro docstrings son las cuatro decisiones.
+
+`force_header` está apagado en todas partes menos en el barrido, con el listado de qué columnas se
+volverían idénticas si no.
+
+`header_elo` deja de estar en un argumento por defecto y pasa a la configuración **y a la clave de
+caché**. El docstring explica por qué no importaba antes y sí ahora: con el corpus a 1800+ la
+elección no costaba nada; con más de la mitad del corpus a 2400+, pedirle a un modelo entrenado con
+maestros que imite a un 1800 es pedirle su modo débil.
+
+Y los dos de diversidad son el mismo razonamiento dos veces. La diversidad se lee **a su propia
+temperatura**, porque la suite juega casi determinista para que las etapas sean comparables y a ese
+ajuste todos los modelos sacan 0. Y necesita **también** su propio top-k, con la razón más afilada:
+la suite lee a `top_k: 1`, que es argmax diga lo que diga la temperatura, así que cambiar solo la
+temperatura parecería una medición de diversidad y sería una segunda copia de la determinista.
+
+```bash title="Terminal"
+uv run rukh eval sweep --model checkpoints/medium-elo/step-3800.pt --elos 1200,1500,1800,2000,2100,2400 --config configs/eval/greedy-sweep.yaml --stage medium-elo
+uv run rukh eval sweep --model checkpoints/medium-v4/best.pt --elos 1200,2100 --config configs/eval/greedy-sweep.yaml --stage medium-v4
+```
+
+Seis condiciones a unos 26 minutos cada una, y después el control sobre el modelo **sin** afinar en
+los dos extremos del eje. El segundo comando es la corrida que impide cantar victoria, y la lección 9
+cuenta qué contestó.
+
+## Las dos órdenes de la CLI
+
+```python title="src/rukh/cli.py"
+def eval_sweep_cmd(
+    model: Annotated[
+        str, typer.Option("--model", help="Checkpoint path or Hub id to evaluate per condition.")
+    ],
+    elos: Annotated[
+        str,
+        typer.Option("--elos", help="Increasing Elo headers to ask for, comma separated."),
+    ] = "1200,1500,1800,2100,2400",
+    suite: Annotated[str, typer.Option("--suite", help="Suite name: full or quick.")] = "full",
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config", exists=True, dir_okay=False, readable=True, help="Suite YAML override."
+        ),
+    ] = None,
+    stage: Annotated[str | None, typer.Option("--stage", help="Name of the sweep.")] = None,
+    no_cache: Annotated[bool, typer.Option("--no-cache", help="Recompute every game.")] = False,
+    device: Annotated[str | None, typer.Option("--device", help="Where to run.")] = None,
+    web: Annotated[
+        bool, typer.Option("--web/--no-web", help="Also write the JSON the course reads.")
+    ] = True,
+) -> None:
+    """Run the suite once per Elo header and say whether the ratings come out monotonic.
+
+    Every row is the same evaluation with one number changed, so anything that differs between
+    them is the condition. The verdict is printed twice on purpose: whether the point estimates
+    rise, and whether the confidence intervals actually separate. Only the second is evidence.
+    """
+    from rukh.eval import load_suite
+    from rukh.eval.suite import SUITES, is_hub_id
+    from rukh.eval.sweep import WEB_FILE, elo_summary, run_sweep, write_sweep
+    from rukh.paths import resolve
+
+    if suite not in SUITES:
+        typer.echo(f"error: --suite must be one of {', '.join(SUITES)}", err=True)
+        raise typer.Exit(code=2)
+    if not Path(model).is_file() and not is_hub_id(model):
+        typer.echo(f"error: --model {model!r} is neither a checkpoint nor a Hub id", err=True)
+        raise typer.Exit(code=2)
+    try:
+        wanted = [int(part) for part in elos.split(",") if part.strip()]
+    except ValueError as exc:
+        typer.echo(f"error: --elos must be a comma-separated list of integers: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    cfg = load_suite(suite, config)
+    try:
+        result = run_sweep(
+            model, cfg, wanted, suite=suite, use_cache=not no_cache, device=device, stage=stage
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    markdown = write_sweep(result, resolve(cfg.out_dir), WEB_FILE if web else None)
+    typer.echo(f"stage:      {result.stage} ({result.params:,} parameters)")
+    typer.echo(elo_summary(result.rows))
+    typer.echo(f"monotonic:  {'yes' if result.monotonic else 'no'} (point estimates)")
+    typer.echo(f"separated:  {'yes' if result.separated else 'no'} (confidence intervals)")
+    if result.span is not None:
+        typer.echo(f"span:       {result.span:.0f} Elo")
+    typer.echo(f"report:     {markdown}")
+```
+
+<Src file="src/rukh/cli.py" tag="p4" lines="903-963" />
+
+Sesenta líneas, y tres decisiones que no están en la librería.
+
+Las **validaciones baratas primero**: el nombre de la suite, que el modelo exista o sea un id del
+Hub, y que `--elos` parsee. Las tres salen con código 2 —error de uso— antes de cargar un modelo,
+que es lo que separa «te has equivocado escribiendo» de «esto ha fallado».
+
+El valor por defecto de `--elos` es `"1200,1500,1800,2100,2400"`: cinco condiciones que cubren el
+eje sin las seis del barrido publicado. Un valor por defecto de una orden es una sugerencia, y
+sugerir el barrido entero invitaría a repetir dos horas y media de máquina sin pensarlo.
+
+Y la salida imprime **los dos veredictos en dos líneas**, cada uno con lo que mide entre paréntesis:
+`monotonic (point estimates)` y `separated (confidence intervals)`. Es la misma insistencia del
+docstring de `SweepResult`, repetida donde la lee quien lanza la orden.
+
+```python title="src/rukh/cli.py"
+def eval_openings_cmd(
+    model: Annotated[str, typer.Option("--model", help="Checkpoint or Hub id to read.")],
+    against: Annotated[
+        str | None,
+        typer.Option("--against", help="A second model to compare the distribution with."),
+    ] = None,
+    header_elo: Annotated[
+        int, typer.Option("--elo", help="Elo header to ask the distribution at.")
+    ] = 1800,
+    top: Annotated[int, typer.Option("--top", help="How many first moves to print.")] = 8,
+    device: Annotated[str | None, typer.Option("--device", help="Where to run.")] = None,
+) -> None:
+    """Print what the model would open with, as probabilities rather than as sampled games.
+
+    No temperature, no top-k, no seed: the softmax over the twenty legal first moves as the
+    weights produce it. That is what makes it the right instrument for an adapter's effect --
+    the share it moved is a property of the weights and does not have to be averaged out of
+    hundreds of self-play games.
+    """
+    from rukh.eval.diversity import first_move_distribution, first_move_entropy
+    from rukh.eval.suite import resolve_model
+    from rukh.tokenize.uci_vocab import UciTokenizer
+    from rukh.train import load_model, pick_device
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    where = device or pick_device()
+    tok = UciTokenizer()
+
+    def read(path: str) -> tuple[dict[str, float], float]:
+        loaded, _ = load_model(resolve_model(path), map_location=where)
+        loaded = loaded.to(where).eval()
+        return first_move_distribution(loaded, tok, header_elo), first_move_entropy(
+            loaded, tok, header_elo
+        )
+
+    try:
+        probs, entropy = read(model)
+        other = read(against) if against is not None else None
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"header:   <w{header_elo:04d}>")
+    typer.echo(f"entropy:  {entropy:.4f} bits of {math.log2(20):.4f}")
+    if other is not None:
+        typer.echo(f"          {other[1]:.4f} bits for {against}")
+    order = sorted(probs, key=lambda move: probs[move], reverse=True)[:top]
+    header_row = "move      share" + ("     other     delta" if other is not None else "")
+    typer.echo(header_row)
+    for move in order:
+        line = f"{move:<9s} {probs[move] * 100:6.2f} %"
+        if other is not None:
+            mine, theirs = probs[move], other[0].get(move, 0.0)
+            line += f"  {theirs * 100:6.2f} %  {(theirs - mine) * 100:+6.2f}"
+        typer.echo(line)
+```
+
+<Src file="src/rukh/cli.py" tag="p4" lines="784-838" />
+
+`rukh eval openings` es la orden que hace utilizable la medición más barata del módulo: imprime con
+qué abriría el modelo **como probabilidades**, no como partidas muestreadas. Y acepta un `--against`
+para comparar dos modelos columna a columna, con la diferencia calculada, que es exactamente la
+tabla que la card de un adaptador publica.
+
+La función interna `read` está ahí para que el modelo y su comparación pasen por el mismo camino
+—cargar, mover al dispositivo, `eval()`, leer la distribución y la entropía—. Dos bloques de código
+casi iguales habrían sido más cortos de escribir y la primera divergencia entre ellos habría
+inventado una diferencia entre los dos modelos.
+
+## Las nueve configuraciones de evaluación
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/greedy.yaml"
+# The sampling the acceptance bar is read at: near-deterministic (D-047). Temperature is worth
+# more than 200 Elo on the same weights, so every comparison between stages has to fix it, and
+# this file is that fixture -- it reproduces exactly what `small-greedy` and `medium-greedy` were
+# measured with, so a new stage lands in the same table.
+#
+# `games` is the month whose first 20,000 rows the position pool reads (`.head(pool)`), and the
+# first 100,000 games of that month are the held-out validation split (D-062). The pool is
+# therefore inside the held-out part even now that the rest of the month trains.
+games: data/uci/year=2025/month=02/games.parquet
+puzzles: data/puzzles/puzzles.parquet
+puzzle_split: test
+legality_positions: 1000
+accuracy_positions: 1000
+position_pool: 20000
+puzzles_per_band: 2000
+elo_games: 20
+elo_move_time: 0.1
+bootstrap: 500
+temperature: 0.05
+top_k: 1
+block: 200
+seed: 42
+header_elo: 1800   # the header every published number was measured at; keep it pinned
+out_dir: artifacts/eval
+# The single results table, which this file stopped writing to and should not have. Every number
+# the project publishes is read at this sampling, so `web_results: null` left the table carrying
+# the rows of the `full` suite -- measured before D-070 corrected the Elo ladder, and therefore
+# retracted. `/proyecto/` served them.
+web_results: artifacts/web/results.json
+cache_db: artifacts/eval/cache-greedy.sqlite
+track: false
+```
+
+<Src file="configs/eval/greedy.yaml" tag="p4" lines="1-31" />
+
+La configuración de referencia va entera porque las ocho restantes son ella con una o dos claves
+cambiadas. Sus tres comentarios son las tres cosas que hay que saber para leer cualquier número del
+proyecto: la temperatura está **fijada** porque vale más de 200 Elo sobre los mismos pesos; el pool
+de posiciones sale de dentro del conjunto reservado; y `web_results` apunta a la tabla única, que es
+la que este fichero escribe y ningún otro debería.
+
+Y la del barrido, que es la que este módulo usa, se cita solo por su diferencia:
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/greedy-sweep.yaml"
+# The suite the Elo sweep of M4 runs once per condition.
+#
+# Identical to `greedy.yaml` -- the sampling every published number was read at (D-047) -- with
+# one change: `force_header`. Validation positions carry their own players' ratings and almost
+# every puzzle carries its game's, so with it off the legality, the accuracy and the puzzle rate
+# come out identical in every row of the sweep. Correct by their own definition, and
+# indistinguishable from evidence that the condition does nothing, which is the one thing this
+# table must not be ambiguous about.
+#
+# Its own cache, for the same reason: these puzzle attempts answer a different question from the
+# ones `cache-greedy.sqlite` holds and must not be confused with them.
+```
+
+<Src file="configs/eval/greedy-sweep.yaml" tag="p4" lines="1-11" />
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/greedy-sweep.yaml"
+force_header: true
+```
+
+<Src file="configs/eval/greedy-sweep.yaml" tag="p4" lines="19-19" />
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/greedy-sweep.yaml"
+header_elo: 1800
+diversity_games: 200
+diversity_plies: 12
+diversity_temperature: 1.0
+diversity_top_k: 20
+out_dir: artifacts/eval
+web_results: null
+cache_db: artifacts/eval/cache-sweep.sqlite
+track: false
+```
+
+<Src file="configs/eval/greedy-sweep.yaml" tag="p4" lines="27-35" />
+
+Una clave nueva —`force_header: true`—, las cuatro de diversidad, y una caché propia. Esa última no
+es aseo: estos intentos de puzle contestan a otra pregunta que los de `cache-greedy.sqlite` y no
+deben confundirse con ellos.
+
+Y hay una tercera variante del barrido que merece verse porque su comentario **es** la aritmética
+del módulo, escrita en un fichero de configuración:
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/greedy-sweep-50.yaml"
+# The sweep again with the games the arithmetic asks for, on the conditions the criterion names.
+#
+# The first pass played 160 games per condition and left every adjacent pair overlapping. Before
+# spending more machine time, `labs/m4/games_needed.py` turns the measured scores into the number
+# of games each comparison would need (`n > 3.84 / (delta p)^2` per condition, two proportions
+# near a half):
+#
+#   <w1500> -> <w2000>   0.466 -> 0.453   -0.013   24 420 games each
+#   <w2000> -> <w2400>   0.453 -> 0.569   +0.116      284 games each
+#   <w1500> -> <w2400>   0.466 -> 0.569   +0.103      357 games each
+#
+# So the middle of the criterion is not a sample-size problem and no run will fix it, while the
+# outer pair is one and 400 games clears it with room. 50 games on each of the eight rungs is
+# 400 per condition, about an hour each; it is run on `<w1500>` and `<w2400>` only, because
+# paying for `<w2000>` again would buy a tighter interval around a difference that is not there.
+#
+# Its own cache, and not out of tidiness: `elo_games` is part of the cache key, so this run
+# cannot read back the games already played even though game `rung:index` is literally the same
+# game (its seed is `seed + index`, independent of the total). That is a real waste and it is
+# written down in `docs/backlog.md`; fixing it belongs to P6, not to the middle of a milestone.
+```
+
+<Src file="configs/eval/greedy-sweep-50.yaml" tag="p4" lines="1-20" />
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/greedy-sweep-50.yaml"
+elo_games: 50
+```
+
+<Src file="configs/eval/greedy-sweep-50.yaml" tag="p4" lines="41-41" />
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/greedy-sweep-50.yaml"
+cache_db: artifacts/eval/cache-sweep50.sqlite
+```
+
+<Src file="configs/eval/greedy-sweep-50.yaml" tag="p4" lines="55-55" />
+
+Dos líneas de diferencia y veinte de razonamiento. El comentario trae dentro la tabla de partidas
+necesarias, y con ella la decisión: **el par de dentro del criterio no es un problema de tamaño de
+muestra** y ninguna corrida lo va a arreglar; el par exterior sí lo es y 400 partidas lo resuelven con
+margen. Así que se paga por `<w1500>` y `<w2400>` y no se vuelve a pagar por `<w2000>`.
+
+El último párrafo es un desperdicio reconocido por escrito, que es la forma correcta de tenerlo:
+`elo_games` forma parte de la clave de caché, así que esta corrida **no puede** reutilizar las
+partidas ya jugadas aunque la partida `rung:index` sea literalmente la misma —su semilla es
+`seed + index`, independiente del total—. Está anotado en el backlog y arreglarlo pertenece a otro
+hito, no a la mitad de este.
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Configuraciones de evaluación nuevas en p4">
+
+| Fichero                  | Para qué sirve                                                                            | Diferencia con `greedy.yaml`                                    |
+| ------------------------ | ----------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `greedy.yaml`            | el muestreo en el que se lee el criterio de aceptación; escribe la tabla única            | arriba, entero                                                  |
+| `greedy-sweep.yaml`      | la suite que el barrido corre una vez por condición                                       | `force_header: true`, cuatro claves de diversidad, caché propia |
+| `greedy-sweep-50.yaml`   | el mismo barrido con 50 partidas por peldaño, para el par exterior del eje                | `elo_games: 50` y su propia caché                               |
+| `greedy-2600.yaml`       | qué hace el modelo cuando se le pide su modo fuerte                                       | `header_elo: 2600`, `web_results: null`                         |
+| `greedy-fast.yaml`       | «¿esto dañó al modelo?» sin la escalera: minutos en vez de una hora                       | `elo_games: 0`, diversidad activada                             |
+| `greedy-loadtest.yaml`   | si la carga de CPU cambia lo que juega Stockfish a 0,1 s por jugada                       | solo `cache_db` y `web_results: null`                           |
+| `sweep-temperature.yaml` | el barrido muestreando la cola en vez de la moda, para contrastar la hipótesis del argmax | `temperature: 1.0`, `top_k: 20`, caché propia                   |
+| `qwen-smoke.yaml`        | el ensayo de `rukh eval qwen`                                                             | lección 5, entero                                               |
+
+</div>
+
+Las tres restantes se diferencian de `greedy.yaml` en su cabecera de comentario y en una clave, y
+las tres cabeceras dicen para qué se escribió el fichero:
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/greedy-fast.yaml"
+# `greedy.yaml` without the Stockfish ladder: everything that does not need an engine.
+#
+# For the stages where the question is "did this damage the model?" rather than "how strong is
+# it?": the style adapters of M4. Legality, next-move accuracy and puzzles all answer the first
+# question, cost minutes instead of an hour, and puzzles in particular track playing strength
+# closely enough to catch an adapter that broke something (in D-072 they moved 22 -> 37 % across
+# a 145-Elo gap).
+#
+# What it cannot do is replace an Elo. A stage measured with this file has no rating and its card
+# says so; it does not borrow one from its base model.
+```
+
+<Src file="configs/eval/greedy-fast.yaml" tag="p4" lines="1-10" />
+
+`greedy-fast.yaml` es el que se usa con los adaptadores de estilo, y su comentario dice por qué es
+suficiente: la pregunta ahí no es «cuánto de fuerte es» sino «¿esto dañó al modelo?», y legalidad,
+exactitud y puzles la contestan en minutos en vez de en una hora. Con la advertencia de rigor: **no
+reemplaza a un Elo**, y una etapa medida con este fichero no tiene valoración y su card lo dice en vez
+de tomarla prestada de su modelo base. Su única diferencia de configuración es `elo_games: 0`.
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/greedy-2600.yaml"
+# Same as `greedy.yaml` except the Elo header. Reported alongside the 1800 row, never
+# instead of it: 1800 is what the published stages were measured at, and mixing the two
+# in one table would compare a model against a different question.
+```
+
+<Src file="configs/eval/greedy-2600.yaml" tag="p4" lines="1-3" />
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/greedy-loadtest.yaml"
+# A copy of `greedy.yaml` with its own cache, to replay games that are already measured
+# without overwriting them. Used once, to find out whether CPU load on the machine changes
+# what Stockfish plays at 0.1 s per move -- if it does, no Elo number taken under load is
+# comparable with a number taken on an idle machine.
+```
+
+<Src file="configs/eval/greedy-loadtest.yaml" tag="p4" lines="1-4" />
+
+Las dos cambian una clave y una caché. `greedy-2600` sube la cabecera y lo publica **junto** a la fila
+de 1800, nunca en su lugar, porque mezclar las dos en una tabla compararía un modelo contra otra
+pregunta. Y `greedy-loadtest` se usó una vez, para saber si la carga de CPU de la máquina cambia lo
+que juega Stockfish a 0,1 s por jugada —si lo cambiara, ningún Elo medido con la máquina ocupada
+sería comparable con uno medido en reposo—.
+
+De ese grupo, `sweep-temperature.yaml` es el que contesta a una hipótesis y merece su propio bloque,
+porque su comentario **es** el experimento:
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/sweep-temperature.yaml"
+# El barrido otra vez, muestreando la distribución en vez de su moda.
+#
+# Toda la suite juega con `temperature: 0.05, top_k: 1`, que es la moda: el modelo hace siempre su
+# jugada más probable. Y la diferencia entre un 1200 y un 2400 no está en la moda -- los dos hacen
+# la recaptura obvia -- sino en la cola, en cada cuánto eligen algo malo. Los datos del hito lo
+# dicen solos: la entropía de la primera jugada, que lee la distribución entera, es monótona en las
+# seis condiciones; los puzles y el Elo, que leen la moda, son planos.
+#
+# Así que esta tirada cambia una sola cosa respecto de `greedy-sweep.yaml`: muestrea a temperatura
+# 1,0 con top-k 20, que es el ajuste "humano" de la demo. Si la brecha entre `<w1200>` y `<w2400>`
+# se abre, la cabecera controla la fuerza y lo que faltaba era dejar de muestrear el pico. Si sale
+# plana, es un segundo resultado nulo y también dice algo.
+#
+# NO sustituye a nada publicado: D-047 fija el muestreo casi determinista como el de todos los
+# números del proyecto, así que esto es una medición aparte, con su caché aparte, y se publica
+```
+
+<Src file="configs/eval/sweep-temperature.yaml" tag="p4" lines="1-15" />
+
+La hipótesis es razonable: toda la suite juega la moda, y la diferencia entre un 1200 y un 2400 no
+está en la moda —los dos hacen la recaptura obvia— sino en la cola. Si eso es lo que pasa, la
+cabecera sí controlaría la fuerza y lo que faltaba sería dejar de jugar el pico. Es contrastable y
+cuesta una hora, así que se contrastó. La lección 9 cuenta que salió que no.
+
+Y la última frase del comentario es la regla del proyecto: esto **no sustituye** a nada publicado.
+El muestreo casi determinista está fijado como el de todos los números, así que esta es una medición
+aparte, con su caché aparte, y se publica diciendo a qué temperatura se leyó.
+
+<Callout kind="hoy" title="Un comentario en español en un repositorio en inglés">
+  Este fichero es el único de `configs/` cuyos comentarios están en castellano: el resto del
+  repositorio —código, comentarios, docstrings, cards— está en inglés por convención, y este se
+  escribió con la lección delante. No rompe nada y está aquí dicho porque una convención que no se
+  comprueba se erosiona en el fichero que se escribió con prisa.
+</Callout>
+
+## Retirar una medición, y escribir la tabla desde lo medido
+
+El hito trae dos funciones más en `eval/report.py` que no son instrumentos de medida sino de
+**publicación**, y las dos existen por lo mismo que la escalera recalibrada.
+
+```python title="src/rukh/eval/report.py"
+def drop_rows(path: Path, stages: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+    """Remove rows from the shared results file; return ``(removed stages, rows that stay)``.
+
+    A measurement can be **retracted**, and when it is, the table has to be able to say so by not
+    carrying it any more. It happened once already: D-070 found that four of the eight rungs of
+    the Elo ladder had invented ratings, wrong by about five hundred points, which made every Elo
+    published before it wrong. The corrected runs were written under new stage names, so the old
+    rows stayed in the table and the project page kept serving retracted numbers for a day.
+
+    Deliberately explicit and per stage rather than a filter or a wildcard: dropping a row is
+    throwing away a measurement, and it should take saying its name.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return [], []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    found = payload.get("rows") if isinstance(payload, dict) else payload
+    rows = [item for item in found if isinstance(item, dict)] if isinstance(found, list) else []
+    wanted = set(stages)
+    removed = sorted({str(item.get("stage")) for item in rows if item.get("stage") in wanted})
+    kept = [item for item in rows if item.get("stage") not in wanted]
+    document = {"updated_at": datetime.now(UTC).isoformat(timespec="seconds"), "rows": kept}
+    path.write_text(
+        json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n"
+    )
+    return removed, kept
+```
+
+<Src file="src/rukh/eval/report.py" tag="p4" lines="236-261" />
+
+Una medición se puede **retirar**, y cuando se retira la tabla tiene que poder decirlo no
+llevándola. Pasó de verdad: al corregir la escalera, las corridas nuevas se escribieron con nombres
+de etapa nuevos, así que las filas viejas se quedaron en la tabla y la página del proyecto sirvió
+números retirados durante un día.
+
+La decisión está en el último párrafo del docstring: **explícita y por etapa**, no un filtro ni un
+comodín. Tirar una fila es tirar una medición, y debería costar decir su nombre.
+
+```python title="src/rukh/eval/report.py"
+BENCHMARKS_MARK = "## Resultados"
+"""Heading of ``docs/benchmarks.md`` from which everything is rewritten by ``render_benchmarks``."""
+
+BENCHMARKS_COLUMNS: list[tuple[str, str]] = [
+    ("Etapa", ""),
+    ("Legalidad sin máscara (%)", "---:"),
+    ("Top-1 (%)", "---:"),
+    ("Top-3 (%)", "---:"),
+    ("Puzles 1000-1500 (%)", "---:"),
+    ("Puzles 1500-2000 (%)", "---:"),
+    ("Puzles 2000+ (%)", "---:"),
+    ("Elo estimado (IC 95 %)", ""),
+    ("Δcp medio", "---:"),
+    ("Entropía 1.ª jugada (bits)", "---:"),
+    ("Fecha", ""),
+]
+```
+
+<Src file="src/rukh/eval/report.py" tag="p4" lines="264-279" />
+
+```python title="src/rukh/eval/report.py"
+def render_benchmarks(rows: list[dict[str, Any]]) -> str:
+    """The results table of ``docs/benchmarks.md``, rendered from the measured rows.
+
+    Written rather than typed, and for the reason the whole project keeps repeating: a table
+    copied by hand from a report is a second source of truth that starts drifting on the day it
+    is written. The encoder's rows are left out -- they share not one column with these -- and so
+    is every row that has no measurement at all.
+    """
+    playing = sorted(
+        (row for row in rows if row.get("kind") != "encoder"), key=lambda row: str(row.get("stage"))
+    )
+    header = "| " + " | ".join(name for name, _ in BENCHMARKS_COLUMNS) + " |"
+    rule = "|" + "|".join(align or "---" for _, align in BENCHMARKS_COLUMNS) + "|"
+    lines = [BENCHMARKS_MARK, "", header, rule]
+    for row in playing:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    f"`{row.get('stage')}`",
+                    _percent(row.get("legality")),
+                    _percent(row.get("top1")),
+                    _percent(row.get("top3")),
+                    _band(row, "puzzles", "1000-1500"),
+                    _band(row, "puzzles", "1500-2000"),
+                    _band(row, "puzzles", "2000+"),
+                    _elo_cell(row),
+                    "n/a" if row.get("delta_cp") is None else f"{row['delta_cp']:.1f}",
+                    "n/a"
+                    if row.get("first_move_entropy") is None
+                    else f"{row['first_move_entropy']:.4f}",
+                    str(row.get("date") or ""),
+                ]
+            )
+            + " |"
+        )
+    lines.append("")
+    lines.append(
+        f"{len(playing)} etapas medidas con la misma suite. Las filas del encoder viven aparte "
+        "porque no comparten una sola columna con estas; las que una medición retiró no están "
+        "(`rukh eval drop`)."
+    )
+    return "\n".join(lines) + "\n"
+
+
+def write_benchmarks(results: Path | str, out: Path | str) -> int:
+    """Rewrite the results section of ``docs/benchmarks.md``; returns how many rows it wrote.
+
+    Everything above ``## Resultados`` is the document's own text -- what each column means and
+    how it is measured -- and is left exactly as it is. Only the table is generated.
+    """
+    payload = json.loads(Path(results).read_text(encoding="utf-8"))
+    found = payload.get("rows") if isinstance(payload, dict) else payload
+    rows = [item for item in found if isinstance(item, dict)] if isinstance(found, list) else []
+    target = Path(out)
+    document = target.read_text(encoding="utf-8")
+    head, mark, _ = document.partition(BENCHMARKS_MARK)
+    if not mark:
+        raise ValueError(f"{target} has no `{BENCHMARKS_MARK}` heading to rewrite")
+    target.write_text(head + render_benchmarks(rows), encoding="utf-8", newline="\n")
+    return len([row for row in rows if row.get("kind") != "encoder"])
+```
+
+<Src file="src/rukh/eval/report.py" tag="p4" lines="303-363" />
+
+La tabla de `docs/benchmarks.md` se **escribe**, no se teclea, y el docstring da la razón que este
+proyecto repite en todas partes: una tabla copiada a mano de un informe es una segunda fuente de
+verdad que empieza a derivar el día en que se escribe.
+
+`write_benchmarks` reescribe solo lo que hay **debajo** de `## Resultados`. Todo lo de arriba es el
+texto del documento —qué significa cada columna y cómo se mide— y se queda exactamente como está. Es
+la separación que permite que un documento sea a la vez explicado a mano y actualizado por una
+máquina.
+
+Y las filas del encoder se quedan fuera, con su motivo dicho en el propio texto generado: no
+comparten una sola columna con un modelo que juega.
+
+```python title="tests/unit/test_benchmarks.py"
+"""`docs/benchmarks.md` is rendered from the measured rows, never typed."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from rukh.eval.report import BENCHMARKS_MARK, render_benchmarks, write_benchmarks
+
+pytestmark = pytest.mark.unit
+
+ROWS = [
+    {
+        "stage": "medium-elo",
+        "kind": None,
+        "legality": 0.998,
+        "top1": 0.541,
+        "top3": 0.83,
+        "puzzles": {"1000-1500": 0.57, "1500-2000": 0.37, "2000+": 0.17},
+        "elo": 1497.9,
+        "elo_ci": [1435.2, 1552.3],
+        "delta_cp": None,
+        "first_move_entropy": 1.7408,
+        "date": "2026-09-20",
+    },
+    {"stage": "encoder", "kind": "encoder", "blunder_f1": 0.18, "date": "2026-09-19"},
+    {
+        "stage": "all-wins",
+        "elo": None,
+        "elo_separated": True,
+        "elo_lower": 2000.0,
+        "date": "2026-09-20",
+    },
+]
+```
+
+<Src file="tests/unit/test_benchmarks.py" tag="p4" lines="1-36" />
+
+Las tres filas de prueba son los tres casos que la tabla tiene que saber imprimir: una etapa medida
+del todo, una del encoder —que no debe salir— y una con **cota** en vez de intervalo, que es lo que
+produce un modelo que gana o pierde todas las partidas.
+
+## Los tests de los dos instrumentos
+
+`tests/unit/test_diversity.py` son 207 líneas y `tests/unit/test_sweep.py` 153. No van enteros porque
+la mitad de cada uno es montaje de modelos de juguete, y los contratos que comprueban se pueden
+nombrar. De diversidad: que un modelo que juega siempre lo mismo da entropía **exactamente** cero;
+que la entropía normalizada es 1 cuando cada partida abre distinto; que la entropía de la primera
+jugada no depende de la semilla; y que un lote que se desincroniza lanza en vez de rellenar. De
+barrido: que `is_monotonic` y `is_separated` contestan lo que dicen en los casos límite —una sola
+fila, una fila sin Elo, una cota de una cola—; que las condiciones fuera de orden se rechazan; y que
+el `results.json` lleva las dos banderas.
+
+Los dos están en
+[el repositorio en la etiqueta `p4`](https://github.com/borja-glez/rukh/tree/p4/tests/unit).
+
+## Qué has aprendido
+
+Dos instrumentos y una lección sobre instrumentos. La entropía de aperturas, en dos números porque
+uno depende del muestreador y el otro es una propiedad de los pesos —y publicar solo el primero sería
+publicar una propiedad del decodificador con nombre de propiedad del modelo—. Y el barrido, que
+cambia un número entre filas y emite dos veredictos, porque «ordenado» y «distinguible» no son la
+misma afirmación.
+
+Por el camino, dos cosas que se llevan fuera: una clave de caché tiene que incluir todo lo que cambia
+la respuesta, y recalibrar un instrumento invalida las medidas anteriores —cuatro de las ocho anclas
+de la escalera estaban mal por 430 a 580 puntos y arrastraban todas las etapas 350 puntos hacia
+abajo—.
+
+Se mide con `artifacts/eval/<stage>-elo-sweep/results.json`, que lleva las seis filas, los dos
+veredictos y el `span`.
+
+Lo siguiente es la parte que un lector puede tocar: el selector que ofrece las condiciones medidas y
+ninguna más, y el cambio de estilo que no descarga otro modelo. Sigue en «El selector en la demo».

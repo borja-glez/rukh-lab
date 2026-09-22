@@ -1,0 +1,2187 @@
+---
+title: 'QLoRA con `transformers`: el decoder entra en el ecosistema'
+description:
+  'models/hf.py —el decoder vestido de PreTrainedModel, con las tres trampas que no salen en ningún
+  tutorial—, train/qwen.py —QLoRA de Qwen3-0.6B con transformers, peft y trl—, y las dos piezas que
+  lo meten en el harness de M2: qwen_source.py, que cuenta las tres maneras de fallar que el decoder
+  no tiene, y qwen_suite.py, que corre la misma suite sobre otro jugador.'
+module: m4
+order: 5
+duration: 295
+runtime: 75
+level: avanzado
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - QLoRA
+  - cuantización de 4 bits
+  - PreTrainedModel
+  - peft
+  - trl
+  - bitsandbytes
+  - SAN
+artifacts:
+  - kind: adapter
+    label: chorcat/rukh-qwen3-pgn-qlora
+---
+
+Lección 5 de 10 del módulo «Fine-tuning e instrucción». Viene de «Estilo y texto PGN» y sigue en
+«Adaptadores y publicación». Es la lección más larga del módulo: cuatro ficheros nuevos, dos suites
+de tests y el extra de dependencias que los hace posibles, unas mil quinientas líneas. Se puede leer
+en dos sesiones, cortando después de la prueba contra `peft`.
+
+## Qué vas a construir
+
+Las dos mitades de una comparación. Por un lado, el decoder de este curso vestido de
+`PreTrainedModel`, que es lo que permite ponerlo al lado de una implementación de referencia. Por
+otro, un Qwen3-0.6B afinado con <Term id="qlora">QLoRA</Term> sobre las mismas partidas y enchufado
+al harness de M2 como un jugador más.
+
+Al terminar tendrás el número que este curso lleva tres módulos debiendo —¿merecía la pena escribir
+un modelo propio?— y, de paso, la comprobación que hace honesto haber escrito LoRA a mano: la misma
+configuración, con `apply_lora` y con `peft`, optimizando el mismo número paso a paso.
+
+## `hf.py`: la envoltura
+
+```python title="src/rukh/models/hf.py"
+"""``MoveDecoder`` dressed as a ``PreTrainedModel``, so the Hugging Face stack works on it.
+
+The decoder is deliberately plain PyTorch: it is the model of this course and reading it should
+not require knowing anybody's framework. But the rest of the ecosystem -- ``peft``, ``trl``'s
+trainers, ``AutoModel``, the Hub's inference widgets -- speaks ``PreTrainedModel``, and a wrapper
+is a hundred lines whereas re-implementing LoRA, DPO and GRPO is not.
+
+The wrapper **owns** a ``MoveDecoder``; it does not reimplement one. So there is exactly one
+definition of the forward pass in this repository, and the test that the two give identical logits
+is a test that the wrapping is faithful rather than a second implementation drifting from the
+first. The weights are the same objects, which is also why ``from_decoder`` costs nothing.
+
+What this buys, concretely, is the check M4 owes the reader: the hand-written LoRA of
+``rukh.models.lora`` and ``peft``'s, on the same weights with the same rank and the same targets,
+have to produce the same loss curve. Without the wrapper the two could not be put side by side at
+all, and "we implemented LoRA" would rest on the author's word.
+"""
+```
+
+<Src file="src/rukh/models/hf.py" tag="p4" lines="1-17" />
+
+El docstring dice la decisión y su límite. El decoder es PyTorch a secas **a propósito**: leerlo no
+debería exigir conocer el framework de nadie. Pero el resto del ecosistema habla `PreTrainedModel`, y
+una envoltura son cien líneas mientras que reimplementar LoRA, DPO y GRPO no lo es. Es un adaptador
+de enchufe: no cambia el aparato, cambia la clavija.
+
+La frase que hay que retener es la del tercer párrafo: la envoltura **contiene** un `MoveDecoder`, no
+reimplementa uno. Hay una sola definición del paso hacia delante en todo el repositorio, así que el
+test de que las dos dan los mismos logits comprueba que el envoltorio es fiel, no que una segunda
+implementación no se ha desviado de la primera.
+
+```python title="src/rukh/models/hf.py"
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import torch
+from torch import nn
+
+from rukh.models.config import DecoderConfig
+from rukh.models.decoder import IGNORE_INDEX, MoveDecoder
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig, PreTrainedModel
+else:  # pragma: no cover - resolved at import time
+    from transformers import PretrainedConfig, PreTrainedModel
+
+from transformers import GenerationMixin
+from transformers.modeling_outputs import CausalLMOutput
+
+__all__ = ["MODEL_TYPE", "RukhConfig", "RukhForCausalLM"]
+
+MODEL_TYPE = "rukh"
+```
+
+<Src file="src/rukh/models/hf.py" tag="p4" lines="19-39" />
+
+El `if TYPE_CHECKING ... else` con las **dos ramas idénticas** parece redundante y no lo es: es lo
+que le dice al comprobador de tipos que estos nombres vienen de `transformers` sin que el import se
+resuelva de manera distinta en tiempo de ejecución. Es el precio de importar de una librería que
+declara sus tipos de forma dinámica.
+
+```python title="src/rukh/models/hf.py"
+class RukhConfig(PretrainedConfig):
+    """``DecoderConfig`` in the shape ``transformers`` expects to serialise.
+
+    The fields are the decoder's, spelled the same way, so a ``config.json`` written here and the
+    YAML a run was configured with say the same thing. ``transformers`` insists on a few names of
+    its own (``vocab_size``, ``model_type``); everything else is left alone rather than renamed
+    into ``hidden_size``/``num_hidden_layers``, because a reader who has the decoder open should
+    recognise what they are looking at.
+    """
+
+    model_type = MODEL_TYPE
+
+    def __init__(
+        self,
+        vocab_size: int = 2030,
+        n_layer: int = 12,
+        n_head: int = 8,
+        d_model: int = 512,
+        block: int = 200,
+        dropout: float = 0.0,
+        pos: str = "learned",
+        tie_embeddings: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        self.vocab_size = vocab_size
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.d_model = d_model
+        self.block = block
+        self.dropout = dropout
+        self.pos = pos
+        self.tie_embeddings = tie_embeddings
+        kwargs.setdefault("tie_word_embeddings", tie_embeddings)
+        super().__init__(**kwargs)
+
+    @classmethod
+    def from_decoder(cls, cfg: DecoderConfig, **kwargs: Any) -> RukhConfig:
+        return cls(
+            vocab_size=cfg.vocab_size,
+            n_layer=cfg.n_layer,
+            n_head=cfg.n_head,
+            d_model=cfg.d_model,
+            block=cfg.block,
+            dropout=cfg.dropout,
+            pos=cfg.pos,
+            tie_embeddings=cfg.tie_embeddings,
+            **kwargs,
+        )
+
+    def decoder_config(self) -> DecoderConfig:
+        """The ``DecoderConfig`` this config describes.
+
+        Not called ``decoder``: ``transformers`` reads a config attribute of that name as the
+        decoder half of an encoder-decoder pair and tries to call ``to_dict`` on it, which turns
+        a bound method into a crash the first time anything asks for a generation config.
+        """
+        return DecoderConfig(
+            vocab_size=self.vocab_size,
+            n_layer=self.n_layer,
+            n_head=self.n_head,
+            d_model=self.d_model,
+            block=self.block,
+            dropout=self.dropout,
+            pos=self.pos,  # type: ignore[arg-type]
+            tie_embeddings=self.tie_embeddings,
+        )
+```
+
+<Src file="src/rukh/models/hf.py" tag="p4" lines="42-107" />
+
+La configuración, con la decisión de nomenclatura explicada en su docstring: los campos se deletrean
+**como los del decoder** (`n_layer`, `d_model`, `block`) y no como los de `transformers`
+(`num_hidden_layers`, `hidden_size`). Solo se ceden los dos nombres que la librería exige,
+`vocab_size` y `model_type`. La razón es de lectura: quien tenga el decoder abierto tiene que
+reconocer lo que está mirando, y un `config.json` escrito aquí y el YAML con el que se configuró la
+corrida dicen lo mismo.
+
+Y luego está la trampa, en el docstring de `decoder_config`. El método **no se puede llamar
+`decoder`**: `transformers` lee un atributo de la config con ese nombre como la mitad decodificadora
+de un par encoder-decoder e intenta llamarle `to_dict()`, lo que convierte un método enlazado en una
+excepción la primera vez que algo pide una config de generación. Hay un test que construye una
+`GenerationConfig` solo para comprobar que no explota.
+
+```python title="src/rukh/models/hf.py"
+class RukhForCausalLM(PreTrainedModel, GenerationMixin):
+    """A ``PreTrainedModel`` whose whole body is one ``MoveDecoder``.
+
+    ``GenerationMixin`` comes along because ``prepare_inputs_for_generation`` is defined and a
+    class that answers it without inheriting the mixin is a model that looks generative and is
+    not. Nothing in this project generates through ``.generate()`` -- the sampler of
+    ``rukh.infer`` does it with the legality mask, which ``transformers`` knows nothing about --
+    but a wrapper that half-implements an interface is worse than one that implements it.
+    """
+
+    config_class = RukhConfig
+    base_model_prefix = "decoder"
+    supports_gradient_checkpointing = False
+    _no_split_modules = ["Block"]
+    _tied_weights_keys = {"decoder.lm_head.weight": "decoder.tokens.weight"}
+    """Which name is the copy and which is the storage: the head shares its tensor with the
+    embedding table, because ``MoveDecoder`` ties them in its constructor. ``safetensors`` stores
+    tensors and not aliases, so ``save_pretrained`` refuses a state dict with two names for one
+    tensor unless it is told. This is the same fact ``rukh.train.checkpoint.TIED_SOURCES`` records
+    for the project's own checkpoint format."""
+
+    def __init__(self, config: RukhConfig) -> None:
+        super().__init__(config)
+        self.decoder = MoveDecoder(config.decoder_config())
+        # Registers the tied-weight map and the other static properties on the top model. It does
+        # not touch the weights in this version of `transformers`, so calling it after building
+        # the decoder is safe; skipping it leaves `all_tied_weights_keys` unset and every save or
+        # load fails on an attribute the framework expects every model to have.
+        self.post_init()
+```
+
+<Src file="src/rukh/models/hf.py" tag="p4" lines="110-138" />
+
+Dos trampas más, las dos comentadas donde ocurren.
+
+**Los pesos atados hay que declararlos.** `lm_head.weight` comparte almacenamiento con la tabla de
+embeddings porque `MoveDecoder` los ata en su constructor; `safetensors` guarda tensores y no alias,
+y rechaza un state dict con dos nombres para un tensor salvo que se le diga cuál es la copia y cuál
+el almacén. Es un enlace simbólico: un segundo nombre para el mismo fichero, y un copiador que no
+sepa de enlaces guarda dos ficheros o se niega a guardar ninguno.
+
+**Hay que llamar a `post_init()`.** Sin él no existe `all_tied_weights_keys` y cualquier guardado o
+carga falla con un `AttributeError` sobre un atributo que uno no ha escrito. El comentario dice
+además por qué es seguro llamarlo **después** de construir el decoder en esta versión de
+`transformers`: no toca los pesos.
+
+`GenerationMixin` viene con el paquete por una razón de honestidad: `prepare_inputs_for_generation`
+está definido, y una clase que contesta a esa interfaz sin heredar el mixin es un modelo que parece
+generativo y no lo es. Nada en este proyecto genera con `.generate()` —el muestreador
+de `rukh.infer` lo hace con la máscara de legalidad, de la que `transformers` no sabe nada—, pero
+una envoltura que implementa media interfaz es peor que una que la implementa.
+
+```python title="src/rukh/models/hf.py"
+    @classmethod
+    def from_decoder(cls, decoder: MoveDecoder, **kwargs: Any) -> RukhForCausalLM:
+        """Wrap an existing decoder **without copying its weights**.
+
+        The tensors are shared, so training the wrapper trains the decoder and a checkpoint taken
+        from either is the same checkpoint. That is the property that makes the peft comparison
+        meaningful: both sides start from literally the same numbers.
+        """
+        model = cls(RukhConfig.from_decoder(decoder.cfg, **kwargs))
+        model.decoder = decoder
+        return model
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.decoder.tokens
+
+    def set_input_embeddings(self, value: nn.Module) -> None:
+        self.decoder.tokens = value  # type: ignore[assignment]
+
+    def get_output_embeddings(self) -> nn.Module:
+        return self.decoder.lm_head
+```
+
+<Src file="src/rukh/models/hf.py" tag="p4" lines="140-159" />
+
+`from_decoder` envuelve **sin copiar los pesos**: los tensores son los mismos objetos, así que
+entrenar la envoltura entrena el decoder y un checkpoint tomado de cualquiera de los dos es el mismo
+checkpoint. Esa es la propiedad que hace significativa la comparación con `peft`: los dos lados
+empiezan literalmente desde los mismos números.
+
+```python title="src/rukh/models/hf.py"
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,  # noqa: ARG002 - the decoder is always causal
+        return_dict: bool | None = None,  # noqa: ARG002 - a dataclass is the only output shape
+        **kwargs: Any,
+    ) -> CausalLMOutput:
+        """Logits, and the decoder's own loss when ``labels`` are given.
+
+        ``labels`` are **already shifted** here, unlike most causal models in ``transformers``.
+        The packed stream of this project stores ``(x, y)`` pairs where ``y`` is ``x`` moved one
+        step, so shifting again inside the model would teach it to predict the move after next.
+        The loss is the decoder's, ``ignore_index=0``, so a run through the wrapper and a run
+        through the training loop optimise the same number.
+        """
+        logits, loss = self.decoder(input_ids, labels)
+        return CausalLMOutput(loss=loss, logits=logits)
+
+    def prepare_inputs_for_generation(
+        self, input_ids: torch.Tensor, **kwargs: Any
+    ) -> dict[str, Any]:
+        """Crop to the context window; there is no KV cache to carry between steps."""
+        return {"input_ids": input_ids[:, -self.config.block :]}
+
+    @property
+    def ignore_index(self) -> int:
+        """The id the loss skips: ``<pad>``, id 0, in every scheme of this project."""
+        return IGNORE_INDEX
+```
+
+<Src file="src/rukh/models/hf.py" tag="p4" lines="161-189" />
+
+Y la tercera trampa, que es la que más caro sale: **aquí las etiquetas no se desplazan**. Casi todos
+los modelos causales de `transformers` desplazan `labels` dentro de `forward`. El flujo empaquetado
+de este proyecto ya guarda `y` un paso por delante de `x`, así que volver a desplazarlas entrenaría
+al modelo a predecir la jugada **de después de la siguiente**.
+
+<Callout kind="roto" title="Un desplazamiento de más no rompe nada, y ese es el problema">
+  El modelo entrenaría. La pérdida bajaría. La curva tendría buena pinta. Lo único raro sería que el
+  modelo jugara mal, y a esas alturas ya hay cinco explicaciones plausibles para eso antes de que a
+  nadie se le ocurra mirar el desplazamiento de las etiquetas. Es el mismo patrón que el
+  `val_remainder_trains` de la lección 2 y que el `best.pt` de un afinado: un fallo silencioso es
+  más caro que una excepción aunque cueste lo mismo arreglarlo, porque el coste de verdad es
+  encontrarlo.
+</Callout>
+
+`prepare_inputs_for_generation` recorta a la ventana de contexto y ya: no hay caché de claves y
+valores que arrastrar entre pasos, porque el decoder no la implementa.
+
+### Los tests de la envoltura, y la prueba que hace honesto el módulo
+
+```python title="tests/unit/test_hf_wrapper.py"
+"""Tests for rukh.models.hf: the wrapper, and the check that our LoRA is LoRA.
+
+The second half is the one that matters for M4. Writing LoRA by hand is only worth the pages it
+takes in the lesson if the thing written is the thing the papers describe, and the way to know
+that is to put it next to the reference implementation on the same weights and watch the two
+optimise the same number. Without this test "we implemented LoRA" would rest on the author's word.
+
+The Hugging Face stack is an optional extra (`uv sync --extra hf`): a CPU CI job with a
+three-minute budget should not install it to run P0-P3. These tests skip when it is absent and are
+run locally and in the extended job.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import torch
+
+from rukh.models import DecoderConfig, MoveDecoder
+from rukh.models.lora import LoraConfig, apply_lora, lora_modules
+
+transformers = pytest.importorskip("transformers", reason="needs the `hf` extra")
+peft = pytest.importorskip("peft", reason="needs the `hf` extra")
+
+from rukh.models.hf import RukhConfig, RukhForCausalLM  # noqa: E402
+
+pytestmark = pytest.mark.unit
+
+TOY = DecoderConfig(vocab_size=64, n_layer=2, n_head=2, d_model=32, block=16, dropout=0.0)
+
+
+def _decoder(seed: int = 0) -> MoveDecoder:
+    torch.manual_seed(seed)
+    return MoveDecoder(TOY)
+
+
+def _batch() -> tuple[torch.Tensor, torch.Tensor]:
+    torch.manual_seed(99)
+    x = torch.randint(1, 64, (4, 16))
+    y = torch.randint(1, 64, (4, 16))
+    return x, y
+```
+
+<Src file="tests/unit/test_hf_wrapper.py" tag="p4" lines="1-42" />
+
+Los dos `importorskip` **antes** del import de `rukh.models.hf` son lo que permite que este fichero
+exista en un repositorio cuya CI de CPU no instala `transformers`. El `# noqa: E402` del import de
+abajo está porque el linter, con razón en general, no quiere imports después de código; aquí el orden
+es el punto.
+
+El docstring dice la política: la pila de Hugging Face es un extra opcional (`uv sync --extra hf`)
+porque una CI de CPU con tres minutos de presupuesto no debería instalarla para correr M0 a M3.
+
+```python title="tests/unit/test_hf_wrapper.py"
+def test_the_wrapper_and_the_decoder_give_the_same_logits() -> None:
+    """One definition of the forward pass, wrapped -- not a second one that can drift."""
+    decoder = _decoder().eval()
+    model = RukhForCausalLM.from_decoder(decoder).eval()
+    x, _ = _batch()
+    with torch.no_grad():
+        torch.testing.assert_close(decoder(x)[0], model(x).logits)
+
+
+def test_wrapping_shares_the_weights_rather_than_copying_them() -> None:
+    decoder = _decoder()
+    model = RukhForCausalLM.from_decoder(decoder)
+    assert model.decoder is decoder
+    assert model.get_input_embeddings().weight.data_ptr() == decoder.tokens.weight.data_ptr()
+
+
+def test_the_loss_is_the_decoder_s_own() -> None:
+    """Same number, so a run through `SFTTrainer` optimises what the training loop optimises."""
+    decoder = _decoder().eval()
+    model = RukhForCausalLM.from_decoder(decoder).eval()
+    x, y = _batch()
+    with torch.no_grad():
+        expected = decoder(x, y)[1]
+        got = model(x, labels=y).loss
+    assert expected is not None
+    torch.testing.assert_close(expected, got)
+
+
+def test_labels_are_not_shifted_again() -> None:
+    """The packed stream already stores `y` one step ahead of `x` (`rukh.tokenize.loader`).
+
+    Every causal model in `transformers` shifts labels inside `forward`; doing that here would
+    train the model to predict the move *after* next, and the loss would still look plausible.
+    """
+    decoder = _decoder().eval()
+    model = RukhForCausalLM.from_decoder(decoder).eval()
+    x, _ = _batch()
+    shifted = torch.roll(x, shifts=-1, dims=1)
+    with torch.no_grad():
+        through_wrapper = model(x, labels=shifted).loss
+        by_hand = decoder(x, shifted)[1]
+    torch.testing.assert_close(through_wrapper, by_hand)
+
+
+def test_the_config_round_trips_through_disk(tmp_path: Path) -> None:
+    decoder = _decoder().eval()
+    model = RukhForCausalLM.from_decoder(decoder).eval()
+    model.save_pretrained(tmp_path)
+    reloaded = RukhForCausalLM.from_pretrained(tmp_path).eval()
+    assert reloaded.config.decoder_config() == TOY
+    x, _ = _batch()
+    with torch.no_grad():
+        torch.testing.assert_close(model(x).logits, reloaded(x).logits)
+```
+
+<Src file="tests/unit/test_hf_wrapper.py" tag="p4" lines="45-97" />
+
+Cinco tests de fidelidad, uno por afirmación de la sección anterior. Mismos logits. Los pesos se
+**comparten** —comprobado por `data_ptr()`, que es la dirección de la memoria: dos tensores con el
+mismo puntero son el mismo tensor—. La pérdida es la del decoder, así que una corrida por
+`SFTTrainer` optimiza lo que optimiza el bucle de entrenamiento. Las etiquetas no se vuelven a
+desplazar, comprobado comparando contra un desplazamiento hecho a mano. Y la config va y vuelve por
+disco.
+
+```python title="tests/unit/test_hf_wrapper.py"
+def test_the_config_is_not_mistaken_for_an_encoder_decoder_pair() -> None:
+    """`transformers` reads a config attribute called `decoder` as the other half of a pair.
+
+    It calls `to_dict()` on it, so a method with that name crashes the first time anything asks
+    for a generation config -- which is anything that touches `.generate()`.
+    """
+    config = RukhConfig.from_decoder(TOY)
+    assert not hasattr(config, "decoder") or not callable(getattr(config, "decoder", None))
+    transformers.GenerationConfig.from_model_config(config)
+
+
+def _peft_config(r: int, alpha: int, targets: list[str]) -> peft.LoraConfig:
+    return peft.LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        lora_dropout=0.0,
+        bias="none",
+        target_modules=targets,
+    )
+
+
+def test_peft_counts_the_same_trainable_parameters_as_the_hand_written_lora() -> None:
+    """Same rank, same matrices: the arithmetic has to agree before the curves can."""
+    ours = _decoder()
+    mine = apply_lora(ours, LoraConfig(r=4, alpha=8, targets=("attn_out",)))
+
+    theirs = RukhForCausalLM.from_decoder(_decoder())
+    adapted = peft.get_peft_model(theirs, _peft_config(4, 8, ["attn.proj"]))
+    reference = sum(p.numel() for p in adapted.parameters() if p.requires_grad)
+    assert mine == reference
+```
+
+<Src file="tests/unit/test_hf_wrapper.py" tag="p4" lines="100-129" />
+
+El test de la config que no se confunde con un par encoder-decoder es dos líneas y evita un fallo que
+aparece lejos de su causa: la excepción sale al pedir una `GenerationConfig`, no al definir el
+método.
+
+Y el de los recuentos es el paso previo a la comparación de verdad: si `peft` y nosotros no cuentan
+los mismos parámetros entrenables, comparar las curvas no tendría sentido porque estaríamos
+entrenando modelos con distinto número de grados de libertad. La aritmética tiene que coincidir
+antes de que puedan coincidir las curvas.
+
+```python title="tests/unit/test_hf_wrapper.py"
+def test_the_hand_written_lora_and_peft_optimise_the_same_number() -> None:
+    """The check that makes the chapter honest.
+
+    Both sides start from the same base weights and are given the same `A` (copied across, so the
+    comparison is of the maths and not of two random draws), then take the same optimiser steps on
+    the same batch. If the update rule differed at all -- the scaling, which side `A` multiplies,
+    whether `B` starts at zero -- the losses would separate immediately.
+    """
+    x, y = _batch()
+    r, alpha, steps = 4, 8, 6
+
+    ours = _decoder()
+    apply_lora(ours, LoraConfig(r=r, alpha=alpha, targets=("attn_out",)))
+    mine = [p for p in ours.parameters() if p.requires_grad]
+
+    theirs = RukhForCausalLM.from_decoder(_decoder())
+    adapted = peft.get_peft_model(theirs, _peft_config(r, alpha, ["attn.proj"]))
+
+    # Copy our `A` into theirs so both start from the same point; `B` is zero on both sides.
+    ours_by_layer = {name: module for name, module in lora_modules(ours)}
+    with torch.no_grad():
+        for name, module in adapted.named_modules():
+            if not hasattr(module, "lora_A") or "default" not in getattr(module, "lora_A", {}):
+                continue
+            key = name.replace("base_model.model.decoder.", "").replace(".base_layer", "")
+            module.lora_A["default"].weight.copy_(ours_by_layer[key].a[0])
+
+    mine_opt = torch.optim.SGD(mine, lr=0.5)
+    their_opt = torch.optim.SGD([p for p in adapted.parameters() if p.requires_grad], lr=0.5)
+
+    my_curve: list[float] = []
+    their_curve: list[float] = []
+    for _ in range(steps):
+        mine_opt.zero_grad()
+        loss = ours(x, y)[1]
+        assert loss is not None
+        loss.backward()
+        mine_opt.step()
+        my_curve.append(float(loss.detach()))
+
+        their_opt.zero_grad()
+        other = adapted(x, labels=y).loss
+        other.backward()
+        their_opt.step()
+        their_curve.append(float(other.detach()))
+
+    assert my_curve[-1] < my_curve[0]  # it is training at all
+    for step, (a, b) in enumerate(zip(my_curve, their_curve, strict=True)):
+        assert a == pytest.approx(b, abs=1e-5), f"step {step}: {a} vs {b}"
+
+
+def test_peft_leaves_the_base_weights_frozen_exactly_as_ours_does() -> None:
+    theirs = RukhForCausalLM.from_decoder(_decoder())
+    adapted = peft.get_peft_model(theirs, _peft_config(4, 8, ["attn.proj"]))
+    trainable = {name for name, p in adapted.named_parameters() if p.requires_grad}
+    assert trainable
+    assert all("lora_" in name for name in trainable)
+```
+
+<Src file="tests/unit/test_hf_wrapper.py" tag="p4" lines="132-188" />
+
+Y esta es la prueba que hace honesto el módulo entero. Se montan dos modelos sobre **los mismos pesos
+base**: uno con `apply_lora`, otro con `peft.get_peft_model`. Se copia nuestra `A` en la suya, para
+que la comparación sea de las matemáticas y no de dos sorteos aleatorios —`B` es cero en los dos
+lados por construcción, y eso es justamente la primera afirmación del método—. Y entonces los dos dan
+pasos de SGD sobre el mismo lote, con la misma tasa, y se comparan las pérdidas paso a paso.
+
+`assert my_curve[-1] < my_curve[0]` antes del bucle de comparación es la guarda que evita el test
+vacío: dos modelos que no entrenan en absoluto también dan curvas idénticas.
+
+El objetivo es `attn_out` y no `q`/`v` por lo que explicaba la lección 3: `peft` no puede expresar un
+adaptador por rodaja sobre una `qkv` fusionada, así que sobre `attn.proj` —una `nn.Linear` normal, un
+solo rango que cubre toda la salida— las dos hacen literalmente lo mismo, y por eso es ahí donde la
+igualdad significa algo.
+
+El `name.replace("base_model.model.decoder.", "").replace(".base_layer", "")` es fontanería: traduce
+el nombre de módulo que crea `peft` al que tiene el modelo desnudo. Es feo y es la clase de fealdad
+que se paga una vez en un test y ahorra escribir una capa de traducción en el código de producción.
+
+Salida en la máquina de referencia (RTX 5090), a través de `labs/m4/lora_check.py`:
+
+```text
+4. step   ours          peft          |delta|
+      0   4.17093372    4.17093372    0.00e+00
+      1   4.16829062    4.16829062    0.00e+00
+      2   4.16558743    4.16558743    0.00e+00
+      3   4.16275978    4.16275978    0.00e+00
+      4   4.15973043    4.15973043    0.00e+00
+      5   4.15640736    4.15640736    0.00e+00
+```
+
+Idénticas hasta el último bit, seis pasos seguidos.
+
+<Transfer
+  concept="Vectores de prueba"
+  where="Cualquier implementación propia de un algoritmo especificado: un cifrado, un codificador, un formato de serialización, un protocolo de reintentos."
+>
+  Nadie que implementa un algoritmo de cifrado se conforma con que «parece que cifra»: lo pasa por
+  los vectores de prueba oficiales, con entradas y salidas publicadas, porque una implementación que
+  se desvía en un bit también produce una salida perfectamente ilegible. Cuando no hay vectores
+  publicados, la implementación de referencia sirve: mismo punto de partida, misma entrada, mismos
+  pasos, y comparar. Lo caro no es el test, es montar la interfaz que permite poner las dos cosas
+  lado a lado — y eso es lo que aquí cuestan cien líneas de envoltura.
+</Transfer>
+
+## El extra `hf`, y por qué es un extra
+
+Nada de esta lección se puede importar con el entorno base del proyecto, y eso es una decisión.
+
+{/* prettier-ignore */}
+```toml title="pyproject.toml"
+[project.optional-dependencies]
+cpu = ["torch>=2.11,<2.12"]
+cu128 = ["torch>=2.11,<2.12"]
+# The Hugging Face training stack, needed only by M4: the `PreTrainedModel` wrapper around
+# `MoveDecoder`, `peft` as the reference LoRA the hand-written one is checked against, and the
+# QLoRA fine-tune of Qwen3 on PGN. It is an extra and not a core dependency because the CPU CI
+# job has a three-minute budget and nothing in P0-P3 imports any of it.
+hf = ["transformers>=5.17", "peft>=0.21", "trl>=1.13", "accelerate>=1.15", "bitsandbytes>=0.50"]
+```
+
+<Src file="pyproject.toml" tag="p4" lines="32-39" />
+
+Cinco paquetes, y el comentario dice por qué van en un extra y no en las dependencias: la CI de CPU
+tiene un presupuesto de tres minutos y **nada de M0 a M3 importa ninguno**. Un proyecto que mete
+`transformers` en sus dependencias por usarlo en un módulo de seis paga la instalación en cada
+corrida de cada rama.
+
+{/* prettier-ignore */}
+```yaml title=".github/workflows/ml.yml"
+      # `hf` as well as `cpu`: without it the Hugging Face tests skip, and one of them is the
+      # only check that the hand-written LoRA of `rukh.models.lora` is the same update rule as
+      # `peft`'s. A claim that is verified on one laptop is not verified.
+      - name: Sync (CPU torch, Hugging Face extra, dev group)
+        run: uv sync --extra cpu --extra hf --group dev
+```
+
+<Src file=".github/workflows/ml.yml" tag="p4" lines="27-31" />
+
+Y aun así la CI **sí** lo instala, con el motivo escrito encima: sin el extra, los tests de Hugging
+Face se saltan, y uno de ellos es la única comprobación de que la LoRA escrita a mano es la misma
+regla de actualización que la de `peft`. La frase que lo cierra vale fuera del proyecto: **una
+afirmación verificada en un solo portátil no está verificada**.
+
+## `qwen.py`: el afinado del modelo general
+
+```python title="src/rukh/train/qwen.py"
+"""QLoRA of a general language model on the same games, so the comparison is fair.
+
+M4 owes the reader a number for a question the whole project raises by existing: why build a
+115 M decoder for chess when a general model five times its size can be fine-tuned in an
+afternoon? The only answer worth printing is a measurement, and a measurement is only worth
+printing when the two sides differ in one thing. So:
+
+- the **games** are the same, drawn from the same month and held out against the same validation
+  split (``rukh.data.pgn_text``);
+- the **metrics** are the same, because the fine-tuned Qwen is plugged into the harness of P2 as
+  another ``MoveSource`` (``rukh.eval.qwen_source``) and plays the same Stockfish ladder;
+- the **representation** is what differs, and that is the point. The decoder reads one token per
+  legal move; Qwen reads ``1. e4 e5 2. Nf3`` cut into whatever pieces its BPE makes of it, and
+  nothing in it forbids writing a move that does not exist.
+
+This file is the training half, and it is deliberately somebody else's code: ``transformers`` for
+the model, ``peft`` for the adapter, ``trl`` for the loop. The project has its own LoRA and its own
+loop and does not need either here -- what it needs is the experience of the ecosystem path,
+which is what a reader will actually reach for, and a run that is comparable to the published
+QLoRA recipes rather than to ours.
+
+Four-bit is attempted and not required. The memory it saves is the reason QLoRA exists, and at
+0.6 B parameters on a 32 GB card there is nothing to save: the honest thing is to try it, report
+whether it worked, and fall back to bf16 rather than pretend a technique was demonstrated when
+the dependency would not build.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from pydantic import Field
+
+from rukh.config import BaseConfig
+from rukh.paths import resolve
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+log = logging.getLogger(__name__)
+
+__all__ = ["QwenConfig", "QwenReport", "four_bit_config", "train_qwen"]
+```
+
+<Src file="src/rukh/train/qwen.py" tag="p4" lines="1-45" />
+
+Veintiséis líneas de docstring que son el diseño del experimento. La lista de tres puntos es la
+condición para que un número valga: mismas partidas, mismas métricas, y una sola diferencia —la
+representación—.
+
+Los dos últimos párrafos son decisiones de curso además de decisiones técnicas. **Este fichero es
+deliberadamente código de otros**: `transformers` para el modelo, `peft` para el adaptador, `trl`
+para el bucle. El proyecto tiene su propia LoRA y su propio bucle y no los necesita aquí; lo que
+necesita es la experiencia del camino del ecosistema, que es el que un lector va a usar de verdad, y
+una corrida comparable con las recetas publicadas de QLoRA en vez de con una variante propia.
+
+Y **cuatro bits se intenta, no se exige**. La memoria que ahorra es la razón de existir de QLoRA, y
+a 0,6 B de parámetros en una tarjeta de 32 GB no hay nada que ahorrar: lo honesto es intentarlo,
+informar de si funcionó y caer a bf16 en vez de fingir que se demostró una técnica cuando la
+dependencia no compilaba.
+
+Fíjate en lo que **no** hay arriba: ni `torch`, ni `transformers`, ni `peft`, ni `trl`. Todos entran
+dentro de las funciones, porque el extra `hf` no está instalado en el entorno base y este módulo
+tiene que poder importarse para que `rukh train qwen --help` conteste.
+
+```python title="src/rukh/train/qwen.py"
+class QwenConfig(BaseConfig):
+    """One QLoRA run of a general model over PGN text."""
+
+    model: str = "Qwen/Qwen3-0.6B"
+    data_dir: str = "data/pgn-text"
+    out_dir: str = "checkpoints"
+    run_name: str = "qwen3-pgn-qlora"
+    max_length: int = Field(default=512, ge=64)
+    """Tokens per sample. A 120-ply game in SAN with the rating header is 350-450 of Qwen's
+    tokens, so 512 fits a whole game and truncates the longest few rather than half of them."""
+    batch_size: int = Field(default=8, ge=1)
+    grad_accum: int = Field(default=4, ge=1)
+    lr: float = Field(default=2e-4, gt=0)
+    max_steps: int = Field(default=1500, ge=1)
+    warmup: int = Field(default=100, ge=0)
+    r: int = Field(default=16, ge=1)
+    alpha: int = Field(default=32, ge=1)
+    dropout: float = Field(default=0.05, ge=0.0, lt=1.0)
+    targets: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
+    four_bit: bool = True
+    """Try to load the base model in 4 bits with ``bitsandbytes``; fall back to bf16 if not."""
+    n_train: int | None = None
+    """Samples to read from ``train.jsonl``; ``None`` reads them all."""
+    seed: int = 42
+
+
+class QwenReport(BaseConfig):
+    """What the run did, including the parts that did not go as configured."""
+
+    model: str
+    adapter_dir: str
+    four_bit: bool
+    """Whether 4-bit quantisation was actually used, not whether it was asked for."""
+    fallback_reason: str | None = None
+    trainable_params: int
+    total_params: int
+    train_samples: int
+    steps: int
+    final_loss: float | None = None
+    weights_memory_mb: float | None = None
+    """What the loaded model occupies before a single step. This is the number QLoRA exists for,
+    and the only one that separates the two precisions: the peak during training is dominated by
+    activations and optimizer state, which 4-bit does not touch."""
+    peak_memory_mb: float | None = None
+
+    @property
+    def trainable_share(self) -> float:
+        return self.trainable_params / max(self.total_params, 1)
+```
+
+<Src file="src/rukh/train/qwen.py" tag="p4" lines="48-95" />
+
+La configuración y —más interesante— el informe. `QwenReport` tiene dos campos que solo existen
+porque la corrida puede no hacer lo que se le pidió: `four_bit` es si la cuantización **se usó de
+verdad**, no si se pidió, y `fallback_reason` dice por qué no, si no.
+
+Y los dos campos de memoria están separados con el docstring que explica la diferencia, que es el
+resultado del experimento: `weights_memory_mb` es lo que ocupa el modelo cargado antes de dar un
+paso, y ese es el número que QLoRA existe para mover; `peak_memory_mb` es el pico durante el
+entrenamiento, dominado por las activaciones y el estado del optimizador, que cuatro bits no tocan.
+Publicar solo el pico sería publicar el número que hace parecer inútil la técnica; publicar solo los
+pesos, el que la hace parecer milagrosa.
+
+```python title="src/rukh/train/qwen.py"
+def four_bit_config() -> tuple[Any | None, str | None]:
+    """``(BitsAndBytesConfig, None)`` when 4-bit is available, ``(None, reason)`` when it is not.
+
+    NF4 with double quantisation and a bf16 compute dtype: the recipe of the QLoRA paper, so the
+    run is comparable with the published ones rather than with a variant of our own.
+    """
+    try:
+        import bitsandbytes  # noqa: F401
+        import torch
+        from transformers import BitsAndBytesConfig
+    except ImportError as exc:
+        return None, f"bitsandbytes is not installed ({exc})"
+    return (
+        BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        ),
+        None,
+    )
+```
+
+<Src file="src/rukh/train/qwen.py" tag="p4" lines="98-118" />
+
+La receta de <Term id="cuantizacion">cuantización</Term>: NF4 con doble cuantización y cómputo en
+bf16, que es la del artículo de QLoRA. Está así para que la corrida sea comparable con las publicadas
+y no con una variante nuestra.
+
+La función devuelve `(config, None)` o `(None, razón)` en vez de lanzar. El tipo de retorno **es** la
+política: quien la llama decide si la ausencia de `bitsandbytes` es fatal, y aquí no lo es.
+
+```python title="src/rukh/train/qwen.py"
+def _dataset(cfg: QwenConfig, split: str) -> Any:
+    from datasets import load_dataset
+
+    path = resolve(cfg.data_dir) / f"{split}.jsonl"
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} not found; run `rukh data pgn-text` first")
+    data = load_dataset("json", data_files={split: path.as_posix()})[split]
+    if split == "train" and cfg.n_train is not None:
+        data = data.select(range(min(cfg.n_train, len(data))))
+    return data
+
+
+def _count_params(model: Any) -> tuple[int, int]:
+    """``(trainable, total)``, counting a 4-bit weight as the parameters it stands for.
+
+    ``bitsandbytes`` stores two 4-bit values per byte, so ``numel()`` on a quantised weight
+    returns half the parameter count and the "0.1 % trainable" line would come out twice as
+    flattering as the truth.
+    """
+    trainable = total = 0
+    for param in model.parameters():
+        count = param.numel()
+        if param.__class__.__name__ == "Params4bit":
+            count *= 2
+        total += count
+        if param.requires_grad:
+            trainable += count
+    return trainable, total
+```
+
+<Src file="src/rukh/train/qwen.py" tag="p4" lines="121-148" />
+
+Y aquí está el detalle de contabilidad que cambia el titular. `bitsandbytes` guarda **dos valores de
+4 bits por byte**, así que `numel()` sobre un peso cuantizado devuelve la mitad de los parámetros que
+representa. Contarlo sin corregir haría que la línea de «solo el 0,76 % es entrenable» saliera el
+doble de favorable de lo que es.
+
+La detección se hace por `param.__class__.__name__ == "Params4bit"` y no por `isinstance`, que
+exigiría importar `bitsandbytes` en una función que tiene que funcionar sin él. Es un olor de código
+en general y la opción correcta aquí.
+
+```python title="src/rukh/train/qwen.py"
+def train_qwen(cfg: QwenConfig, device: str | None = None) -> QwenReport:
+    """Fine-tune ``cfg.model`` on PGN text with LoRA, in 4 bits when that is possible."""
+    import torch
+    from peft import LoraConfig as PeftLoraConfig
+    from peft import get_peft_model, prepare_model_for_kbit_training
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from trl import SFTConfig, SFTTrainer
+
+    where = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    quantization, reason = (None, "not requested")
+    if cfg.four_bit:
+        quantization, reason = four_bit_config()
+    if quantization is None and cfg.four_bit:
+        log.warning("4-bit unavailable, training in bf16 instead: %s", reason)
+
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        cfg.model,
+        dtype=torch.bfloat16,
+        quantization_config=quantization,
+        device_map={"": where} if quantization is not None else None,
+    )
+    if quantization is not None:
+        model = prepare_model_for_kbit_training(model)
+    elif where == "cuda":
+        model = model.to(where)
+    model.config.use_cache = False
+
+    weights_memory = torch.cuda.memory_allocated() / 1e6 if where == "cuda" else None
+    adapted = get_peft_model(
+        model,
+        PeftLoraConfig(
+            r=cfg.r,
+            lora_alpha=cfg.alpha,
+            lora_dropout=cfg.dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=list(cfg.targets),
+        ),
+    )
+    trainable, total = _count_params(adapted)
+    log.info(
+        "%s: %s trainable of %s (%.3f %%), %s",
+        cfg.model,
+        f"{trainable:,}",
+        f"{total:,}",
+        100 * trainable / max(total, 1),
+        "4-bit" if quantization is not None else "bf16",
+    )
+```
+
+<Src file="src/rukh/train/qwen.py" tag="p4" lines="151-201" />
+
+Todos los imports pesados van dentro de la función, por lo de siempre: el extra `hf` no está
+instalado en el entorno base y `rukh --help` tiene que seguir funcionando.
+
+Tres líneas que no son obvias. `tokenizer.pad_token = tokenizer.eos_token` cuando no hay: Qwen3 no
+trae token de relleno, y sin uno el colador de lotes de `trl` falla al primer lote de longitudes
+distintas. `model.config.use_cache = False` porque la caché de claves y valores no sirve durante el
+entrenamiento y sí compite por memoria. Y `weights_memory` se mide **justo después de cargar y antes
+de poner el adaptador**, que es el único momento en que ese número significa «lo que ocupan los
+pesos».
+
+```python title="src/rukh/train/qwen.py"
+    out_dir = resolve(cfg.out_dir) / cfg.run_name
+    args = SFTConfig(
+        output_dir=out_dir.as_posix(),
+        dataset_text_field="text",
+        max_length=cfg.max_length,
+        packing=False,
+        per_device_train_batch_size=cfg.batch_size,
+        gradient_accumulation_steps=cfg.grad_accum,
+        learning_rate=cfg.lr,
+        max_steps=cfg.max_steps,
+        warmup_steps=cfg.warmup,
+        lr_scheduler_type="cosine",
+        logging_steps=25,
+        save_strategy="no",
+        bf16=True,
+        seed=cfg.seed,
+        report_to=["mlflow"],
+        run_name=cfg.run_name,
+    )
+    trainer = SFTTrainer(
+        model=adapted,
+        args=args,
+        train_dataset=_dataset(cfg, "train"),
+        processing_class=tokenizer,
+    )
+    if where == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    result = trainer.train()
+    peak = torch.cuda.max_memory_allocated() / 1e6 if where == "cuda" else None
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    adapted.save_pretrained(out_dir.as_posix())
+    tokenizer.save_pretrained(out_dir.as_posix())
+    report = QwenReport(
+        model=cfg.model,
+        adapter_dir=out_dir.as_posix(),
+        four_bit=quantization is not None,
+        fallback_reason=None if quantization is not None else reason,
+        trainable_params=trainable,
+        total_params=total,
+        train_samples=len(trainer.train_dataset),
+        steps=cfg.max_steps,
+        final_loss=float(result.training_loss) if result.training_loss is not None else None,
+        weights_memory_mb=weights_memory,
+        peak_memory_mb=peak,
+    )
+    (out_dir / "run.json").write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    return report
+```
+
+<Src file="src/rukh/train/qwen.py" tag="p4" lines="203-250" />
+
+`packing=False` es una decisión: empaquetar varias partidas en una secuencia aprovecha mejor el
+contexto y hace que el modelo vea cortes de partida a mitad de texto. Con partidas de 350-450 tokens
+y un `max_length` de 512, empaquetar ahorraría poco y ensuciaría lo que se está midiendo.
+
+`save_strategy: "no"` porque lo que se guarda es el adaptador al final, con `save_pretrained`, y no
+checkpoints intermedios de un modelo de 600 M.
+
+`report_to=["mlflow"]` mete esta corrida en el mismo cuaderno que todas las demás del proyecto, que
+es lo que permite comparar curvas de cosas escritas con librerías distintas.
+
+Y el `run.json` del final es el informe con los campos de arriba: si se usó cuatro bits, por qué no
+si no, cuántos parámetros eran entrenables de verdad, y los dos números de memoria.
+
+```python title="src/rukh/train/qwen.py"
+def load_qwen_adapter(adapter_dir: Path | str, device: str | None = None) -> tuple[Any, Any]:
+    """``(model, tokenizer)`` of a finished run, merged and in eval mode.
+
+    Merged on purpose: the evaluation plays hundreds of games move by move, and a merged model
+    runs the base matrices instead of the base plus two extra matmuls per adapted projection.
+    """
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    directory = Path(adapter_dir)
+    config: Mapping[str, Any] = json.loads(
+        (directory / "adapter_config.json").read_text(encoding="utf-8")
+    )
+    where = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    base = AutoModelForCausalLM.from_pretrained(
+        str(config["base_model_name_or_path"]), dtype=torch.bfloat16
+    )
+    model = PeftModel.from_pretrained(base, directory.as_posix())
+    model = model.merge_and_unload().to(where).eval()
+    tokenizer = AutoTokenizer.from_pretrained(directory.as_posix())
+    return model, tokenizer
+```
+
+<Src file="src/rukh/train/qwen.py" tag="p4" lines="253-274" />
+
+Cargar para evaluar **funde** el adaptador a propósito, y el docstring dice por qué: la evaluación
+juega cientos de partidas jugada a jugada, y un modelo fundido corre las matrices base en vez de la
+base más dos multiplicaciones extra por proyección adaptada. Es la misma propiedad que
+`merge_lora` en nuestra implementación, aquí llamada `merge_and_unload`.
+
+El modelo base sale de `adapter_config.json`, no de la configuración de la corrida: el adaptador dice
+sobre qué se monta, y eso lo hace autocontenido.
+
+{/* prettier-ignore */}
+```yaml title="configs/train/qwen3-pgn.yaml"
+# Qwen3-0.6B fine-tuned on the same games the decoder trains on, written as PGN text.
+#
+# The point is the comparison, so the budget is chosen to be *generous* to Qwen rather than fair
+# to us: 1 500 steps of 32 sequences of up to 512 tokens is about 24 M tokens of chess for a model
+# that already speaks, against the 1.68 B the decoder needed from scratch. If it still loses by a
+# wide margin, nobody can say it was starved.
+#
+# `r = 16` on all four attention projections is the usual QLoRA recipe, twice the rank the
+# project's own adapters use, for the same reason: this side gets the benefit of the doubt.
+model: Qwen/Qwen3-0.6B
+data_dir: data/pgn-text
+out_dir: checkpoints
+run_name: qwen3-pgn-qlora
+max_length: 512
+batch_size: 8
+grad_accum: 4
+lr: 2.0e-4
+max_steps: 1500
+warmup: 100
+r: 16
+alpha: 32
+dropout: 0.05
+targets: [q_proj, k_proj, v_proj, o_proj]
+four_bit: true
+n_train: 100000
+seed: 42
+```
+
+<Src file="configs/train/qwen3-pgn.yaml" tag="p4" lines="1-26" />
+
+El presupuesto se elige **generoso con Qwen** y no justo con nosotros, y el comentario lo dice con
+esas palabras: 1 500 pasos de 32 secuencias de hasta 512 tokens son unos 24 M de tokens de ajedrez
+para un modelo que ya sabe hablar, contra los 1 680 M que el decoder necesitó desde cero. Y `r = 16`
+sobre las cuatro proyecciones de atención es el doble del rango que usan nuestros adaptadores. Si aun
+así pierde por mucho, nadie puede decir que se le dejó sin comer.
+
+{/* prettier-ignore */}
+```yaml title="configs/train/qwen3-smoke.yaml"
+# Two steps over a hundred games: not a run, a rehearsal.
+#
+# The real Qwen fine-tune is half an hour of GPU and everything that can fail in it fails in the
+# first thirty seconds -- the model download, the quantisation backend, the `trl` API, the tokenizer
+# padding, the save. Finding that out at minute twenty-five is the expensive way.
+```
+
+<Src file="configs/train/qwen3-smoke.yaml" tag="p4" lines="1-5" />
+
+La variante de ensayo cambia seis números —`run_name`, `batch_size`, `grad_accum`, `max_steps`,
+`warmup` y `n_train`— y su comentario es la mejor justificación de un fichero de configuración que
+hay en el repositorio: el afinado real es media hora de GPU y **todo lo que puede fallar en él falla
+en los primeros treinta segundos** —la descarga del modelo, el backend de cuantización, la API de
+`trl`, el relleno del tokenizador, el guardado—. Enterarse en el minuto veinticinco es la forma cara.
+
+## `qwen_source.py`: las tres maneras de fallar que el decoder no tiene
+
+```python title="src/rukh/eval/qwen_source.py"
+"""A fine-tuned general model plugged into the harness of P2, so the comparison is like for like.
+
+The decoder cannot write a move that does not exist: its vocabulary *is* the set of moves, and an
+"illegal" move is a legal move played in the wrong position. A language model writing SAN can fail
+in three ways instead of one, and telling them apart is most of what this comparison teaches:
+
+- **unparseable** -- what it wrote is not a move at all (``Nf9``, ``O-O-O-O``, a sentence);
+- **illegal** -- a well-formed move that this position does not allow;
+- **ambiguous** -- a move that two pieces could make, which SAN is supposed to disambiguate and
+  the model did not.
+
+All three are counted separately and none is silently repaired. A game still has to finish, so a
+failed proposal falls back to a legal move, exactly as the decoder's does, and the fallback is
+recorded rather than hidden -- same rule as ``illegal_proposals`` in ``rukh.infer.game``.
+
+The prompt is the PGN text of ``rukh.data.pgn_text``, which is the format the model was fine-tuned
+on, with the same rating header the decoder gets as ``<wXXXX> <bXXXX>``. Generation is greedy and
+six tokens long: a move is one to four of Qwen's tokens and nothing longer is going to help.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import TYPE_CHECKING, Any
+
+import chess
+from pydantic import BaseModel, ConfigDict
+
+from rukh.data.pgn_text import prompt_for
+
+if TYPE_CHECKING:
+    pass
+
+log = logging.getLogger(__name__)
+
+__all__ = ["QwenPlayer", "QwenStats", "parse_san_answer", "qwen_source"]
+```
+
+<Src file="src/rukh/eval/qwen_source.py" tag="p4" lines="1-37" />
+
+El docstring enumera lo que es la mitad de lo que enseña la comparación. El decoder no puede escribir
+una jugada que no existe: su vocabulario **es** el conjunto de jugadas, y una jugada «ilegal» es una
+jugada legal en la posición equivocada. Un modelo de lenguaje que escribe SAN puede fallar de tres
+maneras más, y separarlas es el trabajo de este fichero.
+
+Es la diferencia entre un desplegable y un campo de texto libre en un formulario. El desplegable no
+admite un país que no existe; el campo de texto admite «Espanya», «España » con un espacio al final y
+«asdf», y cada una de esas tres es un error distinto que hay que contar aparte.
+
+```python title="src/rukh/eval/qwen_source.py"
+MAX_NEW_TOKENS = 6
+DECODER_PLIES = 196
+"""Plies the decoder can carry (``block`` 200 minus its three header tokens and the move it is
+about to make). The text model gets the same number, not the 120 its fine-tuning corpus was cut
+at: a harness that let one side play longer games than the other would be measuring the harness.
+Past 120 plies the prompt is longer than anything Qwen was fine-tuned on, and that is a property
+of the model rather than of the measurement -- it belongs in the result, not in the setup."""
+MOVE_NUMBER = re.compile(r"^\d+\.+")
+"""``12.`` or ``12...`` at the head of the answer: bookkeeping, not a move."""
+TRAILING = "!?"
+"""Annotation glyphs a commentator adds; ``+`` and ``#`` are part of SAN and stay."""
+```
+
+<Src file="src/rukh/eval/qwen_source.py" tag="p4" lines="39-49" />
+
+`DECODER_PLIES = 196` lleva el docstring más importante del fichero. El modelo de texto recibe **el
+número de plies del decoder** —200 de contexto menos los tres tokens de cabecera y la jugada que va a
+hacer—, no los 120 a los que se cortó su corpus de afinado. Un harness que dejara a un lado jugar
+partidas más largas que al otro estaría midiendo el harness.
+
+Y la segunda mitad del razonamiento es la que hay que copiar: pasados los 120 plies, el prompt es más
+largo que nada de lo que Qwen vio afinándose, y eso es una **propiedad del modelo**, no de la
+medición. Va en el resultado, no en el montaje.
+
+`TRAILING = "!?"` y no `"!?+#"`: `+` y `#` son parte de SAN —jaque y mate— y quitarlos convertiría
+`Qh5#` en una jugada distinta. Los signos de admiración e interrogación son comentario de quien
+anota.
+
+```python title="src/rukh/eval/qwen_source.py"
+class QwenStats(BaseModel):
+    """How the answers came out, by failure mode rather than as one number."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asked: int = 0
+    legal: int = 0
+    unparseable: int = 0
+    """The answer was not a move in any position."""
+    illegal: int = 0
+    """A well-formed move that this position does not allow."""
+    ambiguous: int = 0
+    """SAN that two pieces could satisfy; the model failed to disambiguate."""
+    empty: int = 0
+    """The model produced no non-whitespace token at all."""
+
+    @property
+    def legal_rate(self) -> float:
+        return self.legal / self.asked if self.asked else 0.0
+
+    def record(self, outcome: str) -> None:
+        self.asked += 1
+        setattr(self, outcome, getattr(self, outcome) + 1)
+```
+
+<Src file="src/rukh/eval/qwen_source.py" tag="p4" lines="52-74" />
+
+Cinco contadores y un `record` de dos líneas. El `setattr(self, outcome, ...)` con el nombre del
+resultado como atributo es lo que hace que añadir un modo de fallo sea añadir un campo, y lo que
+obliga a que los nombres del parser y los del contador sean los mismos —que es un acoplamiento y es
+el correcto: son el mismo vocabulario—.
+
+```python title="src/rukh/eval/qwen_source.py"
+def parse_san_answer(board: chess.Board, answer: str) -> tuple[chess.Move | None, str]:
+    """``(move, outcome)`` for the model's continuation, with the outcome named.
+
+    Only the first token is considered. A model that writes ``e4 e5 2. Nf3`` has answered the
+    question asked and then kept going; scoring the whole continuation would be scoring a
+    different question, and taking the last move would be scoring luck.
+    """
+    text = answer.strip()
+    if not text:
+        return None, "empty"
+    first = text.split()[0]
+    stripped = MOVE_NUMBER.sub("", first)
+    if not stripped:  # the answer was just a move number; the move is the next token
+        parts = text.split()
+        if len(parts) < 2:
+            return None, "empty"
+        stripped = parts[1]
+    stripped = stripped.rstrip(TRAILING)
+    if not stripped:
+        return None, "unparseable"
+    try:
+        return board.parse_san(stripped), "legal"
+    except chess.IllegalMoveError:
+        return None, "illegal"
+    except chess.AmbiguousMoveError:
+        return None, "ambiguous"
+    except (chess.InvalidMoveError, ValueError):
+        return None, "unparseable"
+```
+
+<Src file="src/rukh/eval/qwen_source.py" tag="p4" lines="77-104" />
+
+Veintiocho líneas de análisis sintáctico, y la decisión está en el docstring: **solo se considera el
+primer token**. Un modelo que escribe `e4 e5 2. Nf3` ha contestado a la pregunta y luego ha seguido;
+puntuar la continuación entera sería puntuar otra pregunta, y quedarse con la última jugada sería
+puntuar la suerte.
+
+El `if not stripped` del medio es el caso del número de jugada solo: si el modelo escribe `12.` y
+luego la jugada, hay que mirar el segundo token. Sin eso, una grafía perfectamente normal se contaría
+como `unparseable` y la tabla diría que el modelo escribe basura cuando escribe PGN correcto.
+
+Las tres excepciones de python-chess se traducen a los tres modos de fallo, una a una. Que la
+librería los distinga es lo que permite que este fichero sea corto: `IllegalMoveError` frente a
+`AmbiguousMoveError` frente a `InvalidMoveError` son exactamente las tres preguntas que había que
+contestar.
+
+```python title="src/rukh/eval/qwen_source.py"
+class QwenPlayer:
+    """A ``rukh.infer.Player`` backed by a causal language model that writes SAN."""
+
+    def __init__(
+        self,
+        model: Any,
+        tokenizer: Any,
+        stats: QwenStats | None = None,
+        max_new_tokens: int = MAX_NEW_TOKENS,
+        max_plies: int = DECODER_PLIES,
+    ) -> None:
+        self.model, self.tokenizer = model, tokenizer
+        self.stats = stats if stats is not None else QwenStats()
+        self.max_new_tokens = max_new_tokens
+        self.max_plies = max_plies
+        self.white_elo = self.black_elo = 1800
+
+    @property
+    def limit(self) -> int:
+        """Plies this player can carry; the decoder's number, so both play the same game."""
+        return self.max_plies
+
+    def start(self, white_elo: int, black_elo: int) -> None:
+        self.white_elo, self.black_elo = white_elo, black_elo
+
+    def observe(self, move: chess.Move) -> None:
+        """Nothing to record: the board carries the history and the prompt is built from it."""
+
+    def answer(self, board: chess.Board) -> str:
+        """The raw continuation the model writes for this position."""
+        import torch
+
+        prompt = prompt_for(board, self.white_elo, self.black_elo)
+        encoded = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        with torch.no_grad():
+            out = self.model.generate(
+                **encoded,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+            )
+        written = out[0, encoded["input_ids"].shape[1] :]
+        return str(self.tokenizer.decode(written, skip_special_tokens=True))
+```
+
+<Src file="src/rukh/eval/qwen_source.py" tag="p4" lines="107-149" />
+
+El jugador implementa el protocolo `Player` que M4 extrajo de `play_game`: `limit`, `start`,
+`observe`, `choose`. `observe` no hace nada y lleva su docstring diciéndolo, que es mejor que un
+`pass` sin explicación: el tablero lleva la historia y el prompt se construye de él.
+
+La generación es **greedy** (`do_sample=False`) y de seis tokens. Una jugada son de uno a cuatro
+tokens de Qwen y nada más largo va a ayudar; y greedy porque la suite del decoder juega a
+temperatura 0,05 con top-k 1, que es lo más parecido a la moda que se puede pedir.
+
+`out[0, encoded["input_ids"].shape[1]:]` recorta el prompt de la salida: `generate` devuelve la
+secuencia entera, y decodificarla sin recortar daría el prompt seguido de la respuesta.
+
+```python title="src/rukh/eval/qwen_source.py"
+    def propose(self, board: chess.Board) -> tuple[chess.Move | None, str]:
+        """What the model wrote, parsed, with the outcome named. No mask, no rescue."""
+        move, outcome = parse_san_answer(board, self.answer(board))
+        self.stats.record(outcome)
+        return move, outcome
+
+    def choose(self, board: chess.Board) -> tuple[chess.Move | None, bool]:
+        """The move to play, and whether the model's own answer was usable.
+
+        The fallback is the first legal move in the position's own order, not a second sample:
+        the model already answered, and asking again until it says something legal would measure
+        a different model from the one the legality rate describes.
+        """
+        move, outcome = self.propose(board)
+        if move is not None:
+            return move, True
+        legal = list(board.legal_moves)
+        return (legal[0] if legal else None), False
+
+
+def qwen_source(player: QwenPlayer) -> Any:
+    """The ``MoveSource`` the puzzle suite expects, backed by the same player.
+
+    Puzzles are scored on the move the model *chooses*, so the fallback applies here too and a
+    position where it wrote nonsense counts as a failed puzzle rather than as a missing one.
+    """
+
+    def choose(board: chess.Board, history: list[int]) -> chess.Move | None:  # noqa: ARG001
+        move, _ = player.choose(board)
+        return move
+
+    return choose
+```
+
+<Src file="src/rukh/eval/qwen_source.py" tag="p4" lines="151-182" />
+
+Y las dos decisiones que hacen válida la tasa de legalidad.
+
+`propose` no lleva máscara ni rescate: es lo que el modelo escribió, interpretado, con el resultado
+nombrado. `choose` es lo que la partida necesita para terminar, y rescata con **la primera jugada
+legal en el orden de la posición**, que es una elección arbitraria a propósito: no es una segunda
+muestra.
+
+El docstring lo dice: pedirle otra vez hasta que conteste algo legal mediría un modelo distinto del
+que describe la tasa de legalidad. Es la misma regla que `illegal_proposals` en el decoder: el
+rescate mantiene el harness corriendo, el contador es de lo que se informa.
+
+```python title="tests/unit/test_qwen_source.py"
+"""Tests for rukh.eval.qwen_source: the three ways a text model can fail where the decoder cannot.
+
+Nothing here loads a language model. What is worth testing is the parsing and the accounting: the
+decoder's vocabulary *is* the set of moves, so its only failure is "legal move, wrong position",
+while a model writing SAN can produce something that is not a move, a move this position does not
+allow, or a move two pieces could make. Folding those into one number would throw away the most
+interesting half of the comparison.
+"""
+
+from __future__ import annotations
+
+import chess
+import pytest
+
+from rukh.eval.qwen_source import QwenPlayer, QwenStats, parse_san_answer
+
+pytestmark = pytest.mark.unit
+
+
+def _board(moves: list[str]) -> chess.Board:
+    board = chess.Board()
+    for uci in moves:
+        board.push(chess.Move.from_uci(uci))
+    return board
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        (" e4", "e2e4"),
+        ("e4 e5 2. Nf3", "e2e4"),  # it kept going; only the answer to the question counts
+        ("1. e4", "e2e4"),  # a move number in front is bookkeeping
+        ("e4!?", "e2e4"),  # commentary glyphs are not part of the move
+        ("  Nf3  ", "g1f3"),
+    ],
+    ids=["plain", "kept-going", "numbered", "annotated", "padded"],
+)
+def test_a_legal_answer_is_read_as_the_move_it_names(answer: str, expected: str) -> None:
+    move, outcome = parse_san_answer(chess.Board(), answer)
+    assert outcome == "legal"
+    assert move is not None and move.uci() == expected
+```
+
+<Src file="tests/unit/test_qwen_source.py" tag="p4" lines="1-41" />
+
+El fichero de tests no carga ningún modelo de lenguaje, y el docstring dice por qué: lo que merece
+test es el análisis y la contabilidad. Los cinco casos parametrizados son las cinco grafías que un
+modelo de texto produce de verdad, con su `id` diciendo cuál es cuál.
+
+```python title="tests/unit/test_qwen_source.py"
+def test_a_move_number_alone_reaches_for_the_next_token() -> None:
+    move, outcome = parse_san_answer(chess.Board(), "1. e4")
+    assert outcome == "legal" and move is not None
+
+
+def test_something_that_is_not_a_move_is_unparseable() -> None:
+    """`Nf9` is not a square; no position in chess allows it, so it is its own failure."""
+    for answer in ("Nf9", "hola", "O-O-O-O", "-"):
+        _, outcome = parse_san_answer(chess.Board(), answer)
+        assert outcome == "unparseable", answer
+
+
+def test_a_well_formed_move_this_position_forbids_is_illegal() -> None:
+    """The only failure the decoder can have, so it is the one that makes the two comparable."""
+    move, outcome = parse_san_answer(chess.Board(), "Qh5")  # the queen is boxed in at the start
+    assert outcome == "illegal" and move is None
+
+
+def test_san_two_pieces_could_satisfy_is_ambiguous() -> None:
+    """SAN is contextual: this is the failure mode the decoder's vocabulary cannot even express."""
+    board = _board(["g1f3", "d7d5", "d2d4", "g8f6"])
+    assert board.san(chess.Move.from_uci("b1d2")) == "Nbd2"  # both knights reach d2
+    move, outcome = parse_san_answer(board, "Nd2")
+    assert outcome == "ambiguous" and move is None
+
+
+def test_an_empty_answer_is_counted_as_such() -> None:
+    assert parse_san_answer(chess.Board(), "   ")[1] == "empty"
+    assert parse_san_answer(chess.Board(), "")[1] == "empty"
+
+
+def test_the_stats_add_up_and_the_rate_is_of_what_was_asked() -> None:
+    stats = QwenStats()
+    for outcome in ("legal", "legal", "illegal", "unparseable", "ambiguous", "empty"):
+        stats.record(outcome)
+    assert stats.asked == 6
+    assert (stats.legal, stats.illegal, stats.unparseable, stats.ambiguous, stats.empty) == (
+        2,
+        1,
+        1,
+        1,
+        1,
+    )
+    assert stats.legal_rate == pytest.approx(2 / 6)
+```
+
+<Src file="tests/unit/test_qwen_source.py" tag="p4" lines="44-87" />
+
+Un test por modo de fallo, y cada uno con la posición que lo produce de verdad. `Qh5` desde la
+posición inicial es ilegal porque la dama está encerrada; `Nd2` con los dos caballos alcanzando d2 es
+ambiguo, y el test lo **demuestra** antes de comprobarlo (`assert board.san(...) == "Nbd2"`), que es
+lo que impide que el test siga pasando el día que alguien cambie la posición.
+
+```python title="tests/unit/test_qwen_source.py"
+class _Scripted:
+    """A stand-in for the language model that answers from a list, in order."""
+
+    device = "cpu"
+
+    def __init__(self, answers: list[str]) -> None:
+        self.answers = list(answers)
+
+
+class _Player(QwenPlayer):
+    def __init__(self, answers: list[str]) -> None:
+        super().__init__(_Scripted(answers), tokenizer=None)
+        self._answers = list(answers)
+
+    def answer(self, board: chess.Board) -> str:  # noqa: ARG002
+        return self._answers.pop(0) if self._answers else ""
+
+
+def test_a_failed_proposal_is_rescued_and_still_counted() -> None:
+    """A game has to finish, and the rescue must not hide that the model's own answer failed.
+
+    Same rule as the decoder's `illegal_proposals`: the fallback keeps the harness running, the
+    count is what the legality rate is built from.
+    """
+    player = _Player(["Nf9", "e4"])
+    move, was_legal = player.choose(chess.Board())
+    assert was_legal is False
+    assert move in chess.Board().legal_moves  # rescued, so the game continues
+    assert player.stats.unparseable == 1
+
+    move, was_legal = player.choose(chess.Board())
+    assert was_legal is True
+    assert move is not None and move.uci() == "e2e4"
+    assert player.stats.legal == 1
+
+
+def test_the_rescue_does_not_ask_the_model_again() -> None:
+    """Asking until it answers legally would measure a different model from the reported one."""
+    player = _Player(["Nf9"])
+    player.choose(chess.Board())
+    assert player.stats.asked == 1
+
+
+def test_a_finished_position_rescues_to_nothing_rather_than_crashing() -> None:
+    mate = chess.Board("7k/5KQ1/8/8/8/8/8/8 b - - 0 1")
+    move, was_legal = _Player(["Kh7"]).choose(mate)
+    assert move is None and was_legal is False
+```
+
+<Src file="tests/unit/test_qwen_source.py" tag="p4" lines="90-136" />
+
+El doble sustituto —`_Scripted` para el modelo, `_Player` para el jugador— es lo que permite probar
+la política de rescate sin un modelo. Los tres tests que siguen son los tres contratos: el rescate
+ocurre **y se cuenta**, no se vuelve a preguntar (`asked == 1` después de una respuesta fallida), y
+una posición terminada rescata a `None` en vez de reventar.
+
+### La pieza que deja entrar a otro jugador en la escalera
+
+Para que Qwen juegue contra los mismos rivales que el decoder hizo falta partir `play_game` en dos.
+El cambio está en `src/rukh/infer/game.py`, que es código de M2, y es el cambio más pequeño del
+módulo con más consecuencias.
+
+```python title="src/rukh/infer/game.py"
+"""Playing a whole game: a player against an opponent, counting illegal proposals.
+
+An opponent is anything with ``choose(board) -> chess.Move``: the seeded ``RandomOpponent``
+used by the unit tests, ``StockfishOpponent`` for the Elo harness, or the browser in the demo.
+
+The *player* -- the side being measured -- is a protocol too, and for one reason: M4 has to put
+a general language model through the same ladder as the decoder, and a comparison where the two
+sides are measured by different code is not a comparison. ``DecoderPlayer`` is the original path,
+unchanged and still the default; ``rukh.eval.qwen_source`` supplies the other one. Everything
+around them -- the opponent, termination, adjudication, how a cut game is scored -- stays here,
+which is exactly the part that must not differ between the two.
+```
+
+<Src file="src/rukh/infer/game.py" tag="p4" lines="1-11" />
+
+El párrafo que el hito le añadió al docstring dice la razón y el límite: **todo lo que rodea al
+jugador se queda aquí** —el rival, la terminación, la adjudicación, cómo se puntúa una partida
+cortada—, que es exactamente la parte que no puede diferir entre los dos.
+
+```python title="src/rukh/infer/game.py"
+class Player(Protocol):
+    """Whatever plays the side being measured.
+
+    ``choose`` returns the move the player will actually make **and** whether its unmasked
+    proposal was legal. The two are different questions: a game has to keep going, so an illegal
+    proposal is rescued with a masked draw, but the rescue must not hide the fact that it
+    happened -- that count is the legality signal the whole harness is built around.
+    """
+
+    @property
+    def limit(self) -> int:
+        """Plies this player can carry before it runs out of context."""
+
+    def start(self, white_elo: int, black_elo: int) -> None:
+        """Begin a new game at the given ratings."""
+
+    def choose(self, board: chess.Board) -> tuple[chess.Move | None, bool]: ...
+
+    def observe(self, move: chess.Move) -> None:
+        """Record a move that was played, by either side."""
+
+
+class DecoderPlayer:
+    """``MoveDecoder`` as a ``Player``: the path every published number was measured on."""
+
+    def __init__(self, model: MoveDecoder, tok: UciTokenizer, cfg: SampleConfig) -> None:
+        self.model, self.tok, self.cfg = model, tok, cfg
+        self.masked = cfg.model_copy(update={"mask_illegal": True})
+        self.generator = model_generator(model, cfg)
+        self.history: list[int] = []
+
+    @property
+    def limit(self) -> int:
+        return self.model.cfg.block - HEADER_TOKENS - 1
+
+    def start(self, white_elo: int, black_elo: int) -> None:
+        self.history = _history(self.tok, white_elo, black_elo)
+
+    def choose(self, board: chess.Board) -> tuple[chess.Move | None, bool]:
+        move, _ = pick_move(self.model, self.tok, board, self.history, self.cfg, self.generator)
+        if move is not None:
+            return move, True
+        rescued, _ = pick_move(
+            self.model, self.tok, board, self.history, self.masked, self.generator
+        )
+        return rescued, False
+
+    def observe(self, move: chess.Move) -> None:
+        self.history.append(self.tok.vocab.get(move.uci(), self.tok.unk_id))
+```
+
+<Src file="src/rukh/infer/game.py" tag="p4" lines="48-96" />
+
+El protocolo obliga a decir **dos cosas a la vez**: qué jugada se hace y si la propuesta sin máscara
+era legal. Su docstring explica por qué son preguntas distintas: la partida tiene que seguir, así que
+una propuesta ilegal se rescata con una tirada enmascarada, pero el rescate no puede esconder que
+ocurrió —ese contador es la señal de legalidad sobre la que está construido el harness entero—.
+
+`DecoderPlayer` es el camino original, **palabra por palabra**: las mismas dos llamadas a `pick_move`,
+la misma configuración enmascarada, el mismo generador. Que sea una copia literal y no una
+reescritura es lo que garantiza que ningún número publicado antes de este hito cambie.
+
+```python title="src/rukh/infer/game.py"
+    player = DecoderPlayer(model, tok, cfg)
+    return play_game_with(
+        player,
+        opponent,
+        model_color=model_color,
+        white_elo=white_elo,
+        black_elo=black_elo,
+        max_plies=max_plies,
+        board=board,
+    )
+
+
+def play_game_with(
+    player: Player,
+    opponent: Opponent,
+    model_color: chess.Color = chess.WHITE,
+    white_elo: int = 1800,
+    black_elo: int = 1800,
+    max_plies: int | None = None,
+    board: chess.Board | None = None,
+) -> GameResult:
+    """``play_game`` for any ``Player``; the decoder's version is the one-line wrapper above."""
+    board = board if board is not None else chess.Board()
+    limit = max_plies if max_plies is not None else player.limit
+    player.start(white_elo, black_elo)
+    moves: list[str] = []
+    illegal = 0
+
+    while len(moves) < limit and not is_over(board):
+        if board.turn == model_color:
+            move, was_legal = player.choose(board)
+            if not was_legal:
+                illegal += 1
+            if move is None:
+                break
+        else:
+            move = opponent.choose(board)
+        moves.append(move.uci())
+        player.observe(move)
+        board.push(move)
+```
+
+<Src file="src/rukh/infer/game.py" tag="p4" lines="217-256" />
+
+`play_game` pasa a ser un envoltorio de una línea sobre `play_game_with`, y el bucle es el de antes
+con dos sustituciones: `player.choose` en vez de las dos llamadas a `pick_move`, y `player.observe`
+en vez de añadir a mano el token a la historia. La condición del rescate cambia de `move is None` a
+`not was_legal`, que es la misma cosa dicha desde el lado del jugador.
+
+## `qwen_suite.py`: la misma suite, otro jugador
+
+```python title="src/rukh/eval/qwen_suite.py"
+"""The same suite, run on a general language model, so the M4 table compares like with like.
+
+Everything here is borrowed: the validation positions of ``rukh.eval.legality``, the puzzle split
+of ``rukh.eval.puzzles``, the Stockfish ladder and the bootstrap of ``rukh.eval.elo``. Only the
+player differs, which is the whole design -- if the two sides of the comparison went through
+different code, the difference in the numbers would be partly the code.
+
+One column exists here and not in the decoder's report, and it is the interesting one. A decoder
+whose vocabulary *is* the set of moves can only fail one way: a legal move in the wrong position.
+A model writing SAN can also write something that is not a move at all, or a move two pieces could
+make and that it failed to disambiguate. Those are counted apart (``QwenStats``) rather than
+summed into "illegal", because summing them would hide exactly what the representation costs.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from pydantic import BaseModel, ConfigDict
+
+from rukh import paths
+from rukh.eval.elo import EloResult, estimate, play_rungs
+from rukh.eval.puzzles import PuzzleResult, load_puzzles, run_puzzles
+from rukh.eval.qwen_source import QwenPlayer, QwenStats, qwen_source
+from rukh.eval.report import WebRow, elo_line, write_report_files
+from rukh.eval.suite import EvalConfig, _positions
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+if TYPE_CHECKING:
+    from rukh.eval.legality import Position
+
+log = logging.getLogger(__name__)
+
+__all__ = ["QwenResult", "evaluate_qwen", "run_qwen_suite"]
+```
+
+<Src file="src/rukh/eval/qwen_suite.py" tag="p4" lines="1-37" />
+
+«Todo aquí es prestado» es el diseño y no una disculpa: las posiciones de validación, el reparto de
+puzles, la escalera de Stockfish y el bootstrap son los de M2. Lo único que cambia es el jugador. Si
+los dos lados de la comparación pasaran por código distinto, la diferencia en los números sería en
+parte el código.
+
+```python title="src/rukh/eval/qwen_suite.py"
+class QwenResult(BaseModel):
+    """One evaluation of a text model on the decoder's own suite."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: str
+    base_model: str
+    adapter_dir: str
+    params: int
+    date: str
+    device: str
+    positions: int
+    written: QwenStats
+    """How its answers came out, by failure mode. ``legal_rate`` is the column that faces the
+    decoder's "legality without the mask"."""
+    top1: float | None = None
+    puzzles: PuzzleResult | None = None
+    elo: EloResult | None = None
+    notes: list[str] = []
+    config: dict[str, Any] = {}
+```
+
+<Src file="src/rukh/eval/qwen_suite.py" tag="p4" lines="40-59" />
+
+El resultado tiene los campos del informe normal más uno: `written`, el desglose por modo de fallo,
+cuya `legal_rate` es la columna que se enfrenta directamente a la «legalidad sin máscara» del
+decoder.
+
+```python title="src/rukh/eval/qwen_suite.py"
+def evaluate_qwen(
+    adapter_dir: Path | str,
+    cfg: EvalConfig,
+    stage: str = "qwen3-pgn-qlora",
+    use_cache: bool = True,
+    device: str | None = None,
+) -> QwenResult:
+    """Run legality, next-move accuracy, puzzles and Elo on a fine-tuned general model."""
+    from rukh.eval.cache import EvalCache, config_sha
+    from rukh.train.qwen import load_qwen_adapter
+
+    directory = Path(adapter_dir)
+    model, tokenizer = load_qwen_adapter(directory, device=device)
+    where = str(next(model.parameters()).device)
+    tok = UciTokenizer()
+    notes: list[str] = []
+    positions: list[Position] = _positions(cfg, tok, notes)
+    player = QwenPlayer(model, tokenizer)
+
+    log.info("legality and accuracy over %s positions", min(len(positions), cfg.accuracy_positions))
+    scored = positions[: cfg.accuracy_positions]
+    hits = 0
+    for position in scored:
+        board = _board_of(position)
+        move, _ = player.propose(board)
+        if move is not None and position.target is not None and move.uci() == position.target:
+            hits += 1
+    written = player.stats.model_copy(deep=True)
+
+    result = QwenResult(
+        stage=stage,
+        base_model=_base_model(directory),
+        adapter_dir=directory.as_posix(),
+        params=sum(p.numel() for p in model.parameters()),
+        date=datetime.now(UTC).date().isoformat(),
+        device=where,
+        positions=len(scored),
+        written=written,
+        top1=hits / len(scored) if scored else None,
+        notes=notes,
+        config=cfg.model_dump(mode="json"),
+    )
+```
+
+<Src file="src/rukh/eval/qwen_suite.py" tag="p4" lines="62-103" />
+
+La legalidad y la exactitud se miden sobre las mismas posiciones de validación que el decoder, con
+`_positions` importado de la suite original. La línea que importa es
+`written = player.stats.model_copy(deep=True)`: una **instantánea** de los contadores tomada
+justo aquí.
+
+```python title="src/rukh/eval/qwen_suite.py"
+    cache = EvalCache(
+        paths.resolve(cfg.cache_db) if use_cache else None,
+        f"qwen:{stage}",
+        enabled=use_cache,
+        config_sha=config_sha(cfg.cache_fields()),
+    )
+    try:
+        puzzle_path = paths.resolve(cfg.puzzles)
+        if puzzle_path.is_file():
+            items = load_puzzles(
+                puzzle_path, cfg.puzzles_per_band, seed=cfg.seed, split=cfg.puzzle_split
+            )
+            log.info("puzzles: %s", len(items))
+            result.puzzles = run_puzzles(
+                qwen_source(player),
+                tok,
+                items,
+                cache=cache,
+                header_elo=cfg.header_elo,
+                force_header=cfg.force_header,
+            )
+        else:
+            notes.append(f"puzzles not found at {puzzle_path}: puzzle suite skipped")
+        if cfg.elo_games:
+            log.info("elo: %s games per rung", cfg.elo_games)
+            records = play_rungs(
+                None,
+                tok,
+                cfg.elo_rungs,
+                cfg.elo_games,
+                cfg.sampling(),
+                move_time=cfg.elo_move_time,
+                max_plies=cfg.elo_max_plies,
+                cache=cache,
+                header_elo=cfg.header_elo,
+                player=player,
+            )
+            result.elo = estimate(records, samples=cfg.bootstrap, seed=cfg.seed)
+    finally:
+        cache.close()
+    # `result.written` stays the snapshot taken over the validation positions and nothing else.
+    # The player keeps counting through the puzzles and the games, and folding those in would
+    # give a legality rate over a different denominator than the decoder's -- which is the one
+    # number in this report that has to face the decoder's directly.
+    result.notes = notes
+    return result
+```
+
+<Src file="src/rukh/eval/qwen_suite.py" tag="p4" lines="105-150" />
+
+El comentario del final explica la instantánea, y es el detalle metodológico más fino del fichero. El
+jugador sigue contando durante los puzles y durante las partidas, y sumar todo eso daría una tasa de
+legalidad sobre **otro denominador** que la del decoder, que es el único número de este informe que
+tiene que enfrentarse al suyo directamente.
+
+El `try/finally` alrededor de la caché es lo que garantiza que la base SQLite se cierre aunque un
+puzle reviente a mitad. Y `play_rungs(None, ..., player=player)` pasa `None` donde iría el modelo: la
+escalera acepta un jugador ya construido, que es lo que M4 extrajo al partir `play_game` en dos.
+
+```python title="src/rukh/eval/qwen_suite.py"
+def _board_of(position: Position) -> Any:
+    import chess
+
+    board = chess.Board()
+    for uci in position.moves:
+        board.push(chess.Move.from_uci(uci))
+    return board
+
+
+def _base_model(directory: Path) -> str:
+    import json
+
+    config = directory / "adapter_config.json"
+    if not config.is_file():
+        return "unknown"
+    return str(json.loads(config.read_text(encoding="utf-8")).get("base_model_name_or_path", "?"))
+```
+
+<Src file="src/rukh/eval/qwen_suite.py" tag="p4" lines="153-168" />
+
+Dos ayudantes. `_board_of` reconstruye el tablero desde las jugadas de la posición, porque el
+`Position` del harness lleva la línea y no el tablero. Y `_base_model` lee de qué modelo salió el
+adaptador, con un `"unknown"` en vez de una excepción: un informe al que le falta el nombre del modelo
+base sigue siendo un informe útil.
+
+```python title="src/rukh/eval/qwen_suite.py"
+def render_markdown(result: QwenResult) -> str:
+    """The report, with the failure breakdown the decoder's report has no column for."""
+    stats = result.written
+
+    def share(count: int) -> str:
+        return f"{100 * count / stats.asked:.2f} %" if stats.asked else "n/a"
+
+    lines = [
+        f"# Evaluation of `{result.stage}`",
+        "",
+        f"- Base model: `{result.base_model}`",
+        f"- Adapter: `{result.adapter_dir}`",
+        f"- Parameters: {result.params:,}",
+        f"- Device: `{result.device}`",
+        f"- Date: {result.date}",
+        "",
+        "## Headline",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| Legal moves written, no mask | {share(stats.legal)} |",
+        f"| Top-1 next move | {'n/a' if result.top1 is None else f'{result.top1 * 100:.1f} %'} |",
+        f"| Puzzles solved | "
+        f"{'n/a' if result.puzzles is None else f'{result.puzzles.rate * 100:.1f} %'} |",
+        f"| Estimated Elo | {elo_line(result.elo)} |",
+        "",
+        "## How the answers failed",
+        "",
+        "A decoder cannot write a move that does not exist: its vocabulary is the set of moves, "
+        "so its only failure is a legal move in the wrong position. A model writing SAN has three "
+        "more ways to be wrong, and folding them together would hide what the representation "
+        "costs.",
+        "",
+        "| Outcome | Count | Share |",
+        "|---|---:|---:|",
+        f"| legal | {stats.legal} | {share(stats.legal)} |",
+        f"| illegal here | {stats.illegal} | {share(stats.illegal)} |",
+        f"| not a move at all | {stats.unparseable} | {share(stats.unparseable)} |",
+        f"| ambiguous SAN | {stats.ambiguous} | {share(stats.ambiguous)} |",
+        f"| nothing written | {stats.empty} | {share(stats.empty)} |",
+        f"| **asked** | **{stats.asked}** | |",
+        "",
+    ]
+    if result.puzzles is not None:
+        lines += [
+            "## Puzzles by band",
+            "",
+            "| Band | Attempted | Solved | Rate |",
+            "|---|---:|---:|---:|",
+        ]
+        lines += [
+            f"| {band.band} | {band.attempted} | {band.solved} | {band.rate * 100:.1f} % |"
+            for band in result.puzzles.bands
+        ]
+        lines.append("")
+    if result.elo is not None:
+        lines += ["## Games against Stockfish", "", "| Rung | Games | Score |", "|---|---:|---:|"]
+        lines += [f"| {rung.name} | {rung.games} | {rung.score:.3f} |" for rung in result.elo.rungs]
+        lines.append("")
+    if result.notes:
+        lines += ["## Notes", ""] + [f"- {note}" for note in result.notes] + [""]
+    return "\n".join(lines)
+```
+
+<Src file="src/rukh/eval/qwen_suite.py" tag="p4" lines="171-232" />
+
+El informe en Markdown, con la sección que el del decoder no tiene. Fíjate en que el párrafo
+explicativo de «How the answers failed» va **dentro del informe generado**, no solo en la lección:
+quien abra `artifacts/eval/qwen3-pgn-qlora/report.md` dentro de un año tiene que entender por qué hay
+cinco filas donde el otro informe tiene una.
+
+`share()` devuelve `"n/a"` cuando no se preguntó nada, en vez de dividir por cero. Un informe que
+revienta al generarse es un informe que no existe.
+
+```python title="src/rukh/eval/qwen_suite.py"
+def row_of(result: QwenResult) -> WebRow:
+    """The row this model contributes to the single results table."""
+    elo = result.elo
+    interval = (
+        [elo.ci_low, elo.ci_high]
+        if elo and not elo.separated and elo.ci_low is not None and elo.ci_high is not None
+        else None
+    )
+    return WebRow(
+        stage=result.stage,
+        params=result.params,
+        legality=result.written.legal_rate or None,
+        top1=result.top1,
+        puzzles=result.puzzles.by_band() if result.puzzles else {},
+        elo=elo.elo if elo else None,
+        elo_ci=interval,
+        elo_lower=elo.elo_lower if elo else None,
+        elo_upper=elo.elo_upper if elo else None,
+        elo_separated=bool(elo.separated) if elo else False,
+        date=result.date,
+    )
+
+
+def run_qwen_suite(
+    adapter_dir: Path | str,
+    cfg: EvalConfig,
+    stage: str = "qwen3-pgn-qlora",
+    use_cache: bool = True,
+    device: str | None = None,
+) -> tuple[QwenResult, Any]:
+    """Evaluate and report, so the row lands in the same table as every other stage."""
+    import json
+
+    result = evaluate_qwen(adapter_dir, cfg, stage=stage, use_cache=use_cache, device=device)
+    report = write_report_files(
+        result.stage,
+        render_markdown(result),
+        json.loads(result.model_dump_json()),
+        paths.resolve(cfg.out_dir),
+        paths.resolve(cfg.web_results) if cfg.web_results else None,
+        row_of(result),
+    )
+    return result, report
+```
+
+<Src file="src/rukh/eval/qwen_suite.py" tag="p4" lines="235-277" />
+
+`row_of` construye la fila de la tabla única del proyecto, con la misma forma que la de cualquier
+otra etapa: eso es lo que permite que Qwen aparezca junto al decoder en la misma tabla en vez de en
+un apéndice.
+
+La condición del intervalo es la que maneja el caso que este modelo produjo: cuando `elo.separated`
+es cierto —es decir, cuando se ganaron o se perdieron **todas** las partidas—, no hay intervalo que
+publicar, solo una cota. Qwen perdió 160 de 160, así que su fila lleva `< 807` y no un rango.
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/qwen-smoke.yaml"
+# A rehearsal of `rukh eval qwen`: enough of every phase to fail, not enough to wait for.
+games: data/uci/year=2025/month=02/games.parquet
+puzzles: data/puzzles/puzzles.parquet
+puzzle_split: test
+legality_positions: 12
+accuracy_positions: 12
+position_pool: 500
+puzzles_per_band: 3
+elo_games: 1
+elo_rungs:
+  - name: uci-1320
+    uci_elo: 1320
+    elo: 1320
+elo_move_time: 0.05
+bootstrap: 50
+temperature: 0.05
+top_k: 1
+block: 200
+seed: 42
+header_elo: 1800
+diversity_games: 0
+out_dir: artifacts/eval
+web_results: null
+cache_db: artifacts/eval/cache-qwen-smoke.sqlite
+track: false
+```
+
+<Src file="configs/eval/qwen-smoke.yaml" tag="p4" lines="1-25" />
+
+El ensayo de la evaluación, con la misma filosofía que el del entrenamiento: doce posiciones, tres
+puzles por banda, una partida contra el peldaño más flojo. Suficiente de cada fase para que falle, no
+suficiente como para esperar.
+
+`cache_db` apunta a una base propia: un ensayo no debe contaminar la caché de las mediciones de
+verdad, que se reutiliza entre corridas.
+
+```bash title="Terminal"
+uv sync --extra cu128 --extra hf --group dev
+uv run rukh train qwen --config configs/train/qwen3-smoke.yaml
+uv run rukh eval qwen --adapter checkpoints/qwen3-smoke --config configs/eval/qwen-smoke.yaml --stage qwen3-smoke
+uv run rukh train qwen --config configs/train/qwen3-pgn.yaml
+uv run rukh eval qwen --adapter checkpoints/qwen3-pgn-qlora --config configs/eval/greedy.yaml --stage qwen3-pgn-qlora
+```
+
+Los dos primeros son un minuto entre los dos. El afinado real descarga Qwen3-0.6B del Hub la primera
+vez (1,5 GB) y corre 1 500 pasos; la evaluación por la misma escalera tarda unos 40 minutos, más que
+la del decoder, porque cada jugada es una generación de texto.
+
+<Callout kind="roto" title="Y lo que QLoRA no ahorró">
+  El nombre promete memoria y a esta escala no la da. Cuatro bits sobre Qwen3-0.6B ahorraron **341
+  MB de pesos** (un 29 %) y **7 MB del pico** (un 0,4 %), porque la tabla de embeddings —el 25,9 %
+  del modelo— no se cuantiza y el pico lo marcan las activaciones y el optimizador, no los pesos
+  congelados. La ventaja de QLoRA es real cuando el modelo no cabe; a 0,6 B en una tarjeta de 32 GB
+  no hay nada que no quepa. Se intentó, se midió y se dice, que es lo que permiten los dos campos de
+  memoria de `QwenReport`.
+</Callout>
+
+## Las dos órdenes de la CLI
+
+```python title="src/rukh/cli.py"
+@train_app.command("qwen")
+def train_qwen_cmd(
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", exists=True, dir_okay=False, readable=True, help="YAML config."),
+    ] = None,
+    device: Annotated[str | None, typer.Option("--device", help="Where to run.")] = None,
+) -> None:
+    """QLoRA a general language model on PGN text, for the comparison table of M4.
+
+    Four-bit is attempted and not required: at 0.6 B parameters on a 32 GB card it saves nothing
+    that matters, so if `bitsandbytes` will not load the run falls back to bf16 and says so in
+    its report instead of claiming a technique it did not use.
+    """
+    from rukh.config import load_yaml
+    from rukh.train.qwen import QwenConfig, train_qwen
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    cfg = load_yaml(config, QwenConfig) if config is not None else QwenConfig()
+    try:
+        report = train_qwen(cfg, device=device)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"model:     {report.model}")
+    typer.echo(f"precision: {'4-bit NF4' if report.four_bit else 'bf16'}")
+    if report.fallback_reason:
+        typer.echo(f"fallback:  {report.fallback_reason}")
+    typer.echo(
+        f"trainable: {report.trainable_params:,} of {report.total_params:,} "
+        f"({100 * report.trainable_share:.3f} %)"
+    )
+    typer.echo(f"samples:   {report.train_samples:,} over {report.steps:,} steps")
+    if report.final_loss is not None:
+        typer.echo(f"loss:      {report.final_loss:.4f}")
+    if report.weights_memory_mb is not None:
+        typer.echo(f"weights:   {report.weights_memory_mb:,.0f} MB on the device")
+    if report.peak_memory_mb is not None:
+        typer.echo(f"peak mem:  {report.peak_memory_mb:,.0f} MB during training")
+    typer.echo(f"adapter:   {report.adapter_dir}")
+```
+
+<Src file="src/rukh/cli.py" tag="p4" lines="475-514" />
+
+La orden de entrenamiento es cáscara pura salvo por lo que **imprime**: la precisión que se usó de
+verdad, la razón del respaldo si lo hubo, los parámetros entrenables con su porcentaje, y los dos
+números de memoria. Cada línea sale de un campo de `QwenReport`, así que lo que se ve en la consola
+y lo que queda en `run.json` no pueden discrepar.
+
+Fíjate en que `fallback:` solo se imprime **si hay** razón. Una línea que dijera «fallback: none» en
+cada corrida entrenaría al lector a no leerla.
+
+```python title="src/rukh/cli.py"
+@eval_app.command("qwen")
+def eval_qwen_cmd(
+    adapter: Annotated[
+        Path,
+        typer.Option(
+            "--adapter", exists=True, file_okay=False, help="Directory of the fine-tuned adapter."
+        ),
+    ],
+    suite: Annotated[str, typer.Option("--suite", help="Suite name: full or quick.")] = "full",
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config", exists=True, dir_okay=False, readable=True, help="Suite YAML override."
+        ),
+    ] = None,
+    stage: Annotated[str, typer.Option("--stage", help="Row name in the results table.")] = (
+        "qwen3-pgn-qlora"
+    ),
+    no_cache: Annotated[bool, typer.Option("--no-cache", help="Recompute everything.")] = False,
+    device: Annotated[str | None, typer.Option("--device", help="Where to run.")] = None,
+) -> None:
+    """Put a fine-tuned general model through the decoder's own suite.
+
+    Same positions, same puzzles, same Stockfish ladder. The one column this report has and the
+    decoder's does not is the breakdown of *how* its answers failed: a model writing SAN can write
+    something that is not a move, or a move two pieces could make, and neither is possible for a
+    vocabulary in which one token is one move.
+    """
+    from rukh.eval import load_suite
+    from rukh.eval.qwen_suite import run_qwen_suite
+    from rukh.eval.report import elo_line
+    from rukh.eval.suite import SUITES
+
+    if suite not in SUITES:
+        typer.echo(f"error: --suite must be one of {', '.join(SUITES)}", err=True)
+        raise typer.Exit(code=2)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    cfg = load_suite(suite, config)
+    try:
+        result, report = run_qwen_suite(
+            adapter, cfg, stage=stage, use_cache=not no_cache, device=device
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    stats = result.written
+    typer.echo(f"stage:    {result.stage} ({result.params:,} parameters)")
+    typer.echo(f"legal:    {stats.legal_rate:.4f} of {stats.asked} answers")
+    typer.echo(
+        f"failures: {stats.illegal} illegal, {stats.unparseable} not a move, "
+        f"{stats.ambiguous} ambiguous, {stats.empty} empty"
+    )
+    if result.top1 is not None:
+        typer.echo(f"accuracy: top1 {result.top1:.4f}")
+    if result.puzzles is not None:
+        typer.echo(f"puzzles:  {result.puzzles.rate:.4f} solved")
+    if result.elo is not None:
+        typer.echo(f"elo:      {elo_line(result.elo)} over {result.elo.games} games")
+    typer.echo(f"report:   {report.markdown}")
+```
+
+<Src file="src/rukh/cli.py" tag="p4" lines="841-899" />
+
+Y la de evaluación, cuyo docstring vuelve a decir cuál es la columna que este informe tiene y el del
+decoder no. La línea de `failures:` imprime los cuatro modos de fallo por separado en la consola, que
+es donde se mira mientras corre: un solo número de legalidad haría falta abrir el informe para saber
+**cómo** falló.
+
+## Qué has aprendido
+
+Cómo se entra en un ecosistema sin mudarse a él: cien líneas de envoltura que dejan una sola
+definición del paso hacia delante en el repositorio, y que a cambio abren `peft`, `trl` y el Hub. Las
+tres trampas que cuesta descubrir —las etiquetas ya desplazadas, el atributo de config que no se
+puede llamar `decoder`, los pesos atados que hay que declarar— y el test que convierte «implementamos
+LoRA» en una afirmación comprobable.
+
+Y la otra mitad de una comparación honesta: el mismo corpus, el mismo harness, un presupuesto
+generoso con el otro lado, y una columna nueva que cuenta las tres maneras de fallar que el decoder
+no tiene.
+
+Se mide con el `run.json` de la corrida —si se usó cuatro bits, cuántos parámetros eran entrenables,
+los dos números de memoria— y con el informe de la suite, cuyo desglose por modo de fallo es lo que
+la lección 9 lee.
+
+Lo siguiente es sacar todo esto del disco: exportar un adaptador con sus factores como entradas del
+grafo, y publicar cinco artefactos con cards que digan qué cambiaron y qué costaron. Sigue en
+«Adaptadores y publicación».

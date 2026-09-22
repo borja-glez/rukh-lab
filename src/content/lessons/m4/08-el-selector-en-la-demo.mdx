@@ -1,0 +1,1108 @@
+---
+title: 'El selector en la demo: seis condiciones y 1,6 MB'
+description:
+  'El código de la demo en el commit del hito: el registro que ofrece las seis condiciones medidas y
+  ninguna más, el contrato que lee del propio fichero ONNX cuánto mide un adaptador válido, el
+  worker que sube 1,6 MB en vez de descargar 231, y la prueba de navegador que lo comprueba pidiendo
+  un solo .onnx.'
+module: m4
+order: 8
+duration: 145
+level: medio
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - demo
+  - ONNX
+  - adaptador
+  - WebGPU
+  - Playwright
+  - contrato
+demo: '?stage=medium-elo-fp16'
+artifacts:
+  - kind: demo
+    label: rukh.borjaglez.com
+    href: https://rukh.borjaglez.com
+---
+
+Lección 8 de 10 del módulo «Fine-tuning e instrucción». Viene de «Diversidad y barridos» y sigue en
+«Lo que salió». Todo el código de esta lección es de `rukh-web`, en el commit
+[`8210ff1`](https://github.com/borja-glez/rukh-web/commit/8210ff1).
+
+## Qué vas a construir
+
+Los dos controles que este hito enciende en la demo, y la infraestructura que hace honestos los dos.
+
+El selector «Elo objetivo» llevaba en pantalla y desactivado desde M2. Encenderlo es una línea; lo
+que hay que decidir es **qué ofrece**. El de estilo es nuevo y es el que tiene código detrás: carga
+1,6 MB sobre el modelo ya descargado y cambia lo que el modelo quiere jugar sin pedir otro `.onnx`.
+
+Y la prueba de navegador que convierte la promesa en una propiedad: una aserción que dice que en
+toda la prueba se ha descargado **un solo** fichero de modelo.
+
+## El registro: seis, no veintisiete
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+/**
+ * Elo headers the "juega como" selector offers, and the reason it is a short list.
+ *
+ * These are the conditions that were actually *measured*, one full run of the suite each
+ * (`rukh eval sweep`, M4). The vocabulary has twenty-seven of them and the model will answer any,
+ * but offering twenty-seven would promise twenty-seven measurements and there are six. A control
+ * a player turns is a claim that turning it does something, and the claim is only as wide as the
+ * evidence behind it.
+ */
+export const ELO_TARGETS = [1200, 1500, 1800, 2000, 2100, 2400] as const;
+
+/** The header a conditioned stage starts at: the one every published number was read at. */
+export const DEFAULT_ELO = 1800;
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="8210ff1" lines="72-84" />
+
+Trece líneas de las que once son el comentario, y el comentario es la decisión del hito en la demo.
+
+El vocabulario tiene **veintisiete** cabeceras de Elo y el modelo contesta a todas. El selector
+ofrece **seis**: las que se midieron, con una corrida completa de la suite cada una. Ofrecer las
+veintisiete sería prometer veintisiete mediciones y tener seis.
+
+Una carta de restaurante solo lista los platos que la cocina ha probado; una con veintisiete entradas
+de las que se han cocinado seis no es una carta más larga, es una carta que miente en veintiuna
+líneas.
+
+<Callout kind="mundo-real" title="Un control que se puede mover es una afirmación">
+  La frase del comentario —«a control a player turns is a claim that turning it does something, and
+  the claim is only as wide as the evidence behind it»— es transferible tal cual. Un desplegable con
+  doce opciones de las que tres están medidas es una interfaz que promete doce comportamientos
+  distintos, y el usuario que elige la séptima no tiene manera de saber que nadie la ha comprobado.
+  La lista corta no es una limitación de la demo: es su parte más honesta.
+</Callout>
+
+`DEFAULT_ELO = 1800` con su docstring de una línea: la cabecera con la que se leyó cada número
+publicado. Arrancar en otra dejaría al jugador comparando su experiencia con una tabla medida en otra
+condición.
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+  /**
+   * True when the stage's ONNX takes its LoRA factors as inputs, so styles can be swapped.
+   *
+   * It is not a different model: fed an adapter of zeros the graph computes exactly what the
+   * plain export computes, which is checked on both sides (`tests/unit/test_export_adapter.py`
+   * in `rukh`, `readAdapterShape` here). What the flag really says is that the file declares
+   * `lora_a` and `lora_b`, so the worker has to feed them on every call.
+   */
+  adaptable?: boolean;
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="8210ff1" lines="17-25" />
+
+La bandera `adaptable` en la interfaz `Stage`, con la aclaración que evita el malentendido: **no es
+otro modelo**. Alimentado con un adaptador de ceros, el grafo calcula exactamente lo que calcula la
+exportación normal —comprobado en los dos lados, en `rukh` con un test de Python y aquí con
+`readAdapterShape`—. Lo que la bandera dice de verdad es que el fichero declara `lora_a` y `lora_b`,
+así que el worker tiene que alimentarlos en cada llamada.
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+/**
+ * A style adapter: 1.6 MB of LoRA factors that change how the model opens and nothing else.
+ *
+ * They are offered only on stages marked `adaptable`, and they are tied to the base model they
+ * were trained on — an adapter is a correction to specific weights, so the same file over another
+ * checkpoint is noise. The worker refuses one whose size does not match what the graph declares,
+ * which is the cheap half of that check; the other half is that this list only ever names
+ * adapters of the stage they sit next to.
+ */
+export interface Adapter {
+  id: string;
+  label: string;
+  /** What it does, in the words a player would use. */
+  hint: string;
+  repo: string;
+  /** Path of the flat float32 file inside the repo (`web/adapter.bin`). */
+  file: string;
+  /** Measured, like `STAGE_SIZE_MB`: the worker checks the real length against the graph. */
+  sizeBytes: number;
+  /** Stage ids this adapter may be loaded into. */
+  stages: readonly string[];
+}
+
+/** Adapter sizes in bytes, **measured** on the published files. */
+export const ADAPTER_BYTES = 1_572_864;
+
+export const NO_ADAPTER = 'none';
+
+export const ADAPTERS: Adapter[] = [
+  {
+    id: 'lora-e4',
+    label: 'Abre 1. e4',
+    hint: 'Abre con el peón de rey el 99,9 % de las veces',
+    repo: 'chorcat/rukh-lora-e4',
+    file: 'web/adapter.bin',
+    sizeBytes: ADAPTER_BYTES,
+    stages: ['medium-lora-fp16', 'medium-lora-int8'],
+  },
+  {
+    id: 'lora-d4',
+    label: 'Abre 1. d4',
+    hint: 'Abre con el peón de dama el 99,9 % de las veces',
+    repo: 'chorcat/rukh-lora-d4',
+    file: 'web/adapter.bin',
+    sizeBytes: ADAPTER_BYTES,
+    stages: ['medium-lora-fp16', 'medium-lora-int8'],
+  },
+];
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="8210ff1" lines="86-133" />
+
+Un adaptador en el registro son siete campos, y dos de ellos son la defensa contra el error que más
+duele: **un adaptador es una corrección a unos pesos concretos**, así que el mismo fichero sobre otro
+checkpoint es ruido. `stages` enumera en qué etapas se puede cargar, y `sizeBytes` es la medida real
+del fichero publicado.
+
+El docstring dice cuál de las dos comprobaciones es la barata: el worker rechaza un adaptador cuyo
+tamaño no coincida con lo que el grafo declara. La otra mitad es que esta lista solo nombra
+adaptadores de la etapa junto a la que están.
+
+`hint` es «qué hace, en las palabras que usaría un jugador». Los dos son las cifras medidas de la
+lección 9 —el 99,9 %— dichas sin porcentaje de más.
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+/** The adapters offered for one stage; empty for a stage that cannot take them. */
+export function adaptersFor(stage: Stage): Adapter[] {
+  if (!stage.adaptable) return [];
+  const offered = stage.id === 'test-lora' ? [TEST_ADAPTER] : ADAPTERS;
+  return offered.filter((adapter) => adapter.stages.includes(stage.id));
+}
+
+/** One adapter by id, or `null` for `NO_ADAPTER` and for anything unknown. */
+export function findAdapter(id: string): Adapter | null {
+  if (id === TEST_ADAPTER.id) return TEST_ADAPTER;
+  return ADAPTERS.find((adapter) => adapter.id === id) ?? null;
+}
+
+/** Hub URL of an adapter's browser file, or the same-origin path of the toy one. */
+export function adapterUrl(adapter: Adapter): string {
+  if (!adapter.repo || !adapter.file) return '/test/toy-lora.bin';
+  return hubUrl(adapter.repo, adapter.file);
+}
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="8210ff1" lines="135-152" />
+
+Tres funciones de tres líneas. `adaptersFor` devuelve una lista **vacía** para una etapa que no los
+admite, que es lo que el panel usa para desactivar el control sin una condición aparte. Y
+`adapterUrl` cae al fichero de juguete del mismo origen cuando el adaptador no tiene repositorio, que
+es lo que permite que el E2E recorra el camino entero sin red.
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+  // `medium` fine-tuned on an Elo-balanced corpus (M4). The only stages that answer the "juega
+  // como" selector: the twelve headers below 1800 had never received a gradient until this run,
+  // so on every other stage the control would be asking the model to read noise.
+  {
+    id: 'medium-elo-fp16',
+    label: 'Rukh medium + Elo (fp16)',
+    kind: 'onnx',
+    repo: 'chorcat/rukh-medium-elo',
+    file: 'onnx/model-fp16.onnx',
+    sizeMb: STAGE_SIZE_MB['medium-elo-fp16'],
+    block: DEFAULT_BLOCK,
+    eloConditioned: true,
+  },
+  {
+    id: 'medium-elo-int8',
+    label: 'Rukh medium + Elo (int8)',
+    kind: 'onnx',
+    repo: 'chorcat/rukh-medium-elo',
+    file: 'onnx/model-int8.onnx',
+    sizeMb: STAGE_SIZE_MB['medium-elo-int8'],
+    block: DEFAULT_BLOCK,
+    eloConditioned: true,
+  },
+  // The same weights as `medium`, exported with the LoRA factors as inputs of the graph, in a
+  // repository of its own. A separate stage and not a replacement because the file is a separate
+  // download: somebody who already has `medium-fp16` cached should not lose it to a feature they
+  // may never use, and fed an adapter of zeros this graph computes exactly what that one does.
+  {
+    id: 'medium-lora-fp16',
+    label: 'Rukh medium + estilo (fp16)',
+    kind: 'onnx',
+    repo: 'chorcat/rukh-medium-lora',
+    file: 'onnx/model-fp16.onnx',
+    sizeMb: STAGE_SIZE_MB['medium-lora-fp16'],
+    block: DEFAULT_BLOCK,
+    adaptable: true,
+  },
+  {
+    id: 'medium-lora-int8',
+    label: 'Rukh medium + estilo (int8)',
+    kind: 'onnx',
+    repo: 'chorcat/rukh-medium-lora',
+    file: 'onnx/model-int8.onnx',
+    sizeMb: STAGE_SIZE_MB['medium-lora-int8'],
+    block: DEFAULT_BLOCK,
+    adaptable: true,
+  },
+];
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="8210ff1" lines="214-261" />
+
+Cuatro etapas nuevas y dos comentarios que son decisiones.
+
+El primero dice por qué las etapas de Elo son **las únicas** que contestan al selector: los doce
+tokens por debajo de 1800 no habían recibido un gradiente hasta esta corrida, así que en cualquier
+otra etapa el control estaría pidiéndole al modelo que lea ruido. Es la lección 2 dicha en la
+interfaz.
+
+El segundo dice por qué `medium-lora` es una etapa aparte y no un reemplazo de `medium`: el fichero es
+una descarga aparte, y quien ya tiene `medium-fp16` en caché no debería perderlo por una función que
+puede no usar nunca. Y añade la propiedad que lo hace legítimo: alimentado con ceros, este grafo
+calcula exactamente lo que calcula el otro.
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+/**
+ * Download sizes in MB, **measured** on the published files rather than estimated. They drive
+ * the consent copy, which is the last thing a reader sees before the browser fetches tens of
+ * megabytes, so an estimate that drifts from the file is a promise the page does not keep. Read
+ * them back with `python -c "import os; print(os.path.getsize(...))"` whenever a stage is
+ * re-exported: `small` and the encoder both changed size when their weights did.
+ *
+ * Every number here was re-read from the staged `onnx` folders on 2026-09-20 and every
+ * one of them was wrong -- by 6 to 10 MB, always low, because they had been carried over from the
+ * plan's estimates and never corrected. The consent step had been under-promising every download
+ * since P2.
+ */
+export const STAGE_SIZE_MB = {
+  'tiny-int8': 8,
+  'small-fp16': 79,
+  'small-int8': 43,
+  'medium-fp16': 231,
+  'medium-int8': 122,
+  'medium-dpo-fp16': 231,
+  'medium-elo-fp16': 231,
+  'medium-elo-int8': 122,
+  // The swappable export is 438 KB bigger than the ordinary one -- the cost of a graph that takes
+  // its LoRA factors as inputs is 0.19 % of the file, which is the whole argument for doing it.
+  'medium-lora-fp16': 232,
+  'medium-lora-int8': 122,
+} as const;
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="8210ff1" lines="42-67" />
+
+Y un hallazgo que nadie buscaba. Los tamaños de descarga que la página promete antes de bajar nada
+estaban **todos mal**, entre 6 y 10 MB de menos, porque venían de las estimaciones del plan y nunca
+se comprobaron contra los ficheros publicados. El paso de consentimiento llevaba prometiendo menos de
+lo que descargaba desde M2.
+
+El comentario deja también la instrucción para que no vuelva a pasar: volver a leerlos con
+`os.path.getsize` cada vez que una etapa se reexporta.
+
+Y la línea que resume el hito: la exportación intercambiable es **438 KB más grande** que la normal.
+El coste de un grafo que toma sus factores como entradas es el 0,19 % del fichero.
+
+## El contrato: el fichero dice cuánto mide su adaptador
+
+{/* prettier-ignore */}
+```ts title="src/lib/contract.ts"
+  adapter: AdapterShape | null;
+}
+
+/**
+ * The two tensors a style-swappable graph is fed on every call, and how many floats they are.
+ *
+ * This is the one piece of the adapter format the browser does **not** have to be told: the
+ * exporter declares `lora_a` and `lora_b` with fixed shapes, so the file itself says what an
+ * adapter for it must look like. A downloaded buffer of the wrong length is then a mismatch the
+ * page can name instead of a silent misread of somebody else's adapter.
+ */
+export interface AdapterShape {
+  a: number[];
+  b: number[];
+  /** `prod(a) + prod(b)`: the float32 count of a valid adapter file for this graph. */
+  floats: number;
+}
+
+/** Inputs a graph exported with `rukh export --adapter-inputs` adds, in the order it takes them. */
+export const ADAPTER_INPUTS = ['lora_a', 'lora_b'] as const;
+```
+
+<Src file="src/lib/contract.ts" repo="rukh-web" tag="8210ff1" lines="26-45" />
+
+Esta es la parte elegante del diseño y merece leerse despacio. El formato del adaptador tiene una
+pieza que el navegador **no** necesita que nadie le diga: el exportador declara `lora_a` y `lora_b`
+con formas fijas, así que **el propio fichero dice qué forma debe tener un adaptador para él**.
+
+La consecuencia práctica es que un búfer descargado de la longitud equivocada es un desajuste que la
+página puede **nombrar**, en vez de una lectura silenciosa del adaptador de otro modelo.
+
+{/* prettier-ignore */}
+```ts title="src/lib/contract.ts"
+/**
+ * The shape of the LoRA factors this graph takes, or `null` when it takes none.
+ *
+ * A graph that declares the inputs but not their size cannot be fed at all — there is nothing to
+ * build the zero adapter from — so that case throws rather than pretending the stage is ordinary.
+ */
+export function readAdapterShape(session: SessionLike): AdapterShape | null {
+  const inputs = session.inputNames ?? [];
+  const present = ADAPTER_INPUTS.filter((name) => inputs.includes(name));
+  if (present.length === 0) return null;
+  if (present.length !== ADAPTER_INPUTS.length) {
+    throw new Error(
+      `El modelo declara ${present.join(' y ')} pero no ${ADAPTER_INPUTS.filter(
+        (name) => !present.includes(name),
+      ).join(' y ')}: no es un fichero con adaptadores intercambiables.`,
+    );
+  }
+  const shapes = ADAPTER_INPUTS.map((name) => fixedShape(session.inputMetadata, name));
+  if (shapes.some((shape) => shape === null)) {
+    throw new Error(
+      'El modelo toma los factores de LoRA pero no declara su tamaño, así que no se puede ' +
+        'construir el adaptador vacío. Borra los modelos descargados y vuelve a intentarlo.',
+    );
+  }
+  const [a, b] = shapes as [number[], number[]];
+  return { a, b, floats: product(a) + product(b) };
+}
+
+/** A fully numeric shape for one named value, or `null` when any axis is symbolic or missing. */
+export function fixedShape(
+  metadata: readonly OutputMetadata[] | undefined,
+  name: string,
+): number[] | null {
+  const shape = metadata?.find((entry) => entry.name === name)?.shape;
+  if (!shape || shape.length === 0) return null;
+  const dims = shape.map((dim) => (typeof dim === 'number' && Number.isInteger(dim) ? dim : -1));
+  return dims.some((dim) => dim <= 0) ? null : dims;
+}
+
+function product(dims: readonly number[]): number {
+  return dims.reduce((total, dim) => total * dim, 1);
+}
+```
+
+<Src file="src/lib/contract.ts" repo="rukh-web" tag="8210ff1" lines="102-143" />
+
+Cuarenta y tres líneas con tres casos y ninguna rama ambigua.
+
+Sin ninguna de las dos entradas: `null`, la etapa es ordinaria.
+
+Con **una** de las dos: excepción, y el mensaje nombra la que falta. Un grafo con `lora_a` y sin
+`lora_b` no es un fichero medio válido, es un fichero corrupto o de otra versión del exportador, y
+tratarlo como ordinario dejaría una entrada sin alimentar.
+
+Con las dos pero **sin tamaño declarado**: excepción también, y esta es la decisión que el docstring
+justifica —no hay con qué construir el adaptador vacío, así que fingir que la etapa es normal
+produciría un fallo más adelante y más lejos—. El mensaje es para el jugador y le dice qué hacer:
+borrar los modelos descargados y volver a intentarlo.
+
+`fixedShape` devuelve `null` en cuanto un eje es simbólico o no positivo. Los ejes dinámicos son la
+norma en la entrada de tokens y el error en los factores, cuya forma es fija por construcción.
+
+## El worker: 1,6 MB por estilo, reutilizados
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+/**
+ * The style adapter fed on every call, and the zeros that stand in for "no style".
+ *
+ * Both are allocated once per session and reused: they are the same 1.6 MB on every move, and a
+ * fresh `Float32Array` per inference would be a megabyte and a half of garbage per move for
+ * nothing. `zeros` is not a special case in the graph — the export is built so that an adapter of
+ * zeros computes the base model exactly — so the plain stage and the styled one run the same code.
+ */
+let adapter: { a: Float32Array; b: Float32Array; id: string } | null = null;
+let zeros: { a: Float32Array; b: Float32Array } | null = null;
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="8210ff1" lines="41-50" />
+
+Dos variables de módulo y un docstring con dos decisiones dentro.
+
+Los dos búferes se **asignan una vez por sesión y se reutilizan**: son los mismos 1,6 MB en cada
+jugada, y un `Float32Array` nuevo por inferencia serían megabyte y medio de basura por jugada para
+nada.
+
+Y `zeros` **no es un caso especial en el grafo**. La exportación está construida para que un
+adaptador de ceros calcule exactamente el modelo base, así que la etapa normal y la de estilo corren
+el mismo código. Eso es lo que hace que «sin estilo» no sea una rama que pueda desviarse.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+function sizeOf(shape: readonly number[]): number {
+  return shape.reduce((total, dim) => total * dim, 1);
+}
+
+/** The two tensors the graph wants this call, whether a style is loaded or not. */
+function adapterFeeds(live: ModelContract) {
+  if (!live.adapter || !zeros) return undefined;
+  const factors = adapter ?? zeros;
+  return {
+    lora_a: floatTensor(factors.a, live.adapter.a),
+    lora_b: floatTensor(factors.b, live.adapter.b),
+  };
+}
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="8210ff1" lines="104-116" />
+
+`adapter ?? zeros` es toda la lógica de «sin estilo»: una alternativa de un operador. Si el adaptador
+cargado es `null`, se alimentan los ceros.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+/**
+ * Downloads a style adapter and installs it, or clears it when there is no url.
+ *
+ * The length check is the whole validation: the graph declares how many floats an adapter for it
+ * has, so a file of any other size belongs to another model and would be read as garbage laid
+ * over the right weights — a model that plays legally and badly, which is the worst kind of wrong.
+ */
+async function setAdapter(request: Extract<DecoderRequest, { type: 'adapter' }>): Promise<void> {
+  const started = performance.now();
+  const floats = await serial(async () => {
+    const live = contract;
+    if (!live) throw new Error('el modelo todavía no está cargado');
+    if (!live.adapter) {
+      throw new Error('esta etapa no admite adaptadores de estilo');
+    }
+    if (request.url === null) {
+      adapter = null;
+      return 0;
+    }
+    const bytes = await fetchModel(request.url, request.sizeBytes, (loaded, total) =>
+      reply({ type: 'progress', id: request.id, loaded, total }),
+    );
+    const expected = live.adapter.floats * 4;
+    if (bytes.byteLength !== expected) {
+      throw new Error(
+        `El adaptador no encaja con este modelo: trae ${bytes.byteLength} bytes y el fichero ` +
+          `espera ${expected}. No se cambia de estilo con él.`,
+      );
+    }
+    // `fetchModel` returns a fresh buffer, but not necessarily one aligned for Float32Array.
+    const aligned = bytes.byteOffset % 4 === 0 ? bytes : new Uint8Array(bytes.slice().buffer);
+    const all = new Float32Array(aligned.buffer, aligned.byteOffset, live.adapter.floats);
+    const sizeA = sizeOf(live.adapter.a);
+    adapter = { a: all.slice(0, sizeA), b: all.slice(sizeA), id: request.adapter };
+    return live.adapter.floats;
+  });
+  reply({
+    type: 'adapter-ready',
+    id: request.id,
+    adapter: request.url === null ? '' : request.adapter,
+    floats,
+    loadMs: Math.round(performance.now() - started),
+  });
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="8210ff1" lines="118-160" />
+
+La función que carga un estilo, y su docstring nombra el peor fallo posible de esta función: **la
+comprobación de longitud es toda la validación**. El grafo declara cuántos flotantes tiene un
+adaptador suyo, así que un fichero de cualquier otro tamaño pertenece a otro modelo y se leería como
+basura puesta encima de los pesos correctos —un modelo que juega legal y mal, que es la peor clase de
+error—.
+
+Dos detalles de implementación que no son cosméticos.
+
+El `serial(...)` que envuelve todo el cuerpo es la cola por la que pasan todas las llamadas a ORT: ni
+dos sesiones ni dos inferencias en vuelo a la vez. Cargar un adaptador **mientras** se calcula una
+jugada dejaría al modelo respondiendo con la mitad de un estilo.
+
+Y el comentario del alineamiento es del tipo que solo aparece cuando algo falla: `fetchModel`
+devuelve un búfer nuevo, pero no necesariamente uno alineado a cuatro bytes, y un `Float32Array`
+sobre un `byteOffset` que no es múltiplo de cuatro lanza. La copia solo se hace cuando hace falta.
+
+{/* prettier-ignore */}
+```ts title="src/workers/ort-runtime.ts"
+/** One `(1, T)` int64 tensor under the name the session gives its only input. */
+export function inputFeeds(
+  session: ort.InferenceSession,
+  ids: readonly number[],
+  extra?: Record<string, ort.Tensor>,
+): Record<string, ort.Tensor> {
+  const data = BigInt64Array.from(ids, (id) => BigInt(id));
+  return {
+    [session.inputNames[0]]: new ort.Tensor('int64', data, [1, ids.length]),
+    ...(extra ?? {}),
+  };
+}
+
+/** A float32 tensor for one of the graph's fixed-shape inputs (the LoRA factors). */
+export function floatTensor(data: Float32Array, shape: readonly number[]): ort.Tensor {
+  return new ort.Tensor('float32', data, shape.slice());
+}
+```
+
+<Src file="src/workers/ort-runtime.ts" repo="rukh-web" tag="8210ff1" lines="119-135" />
+
+`inputFeeds` gana un parámetro opcional y lo extiende sobre el objeto de entradas. Que sea opcional
+es lo que mantiene el camino de la etapa normal exactamente como estaba: sin `extra`, el objeto que
+sale es el de antes.
+
+{/* prettier-ignore */}
+```ts title="src/lib/worker-protocol.ts"
+/**
+ * Loads (or clears) the style adapter of a session whose graph takes its LoRA factors as inputs.
+ *
+ * `url: null` clears it, which feeds an adapter of zeros — and an adapter of zeros is exactly the
+ * base model, by construction and by test (`tests/unit/test_export_adapter.py`). So "no style" is
+ * not a different session or a different file; it is the same graph with nothing added.
+ */
+export interface AdapterRequest {
+  type: 'adapter';
+  id: number;
+  /** Adapter id from the registry, for diagnostics; empty when clearing. */
+  adapter: string;
+  url: string | null;
+  sizeBytes: number;
+}
+```
+
+<Src file="src/lib/worker-protocol.ts" repo="rukh-web" tag="8210ff1" lines="56-70" />
+
+El mensaje nuevo del protocolo, con el docstring que explica la semántica de `url: null`: limpia el
+adaptador, lo que alimenta un adaptador de ceros —y un adaptador de ceros **es** exactamente el
+modelo base, por construcción y por test—. Así que «sin estilo» no es otra sesión ni otro fichero: es
+el mismo grafo sin nada añadido.
+
+{/* prettier-ignore */}
+```ts title="src/lib/worker-protocol.ts"
+export interface AdapterMessage {
+  type: 'adapter-ready';
+  id: number;
+  /** Which adapter is live now; empty string when the session is back to the plain model. */
+  adapter: string;
+  /** Floats fed on every call, so the panel can say what a style costs per move. */
+  floats: number;
+  loadMs: number;
+}
+```
+
+<Src file="src/lib/worker-protocol.ts" repo="rukh-web" tag="8210ff1" lines="150-158" />
+
+Y la respuesta, que devuelve **qué adaptador está vivo ahora** —cadena vacía cuando se ha vuelto al
+modelo normal— y cuántos flotantes se alimentan en cada llamada. Ese segundo campo es para que el
+panel pueda decir lo que cuesta un estilo por jugada.
+
+## La interfaz
+
+{/* prettier-ignore */}
+```tsx title="src/islands/App.tsx"
+/**
+ * The style adapter loaded into the live session, and whether one is on its way.
+ *
+ * `NO_ADAPTER` is not "the feature is off": the graph still takes its two factors and is fed
+ * zeros, which is the base model exactly. So switching styles never rebuilds the session and
+ * never re-downloads the model — it uploads 1.6 MB and the next move comes out different.
+ */
+const adapter = signal<string>(NO_ADAPTER);
+const adapterBusy = signal(false);
+```
+
+<Src file="src/islands/App.tsx" repo="rukh-web" tag="8210ff1" lines="100-108" />
+
+Dos señales, y el docstring repite la propiedad que hace que todo esto valga la pena: cambiar de
+estilo **nunca** reconstruye la sesión ni vuelve a descargar el modelo. Sube 1,6 MB y la jugada
+siguiente sale distinta.
+
+{/* prettier-ignore */}
+```tsx title="src/islands/App.tsx"
+/**
+ * Loads a style adapter into the live session, or clears it.
+ *
+ * The signal is set to what actually took, not to what was clicked: a failed download has to
+ * leave the selector showing the style the model is really playing with, or the page would be
+ * claiming a style the weights know nothing about.
+ */
+async function chooseAdapter(id: string): Promise<void> {
+  if (id === adapter.value || adapterBusy.value) return;
+  const entry = findAdapter(id);
+  if (!decoder || status.value !== 'ready') return;
+  adapterBusy.value = true;
+  error.value = null;
+  const previous = adapter.value;
+  try {
+    await decoder.adapter(
+      {
+        adapter: entry?.id ?? '',
+        url: entry ? adapterUrl(entry) : null,
+        sizeBytes: entry?.sizeBytes ?? 0,
+      },
+      (update) => (progress.value = update),
+    );
+    adapter.value = entry ? entry.id : NO_ADAPTER;
+  } catch (cause) {
+    adapter.value = previous;
+    error.value = cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    adapterBusy.value = false;
+    progress.value = null;
+  }
+}
+```
+
+<Src file="src/islands/App.tsx" repo="rukh-web" tag="8210ff1" lines="386-417" />
+
+La decisión está en el docstring y es de las que se olvidan: **la señal se pone a lo que de verdad
+prendió, no a lo que se pulsó**. Una descarga fallida tiene que dejar el selector mostrando el estilo
+con el que el modelo está jugando de verdad, o la página estaría afirmando un estilo que los pesos no
+conocen.
+
+De ahí el `previous` y el `catch` que lo restaura. Y el `finally` que apaga `adapterBusy` pase lo que
+pase, porque un control desactivado para siempre después de un error de red es peor que el error.
+
+{/* prettier-ignore */}
+```tsx title="src/islands/ModelPanel.tsx"
+      <label class="model__field">
+        <span class="caption">Elo objetivo</span>
+        <select
+          class="select"
+          value={String(elo.value)}
+          disabled={!current.eloConditioned}
+          title={current.eloConditioned ? undefined : 'Esta etapa no está condicionada por Elo'}
+          onChange={(event) =>
+            (elo.value = Number((event.currentTarget as HTMLSelectElement).value))
+          }
+        >
+          {ELO_TARGETS.map((target) => (
+            <option key={target} value={String(target)}>
+              {target}
+            </option>
+          ))}
+        </select>
+        {!current.eloConditioned ? (
+          <span class="caption" data-testid="elo-hint">
+            Solo la etapa condicionada responde al Elo objetivo
+          </span>
+        ) : null}
+      </label>
+```
+
+<Src file="src/islands/ModelPanel.tsx" repo="rukh-web" tag="8210ff1" lines="170-192" />
+
+El selector de Elo. Lo que este hito cambió son dos cadenas y una importación: `ELO_TARGETS` pasa a
+venir del registro en vez de calcularse aquí con `Array.from({ length: 13 })`, y los dos textos dejan
+de decir «llega en M4» y dicen qué pasa ahora.
+
+Que la lista viva en el registro y no en el componente no es aseo: es que el mismo array lo lee el
+test unitario del registro, que comprueba que las seis condiciones son las seis medidas.
+
+{/* prettier-ignore */}
+```tsx title="src/islands/ModelPanel.tsx"
+      <label class="model__field">
+        <span class="caption">Estilo</span>
+        <select
+          class="select"
+          data-testid="adapter"
+          value={adapter.value}
+          disabled={styles.length === 0 || phase !== 'ready' || adapterBusy.value}
+          title={styles.length === 0 ? 'Esta etapa no admite adaptadores de estilo' : undefined}
+          onChange={(event) => onAdapter((event.currentTarget as HTMLSelectElement).value)}
+        >
+          <option value={NO_ADAPTER}>Sin estilo</option>
+          {styles.map((entry) => (
+            <option key={entry.id} value={entry.id}>
+              {entry.label} · {megabytes(entry.sizeBytes)} MB
+            </option>
+          ))}
+        </select>
+        <span class="caption" data-testid="adapter-hint">
+          {styles.length === 0
+            ? 'Solo la etapa con adaptadores intercambiables cambia de estilo'
+            : phase !== 'ready'
+              ? 'Carga el modelo y podrás cambiarle el estilo sin descargar nada más'
+              : (styles.find((entry) => entry.id === adapter.value)?.hint ??
+                'Los pesos no se tocan: el estilo son 1,6 MB aparte')}
+        </span>
+      </label>
+```
+
+<Src file="src/islands/ModelPanel.tsx" repo="rukh-web" tag="8210ff1" lines="193-218" />
+
+El selector de estilo, con tres estados en la pista de debajo: la etapa no admite adaptadores, el
+modelo no está cargado todavía, o el estilo cargado tiene su propia descripción. El
+`disabled` cubre los tres casos en los que no se puede tocar —sin estilos, sin modelo, o con una
+descarga en curso—.
+
+El `· {megabytes(entry.sizeBytes)} MB` dentro de cada opción es lo que convierte «cambiar de estilo»
+en una decisión informada: el jugador ve 1,6 MB al lado del nombre antes de elegir.
+
+## La prueba que se lee como la promesa
+
+{/* prettier-ignore */}
+```ts title="e2e/adapter.spec.ts"
+/**
+ * Swapping a style adapter in the browser, against the toy files committed in `public/test/`.
+ *
+ * `toy-decoder-lora.onnx` is the same one-layer decoder as `toy-decoder.onnx`, exported with its
+ * LoRA factors as **inputs of the graph** (`rukh export --adapter-inputs`), and `toy-lora.bin` is
+ * an adapter of exactly the size that graph declares. Both are written by
+ * `rukh/scripts/make_toy_web_models.py` with the same functions that write the published files.
+ *
+ * What is under test here is the claim the whole design rests on: one model file, several styles,
+ * and changing style costs a 256-byte upload rather than another download. The proof is that the
+ * distribution the model publishes for the *same position* is different with the adapter loaded —
+ * "same position" being why the comparison is made from a fresh game both times, and why it reads
+ * the top-five panel (the model's own softmax) instead of the move it happened to sample.
+ */
+const STAGE = '/?stage=test-lora';
+const LOAD_TIMEOUT = 120_000;
+```
+
+<Src file="e2e/adapter.spec.ts" repo="rukh-web" tag="8210ff1" lines="5-20" />
+
+El docstring dice qué está bajo prueba y —más importante— **cómo** se comprueba. La demostración es
+que la distribución que el modelo publica para la **misma posición** es distinta con el adaptador
+cargado. De ahí las dos precauciones: la comparación se hace desde una partida nueva las dos veces,
+y se lee el panel de las cinco mejores —la softmax del propio modelo— en vez de la jugada que le tocó
+muestrear.
+
+{/* prettier-ignore */}
+```ts title="e2e/adapter.spec.ts"
+test.describe('style adapters in the browser', () => {
+  test('the style selector is off for a stage whose graph takes no factors', async ({ page }) => {
+    await page.goto('/?stage=test');
+    await waitIdle(page);
+    const style = page.getByTestId('adapter');
+    await expect(style).toBeDisabled();
+    await expect(page.getByTestId('adapter-hint')).toContainText('intercambiables');
+  });
+
+  test('changing the adapter changes what the model wants to play', async ({ page, hasTouch }) => {
+    const downloads: string[] = [];
+    page.on('request', (request) => {
+      const url = request.url();
+      if (/\.onnx$|\.bin$/.test(url)) downloads.push(url);
+    });
+
+    await load(page);
+    const before = await answerOnce(page, hasTouch);
+
+    // One model file so far, and the style selector is live.
+    expect(downloads.filter((url) => url.endsWith('.onnx'))).toHaveLength(1);
+    const style = page.getByTestId('adapter');
+    await expect(style).toBeEnabled();
+    await expect(style).toHaveValue('none');
+
+    await page.getByRole('button', { name: 'Nueva partida' }).click();
+    await waitIdle(page);
+    await style.selectOption('test-lora');
+    await expect(style).toHaveValue('test-lora', { timeout: LOAD_TIMEOUT });
+
+    const after = await answerOnce(page, hasTouch);
+    expect(after).not.toBe(before);
+
+    // The style cost one small file and **no** second copy of the model: that is the whole point.
+    expect(downloads.filter((url) => url.endsWith('.onnx'))).toHaveLength(1);
+    expect(downloads.filter((url) => url.endsWith('toy-lora.bin'))).toHaveLength(1);
+  });
+```
+
+<Src file="e2e/adapter.spec.ts" repo="rukh-web" tag="8210ff1" lines="66-102" />
+
+Y aquí están las dos aserciones que son el hito entero.
+
+`expect(downloads.filter((url) => url.endsWith('.onnx'))).toHaveLength(1)` **antes** de cambiar de
+estilo, y la misma otra vez **después**. Un solo fichero de modelo en toda la prueba, con un cambio
+de estilo en medio.
+
+`expect(downloads.filter((url) => url.endsWith('toy-lora.bin'))).toHaveLength(1)` dice la otra mitad:
+lo que se descargó fue el adaptador, una vez.
+
+<Callout
+  kind="mundo-real"
+  title="Cuando una promesa se pueda escribir como una aserción, escríbela"
+>
+  «Cambiar de estilo no descarga otro modelo» es una frase de marketing hasta que algo la cuenta.
+  Esas tres líneas la convierten en una propiedad que se rompe sola el día que alguien añada un
+  segundo fichero. Es la diferencia entre documentar una intención y defenderla, y cuesta menos que
+  el párrafo que la explicaría en un README.
+</Callout>
+
+{/* prettier-ignore */}
+```ts title="e2e/adapter.spec.ts"
+  test('clearing the adapter puts the plain model back', async ({ page, hasTouch }) => {
+    await load(page);
+    const before = await answerOnce(page, hasTouch);
+
+    const style = page.getByTestId('adapter');
+    await page.getByRole('button', { name: 'Nueva partida' }).click();
+    await waitIdle(page);
+    await style.selectOption('test-lora');
+    await expect(style).toHaveValue('test-lora', { timeout: LOAD_TIMEOUT });
+
+    await page.getByRole('button', { name: 'Nueva partida' }).click();
+    await waitIdle(page);
+    await style.selectOption('none');
+    await expect(style).toHaveValue('none');
+
+    // An adapter of zeros is the base model by construction, so this has to be the same number
+    // again — not merely close. If it drifts, the graph is not what the export claims.
+    expect(await answerOnce(page, hasTouch)).toBe(before);
+  });
+});
+```
+
+<Src file="e2e/adapter.spec.ts" repo="rukh-web" tag="8210ff1" lines="104-123" />
+
+Y la tercera prueba es la que comprueba la afirmación estructural: al quitar el adaptador vuelve
+**el mismo número**, no uno parecido. El comentario lo dice: un adaptador de ceros es el modelo base
+por construcción, así que esto tiene que ser idéntico. Si deriva, el grafo no es lo que la
+exportación afirma.
+
+## Los ficheros de juguete, escritos por el exportador de verdad
+
+```python title="scripts/make_toy_web_models.py"
+"""Regenerate the toy ONNX files the demo's E2E suite plays against.
+
+They are versioned in `rukh-web/public/test/` so the browser tests walk the real worker path --
+download, contract check, session, inference, style swap -- without fetching hundreds of megabytes
+from the Hub. They are written by the very functions that write the published models, so they carry
+the same `rukh_*` metadata and come out of the same exporter (D-031).
+
+Three files, and the third is what makes the style selector testable:
+
+* `toy-decoder.onnx`      one layer, `d_model=8`, the real 2 030-token vocabulary, `block` 200;
+* `toy-decoder-lora.onnx` the same decoder exported with its LoRA factors as inputs;
+* `toy-lora.bin`          an adapter for it, of the size that graph declares.
+
+The adapter is **not** trained: it is a fixed pseudo-random `B` with a seed, which is enough for
+the only thing the E2E can check without a real corpus -- that loading it changes the move the
+model plays, and that clearing it puts the old move back.
+
+Run from the repository root:
+
+    uv run python scripts/make_toy_web_models.py
+"""
+```
+
+<Src file="scripts/make_toy_web_models.py" tag="p4" lines="1-21" />
+
+El script que hace posible la prueba anterior, y está en `rukh` y no en `rukh-web`. Los tres ficheros
+de juguete viven versionados en `rukh-web/public/test/` para que las pruebas de navegador recorran el
+camino real del worker —descarga, comprobación del contrato, sesión, inferencia, cambio de estilo—
+sin traerse cientos de megabytes del Hub.
+
+Y la propiedad que los hace válidos está en el segundo párrafo: **los escriben las mismísimas
+funciones que escriben los modelos publicados**, así que llevan los mismos metadatos `rukh_*` y salen
+del mismo exportador. Un fichero de prueba escrito a mano probaría el fichero de prueba.
+
+El tercer párrafo es la honestidad de rigor: el adaptador **no está entrenado**, es una `B`
+pseudoaleatoria con semilla, que es suficiente para lo único que el E2E puede comprobar sin un corpus
+—que cargarlo cambia la jugada y que quitarlo devuelve la anterior—.
+
+```python title="scripts/make_toy_web_models.py"
+import argparse
+import sys
+from pathlib import Path
+
+import torch
+
+from rukh.export import export_onnx
+from rukh.export.adapter import browser_lora, export_adaptable_onnx, write_web_adapter
+from rukh.models import DecoderConfig, MoveDecoder
+from rukh.models.lora import LoraConfig, apply_lora, lora_modules
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+# The vocabulary and the context are the real ones: those two are what the browser checks.
+TOY = DecoderConfig(vocab_size=len(UciTokenizer().ids), n_layer=1, n_head=2, d_model=8, block=200)
+LORA = LoraConfig(r=2, alpha=4, targets=("q", "v"))
+SEED = 31
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--out", default="../rukh-web/public/test", type=Path)
+parser.add_argument("--seq-len", default=8, type=int, help="Example length the exporter traces.")
+parser.add_argument(
+    "--plain",
+    action="store_true",
+    help="Also rewrite `toy-decoder.onnx`. Off by default: the committed one was written with "
+    "another seed, and replacing it changes the moves every browser test expects.",
+)
+args = parser.parse_args()
+
+out = args.out.resolve()
+out.mkdir(parents=True, exist_ok=True)
+```
+
+<Src file="scripts/make_toy_web_models.py" tag="p4" lines="23-55" />
+
+El decoder de juguete tiene una capa y `d_model` 8, y el comentario dice qué **no** se reduce: el
+vocabulario y el contexto son los reales, porque esos dos son los que el navegador comprueba en el
+contrato. Un juguete con vocabulario de 64 tokens pasaría el contrato por la razón equivocada.
+
+`--plain` está apagado por defecto y su ayuda explica por qué: el `toy-decoder.onnx` versionado se
+escribió con otra semilla, y reemplazarlo cambia las jugadas que espera cada prueba de navegador.
+
+```python title="scripts/make_toy_web_models.py"
+def toy() -> MoveDecoder:
+    torch.manual_seed(SEED)
+    return MoveDecoder(TOY).eval()
+
+
+if args.plain:
+    plain = export_onnx(toy(), out / "toy-decoder.onnx", seq_len=args.seq_len)
+    print(f"{plain.path}  {plain.bytes:,} bytes  ({plain.exporter}, opset {plain.opset})")
+
+# `browser_lora` is what the demo's real exports use: the `alpha / r` lives in the adapter file,
+# not in the graph, so a graph can take an adapter of any rank without anyone matching two numbers.
+adaptable = export_adaptable_onnx(
+    toy(), out / "toy-decoder-lora.onnx", browser_lora(LORA), seq_len=args.seq_len
+)
+print(f"{adaptable.path}  {adaptable.bytes:,} bytes")
+print(f"  lora_a {adaptable.metadata['rukh_adapter_shape_a']}")
+print(f"  lora_b {adaptable.metadata['rukh_adapter_shape_b']}")
+
+adapted = toy()
+apply_lora(adapted, LORA)
+torch.manual_seed(SEED + 1)
+with torch.no_grad():
+    for _, module in lora_modules(adapted):
+        for b in module.b:
+            # Big enough that the argmax of a one-layer toy actually moves; a style adapter on a
+            # real model is a correction, here it only has to be visible.
+            b.normal_(std=1.5)
+binary = write_web_adapter(adapted, out / "toy-lora.bin", base_repo=None)
+print(f"{binary}  {binary.stat().st_size:,} bytes")
+```
+
+<Src file="scripts/make_toy_web_models.py" tag="p4" lines="58-86" />
+
+`browser_lora(LORA)` es lo que exporta el grafo con escala uno, igual que las exportaciones de verdad
+de la demo: el `alpha / r` vive en el fichero del adaptador. El comentario lo repite aquí porque es
+donde alguien podría escribir `LORA` sin más y producir un grafo que multiplica dos veces.
+
+El `std=1.5` de la `B` lleva su propio comentario: lo bastante grande como para que el argmax de un
+juguete de una capa se mueva de verdad. Un adaptador de estilo sobre un modelo real es una
+corrección; aquí solo tiene que ser **visible**.
+
+```python title="scripts/make_toy_web_models.py"
+# What the E2E asserts: the two files answer differently for the same position.
+tok = UciTokenizer()
+idx = torch.tensor([[tok.vocab["<bos>"], tok.vocab["<w1800>"], tok.vocab["<b1800>"]]])
+with torch.no_grad():
+    base_move = int(toy()(idx)[0][0, -1].argmax())
+    adapted_move = int(adapted(idx)[0][0, -1].argmax())
+print(f"\nfirst move: base {tok.ids[base_move]}, with the toy adapter {tok.ids[adapted_move]}")
+if base_move == adapted_move:
+    raise SystemExit("the toy adapter does not change the first move; raise the std and re-run")
+```
+
+<Src file="scripts/make_toy_web_models.py" tag="p4" lines="88-96" />
+
+Y las nueve líneas que cierran el círculo: el propio script comprueba lo que el E2E va a afirmar —que
+los dos ficheros contestan distinto para la misma posición— y **falla** si no, con la instrucción de
+qué subir. Sin eso, un cambio en el modelo de juguete dejaría una prueba de navegador fallando a
+cuatro capas de distancia de su causa.
+
+```bash title="Terminal"
+uv run python scripts/make_toy_web_models.py
+```
+
+## Lo que queda por hacer en la demo
+
+El E2E de la etapa condicionada comprueba **el cableado**, no los pesos, y su propio comentario en el
+registro lo dice:
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+/**
+ * The same toy graph, flagged as conditioned, so the E2E suite can walk the *enabled* path of the
+ * Elo selector without downloading 221 MB from the Hub.
+ *
+ * The flag says what the registry claims about a stage, and what is under test is the wiring that
+ * reads it: the control is enabled, the hint disappears, and the chosen header reaches the
+ * tokenizer. Whether the weights behind it were really trained on the Elo axis is a question for
+ * `rukh eval sweep`, and no browser test could answer it anyway.
+ */
+export const TEST_ELO_STAGE: Stage = {
+  ...TEST_STAGE,
+  id: 'test-elo',
+  label: 'ONNX de juguete, condicionado (pruebas)',
+  eloConditioned: true,
+};
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="8210ff1" lines="338-352" />
+
+Lo que está bajo prueba es que el control se activa, que la pista desaparece y que la cabecera
+elegida llega al tokenizador. Si los pesos detrás están de verdad condicionados es una pregunta
+para `rukh eval sweep`, y ninguna prueba de navegador podría contestarla.
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+/**
+ * A toy decoder exported with its LoRA factors as inputs, and a toy adapter for it.
+ *
+ * Both are written by `rukh/scripts/make_toy_web_models.py` with the same functions that write the
+ * published files, so the graph really does declare `lora_a` and `lora_b` and the buffer really is
+ * the length that graph asks for. What the E2E can then check is the only thing a browser test
+ * ever could: that loading the adapter changes the move and clearing it puts the old one back.
+ * The adapter is not trained — it is a seeded `B` — because a style is a claim about a corpus and
+ * this file has none.
+ */
+export const TEST_LORA_STAGE: Stage = {
+  ...TEST_STAGE,
+  id: 'test-lora',
+  label: 'ONNX de juguete con adaptadores (pruebas)',
+  url: '/test/toy-decoder-lora.onnx',
+  adaptable: true,
+};
+
+export const TEST_ADAPTER: Adapter = {
+  id: 'test-lora',
+  label: 'Estilo de juguete',
+  hint: 'Adaptador de prueba: cambia la jugada y no significa nada',
+  repo: '',
+  file: '',
+  sizeBytes: 256,
+  stages: [TEST_LORA_STAGE.id],
+};
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="8210ff1" lines="354-380" />
+
+Y la etapa de juguete con adaptadores, cuyo docstring vuelve a decir lo que puede y no puede probar
+un navegador. Que las dos etapas de prueba se construyan con `...TEST_STAGE` y dos campos cambiados
+es lo que garantiza que la única diferencia sea la bandera que se está probando.
+
+<Callout kind="hoy" title="Los dos controles, en la demo publicada">
+  El selector «Elo objetivo» solo se enciende con una etapa condicionada, y la demo no puede saber
+  si un fichero tuyo lo está. Para probar el condicionamiento, carga `chorcat/rukh-medium-elo` desde
+  el desplegable de etapa; para el estilo, `chorcat/rukh-medium-lora` y después uno de los dos
+  adaptadores. Lo que vas a ver en el segundo caso son 231 MB una vez y 1,6 MB por cada cambio de
+  estilo.
+</Callout>
+
+<DemoEmbed
+  query="?stage=medium-lora-fp16"
+  title="La etapa con adaptadores intercambiables"
+  note="Carga el modelo una vez y después cambia el selector «Estilo»: la apertura cambia y no se descarga nada más que 1,6 MB."
+/>
+
+## Qué has aprendido
+
+Dos controles y la razón de que sean honestos. El de Elo ofrece seis condiciones porque seis son las
+medidas, y esa lista vive en el registro para que un test la pueda comprobar. El de estilo carga 1,6
+MB sobre un modelo ya descargado, y todo el formato del adaptador lo lee el navegador **del propio
+fichero ONNX**: el grafo declara las formas de sus dos entradas, así que un búfer de la longitud
+equivocada es un error con nombre en vez de una lectura de basura.
+
+Se mide con una línea de Playwright: un solo `.onnx` pedido en toda la prueba, con un cambio de
+estilo en medio. Y con la tercera prueba, que comprueba que quitar el adaptador devuelve el **mismo**
+número.
+
+Lo siguiente son las cinco mediciones del hito y los cuatro criterios, con los números delante. Sigue
+en «Lo que salió».

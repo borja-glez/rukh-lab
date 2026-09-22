@@ -2,18 +2,19 @@ import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 /**
- * M4 is three lessons, and its five animated figures are spread over them: the hole in the Elo
- * axis and the two LoRA figures with the theory, the shrinking interval and the EloDial island
- * with the results, the adapter swap with the labs.
+ * M4 is ten lessons, and its five animated figures are spread over three of them: the hole in the
+ * Elo axis and the two LoRA figures with the theory, the shrinking interval with the results, the
+ * adapter swap with the labs. The code lessons in between carry no figure, so this spec walks the
+ * three that do plus the one the cheatsheet hangs off.
  */
 const PARTS = {
   '/curso/m4/01-fine-tuning/': ['fig--axis', 'fig--lora', 'fig--spectrum'],
-  '/curso/m4/02-lo-que-salio/': ['fig--shrink'],
-  '/curso/m4/03-labs-de-afinado/': ['fig--swap'],
+  '/curso/m4/09-lo-que-salio/': ['fig--shrink'],
+  '/curso/m4/10-labs-de-afinado/': ['fig--swap'],
 } as const;
 const THEORY = '/curso/m4/01-fine-tuning/';
-const RESULTS = '/curso/m4/02-lo-que-salio/';
-const LABS = '/curso/m4/03-labs-de-afinado/';
+const RESULTS = '/curso/m4/09-lo-que-salio/';
+const LABS = '/curso/m4/10-labs-de-afinado/';
 
 /** Scrolls an island into view and waits until Astro has hydrated it (`ssr` attribute gone). */
 async function hydrated(page: Page, marker: string): Promise<Locator> {
@@ -24,7 +25,7 @@ async function hydrated(page: Page, marker: string): Promise<Locator> {
 }
 
 test.describe('lesson M4 and its animated figures', () => {
-  test('the three parts chain in order, and the labs part closes with the cheatsheet', async ({
+  test('the module chains in order, and the last lesson closes with the cheatsheet', async ({
     page,
   }) => {
     await page.goto(THEORY);
@@ -34,15 +35,15 @@ test.describe('lesson M4 and its animated figures', () => {
     await expect(page.locator('.cheat')).toHaveCount(0);
 
     await page.locator('.lesson__nav-link--next').click();
-    await expect(page).toHaveURL(new RegExp(`${RESULTS}$`));
-    await expect(page.locator('.prose h2', { hasText: 'Cómo se mide' }).first()).toBeVisible();
+    await expect(page).toHaveURL(/\/curso\/m4\/02-tokens-de-elo\/$/);
+    await expect(page.locator('.cheat')).toHaveCount(0);
+
+    await page.goto(RESULTS);
     await expect(page.locator('.prose h2', { hasText: 'Lo que salió' }).first()).toBeVisible();
     await expect(page.locator('.cheat')).toHaveCount(0);
 
-    await page.locator('.lesson__nav-link--next').click();
-    await expect(page).toHaveURL(new RegExp(`${LABS}$`));
-    await expect(page.locator('.prose h2').first()).toHaveText('Labs');
-    /* Every lab now carries the command that runs it, not only the code it describes. */
+    await page.goto(LABS);
+    /* Every lab carries the command that runs it, not only the code it describes. */
     expect(await page.locator('.prose pre').count()).toBeGreaterThanOrEqual(9);
     await expect(page.locator('.cheat')).toHaveCount(1);
   });

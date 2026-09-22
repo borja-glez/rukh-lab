@@ -1,15 +1,16 @@
 ---
-title: 'Fine-tuning: cómo se mide y lo que salió'
+title: 'Lo que salió: cinco mediciones y cuatro criterios'
 description:
-  '«Monótono» y «separado» no son lo mismo, un solo número cambia entre filas, la entropía
-  de aperturas, y lo que salió: la cabecera dejó de ser ruido, el Elo por condición no cumple el criterio
-  y la aritmética dice por qué, el afinado de maestros, los adaptadores de 1,6 MB y Qwen3 contra el decoder.'
+  'Lo que salió al cerrar el hito: la cabecera dejó de ser ruido y se ve sin jugar una partida, el
+  Elo por condición no cumple el criterio y la aritmética dice por qué, el afinado de maestros
+  ensancha el repertorio arriba y lo hunde abajo, los adaptadores de 1,6 MB no cuestan nada, y
+  Qwen3-0.6B pierde 160 partidas de 160.'
 module: m4
-order: 2
-duration: 150
+order: 9
+duration: 50
 level: medio
 status: vigente
-updated: '2026-09-21'
+updated: '2026-09-22'
 keywords:
   - fine-tuning
   - SFT
@@ -34,138 +35,7 @@ keywords:
 import IntervalShrink from '../../../components/figures/IntervalShrink.astro';
 import EloDial from '../../../islands/EloDial.tsx';
 
-Parte 2 de 3 del módulo «Fine-tuning e instrucción». Viene de «Fine-tuning: qué es y cuántas maneras hay» y sigue en «Fine-tuning: los labs».
-
-## Cómo se mide y contra qué
-
-Al terminar esta sección sabrás por qué el criterio de este hito son dos afirmaciones y no una, qué
-mide cada columna del barrido, y qué métrica del spec llevaba tres hitos saliendo `n/a` y por qué
-hacía falta ahora.
-
-### «Monótono» y «separado» no son lo mismo
-
-El plan del hito pide para P4: _Elo por condición monótono (1500 < 2000 < 2400 con IC)_. Esa frase esconde
-dos afirmaciones distintas y hay que medirlas por separado, porque una es barata y la otra es la
-que vale.
-
-**Monótono** quiere decir que las estimaciones puntuales suben con la condición. Es fácil de
-conseguir por casualidad: con tres números y ruido, la probabilidad de que salgan ordenados por azar
-es una de seis.
-
-**Separado** quiere decir que los intervalos de confianza consecutivos no se solapan. Eso ya no pasa
-por casualidad: es la afirmación de que la diferencia sobrevive al ruido de la medición.
-
-Tres equipos con 40, 41 y 42 puntos en una clasificación que se mide con ±3 de error están
-ordenados —eso es un hecho— y no se sabe cuál es mejor —eso es lo que importa—. Monótono es el
-orden; separado es que el orden signifique algo.
-
-Y hay una tercera pregunta que solo aparece cuando la segunda sale que no, que es lo que le pasó a
-este hito: **si no están separados, ¿es porque faltan partidas o porque no hay diferencia?** Las dos
-se escriben igual en el informe y no se parecen en nada. Se contesta con aritmética, no con más
-máquina, y la sección de resultados la contesta con los números delante.
-
-El proyecto ya se quemó con esto. En el hito anterior, una prueba de 32 partidas dio 0,703 contra
-0,609 a favor de `<2600>` frente a `<1800>` y pareció una victoria del condicionamiento. Con 160
-partidas se cayó: 1058 frente a 1095, con los intervalos casi superpuestos. La conclusión hubo que
-retirarla. Por eso `rukh eval sweep` imprime **los dos veredictos** y el hito se juzga con el
-segundo:
-
-```python title="src/rukh/eval/sweep.py"
-def is_separated(rows: list[SweepRow]) -> bool:
-    """Whether every consecutive pair of intervals is disjoint, in the right order."""
-    usable = [row for row in rows if row.elo is not None]
-    for low, high in zip(usable, usable[1:], strict=False):
-        top_of_low = low.elo_ci[1] if low.elo_ci else low.elo_upper
-        bottom_of_high = high.elo_ci[0] if high.elo_ci else high.elo_lower
-        if top_of_low is None or bottom_of_high is None or top_of_low >= bottom_of_high:
-            return False
-    return True
-```
-
-<Callout kind="entrevista" title="Tu métrica sube en las tres condiciones. ¿Ya está?">
-  No. La pregunta siguiente es siempre cuál es el ruido de la medición, y la respuesta honesta
-  empieza midiéndolo: intervalos por bootstrap, o dos tiradas con semillas distintas y la diferencia
-  entre ellas. Una ordenación de tres números sin barras de error es una anécdota con formato de
-  tabla. La versión avanzada de la respuesta añade que el ruido tiene estructura —aquí, los mismos
-  rivales y las mismas aperturas en todas las filas— y que por eso conviene cambiar **una** cosa
-  entre condiciones y no dos.
-</Callout>
-
-### Un solo número cambia entre filas
-
-El barrido corre la misma suite una vez por condición: mismos rivales de Stockfish, mismas
-posiciones de validación, mismos puzles, misma semilla, misma temperatura. Lo único que cambia son
-los dos tokens de cabecera. Cualquier cosa que difiera entre filas es la condición, y eso es lo que
-hace que la tabla se pueda leer.
-
-Hay un detalle que casi arruina esa propiedad y que conviene contar porque es el tipo de error que
-se publica sin que nadie lo note. Los puzles del conjunto llevan **el Elo real** de los jugadores de
-la partida de la que salieron, y `start_history` los usa cuando están. Correcto para medir puzles;
-desastroso para un barrido: la columna de puzles habría salido **idéntica en las seis filas**, que
-es indistinguible de la evidencia de que la condición no hace nada. Por eso existe `force_header`,
-activado solo aquí, que fuerza la cabecera de la condición en los puzles **y en las posiciones de
-validación**, que tenían exactamente el mismo problema por exactamente la misma razón: cada partida
-lleva el Elo real de quien la jugó. La consecuencia es que el barrido tiene su propia caché, porque
-estas tentativas responden a otra pregunta y no deben confundirse con las anteriores.
-
-### ¿Juega peor o juega ilegal?
-
-La legalidad sin máscara vuelve al barrido como columna propia, y no es decorativa. Si el modelo
-condicionado a 1200 empeora, hay dos maneras muy distintas de empeorar: elegir jugadas legales
-peores —que es lo que hace un humano débil— o proponer jugadas que no existen —que es lo que hace un
-modelo que ha dejado de entender el tablero.
-
-La primera sería un dial que funciona. La segunda sería un dial roto con aspecto de funcionar,
-porque la máscara de legalidad de la demo esconde las jugadas ilegales y el jugador solo vería que
-el rival es más flojo. Medir las dos cosas por separado es lo que distingue «aprendió a imitar a un
-1200» de «se le deshizo el modelo al leer un token que apenas ha visto».
-
-Adelanto del resultado, porque cambia cómo se lee el resto: la legalidad salió **100,00 %** a 1200 y
-**99,70 %** a 2400. Es decir, lo contrario de romperse — el modelo condicionado a 1200 es el que
-menos jugadas imposibles escribe de los seis.
-
-### Entropía de aperturas: la métrica que llevaba tres hitos vacía
-
-El spec de diseño del proyecto lista, desde el primer día, una columna de diversidad: _entropía de las aperturas
-jugadas en 200 partidas propias_. Ha salido `n/a` en todos los informes del proyecto, porque hasta
-ahora ninguna afirmación la necesitaba.
-
-Este módulo la necesita. El spec predice del afinado con maestros que _sube el Elo y baja la
-diversidad_, y esa frase tiene dos mitades: una tabla que solo mide la primera no puede comprobarla.
-
-Se mide con dos números, porque fallan de maneras distintas:
-
-**La entropía de líneas** juega N aperturas del modelo contra sí mismo y mide la entropía de
-Shannon de la distribución de líneas distintas. Es la métrica que pide el spec y **depende del
-muestreo**: leída al ajuste casi determinista con el que se comparan todas las etapas (T = 0,05,
-top-k 1), cualquier decoder juega una sola partida y saca exactamente 0. Eso es verdad y dice más
-del muestreador que de los pesos, así que se lee a su propia temperatura y **siempre se publica con
-ella al lado**.
-
-**La entropía de la primera jugada** es analítica: la distribución del propio modelo sobre las
-veinte primeras jugadas legales, renormalizada, sin muestreo de ninguna clase. No tiene varianza
-entre tiradas, es una propiedad de los pesos, y es la que se puede comparar entre etapas tal cual.
-Su techo es log₂(20) = 4,32 bits para un modelo sin ninguna opinión; un modelo afinado sobre un
-repertorio estrecho la hunde.
-
-Un bit es una pregunta de sí o no. Una entropía de 1,6 bits dice que, en promedio, con algo menos
-de dos preguntas binarias bien elegidas («¿es de peón de rey?», «¿es `1. e4`?») adivinas la
-primera jugada del modelo; 2,9 bits, que hacen falta casi tres; 4,32, que las veinte jugadas son
-igual de probables y necesitas las mismas preguntas que para adivinar una carta entre veinte.
-
-Las auto-partidas van en lote: las N avanzan un ply a la vez, todas en la misma pasada, así que 200
-aperturas de 12 plies son 12 pasadas de lote 200 en vez de 2 400 pasadas de lote 1. Y el lote es
-rectangular por construcción, lo que en este modelo no es un detalle: las posiciones son
-**aprendidas**, así que rellenar por la izquierda desplazaría cada token real a una posición en la
-que nunca se entrenó, y rellenar por la derecha dejaría un `<pad>` en la columna que predice. El
-código prefiere fallar a rellenar.
-
-<Callout kind="roto" title="Lo que una métrica de diversidad no mide">
-  La entropía de aperturas dice si el modelo varía, no si varía **bien**. Un modelo que juegue
-  veinte primeras jugadas distintas al azar saca una entropía magnífica y es peor que uno que juega
-  siempre `1. e4`. Por eso viaja siempre junto al Elo y nunca sola: la pareja «más fuerte y menos
-  variado» es un resultado, y «más variado» a secas no es ninguno.
-</Callout>
+Lección 9 de 10 del módulo «Fine-tuning e instrucción». Viene de «El selector en la demo» y cierra con los labs. Todo lo que se mide aquí lo produce el código de las lecciones 2 a 7; esta lección no añade ninguna pieza, solo lee las cinco mediciones y los cuatro criterios del hito.
 
 ## Lo que salió
 
@@ -372,13 +242,13 @@ maleta B pesa más que la A hay que saber que la báscula se mueve casi un kilo 
 nada, y cualquier diferencia entre maletas más pequeña que eso no es una diferencia entre maletas.
 
 <Callout kind="roto" title="Mide cuánto se mueve tu montaje cuando no cambias nada">
-  Esto es lo que convierte el resultado de la sección anterior en algo que se puede afirmar. El
-  suelo de **reproducibilidad** de la escalera es de unos 40 puntos de Elo de una sigma, es decir,
-  unos ±80 al 95 %. Los pares contiguos del barrido están a 124, 51, 40, 68 y 38 puntos, y todos
-  menos el primero **por debajo de lo que el instrumento repite**. No hay número de partidas que
-  arregle eso mientras el rival vaya por tiempo; lo arreglaría hacerlo determinista —límite por
-  nodos en vez de por segundos— y volver a calibrar los ocho peldaños, que es trabajo de otro hito
-  porque invalida todos los Elo ya publicados.
+  Esto es lo que convierte el resultado de la sección anterior en algo que se puede afirmar. El{' '}
+  <Term id="suelo-de-reproducibilidad">suelo de reproducibilidad</Term> de la escalera es de unos 40
+  puntos de Elo de una sigma, es decir, unos ±80 al 95 %. Los pares contiguos del barrido están a
+  124, 51, 40, 68 y 38 puntos, y todos menos el primero **por debajo de lo que el instrumento
+  repite**. No hay número de partidas que arregle eso mientras el rival vaya por tiempo; lo
+  arreglaría hacerlo determinista —límite por nodos en vez de por segundos— y volver a calibrar los
+  ocho peldaños, que es trabajo de otro hito porque invalida todos los Elo ya publicados.
 </Callout>
 
 La consecuencia práctica, y por eso las dos cifras se publican las dos: **comparar dentro de una
@@ -772,6 +642,7 @@ prueba se ha pedido un solo `.onnx`.
   lo que este curso intenta hacer.
 </Callout>
 
-Hasta aquí lo que salió y lo que no. La parte siguiente son los nueve labs, con los comandos que
-producen cada número de esta página, desde mirar el corpus antes de culpar al modelo hasta publicar
-los cinco artefactos. Sigue en «Fine-tuning: los labs».
+Hasta aquí lo que salió y lo que no. La lección que cierra el módulo son los cuatro scripts de
+`labs/m4/` enteros y los nueve laboratorios que producen cada número de esta página, desde mirar el
+corpus antes de culpar al modelo hasta publicar los cinco artefactos. Sigue en «Los labs del
+afinado».

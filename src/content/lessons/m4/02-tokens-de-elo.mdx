@@ -1,0 +1,1536 @@
+---
+title: 'Los tokens de Elo y el corpus que faltaba'
+description:
+  'El código que arregla la mitad baja del eje: el max_elo que faltaba en fetch.py, un descargador
+  que baja cada shard entero en vez de leerlo en remoto, el muestreo plano de elo_bins.py, las
+  rebanadas de partidas que hacen que un mes alimente los dos splits, y el afinado que empieza desde
+  unos pesos sin heredar el optimizador.'
+module: m4
+order: 2
+duration: 175
+runtime: 35
+level: medio
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - Elo
+  - condicionamiento
+  - instruction tuning
+  - corpus
+  - DuckDB
+  - shard
+  - parquet
+  - fine-tuning
+artifacts:
+  - kind: model
+    label: chorcat/rukh-medium-elo
+  - kind: model
+    label: chorcat/rukh-medium-masters
+---
+
+Lección 2 de 10 del módulo «Fine-tuning e instrucción». Viene de «Fine-tuning: qué es y cuántas
+maneras hay» y sigue en «LoRA escrita a mano». Es la primera lección de código del módulo y la que
+hay que hacer antes que ninguna otra: hasta que el corpus está arreglado, las siete siguientes miden
+un eje que solo existe a medias.
+
+## Qué vas a construir
+
+La mitad baja de la escala de Elo, desde cero: un segundo corpus que se diferencia del primero solo
+en el rango de fuerza, un muestreo que lo aplana banda a banda, y un afinado que arranca desde unos
+pesos ya entrenados sin heredar nada más. Son seis ficheros de `rukh` y dos configuraciones, unas
+seiscientas líneas, y al terminar tendrás `data/elo-bins-v2/games.parquet` con 1 219 423 partidas
+repartidas a partes iguales entre nueve bandas y un `medium-elo` entrenado sobre ellas.
+
+Por el camino salen tres decisiones que no se deducen del código y que conviene tener claras antes
+de leerlo: por qué el tope de Elo se aplica a **los dos** jugadores, por qué un mes se descarga
+shard a shard en vez de leerse en remoto, y por qué `--resume` y un afinado son cosas opuestas
+aunque las dos empiecen en un checkpoint.
+
+## El filtro que faltaba
+
+La configuración de la reparación es la de M1 con dos líneas cambiadas, y las dos están explicadas
+dentro del propio fichero. Va entera porque son veinticuatro líneas y cada una es una decisión:
+
+{/* prettier-ignore */}
+```yaml title="configs/data/lichess-low.yaml"
+# The band the first corpus left out: club players, 1000-1799, both sides.
+#
+# `lichess-2025-01-02.yaml` fetched everything from 1800 up, so the Elo header tokens below
+# `<w1800>` have never seen a gradient and "play like 1500" asks the model to read a vector that
+# is still at its initialisation. This file closes that hole with the *same* filters (>= 180 s of
+# base time, normal terminations, no variants, >= 20 plies deferred to P1) so the two halves of
+# the axis differ in rating and in nothing else.
+#
+# It goes to its own `out_dir`: the 1800+ corpus is what every published model trained on, and
+# mixing a weaker slice into `data/raw` would silently change what `data/uci` means.
+dataset: Lichess/standard-chess-games
+months: ['2025-01', '2025-02']
+min_elo: 1000
+max_elo: 1799
+min_base_seconds: 180
+terminations: ['Normal', 'Time forfeit']
+min_plies: 20
+exclude_variants: true
+out_dir: data/raw-low
+# 1.2 M games a month is far more than the balanced sample needs (four 200-Elo bands at up to
+# 200 000 each), and the limit stops the download: club games are the bulk of Lichess, so the
+# band fills after a handful of the month's 72 one-gigabyte shards instead of all of them.
+limit: 1200000
+cache_dir: data/hf-cache
+```
+
+<Src file="configs/data/lichess-low.yaml" tag="p4" lines="1-24" />
+
+Lo que cambia respecto a `lichess-2025-01-02.yaml` —el fichero de la lección anterior— son cuatro
+claves: `min_elo` baja a 1000, aparece un `max_elo` de 1799, `out_dir` va a `data/raw-low` y `limit`
+sube a 1 200 000. Todo lo demás es idéntico **a propósito**: mismos 180 segundos de tiempo base,
+mismas terminaciones, sin variantes, mismo mínimo de 20 plies diferido a la conversión. Las dos
+mitades del eje tienen que diferenciarse en la fuerza y en nada más, porque cualquier otra diferencia
+acabaría atribuida a la fuerza cuando se midan.
+
+El `out_dir` propio no es orden: es lo que impide que `data/uci` cambie de significado en silencio.
+`data/uci` es el corpus con el que se entrenó todo lo publicado, y mezclarle una banda más débil
+convertiría esa frase en falsa sin que nada fallara.
+
+<Callout kind="teoria" title="Por qué el techo va sobre los dos jugadores">
+  `max_elo: 1799` se aplica a las blancas **y** a las negras, igual que `min_elo`. Una partida de un
+  1200 contra un 2400 no es una partida de 1200: es un desajuste, y la mitad de las jugadas son las
+  de alguien que no pertenece a la banda. Filtrar solo por uno de los dos metería en la banda de
+  1200 partidas donde el modelo aprendería a imitar a un 2400 la mitad del tiempo, y la cabecera
+  `<w1200>` acabaría significando «uno flojo contra cualquiera» en vez de «dos flojos».
+</Callout>
+
+## `fetch.py`: el descargador que sobrevivió al anfitrión
+
+El fichero ya existía desde M1 y este hito lo cambia en dos sitios: el filtro gana un tope y la
+descarga cambia de estrategia. La segunda mitad es la interesante, y empieza en el docstring del
+módulo, que es donde este proyecto guarda las razones:
+
+```python title="src/rukh/data/fetch.py"
+The months are read **shard by shard, downloaded first**, not streamed over ``hf://``. Streaming
+was the original design and it is the obvious one: DuckDB reads the remote parquet directly and
+only the rows that pass the filter ever land on disk. It stopped working. A month is 72 files of
+about a gigabyte, and reading them remotely means thousands of small range requests against one
+host, which earns an ``HTTP 429`` partway through and then a retry schedule that doubles until
+the throughput is measured in kilobytes. Measured on 2026-09-20: streaming stalled at 0.02 MB/s
+after fifty minutes with nothing written, while downloading the same shard whole ran at 14.8 MB/s.
+
+So each shard is fetched once, with ``huggingface_hub`` (which caches, resumes and backs off
+properly), filtered locally into a part file and deleted again. Peak disk is one shard, the work
+resumes where it stopped, and ``limit`` now stops the download early instead of only trimming the
+result -- for a slice of the rating range that is the difference between 8 shards and 72.
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p4" lines="9-20" />
+
+Estos doce párrafos de docstring son un epitafio. El diseño original —DuckDB leyendo el parquet
+remoto por `hf://`, con <Term id="predicate-pushdown">empuje de predicados</Term> para que solo
+crucen la red las filas que pasan el filtro— es el diseño elegante y es el que hay que intentar primero. Dejó de funcionar por una razón que no tiene nada que ver con SQL: un mes son 72 <Term id="shard">shards</Term>
+de un gigabyte, leerlos en remoto son miles de peticiones de rango contra un mismo anfitrión, y el
+anfitrión contesta `HTTP 429`. Después viene la parte cara: el cliente reintenta con espera
+creciente, y lo que se mide ya no es ancho de banda sino paciencia. Cincuenta minutos a 0,02 MB/s
+con cero bytes escritos, frente a 14,8 MB/s descargando el mismo shard de una pieza.
+
+Es la diferencia entre pedirle a un bibliotecario cuatro mil páginas sueltas de setenta y dos libros
+y pedirle los tres libros que contienen lo que buscas. La primera petición es más precisa y la
+segunda es la que termina.
+
+### La otra mitad de la respuesta al `429`
+
+Bajarse el shard entero arregla la lectura del corpus, y queda la otra mitad: las conexiones de
+DuckDB que **siguen** leyendo por `hf://`. Eso vive en `src/rukh/data/db.py`, el módulo que fabrica
+todas las conexiones del pipeline.
+
+```python title="src/rukh/data/db.py"
+Finally, it signs the requests to ``hf://``. Reading a month of Lichess means a few hundred range
+requests against the same host, and anonymous ones get ``HTTP 429 Too Many Requests`` partway
+through -- which arrives as a failed ``COPY`` after minutes of work, with no partial file to
+resume from. A token raises the allowance and identifies the traffic, and the retry budget is
+raised from three attempts to eight because a 429 is a "wait", not a "no".
+```
+
+<Src file="src/rukh/data/db.py" tag="p4" lines="14-18" />
+
+El párrafo que el hito le añadió al docstring dice la frase que resume la corrección: **un `429` es
+un «espera», no un «no»**. Un cliente que lo trata como un fallo definitivo tira minutos de trabajo
+sin dejar nada parcial de lo que reanudar.
+
+```python title="src/rukh/data/db.py"
+class DuckDbConfig(BaseConfig):
+    """Settings applied to every DuckDB connection (``duckdb:`` in ``pipeline.yaml``)."""
+
+    memory_limit: str = "32GB"
+    threads: int = Field(default=0, ge=0)
+    """``0`` = ``cpu_count()``."""
+    preserve_insertion_order: bool = False
+    """Keep the input order in the output. Off: it buffers the whole result of a ``COPY``."""
+    http_retries: int = Field(default=8, ge=0)
+    """Attempts per HTTP request. The default of 3 is not enough for a rate-limited host."""
+    http_retry_wait_ms: int = Field(default=500, ge=0)
+    """First backoff, doubled by ``http_retry_backoff`` on each attempt."""
+    http_timeout: int = Field(default=120, ge=1)
+    """Seconds before a single request is given up on; the default 30 is tight over ``hf://``."""
+    authenticate: bool = True
+    """Sign ``hf://`` requests with the locally stored Hugging Face token when there is one."""
+```
+
+<Src file="src/rukh/data/db.py" tag="p4" lines="41-56" />
+
+Cuatro ajustes, cada uno con su docstring diciendo contra qué valor por defecto va. Ocho intentos en
+vez de tres, 120 segundos de espera por petición en vez de 30, y una bandera para firmar las
+peticiones.
+
+```python title="src/rukh/data/db.py"
+def hf_token() -> str | None:
+    """The Hugging Face token this machine is logged in with, or None.
+
+    Read through ``huggingface_hub`` rather than from the environment so it picks up the token
+    that ``huggingface-cli login`` wrote, which is where it usually lives on a workstation.
+    """
+    try:
+        from huggingface_hub import get_token
+    except ImportError:  # pragma: no cover - the hub is a hard dependency
+        return None
+    token = get_token()
+    return token or None
+
+
+def authenticate(con: duckdb.DuckDBPyConnection, token: str | None = None) -> bool:
+    """Give the connection a Hugging Face secret; return whether one was installed."""
+    secret = token if token is not None else hf_token()
+    if not secret:
+        log.info("no Hugging Face token found: hf:// reads go out anonymous and rate-limited")
+        return False
+    con.execute("INSTALL httpfs")
+    con.execute("LOAD httpfs")
+    con.execute("CREATE OR REPLACE SECRET hf (TYPE huggingface, TOKEN ?)", [secret])
+    return True
+```
+
+<Src file="src/rukh/data/db.py" tag="p4" lines="66-89" />
+
+El token se lee **a través de `huggingface_hub`** y no del entorno, porque el sitio donde vive
+normalmente en una estación de trabajo es el fichero que escribió `huggingface-cli login`, no una
+variable exportada. Y cuando no hay ninguno, la función lo **dice en el log** en vez de fallar: se
+puede leer sin token, solo que con menos cuota, y una corrida que muere porque falta un token
+opcional es peor que una lenta.
+
+El `CREATE OR REPLACE SECRET` con parámetro (`?`) y no con interpolación es la misma regla de
+siempre, y aquí importa más que de costumbre: lo que se interpolaría es una credencial, y acabaría
+en cualquier traza de la consulta.
+
+```python title="src/rukh/data/db.py"
+def connect(cfg: DuckDbConfig | None = None) -> duckdb.DuckDBPyConnection:
+    """An in-memory DuckDB connection with the spill directory, memory limit and threads set."""
+    import duckdb
+
+    settings = cfg or DuckDbConfig()
+    con = duckdb.connect()
+    con.execute("SET temp_directory = ?", [temp_directory().as_posix()])
+    con.execute("SET memory_limit = ?", [settings.memory_limit])
+    con.execute("SET threads = ?", [settings.threads or (os.cpu_count() or 4)])
+    con.execute("SET preserve_insertion_order = ?", [settings.preserve_insertion_order])
+    con.execute("SET http_retries = ?", [settings.http_retries])
+    con.execute("SET http_retry_wait_ms = ?", [settings.http_retry_wait_ms])
+    con.execute("SET http_timeout = ?", [settings.http_timeout])
+    if settings.authenticate:
+        authenticate(con)
+    return con
+```
+
+<Src file="src/rukh/data/db.py" tag="p4" lines="92-107" />
+
+Y la función que las junta todas. Que exista una sola fábrica de conexiones es lo que permite que un
+ajuste como este llegue a los ocho pasos del pipeline cambiando un fichero.
+
+### El tope de Elo, en la configuración
+
+```python title="src/rukh/data/fetch.py"
+class FetchConfig(BaseConfig):
+    """What to fetch and how to filter it."""
+
+    dataset: str = "Lichess/standard-chess-games"
+    months: list[str] = Field(min_length=1)
+    min_elo: int = Field(default=1800, ge=0)
+    max_elo: int | None = Field(default=None, ge=0)
+    """Upper bound on both ratings, so a second corpus can cover the band the first one left out.
+
+    The project's whole corpus was fetched with ``min_elo: 1800`` and no ceiling, which means the
+    Elo header tokens below ``<w1800>`` were never trained: conditioning the model on 1500 shows it
+    a vector that is still at its initialisation. Filling that band needs a fetch that is bounded
+    above as well, and a bound that is applied to *both* players for the same reason ``min_elo``
+    is -- a 1200 against a 2400 is not a 1200-rated game, it is a mismatch."""
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p4" lines="44-57" />
+
+Un campo con su docstring debajo: pydantic lo recoge y aparece en el esquema, y el lector lo
+encuentra donde lo va a necesitar. `max_elo` es `int | None` y no un entero grande por defecto,
+porque «sin techo» y «con un techo altísimo» no son lo mismo en la consulta que sale de aquí: la
+primera no añade condición y la segunda añade una que DuckDB tiene que evaluar sobre cada fila.
+
+```python title="src/rukh/data/fetch.py"
+    min_base_seconds: int = Field(default=180, ge=0)
+    terminations: list[str] = Field(default=["Normal", "Time forfeit"], min_length=1)
+    min_plies: int = Field(default=20, ge=0)
+    exclude_variants: bool = True
+    out_dir: str = "data/raw"
+    limit: int | None = Field(default=None, ge=1)
+    """Rows to keep per month. It also stops the download: once the parts hold this many games
+    the remaining shards are never fetched."""
+    cache_dir: str = "data/hf-cache"
+    """Where downloaded shards are parked before being filtered, and deleted from afterwards."""
+    keep_shards: bool = False
+    """Keep the downloaded shards instead of deleting each one once it has been filtered.
+    72 GB per month, so it is off; useful when the same month is going to be re-filtered."""
+    duckdb: DuckDbConfig = Field(default_factory=DuckDbConfig)
+
+    @field_validator("months")
+    @classmethod
+    def _check_months(cls, months: list[str]) -> list[str]:
+        for month in months:
+            if not MONTH_RE.match(month):
+                raise ValueError(f"month {month!r} must look like YYYY-MM")
+        return months
+
+    @model_validator(mode="after")
+    def _check_elo_band(self) -> FetchConfig:
+        if self.max_elo is not None and self.max_elo < self.min_elo:
+            raise ValueError(f"max_elo {self.max_elo} is below min_elo {self.min_elo}")
+        return self
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p4" lines="58-85" />
+
+Tres campos nuevos más y un validador. `limit` ya existía pero cambia de significado, y el docstring
+lo dice: ahora **para la descarga**, no solo recorta el resultado. Con 505 547 partidas útiles en el
+primer shard, 1,2 millones salen de tres en vez de setenta y dos, y eso es lo que convierte cincuenta
+minutos atascados en noventa segundos.
+
+`keep_shards` está apagado porque 72 GB por mes es lo que cuesta dejarlos, y existe porque volver a
+filtrar el mismo mes con otro predicado es algo que pasa. `cache_dir` es dónde aparcan.
+
+Y el validador es una línea de aritmética que ahorra una hora: un techo por debajo del suelo no
+descarga nada, y sin esta comprobación el error aparecería al final, cuando el `COPY` del primer
+shard devolviera cero filas.
+
+### El filtro se construye una vez
+
+```python title="src/rukh/data/fetch.py"
+def where_clause(cfg: FetchConfig) -> str:
+    """The filter itself, one condition per line: the only thing that decides what is kept.
+
+    ``TRY_CAST`` drops rows whose base time is not an integer (correspondence games export
+    ``TimeControl = '-'``). It is built once and used twice -- in the query the dry run prints
+    and against every downloaded shard -- so what is documented is what actually runs.
+    """
+    conditions = [
+        f"WhiteElo >= {cfg.min_elo} AND BlackElo >= {cfg.min_elo}",
+        f"TRY_CAST(split_part(TimeControl, '+', 1) AS INTEGER) >= {cfg.min_base_seconds}",
+        "Termination IN (" + ", ".join(_sql_string(t) for t in cfg.terminations) + ")",
+    ]
+    if cfg.max_elo is not None:
+        conditions.insert(1, f"WhiteElo <= {cfg.max_elo} AND BlackElo <= {cfg.max_elo}")
+    if cfg.exclude_variants:
+        conditions.append("Event NOT ILIKE '%variant%'")
+    return "\n    AND ".join(conditions)
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p4" lines="120-136" />
+
+Antes de este hito la condición `WHERE` vivía dentro de `build_query`, que es la función que imprime
+el ensayo. Ahora se construye aparte y se usa **dos veces**: en esa consulta y contra cada shard
+descargado. Es la única manera de que «lo documentado es lo que corre» sea cierto en vez de una
+aspiración; con dos copias del predicado, la del ensayo se queda atrás en la primera edición y
+nadie lo nota, porque las dos siguen siendo SQL válido.
+
+`conditions.insert(1, …)` y no `append` para que el techo quede pegado al suelo en el texto que se
+imprime. Es cosmética, y es la clase de cosmética que se agradece cuando lo que hay que leer es una
+condición de cinco líneas en un log.
+
+### Un shard a la vez
+
+```python title="src/rukh/data/fetch.py"
+def month_shards(cfg: FetchConfig, month: str) -> list[str]:
+    """Repository paths of the parquet shards of one month, in order."""
+    from huggingface_hub import HfApi
+
+    year, mm = _split_month(month)
+    prefix = f"data/year={year}/month={mm}/"
+    api = HfApi()
+    files = api.list_repo_files(cfg.dataset, repo_type="dataset")
+    return sorted(name for name in files if name.startswith(prefix) and name.endswith(".parquet"))
+
+
+def _download(cfg: FetchConfig, shard: str) -> Path:
+    """One shard as a real file on disk, resumed if a previous run was cut off partway.
+
+    ``local_dir`` and not ``cache_dir``. The Hub cache stores the bytes under ``blobs/`` and hands
+    back a link into ``snapshots/``, so deleting what this returns frees nothing: the first run
+    that way left 5.7 GB of shards behind after claiming to have cleaned up. With ``local_dir``
+    the path *is* the file, and ``unlink`` means what it says.
+    """
+    from huggingface_hub import hf_hub_download
+
+    return Path(
+        hf_hub_download(
+            cfg.dataset,
+            shard,
+            repo_type="dataset",
+            local_dir=paths.resolve(cfg.cache_dir).as_posix(),
+        )
+    )
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p4" lines="195-223" />
+
+Los dos `import` están **dentro** de las funciones, no arriba. `huggingface_hub` es una dependencia
+pesada y el resto de `fetch.py` —planificar, construir la consulta, escribir el manifiesto— funciona
+sin ella; importarla al cargar el módulo haría que un `rukh data fetch --dry-run` la necesitara.
+
+`local_dir` en vez de `cache_dir` es la corrección de un fallo que costó 5,7 GB de disco. La caché
+del Hub guarda los bytes en `blobs/` y devuelve un enlace en `snapshots/`: borrar lo que devuelve
+`hf_hub_download` borra el enlace y no los bytes, así que la primera versión dijo que había limpiado
+y no había limpiado nada. Con `local_dir` la ruta **es** el fichero.
+
+```python title="src/rukh/data/fetch.py"
+def _filter_shard(
+    con: Any, cfg: FetchConfig, month: str, local: Path, target: Path, remaining: int | None
+) -> int:
+    """Write the rows of ``local`` that pass the filter into ``target``; return how many."""
+    limit = "" if remaining is None else f"\nLIMIT {remaining}"
+    con.execute(
+        f"""
+        COPY (
+          SELECT *, {_sql_string(month)} AS month
+          FROM read_parquet({_sql_string(local.as_posix())}, hive_partitioning = false)
+          WHERE {where_clause(cfg)}{limit}
+        ) TO {_sql_string(target.as_posix())} (FORMAT PARQUET)
+        """
+    )
+    row = con.execute(
+        f"SELECT count(*) FROM read_parquet({_sql_string(target.as_posix())})"
+    ).fetchone()
+    return int(row[0]) if row else 0
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p4" lines="226-243" />
+
+El filtro de un shard, con su `LIMIT` calculado desde lo que ya se lleva. Y la función devuelve
+**filas contadas del fichero escrito**, no las que se pidieron: es la misma regla que el manifiesto
+de `elo_bins`, y la razón es que un `COPY` puede escribir menos de lo que pediste y lo único que
+sabe cuántas escribió es el fichero.
+
+```python title="src/rukh/data/fetch.py"
+def _fetch_month(con: Any, cfg: FetchConfig, month: str, target: Path) -> int:
+    """Download, filter and delete the month's shards until ``limit`` is reached.
+
+    Parts are kept next to the target until the month is done, so an interrupted month resumes
+    from the shard it stopped at instead of starting over.
+    """
+    parts_dir = target.parent / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    shards = month_shards(cfg, month)
+    if not shards:
+        raise FileNotFoundError(f"{cfg.dataset} has no parquet shards for {month}")
+    kept = 0
+    for index, shard in enumerate(shards):
+        part = parts_dir / f"part-{index:05d}.parquet"
+        if part.is_file() and part.stat().st_size:
+            kept += _count(con, part)
+            log.info("part %s/%s already filtered (%s games so far)", index + 1, len(shards), kept)
+        else:
+            remaining = None if cfg.limit is None else cfg.limit - kept
+            if remaining is not None and remaining <= 0:
+                break
+            local = _download(cfg, shard)
+            kept += _filter_shard(con, cfg, month, local, part, remaining)
+            if not cfg.keep_shards:
+                local.unlink(missing_ok=True)
+            log.info(
+                "shard %s/%s of %s filtered: %s games so far", index + 1, len(shards), month, kept
+            )
+        if cfg.limit is not None and kept >= cfg.limit:
+            log.info("%s reached the limit of %s games", month, cfg.limit)
+            break
+    parts = sorted(path for path in parts_dir.glob("part-*.parquet") if path.stat().st_size)
+    # Counted in rows, not in bytes: a parquet with no rows still has a header and a footer, so
+    # an empty month would sail through a size check and land downstream looking like a corpus.
+    if not parts or not kept:
+        raise RuntimeError(f"no games of {month} passed the filter")
+    files = ", ".join(_sql_string(path.as_posix()) for path in parts)
+    # `hive_partitioning = false` again: the parts sit under `year=/month=/parts/`, so without it
+    # DuckDB would read the directory names as columns and collide with the explicit `month`.
+    con.execute(
+        f"COPY (SELECT * FROM read_parquet([{files}], hive_partitioning = false, "
+        f"union_by_name = true)) TO {_sql_string(target.as_posix())} (FORMAT PARQUET)"
+    )
+    total = _count(con, target)
+    shutil.rmtree(parts_dir, ignore_errors=True)
+    return total
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p4" lines="246-291" />
+
+Cuarenta y siete líneas que son el hito entero, en cuanto a descarga. Cuatro decisiones dentro:
+
+**Las partes se quedan en disco hasta que el mes termina.** Un mes interrumpido reanuda por el shard
+en el que se quedó, porque `part-00007.parquet` ya existe y no hay que volver a bajar nada. La
+alternativa —acumular en memoria y escribir al final— es lo que dejó 8,6 GB de búfer y cero bytes
+escritos en el intento anterior.
+
+**El `break` se comprueba dos veces.** Una antes de descargar (si ya no queda cupo, ni se pide el
+shard) y otra después de filtrar. Sin la primera, el último shard se descargaría entero para
+tirarlo.
+
+**Un mes que no deja pasar nada es un error, no un parquet vacío.** El comentario lo dice y merece
+leerse dos veces: un parquet de cero filas tiene cabecera y pie, pesa unos cientos de bytes, y
+cualquier comprobación por tamaño lo daría por bueno. Aguas abajo, un corpus de cero filas se
+convierte, se tokeniza y produce un modelo que no aprende nada, y el primer sitio donde se nota es
+el Elo cuarenta minutos después.
+
+**`hive_partitioning = false` otra vez**, al unir las partes. Viven bajo `year=/month=/parts/`, y sin
+esa opción DuckDB leería los nombres de los directorios como columnas y chocaría con el alias
+`month` que la consulta ya pone.
+
+```python title="src/rukh/data/fetch.py"
+def _is_empty(path: Path) -> bool:
+    """Whether the month still has to be fetched: missing, or the stub a failed COPY leaves."""
+    return not path.is_file() or path.stat().st_size == 0
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p4" lines="182-184" />
+
+Tres líneas con un caso dentro: **un fichero de cero bytes no cuenta como mes descargado**. Es lo
+que deja un `COPY` que murió a medias, y `path.is_file()` a secas lo daría por hecho.
+
+```python title="src/rukh/data/fetch.py"
+    fetch_plan = plan(cfg)
+    if dry_run:
+        return fetch_plan
+
+    out_dir = Path(fetch_plan.out_dir)
+    counts: dict[str, int] = {}
+    files: list[FileHash] = []
+    con = connect(cfg.duckdb)
+    try:
+        for month, out_path in zip(cfg.months, fetch_plan.out_paths, strict=True):
+            target = out_dir / out_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not (overwrite or _is_empty(target)):
+                log.info("%s is already there, keeping it (pass overwrite=True to refetch)", target)
+                counts[month] = _count(con, target)
+            else:
+                log.info("fetching %s into %s", month, target)
+                counts[month] = _fetch_month(con, cfg, month, target)
+            files.append(
+                FileHash(path=out_path, sha256=_sha256(target), bytes=target.stat().st_size)
+            )
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p4" lines="314-334" />
+
+Y el bucle principal, que ahora tiene una rama más: un mes que ya está en disco se **cuenta** en vez
+de volver a descargarse, salvo que se pida `overwrite`. Lo que se registra en el manifiesto es
+idéntico en las dos ramas —el hash y el tamaño del fichero final—, que es lo que permite que una
+descarga en tres tandas produzca el mismo manifiesto que una de una sola.
+
+```bash title="Terminal"
+uv run rukh data fetch --config configs/data/lichess-low.yaml
+uv run rukh data uci --config configs/data/pipeline-low.yaml
+```
+
+Diez minutos la descarga, cinco la conversión. Lo que sale:
+
+| Paso                                        |      Partidas |
+| ------------------------------------------- | ------------: |
+| Partidas descargadas (1000-1799, dos meses) |     2 400 000 |
+| Convertidas a UCI                           | **2 292 475** |
+| Ilegales encontradas                        |         **0** |
+| Descartadas por cortas (< 20 plies)         |       107 513 |
+| Descartadas por largas (> 300 plies)        |            12 |
+
+## `elo_bins.py`: aplanar el eje
+
+Con las dos mitades en disco, el corpus del afinado se construye **plano**: el mismo número de
+partidas por banda de 200 Elo, de 1000 a 2600. El fichero que lo hace tenía 76 líneas al empezar el
+hito y tiene 158 al acabarlo, y las dos cosas que ganó son las dos que hacían falta.
+
+```python title="src/rukh/data/elo_bins.py"
+"""Elo-balanced sample: up to ``n_per_bin`` games per band of the average rating.
+
+The first version of this file read one directory of months and binned by hundreds, which is all
+the 1800+ corpus could support. It turned out to be the reason "play like 1500" did nothing: the
+whole project had been fetched with ``min_elo: 1800``, so ``data/elo-bins`` started at the 1800
+bin and the header tokens below it never received a gradient. Conditioning on a weak rating
+showed the model a vector that was still at its initialisation.
+
+Filling the axis needs two things this module now has. **Several sources**, because the low band
+lives in its own corpus (``data/uci-low``) and must not be mixed into ``data/uci``, which is what
+every published model trained on. And a **band width**, because a flat sample over 100-Elo bins
+wastes the budget at the crowded end and starves the thin one: the top bins are naturally small
+(2 316 games at 2800 against 50 000 at 1800), so the band the sample is balanced over is a
+parameter and the manifest publishes what each one really got.
+
+"Flat" is the point. A corpus whose ratings are distributed like Lichess teaches the model that
+`<w1500>` is rare and `<w2000>` is normal; a corpus with the same number of games per band
+teaches it what each header *means*, which is what conditioning needs.
+"""
+```
+
+<Src file="src/rukh/data/elo_bins.py" tag="p4" lines="1-19" />
+
+El docstring cuenta el diagnóstico completo, y su último párrafo es la idea del módulo dicha en tres
+líneas: un corpus con la forma real le enseña al modelo que `<w1500>` es **raro**, que no es lo mismo
+que enseñarle qué **significa**.
+
+```python title="src/rukh/data/elo_bins.py"
+class EloBinsConfig(BaseConfig):
+    """Source trees, band width, per-band cap and seed."""
+
+    sources: list[str] = ["data/uci"]
+    """Every tree of ``year=YYYY/month=MM/games.parquet`` to sample from, in order.
+
+    A list and not one directory because the axis is split across corpora: the 1800+ games and
+    the 1000-1799 ones were fetched separately and live apart on purpose, so that
+    ``data/uci`` keeps meaning exactly what the published models trained on."""
+    out_dir: str = "data/elo-bins"
+    bin_width: int = Field(default=100, ge=50)
+    """Width of a band in Elo. The sample is flat over *these*, so widening them trades
+    resolution along the axis for more games in the thin bands at the top."""
+    min_bin: int | None = None
+    """Lowest band kept, inclusive. ``None`` keeps everything the sources have."""
+    max_bin: int | None = None
+    """Highest band kept, inclusive of its whole width."""
+    n_per_bin: int = Field(default=50_000, ge=1)
+    seed: int = 42
+    duckdb: DuckDbConfig = Field(default_factory=DuckDbConfig)
+
+    @model_validator(mode="after")
+    def _check(self) -> EloBinsConfig:
+        if not self.sources:
+            raise ValueError("sources must name at least one directory")
+        if self.min_bin is not None and self.max_bin is not None and self.max_bin < self.min_bin:
+            raise ValueError(f"max_bin {self.max_bin} is below min_bin {self.min_bin}")
+        return self
+```
+
+<Src file="src/rukh/data/elo_bins.py" tag="p4" lines="36-63" />
+
+`sources` es una lista y no un directorio, y ese cambio de tipo es la mitad de la reparación: las
+dos mitades del eje viven aparte en disco a propósito y se juntan **solo aquí**, en el único paso
+cuyo trabajo es enseñar qué significa una cabecera.
+
+`bin_width` existe porque un muestreo plano sobre bandas de 100 gasta el presupuesto donde sobra
+gente y mata de hambre donde falta: las bandas altas son naturalmente pequeñas —2 316 partidas a
+2800 contra 50 000 a 1800—, así que la anchura de la banda sobre la que se equilibra es un parámetro
+y el manifiesto publica lo que cada una recibió de verdad. En este módulo son 200: 100 pondría las
+cuatro bandas de club a la misma resolución que las de maestro y luego las dejaría sin partidas, y
+400 mezclaría «1500» y «1800» en un solo token de significado.
+
+`min_bin` y `max_bin` son `None` por defecto, que quiere decir «todo lo que tengan las fuentes». El
+validador solo comprueba lo que no se puede deducir: que la lista no esté vacía y que el techo no
+esté por debajo del suelo.
+
+```python title="src/rukh/data/elo_bins.py"
+def _bin_expression(bin_width: int) -> str:
+    return f"((white_elo + black_elo) // 2) // {bin_width} * {bin_width}"
+
+
+def sample_bins(
+    sources: list[Path],
+    target: Path,
+    n_per_bin: int,
+    seed: int,
+    duckdb_cfg: DuckDbConfig | None = None,
+    bin_width: int = 100,
+    min_bin: int | None = None,
+    max_bin: int | None = None,
+) -> dict[str, int]:
+    """DuckDB: ``bin = avg(white_elo, black_elo) // width * width``; keep ``n_per_bin`` by hash.
+
+    The seed shifts the hash, not the id: ``hash(game_id + seed)`` overflowed BIGINT for ids
+    near the top of the range.
+    """
+    files = ", ".join(f"'{p.as_posix()}'" for p in sources)
+    where = ["true"]
+    if min_bin is not None:
+        where.append(f"bin >= {int(min_bin)}")
+    if max_bin is not None:
+        where.append(f"bin <= {int(max_bin)}")
+    band_filter = " AND ".join(where)
+    con = connect(duckdb_cfg)
+    try:
+        con.execute(
+            f"""
+            COPY (
+              SELECT * EXCLUDE (rk)
+              FROM (
+                SELECT *,
+                       row_number() OVER (PARTITION BY bin ORDER BY hash(game_id) + {seed}) AS rk
+                FROM (
+                  SELECT *, {_bin_expression(bin_width)} AS bin
+                  FROM read_parquet([{files}], hive_partitioning = false, union_by_name = true)
+                )
+                WHERE {band_filter}
+              )
+              WHERE rk <= {int(n_per_bin)}
+              ORDER BY bin, rk
+            ) TO '{target.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+        rows = con.execute(
+            f"SELECT bin, count(*) FROM read_parquet('{target.as_posix()}') "
+            "GROUP BY bin ORDER BY bin"
+        ).fetchall()
+    finally:
+        con.close()
+    return {str(int(b)): int(n) for b, n in rows}
+```
+
+<Src file="src/rukh/data/elo_bins.py" tag="p4" lines="66-118" />
+
+El muestreo entero es una consulta, y tiene tres decisiones dentro.
+
+`(white_elo + black_elo) // 2 // ancho * ancho` es **truncar**, no redondear, y usa la misma
+convención que `elo_bin` en el tokenizador, así que una media de 1899 cae en la banda de 1800. Dos
+redondeos distintos entre el corpus y el token de cabecera pondrían una partida en una banda y la
+etiquetarían con otra, y nada lo diría: el modelo aprendería un eje desplazado media banda y todas
+las mediciones seguirían siendo plausibles.
+
+`row_number() OVER (PARTITION BY bin ORDER BY hash(game_id) + seed)` es el muestreo: numera las
+partidas de cada banda en un orden que depende de un hash, y se queda con las `n_per_bin` primeras.
+Es determinista —la misma semilla da el mismo corpus— y no necesita cargar la banda en memoria. La
+semilla desplaza el **hash** y no el identificador, y el docstring dice por qué: `hash(game_id +
+seed)` desbordaba `BIGINT` con los identificadores del extremo alto del rango. Es un fallo que no
+levanta excepción en DuckDB, solo produce otro orden.
+
+`read_parquet([...])` con una **lista** de ficheros es lo que permite que las dos mitades vivan en
+directorios separados. Y `union_by_name = true` está por si los dos corpus se convirtieron con
+versiones distintas del paso `uci` y el orden de las columnas no coincide: unir por posición en ese
+caso da un parquet en el que el Elo de las negras está en la columna del resultado.
+
+```python title="src/rukh/data/elo_bins.py"
+def run(cfg: EloBinsConfig) -> Manifest:
+    """Sample every month under each source and write ``out_dir/games.parquet`` + manifest."""
+    months: list[tuple[str, Path]] = []
+    for source in cfg.sources:
+        found = month_dirs(resolve(source))
+        if not found:
+            raise FileNotFoundError(f"no games under {resolve(source)}")
+        months.extend(found)
+    out_dir = resolve(cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / GAMES_FILE
+    counts = sample_bins(
+        [p for _, p in months],
+        target,
+        cfg.n_per_bin,
+        cfg.seed,
+        cfg.duckdb,
+        bin_width=cfg.bin_width,
+        min_bin=cfg.min_bin,
+        max_bin=cfg.max_bin,
+    )
+    manifest = Manifest(
+        dataset="Lichess/standard-chess-games",
+        months=sorted({month for month, _ in months}),
+        filters={
+            "bin": _bin_expression(cfg.bin_width),
+            "sources": list(cfg.sources),
+            "bin_width": cfg.bin_width,
+            "min_bin": cfg.min_bin,
+            "max_bin": cfg.max_bin,
+            "n_per_bin": cfg.n_per_bin,
+            "seed": cfg.seed,
+        },
+        counts=counts,
+        files=[FileHash(path=GAMES_FILE, sha256=sha256_file(target), bytes=target.stat().st_size)],
+    )
+    (out_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2) + "\n", "utf-8")
+    return manifest
+```
+
+<Src file="src/rukh/data/elo_bins.py" tag="p4" lines="121-158" />
+
+Lo que hace honesta la tabla de más abajo está en la línea que devuelve `sample_bins`: el conteo sale
+de **leer el fichero escrito**, no de lo que se pidió. Con eso, el manifiesto puede decir que una
+banda se quedó corta en vez de dar a entender que todas están llenas, y el manifiesto guarda además
+la expresión del bin, el ancho, los extremos y la semilla: todo lo que haría falta para reproducir
+exactamente este corpus.
+
+### La configuración del corpus plano
+
+{/* prettier-ignore */}
+```yaml title="configs/data/pipeline-low.yaml"
+# The P4 corpus: the 1000-1799 band that `pipeline-v4.yaml` never had, converted and balanced.
+#
+# Only the steps P4 needs are configured. `uci` reads `data/raw-low` into its own `data/uci-low`
+# so `data/uci` keeps meaning "what the published models trained on"; `elo_bins` is the only step
+# that joins the two, and it is the step whose whole job is to teach the Elo header.
+duckdb:
+  memory_limit: 32GB
+  threads: 0
+uci:
+  raw_dir: data/raw-low
+  out_dir: data/uci-low
+  min_plies: 20
+  max_plies: 300
+  workers: 0
+elo_bins:
+  # Both halves of the axis, in bands of 200 Elo. 200 is a compromise: 100 would put the four
+  # club bands at the same resolution as the master ones and then starve them of games, and 400
+  # would blur "1500" and "1800" into one token's worth of meaning.
+  sources: [data/uci-low, data/uci]
+  out_dir: data/elo-bins-v2
+  bin_width: 200
+  min_bin: 1000
+  max_bin: 2600
+  # Flat by construction. The real corpus is a pyramid and that is exactly what teaches the model
+  # that `<w1500>` is rare rather than what it means; the manifest publishes what each band got,
+  # because the top ones cannot fill their quota and the lesson says so.
+  n_per_bin: 150000
+  seed: 42
+tokenize:
+  uci_dir: data/uci
+  out_dir: data/tokens-elo
+  artifacts_dir: artifacts/tokenizer
+  web_artifacts_dir: artifacts/web
+  fixture_pgn: tests/fixtures/games.pgn
+  # No months: the training split is the balanced sample and nothing else, so the fine-tune sees
+  # the flat distribution and not the pyramid it came from.
+  train_months: []
+  extra_train_parquets: ['data/elo-bins-v2/games.parquet']
+  val_month: '2025-02'
+  val_games: 100000
+  # The balanced sample is the whole training split: the rest of the validation month must not
+  # join it, or 2.85 M games of 1800+ play would flatten the very shape this corpus exists for.
+  val_remainder_trains: false
+  stats_games: data/uci/year=2025/month=01/games.parquet
+  bpe_vocab_size: 4096
+  bpe_train_games: 200000
+  stats_n_games: 20000
+  max_len: 200
+```
+
+<Src file="configs/data/pipeline-low.yaml" tag="p4" lines="1-48" />
+
+Solo se configuran los pasos que M4 necesita. `uci` lee `data/raw-low` y escribe en `data/uci-low`;
+`elo_bins` es el único que junta las dos fuentes; `tokenize` empaqueta el resultado.
+
+Tres claves de la sección `tokenize` son el experimento y no intendencia. `train_months: []` deja el
+split de entrenamiento sin meses enteros: lo único que entra es `extra_train_parquets`, o sea la
+muestra equilibrada. `val_month` y `val_games` son los mismos que en todas las demás corridas del
+proyecto —las primeras 100 000 partidas de 2025-02— para que las pérdidas se puedan comparar. Y
+`val_remainder_trains: false` es la que existe por este módulo, y tiene su propia sección más abajo.
+
+<Callout kind="hoy" title="Las once configuraciones de `configs/data/` que trae este hito">
+  `p4` añade once ficheros a `configs/data/` y modifica uno. Tres son de M4 y se muestran en este
+  módulo; el resto son las variantes con las que se fue ampliando el corpus en M2 y M3, que solo se
+  formalizaron como fichero al cerrar este hito. Se citan por diferencia porque todas son
+  `pipeline.yaml` con una o dos claves cambiadas.
+</Callout>
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Configuraciones de datos nuevas en p4">
+
+| Fichero                  | Qué es                                                             | Diferencia con `pipeline.yaml`                       |
+| ------------------------ | ------------------------------------------------------------------ | ---------------------------------------------------- |
+| `lichess-low.yaml`       | la descarga de la banda 1000-1799                                  | fichero de `fetch`, no de `pipeline`; arriba, entero |
+| `lichess-more.yaml`      | un mes más de 1800+, con `threads: 3` para no ahogar al dataloader | fichero de `fetch`; abajo, entero                    |
+| `pipeline-low.yaml`      | el corpus plano de M4                                              | arriba, entero                                       |
+| `pipeline-masters.yaml`  | el pack de solo la Elite Database, para `medium-masters`           | abajo, entero                                        |
+| `pipeline-style.yaml`    | los dos cortes de estilo de los adaptadores                        | lección 4                                            |
+| `pipeline-style-e4.yaml` | el pack del corte `e4`                                             | lección 4                                            |
+| `pipeline-style-d4.yaml` | el pack del corte `d4`                                             | lección 4, solo la diferencia con el anterior        |
+| `pipeline-pgn.yaml`      | las mismas partidas como texto PGN, para Qwen                      | lección 4                                            |
+| `pipeline-v2.yaml`       | el pack de M2 sobre el corpus recuperado                           | `tokenize.out_dir: data/tokens-v2`                   |
+| `pipeline-v3.yaml`       | el pack de M2 con 24 meses de la Elite Database                    | `out_dir: data/tokens-v3` y `extra_train_parquets`   |
+| `pipeline-v4.yaml`       | el pack con 44 meses de la Elite: 19,0 M de partidas               | igual que `v3` con `out_dir: data/tokens-v4`         |
+| `pipeline-elite.yaml`    | la conversión de 24 meses de la Elite Database                     | `elite.months` con 24 meses y `workers: 6`           |
+| `pipeline-elite44.yaml`  | la conversión de 44 meses                                          | `elite.months` con 44 meses y `workers: 6`           |
+
+</div>
+
+De ese grupo, el que este módulo usa después de `pipeline-low` es el de maestros, que es el corpus
+del otro afinado y cabe entero:
+
+{/* prettier-ignore */}
+```yaml title="configs/data/pipeline-masters.yaml"
+# Token pack of the Elite Database alone, for the masters fine-tune of M4.
+#
+# The elite games are already part of `tokens-v4`, mixed in with the 1800+ corpus; this pack has
+# nothing else in it. That is the whole experiment: `docs/spec/02` predicts that a last fine-tune
+# on masters raises the Elo and lowers the diversity, and neither half of that sentence can be
+# read off a corpus where masters are one ingredient among several.
+#
+# Same validation split as every other run -- the first 100 000 games of 2025-02 -- and its
+# remainder stays out of training, so what the model is fine-tuned on is masters and only masters.
+tokenize:
+  uci_dir: data/uci
+  out_dir: data/tokens-masters
+  train_months: []
+  extra_train_parquets: ['data/elite/games.parquet']
+  val_month: '2025-02'
+  val_games: 100000
+  val_remainder_trains: false
+  stats_games: data/uci/year=2025/month=01/games.parquet
+  max_len: 200
+```
+
+<Src file="configs/data/pipeline-masters.yaml" tag="p4" lines="1-19" />
+
+Diecinueve líneas, de las que diez son el comentario que justifica las otras nueve. Las partidas de
+élite ya forman parte de `tokens-v4`, mezcladas con el corpus de 1800+; este pack no tiene nada más
+dentro, y esa es toda la intervención. El pronóstico que se pone a prueba —sube el Elo, baja la
+diversidad— no se puede leer sobre un corpus donde los maestros son un ingrediente entre varios.
+
+Y el otro fichero de `fetch` que trae el hito, por completitud, porque enseña una decisión que el de
+la banda baja no tiene:
+
+{/* prettier-ignore */}
+```yaml title="configs/data/lichess-more.yaml"
+# Lever 2: months beyond the two P1 fetched. Same filters, a higher cap -- the 3,000,000 of
+# `lichess-2025-01-02.yaml` was our own ceiling, not the dataset's (7,136,017,970 games).
+# `threads` is held below cpu_count() on purpose: this runs while the GPU trains and the
+# dataloader needs cores.
+dataset: Lichess/standard-chess-games
+months: ["2025-03"]
+min_elo: 1800
+min_base_seconds: 180
+terminations: ["Normal", "Time forfeit"]
+min_plies: 20
+exclude_variants: true
+out_dir: data/raw
+limit: 6000000
+duckdb:
+  memory_limit: 16GB
+  threads: 3   # 8 tripped HTTP 429 three times running; fewer parallel range requests
+```
+
+<Src file="configs/data/lichess-more.yaml" tag="p4" lines="1-16" />
+
+`threads: 3` por debajo del número de núcleos, con el motivo escrito al lado: esta descarga corre
+**mientras la GPU entrena**, y el dataloader necesita núcleos. Ocho hilos provocaron tres `429`
+seguidos. Un parámetro de rendimiento sin la frase que dice contra qué compite es un número mágico.
+
+## `pack.py`: rebanadas de partidas
+
+El empaquetador tenía una limitación que este corpus destapa: leía **meses enteros**, y un mes era
+o entrenamiento o validación. Con un corpus cuya forma es el experimento eso no vale, y la solución
+es un tipo de cuatro líneas.
+
+```python title="src/rukh/tokenize/pack.py"
+@dataclass(frozen=True)
+class GameSlice:
+    """A contiguous run of games inside one UCI parquet.
+
+    ``skip`` games are dropped from the front and at most ``take`` are kept (``None`` = to the
+    end). It exists so one month can feed both splits: the validation slice is the first
+    ``val_games`` rows and training gets the remainder, instead of a whole month sitting idle
+    as validation when validation only ever reads a few hundred thousand tokens per eval.
+    """
+
+    path: Path
+    skip: int = 0
+    take: int | None = None
+
+    def label(self) -> str:
+        """``month=02/games.parquet[100000:]``: what ``meta.json`` records as the source."""
+        name = f"{self.path.parent.name}/{self.path.name}"
+        if not self.skip and self.take is None:
+            return name
+        end = "" if self.take is None else str(self.skip + self.take)
+        return f"{name}[{self.skip}:{end}]"
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p4" lines="162-182" />
+
+Una rebanada es un parquet más un `skip` y un `take`. Es `frozen=True` porque es un descriptor y no
+un objeto con vida: se construye, se pasa a `pack_games` y no cambia; congelarlo lo hace hashable y
+evita la clase de fallo en la que alguien reutiliza la misma rebanada para dos splits y le mueve el
+`take` a uno de ellos.
+
+`label()` es la parte que se agradece meses después: lo que `meta.json` acaba registrando como
+origen es `month=02/games.parquet[100000:]`, que dice exactamente qué partidas entraron. Un
+`meta.json` que solo dijera `games.parquet` describiría igual de bien dos packs distintos.
+
+```python title="src/rukh/tokenize/pack.py"
+def pack_month(games: Path, encoder: GameEncoder, out: Path) -> PackInfo:
+    """Encode every game of ``games`` (a UCI parquet) into ``out/tokens.npy`` + ``starts.npy``."""
+    return pack_games([GameSlice(Path(games))], encoder, out)
+
+
+def pack_games(sources: Sequence[GameSlice], encoder: GameEncoder, out: Path) -> PackInfo:
+    """Encode every game of ``sources``, in order, into ``out/tokens.npy`` + ``starts.npy``.
+
+    Each parquet is read row group by row group and the token stream is appended to a raw file;
+    once its length is known the raw file is copied into the ``.npy`` memmap in 64 MiB chunks,
+    so neither the games nor the whole stream are ever held in memory at once. Several sources
+    concatenate into a single stream, which is why ``starts.npy`` is written last: its offsets
+    are absolute over the concatenation.
+    """
+    if encoder.vocab_size() > np.iinfo(np.uint16).max + 1:
+        raise ValueError("vocabulary does not fit in uint16")
+    if not sources:
+        raise ValueError("pack_games needs at least one source")
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p4" lines="185-202" />
+
+`pack_month` no desaparece: se convierte en una línea sobre `pack_games`. Es lo que mantiene en
+verde los tests y las llamadas de M1 y M2 sin tener que reescribirlos, y cuesta una función de dos
+líneas.
+
+El docstring de `pack_games` dice la propiedad que hace falta entender para leer el resto: varias
+fuentes se **concatenan** en un solo flujo, y por eso `starts.npy` se escribe al final, con
+desplazamientos absolutos sobre la concatenación.
+
+```python title="src/rukh/tokenize/pack.py"
+    with raw_path.open("wb") as raw:
+        for source in sources:
+            reader = pq.ParquetFile(source.path)
+            seen = 0
+            taken = 0
+            for batch in reader.iter_batches(
+                batch_size=CHUNK_GAMES, columns=["uci", "white_elo", "black_elo", "result"]
+            ):
+                rows_here = batch.num_rows
+                lo = min(max(source.skip - seen, 0), rows_here)
+                hi = rows_here
+                if source.take is not None:
+                    hi = min(hi, lo + source.take - taken)
+                seen += rows_here
+                if hi <= lo:
+                    if source.take is not None and taken >= source.take:
+                        break
+                    continue
+                batch = batch.slice(lo, hi - lo)
+                taken += hi - lo
+                buffer: list[int] = []
+                rows = zip(
+                    batch.column("uci").to_pylist(),
+                    batch.column("white_elo").to_pylist(),
+                    batch.column("black_elo").to_pylist(),
+                    batch.column("result").to_pylist(),
+                    strict=True,
+                )
+                for uci, w_elo, b_elo, result in rows:
+                    ids = encoder.encode_game(uci, int(w_elo), int(b_elo), result, max_len=1 << 30)
+                    starts.append(n_tokens)
+                    n_tokens += len(ids)
+                    buffer.extend(ids)
+                raw.write(np.asarray(buffer, dtype=np.uint16).tobytes())
+                if source.take is not None and taken >= source.take:
+                    break
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p4" lines="208-243" />
+
+La aritmética de `lo` y `hi` es lo único intrincado del fichero y vale la pena seguirla con un
+ejemplo. `seen` son las filas que ya han pasado por delante, `taken` las que ya se han quedado.
+Para un lote de 10 000 filas con `skip = 25 000` y `seen = 20 000`, `lo = min(max(5000, 0), 10000) =
+5000`: se tiran las cinco mil primeras del lote y se cogen las otras cinco mil. Cuando `skip` ya se
+ha consumido, `max(skip - seen, 0)` es cero y `lo` también.
+
+El `continue` del medio es el caso que se olvida: un lote **entero** por delante del `skip` no
+contribuye nada, pero tampoco termina la fuente, así que hay que seguir. Distinguirlo de «ya he
+cogido todo lo que quería» es lo que hace el `if` de dentro.
+
+Y `batch.slice(lo, hi - lo)` es de pyarrow y no copia: recorta la vista del lote antes de convertir
+las columnas a listas de Python, que es donde está el coste de verdad. Cortar después de
+`to_pylist()` funcionaría y decodificaría diez mil partidas para quedarse con cinco mil.
+
+```python title="src/rukh/tokenize/pack.py"
+def split_sources(cfg: TokenizeConfig) -> dict[str, list[GameSlice]]:
+    """The parquet slices behind each split, as ``pack_scheme`` will read them.
+
+    ``train_months`` are taken whole. ``val_month`` is cut in two: its first ``val_games`` games
+    are the validation set and, unless ``val_remainder_trains`` is off, everything after them
+    joins training. With ``val_games = 0`` the whole month is validation, which is what P1 and P2
+    did -- and what left 238 M tokens unused, since an eval reads 50 batches and not a month
+    (D-062).
+
+    ``val_remainder_trains`` exists for a corpus whose *shape* is the point. The Elo-balanced
+    sample of M4 has the same number of games per rating band on purpose, because that is what
+    teaches the model what a header means rather than how common it is; pouring 2.85 M rated-1800+
+    games of the validation month on top would quietly undo exactly that. Turning it off keeps the
+    validation set identical to the one every other run is measured against -- the same first
+    ``val_games`` of the same month -- while leaving the training split as it was configured.
+
+    ``extra_train_parquets`` appends UCI parquets that live outside the ``year=/month=`` layout,
+    which is how the Elite Database (2200+ only) joins the corpus without pretending to be a
+    Lichess month.
+    """
+    uci_dir = resolve(cfg.uci_dir)
+    train = [GameSlice(month_parquet(uci_dir, month)) for month in cfg.train_months]
+    val_parquet = month_parquet(uci_dir, cfg.val_month)
+    if cfg.val_games:
+        val = [GameSlice(val_parquet, take=cfg.val_games)]
+        if cfg.val_remainder_trains:
+            train.append(GameSlice(val_parquet, skip=cfg.val_games))
+    else:
+        val = [GameSlice(val_parquet)]
+    train += [GameSlice(resolve(extra)) for extra in cfg.extra_train_parquets]
+    return {"train": train, "val": val}
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p4" lines="285-315" />
+
+Aquí está la clave que este módulo añadió y por la que casi se estropea el experimento.
+
+El empaquetador tenía una regla razonable: el mes de validación se parte en dos, sus primeras
+`val_games` partidas validan y **el resto se suma al entrenamiento**. Es lo que recuperó 238 millones
+de tokens en el hito anterior, porque una evaluación lee cincuenta lotes y no un mes entero.
+
+Sobre un corpus cuya forma **es** el experimento, esa misma regla añade 2,85 millones de partidas de
+1800+ encima del reparto plano y lo deshace sin decir nada. De ahí `val_remainder_trains`, y de ahí
+que esté en `false` en `pipeline-low.yaml`: el conjunto de validación sigue siendo exactamente el
+mismo con el que se miden todas las demás corridas —para que las pérdidas sean comparables— y el de
+entrenamiento es el corpus equilibrado y nada más.
+
+<Callout kind="roto" title="Una optimización correcta que rompe el experimento de al lado">
+  Nadie escribió mal `val_remainder_trains`. La regla que añadía el resto del mes de validación al
+  entrenamiento era **la correcta** cuando se escribió, y sigue siéndolo para un preentrenamiento:
+  deja de desperdiciar el 97 % de un mes. Lo que la vuelve dañina es un corpus nuevo cuya propiedad
+  interesante es su **forma**, porque la optimización la destruye antes de que nadie la mida. La
+  regla que deja: una opción por defecto que mejora el caso normal tiene que poder apagarse, y lo
+  que decide si hay que apagarla no es el código, es qué afirma el experimento.
+</Callout>
+
+```python title="src/rukh/tokenize/pack.py"
+def pack_scheme(cfg: TokenizeConfig, scheme: str, bpe: Tokenizer | None = None) -> list[Path]:
+    """Pack the ``train`` and ``val`` splits under ``out_dir/<scheme>/{train,val}``."""
+    encoder = make_encoder(scheme, bpe)
+    written: list[Path] = []
+    for split, sources in split_sources(cfg).items():
+        out = resolve(cfg.out_dir) / scheme / split
+        pack_games(sources, encoder, out)
+        written.append(out / META_FILE)
+    return written
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p4" lines="318-326" />
+
+Nueve líneas, y todo lo que hace es recorrer el diccionario que devuelve `split_sources`. Que la
+función que decide **qué** se empaqueta esté separada de la que lo empaqueta es lo que permite que
+los tests de la primera no necesiten escribir un solo `.npy`.
+
+## `loader.py`: el pickle que no cabía
+
+El corpus de este módulo es más pequeño que el de M2, pero el de M2 dejó un fallo que aparece justo
+cuando el número de partidas crece, y la corrección vive aquí:
+
+```python title="src/rukh/tokenize/loader.py"
+    def __init__(self, directory: Path, block: int = 200, start_at_game: bool = True) -> None:
+        if block < 2:
+            raise ValueError("block must be at least 2")
+        self.directory = Path(directory)
+        self.block = block
+        self.start_at_game = start_at_game
+        self.info: PackInfo = read_pack_info(self.directory)
+        self.pad_id = 0
+        self._open()
+
+    def _open(self) -> None:
+        """Map the two arrays from disk. Called on construction and in every worker process."""
+        self.tokens = np.load(self.directory / TOKENS_FILE, mmap_mode="r")
+        self.starts = np.load(self.directory / STARTS_FILE, mmap_mode="r")
+
+    def __getstate__(self) -> dict[str, object]:
+        """Ship the paths to a worker, never the arrays.
+
+        ``DataLoader`` workers are spawned on Windows, so the dataset is pickled once per worker.
+        ``starts`` is one int64 per game: 95 MB at 12.5 M games, 145 MB at 18.9 M, and at 145 MB
+        the spawn died with ``UnpicklingError: pickle data was truncated`` before a single step
+        ran. Both arrays live in files the worker can map itself (D-067).
+        """
+        return {k: v for k, v in self.__dict__.items() if k not in ("tokens", "starts")}
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+        self._open()
+```
+
+<Src file="src/rukh/tokenize/loader.py" tag="p4" lines="24-51" />
+
+Los workers del `DataLoader` se lanzan con `spawn` en Windows, lo que significa que el dataset se
+**serializa** una vez por worker. `starts` es un `int64` por partida: 95 MB con 12,5 millones de
+partidas, 145 MB con 18,9 millones, y a 145 MB el arranque murió con `UnpicklingError: pickle data
+was truncated` antes de dar un solo paso.
+
+La corrección son tres métodos y ninguna lógica nueva. `__getstate__` manda todo menos los dos
+arrays; `__setstate__` los vuelve a mapear con `_open`. Los dos viven en ficheros que el worker
+puede abrir por su cuenta, así que lo que se enviaba por la tubería era una copia de algo que ya
+estaba en disco.
+
+Y `starts` pasa a abrirse también con `mmap_mode="r"`, igual que `tokens`. Lo que antes eran 145 MB
+residentes por worker ahora son páginas compartidas del mismo fichero.
+
+<Transfer
+  concept="Mandar la referencia, no el contenido"
+  where="Cualquier cosa que cruce un proceso, una cola de mensajes o una petición HTTP: un identificador y una ruta común pesan menos que el objeto, y el destinatario ya sabe llegar."
+>
+  Un objeto que cruza un proceso no tiene por qué llevarse los datos consigo si los dos lados pueden
+  llegar a ellos. Mandar la **ruta** en vez del contenido es la misma idea que un enlace en un
+  correo en lugar de un adjunto de cien megas, y en multiprocessing tiene un beneficio extra: el
+  sistema operativo comparte las páginas del fichero mapeado entre todos los procesos, así que ocho
+  workers no cuestan ocho copias.
+</Transfer>
+
+## Empezar desde unos pesos, sin heredar nada más
+
+Falta la última pieza, y es del bucle de entrenamiento. Afinar necesita empezar desde un checkpoint,
+y el bucle ya sabía hacerlo: `--resume`. Pero `--resume` es exactamente lo contrario de lo que quiere
+un afinado.
+
+```python title="src/rukh/train/loop.py"
+    init_from: str | None = None
+    """Checkpoint to start the weights from, for a fine-tune.
+
+    Deliberately not ``--resume``, which is for a run that was interrupted: resuming restores the
+    optimizer moments, the step counter, the RNG and the MLflow run so the curve carries on as if
+    nothing had stopped. A fine-tune wants the opposite -- the weights and nothing else -- because
+    it is a **new** run, with its own data, its own learning rate and its own schedule, and the
+    Adam moments of a 48 000-step cosine that has already decayed would fight the warmup of the
+    one that starts now. Asking for both at once is a contradiction and is refused.
+
+    It lives here and not on ``RunConfig`` because the encoder's runs already have their own way
+    in (``HeadsConfig.encoder_ckpt``), and a field that three configs accept but only one honours
+    is a silent no-op waiting to be written into a YAML."""
+```
+
+<Src file="src/rukh/train/loop.py" tag="p4" lines="94-106" />
+
+El docstring del campo es la explicación entera. `--resume` restaura los momentos de Adam, el
+contador de pasos, el estado del generador aleatorio y hasta la corrida de MLflow, para que la curva
+siga como si no se hubiera parado. Un afinado quiere lo opuesto —los pesos y nada más— porque es una
+corrida **nueva**, con sus datos, su tasa y su calendario, y los momentos de un coseno de 48 000
+pasos ya decaído pelearían contra el warmup que empieza ahora.
+
+`--resume` es volver del café: la mesa está como la dejaste, con las notas de Adam, el contador de
+pasos y el run abierto. `init_from` es empezar en otra empresa: te llevas lo que sabes y nada más.
+
+El último párrafo del docstring es una decisión de diseño que se pasa por alto: el campo vive en
+`TrainConfig` y no en `RunConfig`, la clase base, porque las corridas del encoder ya tienen su propia
+entrada (`HeadsConfig.encoder_ckpt`). Un campo que tres configuraciones aceptan y solo una respeta
+es un no-op silencioso esperando a que alguien lo escriba en un YAML.
+
+```python title="src/rukh/train/common.py"
+def load_init_weights(init_from: str | None, model: nn.Module, where: torch.device) -> str | None:
+    """Load ``init_from`` into ``model`` and return the resolved path, or None when there is none.
+
+    Only ``model_state`` is read. The optimizer, the step counter and the MLflow run of the
+    checkpoint are ignored on purpose: this is where a fine-tune starts, not where a run left off.
+    """
+    if init_from is None:
+        return None
+    path = paths.resolve(init_from)
+    if not path.is_file():
+        raise FileNotFoundError(f"init_from checkpoint not found: {path}")
+    payload = load_checkpoint(path, map_location=where)
+    load_state(model, payload["model_state"])
+    log.info("initialised from %s (step %s), fresh optimizer", path, payload.get("step", "?"))
+    return path.as_posix()
+```
+
+<Src file="src/rukh/train/common.py" tag="p4" lines="203-217" />
+
+Quince líneas, y lo que importa es lo que **no** hacen: del checkpoint se lee `model_state` y nada
+más. `opt_state`, `step`, `run_id` y el resto siguen ahí en el fichero y se ignoran a propósito.
+
+El `log.info` no es decoración. Un afinado que arranca desde el checkpoint equivocado produce números
+perfectamente plausibles, y la línea que dice desde dónde arrancó y en qué paso estaba es lo que
+permite descubrirlo al leer el log en vez de al comparar dos Elos que no cuadran.
+
+```python title="src/rukh/train/loop.py"
+    model = MoveDecoder(model_cfg).to(where)
+    if resume is not None and cfg.init_from is not None:
+        raise ValueError("--resume continues a run; init_from starts a new one: pick one")
+    # The weights are loaded *before* the adapters go on, because the checkpoint knows the module
+    # names of a plain decoder and wrapping renames them.
+    initialised_from = load_init_weights(cfg.init_from, model, where)
+```
+
+<Src file="src/rukh/train/loop.py" tag="p4" lines="177-182" />
+
+Seis líneas con dos decisiones. La primera es rechazar la combinación: `--resume` continúa una
+corrida e `init_from` empieza una, y pedir las dos es una contradicción. Podría resolverse eligiendo
+una —y entonces la mitad de las veces se elegiría la que el usuario no quería, sin avisar—.
+
+La segunda está en el comentario: los pesos se cargan **antes** de poner los adaptadores de LoRA,
+porque el checkpoint conoce los nombres de módulo de un decoder normal y envolver los renombra. El
+orden importa y no se deduce leyendo cualquiera de las dos funciones por separado, que es
+exactamente cuándo hace falta un comentario.
+
+```python title="src/rukh/train/loop.py"
+def _warn_if_best_is_not_the_result(
+    cfg: TrainConfig, out_dir: Path, final: Path, best_val: float
+) -> None:
+    """Say out loud when ``best.pt`` is not this run's answer, because usually it is.
+
+    ``best.pt`` means "lowest validation loss", and validation is imitation of 1800+ play. For a
+    pretraining run that is the objective and the two coincide. For a fine-tune whose whole point
+    is to shift the corpus somewhere else -- the Elo-balanced sample, masters only, one opening --
+    the validation loss is *expected* to rise, so ``best.pt`` freezes an almost-untouched model a
+    few hundred steps in. Anyone evaluating it later would be measuring the wrong weights, and the
+    numbers would look plausible, which is the dangerous kind of wrong.
+    """
+    best = out_dir / BEST_NAME
+    if cfg.init_from is None or not best.is_file():
+        return
+    from rukh.train.checkpoint import load_checkpoint
+
+    best_step = int(load_checkpoint(best).get("step", 0))
+    if best_step >= cfg.max_steps:
+        return
+    log.warning(
+        "%s holds step %d (val/loss %.4f), not the end of this fine-tune. The result of this run "
+        "is %s; validation measures imitation of the old corpus, which is not what it optimised.",
+        best,
+        best_step,
+        best_val,
+        final,
+    )
+```
+
+<Src file="src/rukh/train/loop.py" tag="p4" lines="305-332" />
+
+Y esto es un aviso que este afinado obligó a escribir. `best.pt` significa «la pérdida de validación
+más baja», y la validación mide imitación de juego de 1800+. En un preentrenamiento eso **es** el
+objetivo y las dos cosas coinciden. En un afinado que cambia de corpus a propósito, la pérdida de
+validación sube desde el principio, así que `best.pt` se queda congelado en el paso 200 —un modelo
+casi sin tocar— y cualquiera que lo evaluara después estaría midiendo los pesos equivocados con
+números perfectamente plausibles.
+
+La función no arregla nada: **lo dice**. Solo avisa cuando hay un `init_from` (si no, `best.pt` sí
+es el resultado) y cuando el paso de `best.pt` está por debajo de `max_steps`.
+
+<Callout kind="roto" title="`best.pt` no es el resultado de un afinado">
+  El resultado de un afinado es su **último** checkpoint, `step-3800.pt`, y ahora el bucle lo
+  escribe en el log en vez de dejarlo a la intuición de quien lo lea. Es la clase de error que no
+  produce ninguna excepción: el fichero existe, se carga, juega, y da un Elo razonable. El de un
+  modelo que no ha aprendido lo que creías.
+</Callout>
+
+<Exercise n="01" title="¿Por qué best.pt es exactamente el paso 200, y no el 0 ni el 3 800?">
+  Mira `configs/train/medium-elo.yaml` más abajo (`eval_every`, `warmup`, `max_steps`) y la rama del
+  bucle que guarda `best.pt` en `src/rukh/train/loop.py`. Antes de leer la solución, escribe en qué
+  paso se quedaría `best.pt` si `eval_every` fuera 50, y qué tendría que pasar con la pérdida de
+  validación para que se quedara en el último paso.
+
+  <Solution>
+    Tres hechos y ninguno es del modelo. Primero, el bucle no evalúa en el paso 0: `best_val` empieza
+    en infinito y la primera evaluación llega cuando `done % eval_every == 0`, es decir, en el paso
+    200. Segundo, esa primera evaluación **siempre** mejora a infinito, así que `best.pt` se escribe
+    en el 200 pase lo que pase. Tercero, la validación mide imitación de partidas de 1800+ y el corpus
+    del afinado tiene el 49 % de partidas por debajo, así que la pérdida de validación sube desde la
+    primera evaluación y ninguna posterior bate a la del 200. Con `eval_every: 50` se quedaría en el
+    paso 50, un modelo todavía más intacto (y dentro del warmup de 200 pasos, con la tasa de
+    aprendizaje aún subiendo). Para que `best.pt` fuera el paso 3 800 haría falta que la pérdida de
+    validación **bajara** durante el afinado, o sea, que el corpus nuevo se pareciera más a la
+    validación que el viejo, que es justo lo contrario de lo que este afinado hace a propósito. Por
+    eso el fichero correcto es `step-3800.pt` y por eso el bucle lo avisa por escrito.
+
+  </Solution>
+</Exercise>
+
+## Las dos configuraciones de afinado
+
+{/* prettier-ignore */}
+```yaml title="configs/train/medium-elo.yaml"
+# `medium-v4` fine-tuned on the Elo-balanced corpus: the run that is supposed to make the dial real.
+#
+# The base is `medium-v4` and not `medium-v4 + DPO`. DPO taught the model to prefer the engine's
+# move over the human one; pouring 1.2 M games of imitation on top would partly undo that, and the
+# question this run answers is about the Elo header and nothing else. Whether the two compose is a
+# P5 question, asked after this one has an answer.
+#
+# `data/tokens-elo` is flat from `<w1000>` to `<w2400>` by construction (about 70-85 k games per
+# bin against the 20-to-1 pyramid a real corpus has). That flatness is the whole intervention: a
+# corpus shaped like Lichess teaches the model that `<w1500>` is *rare*, which is not the same
+# thing as what it means.
+#
+# 3 800 steps is 194.6 M tokens over a 95.7 M-token corpus: about two passes. Deliberately short
+# and at the spec's fine-tuning rate (1e-4, sixteen times below pretraining), because the risk
+# here is not underfitting the new corpus -- it is forgetting the strong play that 1.68 B tokens
+# bought. The measurement that decides whether that happened is the `<w2400>` row of the sweep
+# against `medium-v4`'s own 1504.
+preset: medium
+init_from: checkpoints/medium-v4-20260919-174623/best.pt
+tokens_dir: data/tokens-elo/uci
+block: 200
+batch_size: 32
+grad_accum: 8 # 256 effective sequences of 200 tokens
+lr: 1.0e-4
+min_lr_ratio: 0.1
+warmup: 200
+max_steps: 3800
+weight_decay: 0.1
+betas: [0.9, 0.95]
+grad_clip: 1.0
+precision: bf16
+compile: true
+eval_every: 200
+eval_batches: 50
+ckpt_every: 500
+out_dir: checkpoints
+seed: 42
+run_name: medium-elo
+unique_run_name: true
+workers: 4
+log_every: 10
+```
+
+<Src file="configs/train/medium-elo.yaml" tag="p4" lines="1-41" />
+
+Diecisiete líneas de comentario para veinticuatro de configuración, y están bien gastadas: cada
+párrafo contesta una pregunta que alguien se haría al leer el YAML.
+
+De dónde parte, y por qué no del modelo con DPO. Por qué el corpus es plano. Y por qué 3 800 pasos
+a 1e-4 y no más: el riesgo aquí no es quedarse corto con el corpus nuevo, es **olvidar** el juego
+fuerte que costaron 1 680 millones de tokens.
+
+La segunda configuración es la misma con el corpus cambiado, y por eso se cita solo por su
+diferencia:
+
+{/* prettier-ignore */}
+```yaml title="configs/train/medium-masters.yaml"
+# `medium-v4` fine-tuned on masters only: the trade `docs/spec/02` predicts, measured.
+#
+# "Seguir preentrenando con rukh-games-elite (lr 1e-4). Medir: sube el Elo, baja la diversidad."
+# Both halves need a number. The Elo comes from the usual suite; the diversity is the opening
+# entropy `rukh.eval.diversity` measures, which was `n/a` in every report before this milestone
+# precisely because nothing had needed it yet.
+#
+# The token budget is the same as `medium-elo`'s (3 800 steps of 51 200 tokens, 194.6 M) so the
+# two fine-tunes differ in their corpus and in nothing else. Against the 1 210 419 259 tokens of
+# the elite pack (13 146 352 games) that is 0.16 of an epoch: a fine-tune, not a second
+# pretraining, and every sample it sees is new.
+preset: medium
+init_from: checkpoints/medium-v4-20260919-174623/best.pt
+tokens_dir: data/tokens-masters/uci
+```
+
+<Src file="configs/train/medium-masters.yaml" tag="p4" lines="1-14" />
+
+Las veintiuna líneas que faltan son idénticas a las de `medium-elo.yaml` —mismo `lr`, mismo `warmup`,
+mismos 3 800 pasos, misma semilla— y eso es la mitad del experimento: los dos afinados se
+diferencian en su corpus y en nada más. El mismo presupuesto de tokens (3 800 pasos de 51 200 tokens,
+194,6 M) sobre el pack de élite es 0,16 de una época, así que cada muestra que ve es nueva.
+
+<Callout kind="hoy" title="Las once configuraciones de `configs/train/` que trae este hito">
+  Como con las de datos, la mayoría son de hitos anteriores que solo se formalizaron al cerrar `p4`.
+  Las cuatro que usa este módulo se muestran enteras aquí y en las lecciones 3 y 5.
+</Callout>
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Configuraciones de entrenamiento nuevas en p4">
+
+| Fichero                   | Para qué sirve                                                          | Dónde está                          |
+| ------------------------- | ----------------------------------------------------------------------- | ----------------------------------- |
+| `medium-elo.yaml`         | el afinado condicionado por Elo, sobre el corpus plano                  | arriba, entero                      |
+| `medium-masters.yaml`     | el afinado sobre solo partidas de élite                                 | arriba, por diferencia              |
+| `lora-e4.yaml`            | el adaptador de estilo que abre `1. e4`                                 | lección 3, entero                   |
+| `lora-d4.yaml`            | el adaptador de estilo que abre `1. d4`                                 | lección 3, por diferencia           |
+| `qwen3-pgn.yaml`          | el QLoRA de Qwen3-0.6B sobre el corpus PGN                              | lección 5, entero                   |
+| `qwen3-smoke.yaml`        | la misma receta en diez pasos, para comprobar que el camino funciona    | lección 5, por diferencia           |
+| `medium-v3.yaml`          | `medium` sobre el corpus de 24 meses de élite (M2)                      | `tokens_dir: data/tokens-v3`        |
+| `medium-v4.yaml`          | `medium` sobre el de 44 meses: el modelo del que parte todo este módulo | `tokens_dir: data/tokens-v4`        |
+| `small-v2.yaml`           | `small` sobre el corpus recuperado de M2                                | 28 000 pasos, 471 M tokens únicos   |
+| `small-v3.yaml`           | `small` sobre el corpus mixto con la Elite Database                     | `tokens_dir: data/tokens-v3`        |
+| `encoder-mmm-v4.yaml`     | el encoder de M3 a 38 M de parámetros sobre el corpus de 1,68 B         | preentrenamiento del encoder        |
+| `encoder-heads-v4.yaml`   | las cabezas del encoder sobre ese preentrenamiento                      | `encoder_ckpt` de `mmm-v4`          |
+| `encoder-heads-rank.yaml` | las mismas cabezas sobre el esquema de entrada por línea                | `encoder_ckpt` del checkpoint `mmm` |
+
+</div>
+
+## Por qué el corpus de afinado es plano y el mundo no
+
+El corpus plano no es lo que hay en Lichess ni de lejos, y es a propósito. Un corpus con la forma
+real le enseña al modelo que `<w1500>` es **raro**, que no es lo mismo que enseñarle qué
+**significa**. La frecuencia de una condición y su contenido son dos cosas distintas, y aquí solo
+interesa la segunda: el modelo tiene que saber qué viene después de cada token de Elo, no con qué
+probabilidad aparece. Un diccionario le dedica la misma entrada a «casa» que a «abstruso» aunque la
+primera se use mil veces más, porque lo que se le pide al diccionario es qué significa cada palabra,
+no cuántas veces sale. El corpus plano es ese diccionario: una entrada del mismo tamaño para cada
+cabecera.
+
+| Banda |   Partidas |
+| ----- | ---------: |
+| 1000  |    150 000 |
+| 1200  |    150 000 |
+| 1400  |    150 000 |
+| 1600  |    150 000 |
+| 1800  |    150 000 |
+| 2000  |    150 000 |
+| 2200  |    150 000 |
+| 2400  |    146 232 |
+| 2600  | **23 191** |
+
+Las dos últimas filas son el límite de los datos y se publican tal cual. No hay 150 000 partidas de
+2600+ en dos meses de Lichess; hay 23 191, y ninguna manera honesta de fabricar las que faltan. El
+corpus queda plano donde puede y se estrecha donde el mundo se estrecha, y como el criterio del
+hito vive entero dentro de la parte plana (1500, 2000 y 2400), eso no lo compromete. Total:
+**1 219 423 partidas, 95 722 318 tokens**.
+
+Y por abajo el corpus también se acaba, esta vez por decisión: la descarga empieza en 1000, así que
+`<w0600>`, `<w0700>`, `<w0800>` y `<w0900>` **siguen sin un solo gradiente** después de este
+módulo. El eje que se arregla va de 1000 en adelante; esas cuatro cabeceras siguen siendo el botón
+del piso que no existe, y por eso ni el barrido de la lección 7 ni el selector de la demo las
+ofrecen.
+
+Contado sobre el flujo empaquetado, token a token, así queda la cabecera que el modelo lee:
+
+| Token     | Partidas |     | Token      | Partidas |
+| --------- | -------: | --- | ---------- | -------: |
+| `<w1000>` |   59 335 |     | `<w1900>`  |   79 730 |
+| `<w1100>` |   87 662 |     | `<w2000>`  |   85 267 |
+| `<w1200>` |   71 956 |     | `<w2100>`  |   68 393 |
+| `<w1300>` |   78 537 |     | `<w2200>`  |   85 367 |
+| `<w1400>` |   71 209 |     | `<w2300>`  |   68 169 |
+| `<w1500>` |   79 820 |     | `<w2400>`  |   81 258 |
+| `<w1600>` |   81 664 |     | `<w2500>`  |   47 622 |
+| `<w1700>` |   69 817 |     | `<w2600>`  |   19 073 |
+| `<w1800>` |   76 633 |     | `<w2700>`+ |    7 911 |
+
+## Qué costó el afinado
+
+`medium-v4` afinado 3 800 pasos sobre ese corpus, a la tasa de afinado del spec (1e-4, cuatro veces
+y media por debajo del 4,5e-4 del preentrenamiento), son 194,56 M de tokens: unas dos pasadas.
+
+La validación mide imitación de juego 1800+, que es justo lo que este afinado **deja de optimizar**,
+así que se espera que empeore. Empeoró, y poco:
+
+|                           | pérdida de validación | top-1 de validación |
+| ------------------------- | --------------------: | ------------------: |
+| `medium-v4` (paso 48 000) |                1,3733 |             54,73 % |
+| `medium-elo` (paso 3 800) |                1,3987 |         **54,66 %** |
+
+Veinticinco milésimas de nat y siete centésimas de punto de top-1. Es el precio del eje, medido
+sobre el mismo conjunto y con el mismo medidor. Lo que queda por saber —y es lo que decide el
+hito— es qué compró, y eso se mide en la lección 7 y se lee en la 9.
+
+```bash title="Terminal"
+uv run rukh data elo-bins --config configs/data/pipeline-low.yaml
+uv run rukh data tokenize --config configs/data/pipeline-low.yaml --scheme uci --pack
+uv run rukh train --config configs/train/medium-elo.yaml
+```
+
+El afinado son 3 800 pasos y **19,5 minutos**; el de maestros, con `pipeline-masters.yaml` y
+`medium-masters.yaml`, 20,7.
+
+## Qué has aprendido
+
+El corpus del módulo, construido desde el filtro hasta el checkpoint. Un `max_elo` que se aplica a
+los dos jugadores porque una partida desigual no pertenece a ninguna banda; un descargador que baja
+cada shard entero, lo filtra y lo borra, porque leer en remoto miles de rangos contra un anfitrión
+es una forma cara de no descargar nada; un muestreo por hash que aplana nueve bandas y publica lo
+que cada una recibió de verdad; un empaquetador que corta un mes en dos para que una validación
+comparable no le robe la forma al corpus; y un `init_from` que se lleva los pesos y deja el
+optimizador, con el aviso de que `best.pt` ya no es la respuesta.
+
+Se mide en dos sitios: el manifiesto de `data/elo-bins-v2/` dice cuántas partidas tiene cada banda,
+y la pérdida de validación de la corrida dice cuánto costó el eje (1,3733 → 1,3987). Lo que el eje
+**compró** no se sabe todavía, y hace falta un barrido para saberlo.
+
+Lo siguiente es la otra mitad del módulo: en vez de mover los 115 millones de parámetros, mover
+393 216. Sigue en «LoRA escrita a mano».

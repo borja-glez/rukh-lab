@@ -1,0 +1,1112 @@
+---
+title: 'Los labs del afinado'
+description:
+  'Los cuatro scripts de labs/m4 enteros y los nueve laboratorios que producen cada número del
+  módulo: mirar el corpus antes de culpar al modelo, descargar la mitad que faltaba, el corpus plano
+  y el afinado condicionado, LoRA a mano contra peft, cuántas partidas harían falta, estilo con
+  adaptadores, Qwen3 con QLoRA y publicar los cinco artefactos.'
+module: m4
+order: 10
+duration: 125
+runtime: 530
+level: medio
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - fine-tuning
+  - SFT
+  - instruction tuning
+  - condicionamiento
+  - Elo
+  - LoRA
+  - rango
+  - adaptador
+  - peft
+  - PreTrainedModel
+  - QLoRA
+  - cuantización de 4 bits
+  - olvido catastrófico
+  - entropía de aperturas
+  - diversidad
+  - SAN
+  - monotonía
+  - intervalo de confianza
+---
+
+import AdapterSwap from '../../../components/figures/AdapterSwap.astro';
+
+Lección 10 de 10 del módulo «Fine-tuning e instrucción». Viene de «Lo que salió» y cierra el módulo.
+Las ocho lecciones anteriores muestran el código de `rukh`; esta muestra los cuatro scripts de
+`labs/m4/` —que no son parte del motor, son instrumentos de medida— y la secuencia de órdenes que
+convierte el repositorio en los cinco artefactos del hito.
+
+## Los labs
+
+Nueve laboratorios. Los dos primeros son de datos y no tocan el modelo; es donde estaba el fallo
+y es donde hay que empezar.
+
+<Callout kind="hoy" title="Punto de partida, si te saltaste algo">
+  Todo parte de `checkpoints/medium-v4/best.pt` (M2, parte 4) y necesita `data/uci/`, los 44 meses
+  de `data/elite/games.parquet` y el tokenizador. `uv run rukh pull --module m4` lo trae, y también
+  los cinco resultados del módulo por si solo quieres medirlos. El tramo bajo de Elo y su corpus
+  plano se regeneran en minutos con los comandos de cada lab; la secuencia completa, con lo que
+  tardó cada paso, está en `docs/runbooks/afinado-y-adaptadores.md`. Un afinado deja su checkpoint
+  en una carpeta con fecha (`checkpoints/medium-elo-20260920-143756/`); los comandos lo nombran sin
+  ella (`checkpoints/medium-elo/step-3800.pt`) y las dos grafías valen.
+</Callout>
+
+<LabRoutes lesson="m4/10-labs-de-afinado" />
+
+### Lab 1 · Mirar el corpus antes de culpar al modelo
+
+**Objetivo:** encontrar el agujero con una consulta, no con una intuición.
+
+El punto de partida es una afirmación que parecía cerrada: «el condicionamiento por Elo abre el eje
+pero no da fuerza». Antes de aceptarla, cuenta cuántas veces ha visto el modelo cada token de
+cabecera. El flujo empaquetado lo pone fácil, porque el segundo token de cada partida **es** el Elo
+de las blancas, y ese es todo el instrumento: cincuenta y cinco líneas sin modelo, sin GPU y sin red.
+
+```python title="labs/m4/header_histogram.py"
+"""Count how many times the model has seen each Elo header, before blaming the model.
+
+Lab 1 of M4. The claim under test is "the Elo conditioning opens the axis but gives no strength",
+which was the conclusion of the previous milestone. Before accepting it, count: the second token of
+every packed game *is* White's Elo header, so a histogram of `tokens[starts + 1]` says exactly how
+much training each condition got.
+
+Run from the repository root. `--tokens` points at any packed stream:
+
+    uv run python labs/m4/header_histogram.py
+    uv run python labs/m4/header_histogram.py --tokens data/tokens-elo/uci/train
+
+The corpus every published model trained on (`data/tokens-v4/uci/train`) starts at `<w1800>` and
+has nothing below it: twelve header tokens that exist in the vocabulary, have a row in the
+embedding table, and never received a gradient.
+"""
+```
+
+<Src file="labs/m4/header_histogram.py" tag="p4" lines="1-16" />
+
+El docstring dice la afirmación que se pone a prueba y cómo se ejecuta, que es lo que un lab necesita
+llevar encima: dentro de seis meses nadie se acuerda de qué pregunta contestaba este fichero.
+
+```python title="labs/m4/header_histogram.py"
+import argparse
+import collections
+import sys
+from pathlib import Path
+
+import numpy as np
+
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+# The Windows console is cp1252 by default; ask for UTF-8 before printing the bar chart.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--tokens", default="data/tokens-v4/uci/train", type=Path)
+parser.add_argument("--width", default=48, type=int, help="Columns of the widest bar.")
+args = parser.parse_args()
+
+tok = UciTokenizer()
+tokens = np.load(args.tokens / "tokens.npy", mmap_mode="r")
+starts = np.load(args.tokens / "starts.npy")
+```
+
+<Src file="labs/m4/header_histogram.py" tag="p4" lines="18-38" />
+
+Tres detalles que no son decoración. El `reconfigure` de `sys.stdout` está porque la consola de
+Windows es cp1252 por defecto y el `#` de las barras no es el problema: lo son los `<w1800>` y, en
+general, cualquier salida que el script quiera imprimir sin que un `UnicodeEncodeError` mate la
+medición al final. `tokens.npy` se abre con `mmap_mode="r"` —mil seiscientos ochenta millones de
+`uint16` son 3,4 GB y aquí solo se leen 18,9 millones de posiciones sueltas—, y `starts.npy` se
+carga entero porque el indexado que viene lo necesita como array, no como vista.
+
+```python title="labs/m4/header_histogram.py"
+# Every game is `<bos> <wXXXX> <bXXXX> moves...`, so offset 1 from its start is White's header.
+counts = collections.Counter(tokens[starts + 1].tolist())
+if not counts:
+    raise SystemExit(f"no games in {args.tokens}")
+
+top = max(counts.values())
+print(f"{args.tokens}: {len(starts):,} games, {len(tokens):,} tokens\n")
+for token_id, n in sorted(counts.items()):
+    bar = "#" * max(1, round(args.width * n / top))
+    print(f"  {tok.ids[token_id]:>9s}  {n:>9,d}  {bar}")
+
+# The twelve tokens the vocabulary has below 1800, and how many of them the corpus ever used.
+below = [tok.vocab[f"<w{elo:04d}>"] for elo in range(600, 1800, 100)]
+seen = sum(1 for token_id in below if counts.get(token_id))
+print(f"\nheaders below <w1800>: {seen} of {len(below)} ever seen in this corpus")
+print("an untrained header is not a header that does not work: it is noise with a row in a table")
+```
+
+<Src file="labs/m4/header_histogram.py" tag="p4" lines="40-55" />
+
+`tokens[starts + 1]` es la medición completa: una sola indexación vectorizada que saca el segundo
+token de cada partida de golpe. No hay bucle sobre partidas, no se decodifica ninguna, y el
+`Counter` recibe 18,9 millones de enteros. La última parte es la que convierte el histograma en un
+veredicto: en vez de dejar que el lector cuente filas ausentes, pregunta explícitamente por los doce
+tokens que el vocabulario tiene por debajo de 1800 y dice cuántos se han visto alguna vez. Una tabla
+a la que le falta una fila se lee como una tabla; una línea que dice «0 de 12» no.
+
+Lo que sale del corpus con el que se entrenó el modelo publicado:
+
+```text
+data/tokens-v4/uci/train: 18,942,740 games, 1,681,069,636 tokens
+
+    <w1800>  1,570,327  #############
+    <w1900>  1,539,899  ############
+    <w2000>  1,140,483  #########
+    <w2100>    726,462  ######
+    <w2200>    413,442  ###
+    <w2300>  1,075,847  #########
+    <w2400>  2,513,495  ####################
+    <w2500>  5,969,302  ################################################
+    <w2600>  2,384,084  ###################
+    <w2700>    845,767  #######
+    <w2800>    367,217  ###
+    <w2900>    224,455  ##
+    <w3000>    153,060  #
+    <w3100>     17,107  #
+    <w3200>      1,793  #
+
+headers below <w1800>: 0 of 12 ever seen in this corpus
+```
+
+**Cero de doce.** No hay una sola partida por debajo de 1800 en mil seiscientos ochenta millones de
+tokens. Los doce tokens anteriores existen en el vocabulario, tienen su fila en la tabla de
+embeddings, y esa fila es la que dejó `nn.init.normal_(std=0.02)`.
+
+De paso el histograma enseña otra cosa que no se buscaba: el corpus está dominado por `<w2500>`,
+con **5 969 302 partidas**, casi un tercio del total. Es la Elite Database, que entró entera en P2
+y arrastra la distribución hacia arriba. Un corpus no es plano porque nadie lo aplane.
+
+- Comprueba también el manifiesto del conjunto balanceado de P1
+  (`data/elo-bins/manifest.json`): su bin más bajo es `1800`, que es la misma frase dicha desde
+  otro sitio.
+- Y mira el filtro: `configs/data/lichess-2025-01-02.yaml`, `min_elo: 1800`, aplicado a los dos
+  jugadores. Está entero en la lección 1.
+
+<Callout kind="mundo-real" title="El histograma de la entrada es el primer sitio, no el último">
+  Cuando una condición, una etiqueta o una clase «no funciona», la primera pregunta no es qué le
+  pasa al modelo: es cuántos ejemplos de eso ha visto. Es una consulta de tres líneas y descarta la
+  explicación más común de todas antes de gastar una GPU en las otras.
+</Callout>
+
+### Lab 2 · Descargar la mitad que faltaba
+
+**Objetivo:** un segundo corpus que se diferencie del primero **solo** en el rango de fuerza, y un
+descargador que sobreviva al anfitrión.
+
+El código de este lab es `src/rukh/data/fetch.py` y está entero en la lección 2: el `max_elo` que
+faltaba, el descargador shard a shard y el `limit` que para la descarga en vez de recortar el
+resultado. Aquí van las órdenes y lo que tardaron.
+
+```bash title="Terminal"
+uv run rukh data fetch --config configs/data/lichess-low.yaml
+uv run rukh data uci --config configs/data/pipeline-low.yaml
+```
+
+La descarga son tres shards por mes —el tope de 1,2 millones de partidas se llena antes de los
+setenta y dos—, unos diez minutos, y deja `data/raw-low/`; la conversión, cinco minutos más, deja
+`data/uci-low/` con 1 147 074 partidas de enero y 1 145 401 de febrero. La configuración escribe en
+carpetas propias a propósito: `data/uci` sigue significando «lo que entrenó los modelos publicados».
+
+- Test: con `max_elo` aparecen las dos condiciones; sin él, ninguna; un techo por debajo del
+  suelo es un error de configuración.
+- Test sobre las dos configuraciones que se envían: `low.max_elo + 1 == high.min_elo`, y todo lo
+  demás idéntico. Las dos mitades del eje tienen que **embaldosar** el rango sin solaparse ni
+  dejar hueco, y eso es una propiedad que se puede comprobar en CI sin red.
+- Un mes ya descargado no se vuelve a descargar, y un mes interrumpido reanuda por el shard en
+  el que se quedó. Los dos casos tienen test.
+- Un fichero de cero bytes —lo que deja un `COPY` que murió a medias— **no** cuenta como mes
+  descargado. Y un filtro que no deja pasar nada es un error, no un parquet vacío: un corpus de
+  cero filas aguas abajo parece un corpus.
+
+<Callout kind="roto" title="Descargar con `cache_dir` y creer que borras">
+  La primera versión usaba `hf_hub_download(..., cache_dir=...)` y borraba lo que devolvía. La caché
+  del Hub guarda los bytes en `blobs/` y devuelve un enlace en `snapshots/`, así que borrar el
+  enlace no libera nada: la corrida dejó **5,7 GB** de shards detrás después de decir que había
+  limpiado. Con `local_dir` la ruta *es* el fichero y `unlink` significa lo que dice.
+</Callout>
+
+### Lab 3 · El corpus plano y el afinado condicionado
+
+**Objetivo:** un corpus cuya forma sea el experimento, y un afinado que no herede el calendario del
+preentrenamiento.
+
+`src/rukh/data/elo_bins.py`, `configs/data/pipeline-low.yaml` y las dos piezas del bucle que hacen
+posible empezar desde unos pesos sin heredar el optimizador están en la lección 2. Las órdenes:
+
+```bash title="Terminal"
+uv run rukh data elo-bins --config configs/data/pipeline-low.yaml
+uv run rukh data tokenize --config configs/data/pipeline-low.yaml --scheme uci --pack
+uv run rukh train --config configs/train/medium-elo.yaml
+```
+
+Salida real del corpus plano: 150 000 partidas en cada banda de 1000 a 2200, 146 232 en la de 2400
+y 23 191 en la de 2600, porque las dos últimas no tienen con qué llenar la cuota y el manifiesto
+lo dice en vez de rellenarlo. El afinado son 3 800 pasos, **19,5 minutos**, y termina en
+`checkpoints/medium-elo-*/step-3800.pt`; `best.pt` se queda en el paso 200 y el bucle avisa de
+por qué (la lección 2 lo explica). El afinado de maestros es el mismo comando con
+`pipeline-masters.yaml` para tokenizar la Elite y `medium-masters.yaml` para entrenar: 20,7
+minutos.
+
+- Test: dos corpus se convierten en un eje; el muestreo sale **plano** por muy sesgada que esté
+  la fuente (quince partidas de 1200 contra cinco de 2000 dan cinco y cinco); las bandas fuera
+  del rango se descartan; el ancho de banda aparece en la fórmula que publica el manifiesto.
+- Tests del bucle: `init_from` toma los pesos y deja el optimizador a cero, con su propia carpeta,
+  su propio contador y su propio run; con `lr = 0` el afinado _es_ el checkpoint del que partió;
+  `init_from` y `--resume` a la vez son una contradicción y se rechazan.
+
+### Lab 4 · LoRA escrita a mano
+
+**Objetivo:** un adaptador que sea LoRA de verdad, y las pruebas que lo demuestran.
+
+`src/rukh/models/lora.py` está entero en la lección 3, y sus ocho tests con él. Este lab es el
+script que comprueba las cuatro afirmaciones del método sin necesitar ningún checkpoint: se
+construye su propio decoder de juguete.
+
+```python title="labs/m4/lora_check.py"
+"""Check that the LoRA written by hand is LoRA, including against `peft`.
+
+Lab 4 and Lab 5 of M4, in one script and with no checkpoint: it builds its own toy decoder.
+
+Four claims, in order of how easy they are to get wrong:
+
+1. **An untrained adapter is the identity.** `B` starts at zero, so applying LoRA changes nothing
+   until a gradient arrives. Any other initialisation moves the weights before the model has
+   learned anything, and every comparison against the base starts from a model that is already
+   different.
+2. **Only the factors train**, and there are exactly `layers x targets x 2 x r x d_model` of them.
+3. **Merging is exact.** `W + BA` folded into the weight gives the same logits as the wrapper
+   computing it on the fly. That is what lets a 1.6 MB adapter be exported, quantised and served
+   as an ordinary model.
+4. **It is the same update rule as `peft`'s.** Same base weights, same `A` copied across, same
+   optimiser, same batch: the two loss curves have to coincide step by step. If the scaling, the
+   side `A` multiplies on, or the zero initialisation of `B` differed, they would separate on the
+   first step -- and all three mistakes produce a model that trains and converges anyway.
+
+Run from the repository root:
+
+    uv run python labs/m4/lora_check.py
+
+The fourth check needs the `hf` extra (`uv sync --extra cu128 --extra hf`); without it the script
+runs the first three and says so.
+"""
+```
+
+<Src file="labs/m4/lora_check.py" tag="p4" lines="1-26" />
+
+El docstring es la mitad del valor del script, porque las cuatro afirmaciones están ordenadas por
+**lo fácil que es equivocarse** en ellas. Nadie se equivoca en que un adaptador sin entrenar es la
+identidad; equivocarse en el lado por el que multiplica `A` o en dónde vive `alpha / r` es lo normal,
+y los tres errores producen un modelo que entrena y converge igual.
+
+```python title="labs/m4/lora_check.py"
+import sys
+
+import torch
+
+from rukh.models import DecoderConfig, MoveDecoder, preset
+from rukh.models.lora import LoraConfig, apply_lora, lora_modules, merge_lora
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+TOY = DecoderConfig(vocab_size=64, n_layer=2, n_head=2, d_model=32, block=16, dropout=0.0)
+R, ALPHA, STEPS = 4, 8, 6
+
+
+def toy(seed: int = 0) -> MoveDecoder:
+    torch.manual_seed(seed)
+    return MoveDecoder(TOY)
+
+
+torch.manual_seed(99)
+x = torch.randint(1, 64, (4, 16))
+y = torch.randint(1, 64, (4, 16))
+```
+
+<Src file="labs/m4/lora_check.py" tag="p4" lines="28-49" />
+
+El decoder de juguete son 2 capas, 2 cabezas y `d_model` 32: lo bastante pequeño para que las cuatro
+comprobaciones corran en segundos y lo bastante real para que sea el mismo `MoveDecoder` del
+proyecto y no una maqueta. `toy(seed)` siembra antes de construir, que es lo que permite montar dos
+modelos con **exactamente** los mismos pesos base más adelante.
+
+```python title="labs/m4/lora_check.py"
+# --- 1. an untrained adapter is the identity ---------------------------------
+model = toy().eval()
+with torch.no_grad():
+    before = model(x)[0]
+trainable = apply_lora(model, LoraConfig(r=R, alpha=ALPHA, targets=("q", "v")))
+with torch.no_grad():
+    after = model(x)[0]
+print(f"1. identity at step 0: max |delta| = {(before - after).abs().max():.2e}")
+
+# --- 2. the parameter count is the formula -----------------------------------
+expected = TOY.n_layer * 2 * 2 * R * TOY.d_model
+by_grad = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"2. trainable: {trainable:,} == {by_grad:,} == layers*targets*2*r*d_model = {expected:,}")
+medium = preset("medium")
+real = medium.n_layer * 2 * 2 * 8 * medium.d_model
+print(f"   on `medium` with r=8: {real:,} of 115,120,128 = {100 * real / 115_120_128:.3f} %")
+print(f"   as float32: {real * 4:,} bytes = {real * 4 / 1e6:.1f} MB")
+
+# --- 3. merging is exact ------------------------------------------------------
+torch.manual_seed(7)
+with torch.no_grad():
+    for _, adapter in lora_modules(model):
+        for b in adapter.b:
+            b.normal_(std=0.05)
+    adapted = model(x)[0].clone()
+merge_lora(model)
+with torch.no_grad():
+    merged = model(x)[0]
+print(f"3. merge is exact: max |delta| = {(adapted - merged).abs().max():.2e}")
+print(f"   and no wrappers are left: {len(list(lora_modules(model)))} adapters")
+```
+
+<Src file="labs/m4/lora_check.py" tag="p4" lines="51-80" />
+
+Las tres primeras comprobaciones, cada una en cuatro líneas.
+
+La primera compara los logits antes y después de `apply_lora` y espera **cero exacto**, no «algo
+pequeño»: `B` arranca en ceros, así que la corrección es `B·A = 0` y la suma no cambia ni un bit. Si
+imprimiera `1e-8` habría que preocuparse, porque significaría que la inicialización no es cero.
+
+La segunda no se conforma con contar: compara **tres** números que tienen que coincidir —lo que
+devuelve `apply_lora`, lo que suman los parámetros con `requires_grad`, y la fórmula— y después la
+aplica sobre el `medium` de verdad para imprimir el 0,34 % y los 1,6 MB que la lección cita. Un
+recuento que sale de la fórmula y un recuento que sale del modelo son dos medidas independientes de
+la misma cosa.
+
+La tercera es la que autoriza a publicar un adaptador. Llena las `B` con ruido —si se dejaran en
+cero, fundir sería trivialmente exacto y la comprobación no diría nada—, guarda los logits del
+modelo envuelto, funde, y compara. `1.19e-07` sobre el juguete es la precisión de `float32` y no un
+error. La segunda línea comprueba lo otro que hace falta para publicar: que después de fundir no
+queda ningún envoltorio, o sea que el modelo es indistinguible de uno afinado entero.
+
+### Lab 5 · La envoltura HF y la prueba contra `peft`
+
+**Objetivo:** que el decoder entre en el ecosistema sin dejar de ser el decoder, y usarlo para
+comprobar el laboratorio anterior.
+
+`src/rukh/models/hf.py` y `tests/unit/test_hf_wrapper.py` están en la lección 5. La cuarta
+comprobación del script anterior es la que cierra los dos labs:
+
+```python title="labs/m4/lora_check.py"
+# --- 4. the same update rule as `peft` ---------------------------------------
+try:
+    import peft
+
+    from rukh.models.hf import RukhForCausalLM
+except ImportError as exc:
+    print(f"4. skipped: needs the `hf` extra ({exc})")
+    raise SystemExit(0) from None
+
+ours = toy()
+apply_lora(ours, LoraConfig(r=R, alpha=ALPHA, targets=("attn_out",)))
+theirs = peft.get_peft_model(
+    RukhForCausalLM.from_decoder(toy()),
+    peft.LoraConfig(
+        r=R, lora_alpha=ALPHA, lora_dropout=0.0, bias="none", target_modules=["attn.proj"]
+    ),
+)
+
+# `attn.proj` and not `q`/`v`: `peft` cannot express a per-slice adapter on a fused `qkv`, so over
+# there `target_modules=["qkv"]` would be ONE A/B pair of 2304 rows against our one per slice.
+# Different parameterisations; comparing them would measure that difference, not the code.
+ours_by_layer = dict(lora_modules(ours))
+with torch.no_grad():
+    for name, module in theirs.named_modules():
+        if "default" not in getattr(module, "lora_A", {}):
+            continue
+        key = name.replace("base_model.model.decoder.", "").replace(".base_layer", "")
+        module.lora_A["default"].weight.copy_(ours_by_layer[key].a[0])
+
+mine = torch.optim.SGD([p for p in ours.parameters() if p.requires_grad], lr=0.5)
+yours = torch.optim.SGD([p for p in theirs.parameters() if p.requires_grad], lr=0.5)
+print("4. step   ours          peft          |delta|")
+for step in range(STEPS):
+    mine.zero_grad()
+    a = ours(x, y)[1]
+    a.backward()
+    mine.step()
+
+    yours.zero_grad()
+    b = theirs(x, labels=y).loss
+    b.backward()
+    yours.step()
+    print(f"   {step:>4d}   {a.item():.8f}    {b.item():.8f}    {abs(a.item() - b.item()):.2e}")
+```
+
+<Src file="labs/m4/lora_check.py" tag="p4" lines="82-124" />
+
+El `try/import` que abre el bloque es deliberado: `peft` y `transformers` viven en el extra `hf` y
+el resto del proyecto no los necesita, así que el script **no falla** cuando no están, dice que se
+salta la cuarta y sale con código cero. Un lab que exige un extra opcional para imprimir tres
+comprobaciones que no lo necesitan es un lab que la gente deja de ejecutar.
+
+Después hay tres decisiones en trece líneas.
+
+`toy()` se llama **dos veces con la misma semilla**, una para cada lado, en vez de compartir el
+objeto: `peft.get_peft_model` envuelve y modifica el modelo que recibe, y compartirlo mediría la
+comparación contra sí misma.
+
+La `A` se copia de nuestro lado al suyo. Sin eso la comparación mediría dos sorteos de
+`kaiming_uniform_` distintos, que se separan en el primer paso por una razón que no tiene nada que
+ver con la corrección del código. `B` no hace falta copiarla porque es cero en los dos lados por
+construcción, y ese hecho es justamente la primera afirmación del lab.
+
+Y el objetivo es `attn_out` y no `q`/`v`, por lo que dice el comentario: `peft` no puede expresar un
+adaptador por rodaja sobre una `qkv` fusionada. Pedirle `target_modules=["qkv"]` da **una** pareja
+`A`/`B` de 2304 filas donde nosotros damos una por rodaja. Son parametrizaciones distintas, y
+compararlas mediría esa diferencia en vez de medir el código.
+
+```bash title="Terminal"
+uv sync --extra cu128 --extra hf --group dev
+uv run pytest -m unit -q tests/unit/test_lora.py tests/unit/test_hf_wrapper.py
+uv run python labs/m4/lora_check.py
+```
+
+Salida en la máquina de referencia (RTX 5090), el cuarto bloque del script:
+
+```text
+4. step   ours          peft          |delta|
+      0   4.17093372    4.17093372    0.00e+00
+      1   4.16829062    4.16829062    0.00e+00
+      2   4.16558743    4.16558743    0.00e+00
+      3   4.16275978    4.16275978    0.00e+00
+      4   4.15973043    4.15973043    0.00e+00
+      5   4.15640736    4.15640736    0.00e+00
+```
+
+**Idénticas hasta el último bit**, seis pasos seguidos. Eso es lo que convierte «implementamos
+LoRA» en una afirmación comprobable en vez de en la palabra del autor.
+
+### Lab 6 · ¿Faltan partidas o no hay diferencia?
+
+**Objetivo:** no volver a pagar una noche de Stockfish sin saber antes si serviría de algo.
+
+Dos intervalos solapados se leen igual en el informe y pueden significar cosas opuestas. La escalera
+no mide Elo directamente: mide una **tasa de puntos** —victorias más medio empate, entre partidas—
+y el Elo es una transformación de ella. Una tasa es una proporción, y las proporciones tienen una
+fórmula para esto:
+
+```python title="labs/m4/games_needed.py"
+"""How many games each pair of conditions would need before its intervals stop overlapping.
+
+Lab 6 of M4. The sweep of this milestone leaves `1500 < 2000 < 2400` unproven, and there are two
+very different reasons a comparison can come out unproven: too few games, or no difference to
+find. Telling them apart is arithmetic, not opinion.
+
+The ladder plays `n` games per condition and scores them, so the score is a proportion and its
+standard error is `sqrt(p (1 - p) / n)`. Two 95 % intervals stop touching when the gap between
+the scores is wider than `1.96 * (se1 + se2)`, which for two proportions near a half means
+
+    n  >  3.84 / (delta p)^2
+
+per condition. Put the measured gap in and the answer comes out in games. A pair that needs two
+hundred is a pair worth re-running; a pair that needs twenty thousand is a pair where the honest
+conclusion is that the difference is not there, and no amount of machine time will change it.
+
+Run from the repository root, on the sweep's own file:
+
+    uv run python labs/m4/games_needed.py
+    uv run python labs/m4/games_needed.py --only 1500,2000,2400
+
+``--only`` keeps just the conditions it names, in the order they are given, which is how the
+acceptance criterion of this project is read: it asks about `<w1500>`, `<w2000>` and `<w2400>`
+and about no other pair.
+"""
+```
+
+<Src file="labs/m4/games_needed.py" tag="p4" lines="1-25" />
+
+La derivación entera está en el docstring, y eso es a propósito: la fórmula `n > 3,84 / (Δp)²` es
+trivial de aplicar y muy fácil de aplicar mal, y quien la lea dentro de un año necesita saber de
+dónde sale el 3,84 (es `1,96²`) y para qué régimen vale (proporciones cerca de la mitad, que es
+donde está una escalera bien calibrada).
+
+```python title="labs/m4/games_needed.py"
+import argparse
+import json
+import math
+import sys
+from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+Z = 1.959963985  # two-sided 95 %
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--results", default="artifacts/eval/medium-elo-elo-sweep/results.json")
+parser.add_argument("--games", type=int, default=160, help="Games per condition already played.")
+parser.add_argument("--only", default="", help="Comma-separated headers to keep, e.g. 1500,2000.")
+args = parser.parse_args()
+
+rows = json.loads(Path(args.results).read_text(encoding="utf-8"))["rows"]
+if args.only:
+    wanted = [int(value) for value in args.only.split(",")]
+    by_header = {int(row["header_elo"]): row for row in rows}
+    missing = [elo for elo in wanted if elo not in by_header]
+    if missing:
+        raise SystemExit(f"{args.results} has no condition for {missing}")
+    rows = [by_header[elo] for elo in wanted]
+if len(rows) < 2:
+    raise SystemExit(f"{args.results} has {len(rows)} condition(s); a comparison needs two")
+```
+
+<Src file="labs/m4/games_needed.py" tag="p4" lines="27-53" />
+
+`--only` no filtra: **reordena**. Construye el índice por cabecera y devuelve las filas en el orden
+en el que se pidieron, porque el criterio del hito pregunta por `<w1500>`, `<w2000>` y `<w2400>` en
+ese orden y por ningún otro par. Y una condición que se pide y no está en el fichero es un
+`SystemExit`, no una fila que falta en silencio: el error más caro de este lab sería contestar sobre
+un par distinto del que se preguntó.
+
+```python title="labs/m4/games_needed.py"
+def se(p: float, n: int) -> float:
+    return math.sqrt(max(p * (1.0 - p), 1e-12) / n)
+
+
+def needed(p1: float, p2: float) -> float:
+    """Games per condition for the two 95 % intervals to stop touching."""
+    gap = abs(p2 - p1)
+    if gap <= 0:
+        return math.inf
+    spread = math.sqrt(p1 * (1 - p1)) + math.sqrt(p2 * (1 - p2))
+    return (Z * spread / gap) ** 2
+```
+
+<Src file="labs/m4/games_needed.py" tag="p4" lines="56-66" />
+
+`max(p(1-p), 1e-12)` en `se` es la guarda de la tasa 0,000 —que este módulo produjo de verdad: Qwen
+perdió las 160 partidas— porque una proporción de cero tiene error típico cero y todo lo que se
+divida por él explota. Y `needed` devuelve `math.inf` cuando la diferencia es exactamente cero, en
+vez de dividir por cero: dos condiciones que puntúan igual no necesitan «muchas» partidas, necesitan
+infinitas, y la diferencia entre esas dos frases es la que el lab existe para enseñar.
+
+```python title="labs/m4/games_needed.py"
+print(f"{args.results}: {len(rows)} conditions, {args.games} games each\n")
+print("  pair                 score      gap   separated now   games needed each")
+for low, high in zip(rows, rows[1:], strict=False):
+    p1, p2 = low["score"], high["score"]
+    gap = p2 - p1
+    apart = (p1 + Z * se(p1, args.games)) < (p2 - Z * se(p2, args.games))
+    n = needed(p1, p2)
+    n_text = "never" if not math.isfinite(n) else f"{math.ceil(n):,}"
+    print(
+        f"  <w{low['header_elo']}> -> <w{high['header_elo']}>  "
+        f"{p1:.3f}->{p2:.3f}  {gap:+.3f}   {'yes' if apart else 'no ':<13}   {n_text}"
+    )
+
+ends = (rows[0], rows[-1])
+p1, p2 = ends[0]["score"], ends[1]["score"]
+apart = (p1 + Z * se(p1, args.games)) < (p2 - Z * se(p2, args.games))
+print(
+    f"\n  ends <w{ends[0]['header_elo']}> -> <w{ends[1]['header_elo']}>: "
+    f"{p1:.3f} -> {p2:.3f}, separated now: {'yes' if apart else 'no'}, "
+    f"needs {math.ceil(needed(p1, p2)):,} games each"
+)
+print(
+    "\na pair that needs a few hundred games is a measurement problem;\n"
+    "a pair that needs tens of thousands is a difference that is not there"
+)
+```
+
+<Src file="labs/m4/games_needed.py" tag="p4" lines="69-93" />
+
+La tabla imprime dos cosas por par y las dos hacen falta: si están separados **ahora** (con las 160
+partidas que ya se jugaron) y cuántas harían falta. Después repite el cálculo sobre los **extremos**
+del barrido, que es el par que el criterio no nombra y el único que salió separado. Las dos últimas
+líneas son el resumen que el lab quiere dejar en la cabeza, escrito en el propio script para que
+salga cada vez que se ejecuta y no solo en la lección.
+
+El barrido que produce `artifacts/eval/medium-elo-elo-sweep/results.json` es la medición cara del
+módulo: seis condiciones a unos 26 minutos cada una, y después el control sobre el modelo **sin**
+afinar en los dos extremos del eje, que es lo que impide cantar victoria (la lección 9 cuenta qué
+contestó). El código del barrido está en la lección 7.
+
+```bash title="Terminal"
+uv run rukh eval sweep --model checkpoints/medium-elo/step-3800.pt --elos 1200,1500,1800,2000,2100,2400 --config configs/eval/greedy-sweep.yaml --stage medium-elo
+uv run rukh eval sweep --model checkpoints/medium-v4/best.pt --elos 1200,2100 --config configs/eval/greedy-sweep.yaml --stage medium-v4
+uv run python labs/m4/games_needed.py --only 1500,2000,2400
+```
+
+Salida en la máquina de referencia (RTX 5090), pidiéndole solo las condiciones que nombra el
+criterio:
+
+```text
+  <w1500> -> <w2000>  0.466->0.453  -0.013   no              24,420
+  <w2000> -> <w2400>  0.453->0.569  +0.116   no                 284
+```
+
+- Comprueba que el número de la última columna baja como el **cuadrado** de la diferencia: la mitad
+  de diferencia son cuatro veces más partidas. Por eso una comparación floja es tan cara.
+- Compáralo con las 160 partidas que ya se jugaron: la fila de 284 estaba a una hora de máquina y la
+  de 24 420, a sesenta.
+- El mismo cálculo, al revés, dice cuánta diferencia detecta una tirada: con 160 partidas por
+  condición no se ve nada por debajo de 0,155 de tasa, que son unos **110 puntos de Elo**. Ese es el
+  instrumento, y conviene saber qué no puede ver antes de concluir que no hay nada.
+
+<Callout kind="teoria" title="El resultado negativo hay que ganárselo">
+  «No sale» no es una conclusión mientras no se sepa si el experimento podía verlo. Esta es la
+  diferencia entre decir «el condicionamiento no da fuerza» y decir «el condicionamiento no da
+  fuerza, y con este instrumento habría visto cualquier efecto mayor de 110 Elo». Lo segundo es una
+  medida; lo primero es una impresión con formato de tabla.
+</Callout>
+
+### Lab 7 · Estilo con adaptadores
+
+**Objetivo:** dos adaptadores que cambien algo que se vea, y medir qué cuesta.
+
+El eje de estilo es la primera jugada de las blancas. Es la elección más aburrida posible y es la
+correcta: se ve en la demo. Cargas un adaptador y el modelo abre `1. e4`; cargas el otro y abre
+`1. d4`. Un adaptador que moviera algo real pero invisible sería mejor aprendizaje automático y peor
+enseñanza.
+
+`src/rukh/data/style.py` y las configuraciones de los cortes están en la lección 4; el exportador
+con los factores como entradas del grafo, en la lección 6.
+
+```bash title="Terminal"
+uv run rukh data style --config configs/data/pipeline-style.yaml
+uv run rukh data tokenize --config configs/data/pipeline-style-e4.yaml --scheme uci --pack
+uv run rukh data tokenize --config configs/data/pipeline-style-d4.yaml --scheme uci --pack
+uv run rukh train --config configs/train/lora-e4.yaml
+uv run rukh train --config configs/train/lora-d4.yaml
+```
+
+Cada adaptador son 1 500 pasos y unos **siete minutos**, y deja `adapter.safetensors` con
+`adapter_config.json` al lado de sus checkpoints fundidos.
+
+- Tests: la rebanada de primera jugada solo contiene partidas que empiezan por ella; el prefijo
+  no se cuela en otra jugada; los prefijos de ECO seleccionan familias; el suelo de Elo filtra;
+  el tope limita; el manifiesto registra el predicado que una card publicada tendrá que citar; y
+  una comilla en un campo no puede salirse del predicado.
+- El entrenamiento reutiliza el bucle del decoder con `lora:` en la config. Los checkpoints
+  guardan los pesos **fundidos** —para que el exportador y el publicador no se enteren de que
+  hubo LoRA— y el adaptador se escribe al lado como su propio fichero pequeño.
+- Un adaptador no se puede reanudar con `--resume`: sus checkpoints llevan pesos fundidos, que
+  ya no dicen dónde acababa el adaptador. El bucle lo rechaza diciéndolo.
+
+<AdapterSwap />
+
+Y aquí el cuarto script, que es el que comprueba la afirmación central de LoRA con una línea de
+álgebra en vez de con una metáfora.
+
+```python title="labs/m4/lora_spectrum.py"
+"""How many directions a rank-8 adapter really moves, measured with an SVD.
+
+The figure of M4's LoRA section, and the check labs 4 and 5 lean on. "The correction has to pass
+through eight dimensions" is easy to write and easy to believe without checking.
+The check is one line of linear algebra: the singular values of
+``delta W = (alpha / r) B A`` are the lengths of the directions that correction can push along, and
+there are exactly ``r`` of them that are not zero. Next to the singular values of ``W`` itself --
+seven hundred and sixty-eight of them, all non-zero -- the picture is the whole method.
+
+Run from the repository root:
+
+    uv run python labs/m4/lora_spectrum.py --adapter checkpoints/lora-e4-20260920-160133
+"""
+```
+
+<Src file="labs/m4/lora_spectrum.py" tag="p4" lines="1-13" />
+
+«La corrección tiene que caber por ocho dimensiones» es fácil de escribir y fácil de creer sin
+comprobar. Los valores singulares de una matriz son las longitudes de las direcciones por las que
+puede empujar, y los de `(alpha/r)·B·A` son exactamente `r` distintos de cero por construcción: si
+salieran nueve, lo que se ha entrenado no es un adaptador de rango ocho.
+
+```python title="labs/m4/lora_spectrum.py"
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import torch
+
+from rukh.models.lora import load_adapter, lora_modules
+from rukh.train import load_model
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--ckpt", default="checkpoints/medium-v4-20260919-174623/best.pt", type=Path)
+parser.add_argument("--adapter", default="checkpoints/lora-e4-20260920-160133", type=Path)
+parser.add_argument("--layer", default=0, type=int, help="Block to read the matrices from.")
+parser.add_argument("--keep", default=24, type=int, help="Singular values to write out.")
+parser.add_argument("--out", default="artifacts/web/lora-spectrum.json", type=Path)
+args = parser.parse_args()
+
+model = load_model(args.ckpt)[0].eval()
+cfg = load_adapter(model, args.adapter / "adapter.safetensors")
+adapters = dict(lora_modules(model))
+name = f"blocks.{args.layer}.attn.qkv"
+adapter = adapters[name]
+
+# The query slice of the fused projection: the first `d_model` output rows.
+start, stop = adapter.slices[0]
+with torch.no_grad():
+    base = adapter.base.weight[start:stop].float()
+    delta = (cfg.scale * (adapter.b[0].float() @ adapter.a[0].float())).float()
+    base_sv = torch.linalg.svdvals(base)
+    delta_sv = torch.linalg.svdvals(delta)
+```
+
+<Src file="labs/m4/lora_spectrum.py" tag="p4" lines="15-48" />
+
+`load_adapter` devuelve la configuración del adaptador, no solo carga los pesos, y eso es lo que
+permite que el script imprima el `r`, el `alpha` y el `scale` **leídos del fichero** en vez de
+repetir los que uno cree que usó. `adapter.slices[0]` es la rodaja de la consulta dentro de la
+proyección fusionada, y ahí está la razón de que la comparación sea justa: se comparan `W[start:stop]`
+y su propia corrección, la misma submatriz en los dos lados. Y todo se sube a `float()` antes del
+SVD porque `torch.linalg.svdvals` en `float16` devolvería ceros donde hay valores de 1e-7, que es
+justo el número que decide si el noveno valor singular es cero de verdad.
+
+```python title="labs/m4/lora_spectrum.py"
+nonzero = int((delta_sv > delta_sv.max() * 1e-6).sum())
+print(f"{name} query slice: W is {tuple(base.shape)}, delta W is {tuple(delta.shape)}")
+print(f"  r = {cfg.r}, alpha = {cfg.alpha}, scale = {cfg.scale}")
+print(
+    f"  non-zero singular values: W {int((base_sv > base_sv.max() * 1e-6).sum())}, "
+    f"delta W {nonzero}"
+)
+print(f"  ||delta W||_F / ||W||_F = {torch.linalg.norm(delta) / torch.linalg.norm(base):.4f}")
+print("  first singular values of delta W:", [round(float(v), 4) for v in delta_sv[: cfg.r + 2]])
+```
+
+<Src file="labs/m4/lora_spectrum.py" tag="p4" lines="50-58" />
+
+«Distinto de cero» necesita un umbral, y el umbral es **relativo**: `> max · 1e-6`. Un absoluto
+elegido a ojo daría respuestas distintas según la escala de la matriz, y la escala de un adaptador
+entrenado no se conoce de antemano. Se imprimen `r + 2` valores y no `r` por la misma razón por la
+que un test comprueba el caso de al lado: el interés está en el noveno.
+
+```python title="labs/m4/lora_spectrum.py"
+payload = {
+    "adapter": args.adapter.name,
+    "module": name,
+    "r": cfg.r,
+    "alpha": cfg.alpha,
+    "scale": cfg.scale,
+    "shape": list(base.shape),
+    "nonzero_delta": nonzero,
+    "relative_norm": float(torch.linalg.norm(delta) / torch.linalg.norm(base)),
+    "base": [float(v) for v in base_sv[: args.keep]],
+    "delta": [float(v) for v in delta_sv[: args.keep]],
+}
+args.out.parent.mkdir(parents=True, exist_ok=True)
+args.out.write_text(json.dumps(payload, indent=1) + "\n", encoding="utf-8", newline="\n")
+print(f"\nwrote {args.out}")
+```
+
+<Src file="labs/m4/lora_spectrum.py" tag="p4" lines="60-74" />
+
+El JSON es lo que dibuja la figura de la lección 1, y lleva dentro `r`, `alpha`, `scale` y el módulo
+del que salió: una figura que no puede decir de qué adaptador es no es una medición, es un adorno.
+
+```bash title="Terminal"
+uv run python labs/m4/lora_spectrum.py --adapter checkpoints/lora-e4
+```
+
+Salida en la máquina de referencia (RTX 5090):
+
+```text
+blocks.0.attn.qkv query slice: W is (768, 768), delta W is (768, 768)
+  r = 8, alpha = 16, scale = 2.0
+  non-zero singular values: W 768, delta W 8
+  ||delta W||_F / ||W||_F = 0.0441
+  first singular values of delta W: [0.8338, 0.4277, 0.3592, 0.3211, 0.2811, 0.2302, 0.1991, 0.1774, 0.0, 0.0]
+```
+
+Ocho, y el noveno es `0.0` y no algo pequeño.
+
+```bash title="Terminal"
+uv run rukh export --ckpt checkpoints/medium-v4/best.pt --out artifacts/onnx/medium-lora --fp16 --int8 --check-parity --positions 1000 --adapter-inputs --adapter checkpoints/lora-e4
+```
+
+Unos quince minutos, y las tres comprobaciones del exportador adaptable salen en la consola con su
+número: la paridad con los factores a cero, la diferencia entre los dos adaptadores y la paridad del
+adaptador cargado en PyTorch frente al grafo sobre mil posiciones. La lección 6 muestra el código y
+explica por qué el `alpha / r` viaja dentro del fichero del adaptador y no dentro del grafo.
+
+### Lab 8 · Qwen3 con QLoRA, por el mismo harness
+
+**Objetivo:** que el modelo general y el propio se midan con el mismo metro, y que lo único
+distinto entre ellos sea la representación.
+
+`src/rukh/data/pgn_text.py` está en la lección 4; `src/rukh/train/qwen.py`, `eval/qwen_source.py` y
+`eval/qwen_suite.py`, en la lección 5. Las mismas partidas, escritas como las leería un humano:
+
+```text
+[WhiteElo "2015"] [BlackElo "2028"]
+1. e4 c6 2. d4 d5 3. exd5 cxd5 4. Bd3 Nf6 5. h3 Nc6 6. c3 e5 ... 1-0
+```
+
+```bash title="Terminal"
+uv run rukh data pgn-text --config configs/data/pipeline-pgn.yaml
+uv run rukh train qwen --config configs/train/qwen3-pgn.yaml
+uv run rukh eval qwen --adapter checkpoints/qwen3-pgn-qlora --config configs/eval/greedy.yaml --stage qwen3-pgn-qlora
+```
+
+El afinado descarga Qwen3-0.6B del Hub la primera vez (1,5 GB) y corre 1 500 pasos; la evaluación
+por la misma escalera tarda unos 40 minutos, más que la del decoder, porque cada jugada es una
+generación de texto. Si `bitsandbytes` no carga, la corrida cae a bf16 y lo escribe en su `run.json`.
+
+- El presupuesto se elige **generoso con Qwen**, no justo con nosotros: `r = 16` sobre las cuatro
+  proyecciones de atención (el doble del rango que usan nuestros adaptadores) y 1 500 pasos de
+  hasta 24 M de tokens de ajedrez, para un modelo que ya sabe hablar. Si aun así pierde por mucho,
+  nadie puede decir que se le dejó sin comer.
+- Cuatro bits se **intenta** y no se exige. Fingir que se demostró QLoRA cuando la cuantización no
+  se usó sería peor que no intentarlo.
+- El rescate de una jugada ilegal **no vuelve a preguntarle al modelo**. Insistir hasta que conteste
+  algo legal mediría un modelo distinto del que describe la tasa de legalidad.
+
+### Lab 9 · Publicar y encender el selector
+
+**Objetivo:** que lo medido salga del disco, y que la demo no prometa más de lo que se midió.
+
+Un adaptador no es un modelo y su repositorio no debe parecerlo. Sin pesos, sin ONNX, sin
+vocabulario: tres ficheros, y una card que empieza por el modelo base y por el comando que lo
+carga, porque sin el checkpoint base exacto el adaptador es un montón de números sin modelo que
+corregir. `src/rukh/publish/adapter.py` y las dos plantillas de card están en la lección 6; el
+selector de la demo, en la lección 8.
+
+```bash title="Terminal"
+uv run rukh eval --model checkpoints/medium-elo/step-3800.pt --config configs/eval/greedy.yaml --stage medium-elo
+uv run rukh export --ckpt checkpoints/medium-elo/step-3800.pt --out artifacts/onnx/medium-elo --fp16 --int8 --check-parity
+uv run rukh publish model --ckpt checkpoints/medium-elo/step-3800.pt --repo chorcat/rukh-medium-elo --stage medium-elo --onnx artifacts/onnx/medium-elo --dry-run
+uv run rukh publish adapter --run checkpoints/lora-e4 --repo chorcat/rukh-lora-e4 --base chorcat/rukh-medium --effect artifacts/publish/effects/lora-e4.json --dry-run
+uv run rukh publish qwen --run checkpoints/qwen3-pgn-qlora --repo chorcat/rukh-qwen3-pgn-qlora --dry-run
+```
+
+Lo mismo para `medium-masters` y para `lora-d4`. Con `--dry-run` la carpeta entera queda en
+`artifacts/publish/` y la card se puede leer antes de subir nada; sin él hace falta `HF_TOKEN`.
+
+- La card publica lo que el adaptador **cambió** y lo que **costó**, que son dos tablas y no una.
+  Lo que cambió: la probabilidad que el modelo le da a `e2e4` desde la posición inicial, leída de
+  la softmax sin muestrear —59,64 % → **99,85 %**— y la entropía de la primera jugada, 1,7695 →
+  **0,0209** bits. Lo que costó: legalidad, top-1 y puzles medidos en los dos, con la misma suite y
+  la misma semilla. Un estilo que cambia la apertura es fácil; un estilo que cambia la apertura **y
+  nada más** es la afirmación que vale, y solo es una afirmación si el «nada más» está medido.
+- Publicar un adaptador con el Elo del modelo base sería publicar el número de otro, así que cuando
+  una medición no existe la card dice «no medido» en vez de tomarla prestada. Hay un test de eso.
+- El recuento de parámetros de la card es la **fórmula** sobre el modelo base real, no el tamaño
+  del fichero del test.
+- Salen cinco ficheros, no tres: los mismos factores dos veces. `adapter.safetensors` es el que lee
+  `load_adapter` en PyTorch; `web/adapter.bin` es el mismo contenido como un búfer plano de
+  `float32` con el `alpha/r` ya aplicado, que es lo que descarga el navegador, y `web/adapter.json`
+  lleva sus formas porque un búfer de números no dice nada de sí mismo. Los dos los escribe la
+  misma función a partir de los mismos tensores, así que no pueden separarse.
+
+<Callout kind="hoy" title="Tus cinco modelos, en la misma pantalla">
+  Este módulo deja una **familia**, y la demo es donde se nota. Exporta tu `medium-elo` y tu
+  `medium-masters` y cárgalos uno tras otro en «Tu propio modelo»: la misma apertura, tres veces,
+  con tu base de M2 en medio. Lo que M4 tardó cinco instrumentos en demostrar —que el afinado
+  cambia el repertorio y no la fuerza— se ve en un par de minutos de partidas.
+
+Un aviso que ahorra desconcierto: el selector **«Elo objetivo»** solo se enciende con una etapa
+condicionada, y la demo no puede saber si tu fichero lo está. Para probar el condicionamiento,
+carga `chorcat/rukh-medium-elo` desde el desplegable de etapa, que sí viene declarado; tu
+`medium-elo` propio juega en su condición por defecto. Es la diferencia entre lo que un fichero
+declara y lo que el registro de la demo sabe, y es la misma razón por la que el selector estuvo
+apagado desde P2.
+
+</Callout>
+
+### El README de los labs
+
+Los cuatro scripts vienen con su propio README, que es lo que un lector encuentra si llega al
+directorio sin pasar por el curso: qué necesita cada uno, qué imprime y qué significa lo que
+imprime.
+
+{/* prettier-ignore */}
+````md title="labs/m4/README.md"
+# M4 labs
+
+Scripts referenced by the M4 lesson (`rukh-lab`, `curso/m4/01-fine-tuning`). Run them from the
+repository root.
+
+| Script | Needs | Lesson lab |
+|---|---|---|
+| `header_histogram.py` | a packed token stream | 1 · mirar el corpus antes de culpar al modelo |
+| `lora_check.py` | nothing (check 4 needs the `hf` extra) | 4 y 5 · LoRA a mano y la prueba contra `peft` |
+| `games_needed.py` | a sweep's `results.json` | 6 · ¿faltan partidas o no hay diferencia? |
+| `lora_spectrum.py` | a checkpoint and a trained adapter | la figura de la sección de LoRA |
+
+Both are copies of the code the lesson shows, and both print the numbers the lesson quotes. If you
+edit one, edit the other.
+
+## `header_histogram.py`
+
+Counts how many times the model has seen each Elo header. The second token of every packed game
+*is* White's header, so the whole measurement is a `Counter` over `tokens[starts + 1]`.
+
+On `data/tokens-v4/uci/train` — the corpus every published model trained on — it prints:
+
+```
+data/tokens-v4/uci/train: 18,942,740 games, 1,681,069,636 tokens
+
+    <w1800>  1,570,327  #############
+    ...
+    <w2500>  5,969,302  ################################################
+    ...
+headers below <w1800>: 0 of 12 ever seen in this corpus
+```
+
+Zero of twelve. That is the whole of M4's first section: the headers below 1800 exist in the
+vocabulary, have a row in the embedding table, and never received a gradient. Run it again with
+`--tokens data/tokens-elo/uci/train` to see the corpus that fixed it.
+
+## `lora_check.py`
+
+Four claims about the hand-written LoRA, in order of how easy they are to get wrong, on a toy
+decoder it builds itself. The fourth is the one that makes the chapter honest: the same
+configuration trained with `apply_lora` and with `peft.get_peft_model`, on the same base weights
+and with the same `A` copied across, has to optimise the same number. It does, bit for bit:
+
+```
+4. step   ours          peft          |delta|
+      0   4.17093372    4.17093372    0.00e+00
+      ...
+      5   4.15640736    4.15640736    0.00e+00
+```
+
+The comparison runs on `attn.proj` and not on the query and value projections, and that is not a
+detail: `peft` cannot express what we do on a fused `qkv`. Asked for `target_modules=["qkv"]` it
+adapts all three projections with **one** `A`/`B` pair of 2304 rows, while `apply_lora` gives one
+pair per slice. Those are different parameterisations, and comparing them would measure the
+difference rather than the correctness of the code.
+````
+
+<Src file="labs/m4/README.md" tag="p4" lines="1-55" />
+
+{/* prettier-ignore */}
+````md title="labs/m4/README.md"
+## `games_needed.py`
+
+The question every overlapping interval raises, answered with arithmetic instead of machine time.
+The ladder scores a proportion, so its standard error is `sqrt(p (1 - p) / n)` and two 95 %
+intervals stop touching when the gap between the scores beats `1.96 (se1 + se2)` — about
+`n > 3.84 / (delta p)^2` games per condition for proportions near a half.
+
+On the sweep this milestone ran, with `--only 1500,2000,2400` (the conditions `GOAL.md` names):
+
+```
+  <w1500> -> <w2000>  0.466->0.453  -0.013   no              24,420
+  <w2000> -> <w2400>  0.453->0.569  +0.116   no                 284
+```
+
+Twenty-four thousand games is sixty hours of Stockfish to tighten an interval around a difference
+that is not there; two hundred and eighty-four is an hour. The two rows read the same on the
+report — "not separated" — and mean opposite things, which is the whole point of running this
+before deciding whether to re-run anything.
+
+## `lora_spectrum.py`
+
+"The correction has to pass through eight dimensions" is easy to write and easy to believe without
+checking. The check is one line of linear algebra: the singular values of `W` and of
+`delta W = (alpha / r) B A` for the same matrix.
+
+On the published `lora-e4`, over the query slice of `blocks.0.attn.qkv`:
+
+```
+  r = 8, alpha = 16, scale = 2.0
+  non-zero singular values: W 768, delta W 8
+  ||delta W||_F / ||W||_F = 0.0441
+  first singular values of delta W: [0.8338, 0.4277, 0.3592, 0.3211, 0.2811, 0.2302, 0.1991, 0.1774, 0.0, 0.0]
+```
+
+Eight, and the ninth is `0.0` rather than something small. It writes
+`artifacts/web/lora-spectrum.json`, which is what the lesson's `LoraSpectrum` figure draws.
+````
+
+<Src file="labs/m4/README.md" tag="p4" lines="57-92" />
+
+La tabla de arriba es la que hay que mirar antes de ejecutar nada: los dos labs que no necesitan
+nada (`lora_check.py` y, con cualquier flujo empaquetado, `header_histogram.py`) son los que más
+enseñan, y los dos que necesitan un checkpoint o un barrido se pueden leer sin ejecutarlos porque el
+README pega su salida real.
+
+<Callout kind="roto" title="Un README que se quedó a medias de una edición">
+  Fíjate en la frase que sigue a la tabla: «Both are copies of the code the lesson shows». Eran dos
+  scripts cuando se escribió y ahora son cuatro, y la frase se quedó en singular plural de dos. No
+  es un error que rompa nada y por eso está todavía ahí, que es exactamente cómo envejece la
+  documentación: lo que no tiene test se desincroniza y nadie lo nota. La regla no es «escribe menos
+  documentación», es «pon la que se pueda comprobar donde algo la compruebe» — y por eso los números
+  que este README cita salen de la salida real de los scripts y no de la memoria de quien lo editó.
+</Callout>
+
+## Qué has aprendido, cómo se mide
+
+Primero los números, una fila por etapa, tal y como los cita este módulo (la fila de `medium-elo`
+es la condición `<w1800>` del barrido, que comparte suite con las otras cinco; su Elo canónico,
+1558, sale de otra tirada y no se mezcla):
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla de métricas por etapa">
+
+| Etapa                     |               Elo (IC 95 %) |   legal |  top-1 | puzles | entropía 1.ª a `<w1800>` |
+| ------------------------- | --------------------------: | ------: | -----: | -----: | -----------------------: |
+| `medium-v4` (base)        |            1504 (1446–1558) |  99,8 % | 54,4 % | 37,5 % |              1,7695 bits |
+| `medium-elo` (`<w1800>`)  |            1498 (1435–1552) | 99,80 % | 54,1 % | 38,2 % |                   1,7408 |
+| `medium-masters`          |            1583 (1525–1641) |       — | 54,9 % | 38,0 % |                   1,8850 |
+| `medium-v4` + `lora-e4`   |                   no medido | 99,80 % | 54,7 % | 37,8 % |                   0,0209 |
+| `qwen3-pgn-qlora` (0,6 B) | < 807 (160 derrotas de 160) | 62,50 % | 12,5 % |  0,9 % |                        — |
+
+</div>
+
+Ninguna columna de fuerza separa su intervalo del de la base; todas las de comportamiento se
+mueven. Eso es el módulo, y estas seis frases son cómo se llegó:
+
+- **El corpus antes que el modelo.** Los doce tokens de Elo por debajo de 1800 nunca habían
+  recibido un gradiente porque `min_elo: 1800` filtraba a **los dos** jugadores. **Medido** con un
+  `Counter` sobre el segundo token de cada partida empaquetada: 18 942 740 partidas, **0 de 12**
+  cabeceras vistas alguna vez. No hacía falta ni cargar el modelo, y es el primer sitio donde mirar
+  la próxima vez que una condición «no funcione».
+- **El eje dejó de ser ruido, y se ve sin jugar una partida.** La entropía analítica de la primera
+  jugada pasa a ser **monótona en las seis condiciones** (1,596 → 1,992 bits) donde el modelo viejo
+  tenía un escalón de **1,17 bits** justo en el corte de los datos, con el signo del ruido: menos
+  decidido por debajo del suelo que en cualquier cabecera que conocía. Por encima de 1800 los dos
+  modelos coinciden: no hubo olvido catastrófico.
+- **El criterio 1 del hito no se cumple, y está medido por qué.** Entre `<w1500>` y `<w2000>`
+  la diferencia de tasa es **−0,013** y harían falta **24 420 partidas** por condición: no faltan
+  partidas, no hay diferencia. El control sobre el modelo **sin** afinar recorre 161 de los 219
+  puntos del eje con cabeceras que nunca entrenó, el mismo montaje medido dos veces se mueve 60
+  puntos (1498 y 1558, 1,18 σ), y con 160 partidas el instrumento no ve nada por debajo de unos
+  110 Elo. Tres herramientas —partidas necesarias, corrida de control, suelo de reproducibilidad— y
+  las tres se reutilizan.
+- **La explicación obvia se comprobó y salió que no.** Muestrear la cola a temperatura 1,0 en vez
+  de jugar la moda ensancha la brecha (219 → 270) pero ensancha más los intervalos (123 → 195):
+  el cociente baja de 1,78 a 1,38 y en tasa la diferencia pasa de 4,40 σ a 3,85 σ. El muestreo
+  cuesta unos 400 Elo y saca al modelo del rango de la escalera. La cabecera mueve el estilo, no la
+  fuerza táctica, y ya se sabe por qué: predecir el siguiente token nunca premia calcular mejor.
+- **LoRA escrita a mano es LoRA, y 393 216 números cambian una decisión sin costar nada.** La
+  misma configuración con `apply_lora` y con `peft` optimiza el mismo número seis pasos seguidos
+  con diferencia **cero**; `lora-e4` sube `1. e4` del 59,64 % al **99,85 %** y deja legalidad,
+  top-1 y puzles donde estaban, con **199 líneas distintas** en 200 auto-partidas (fijó la primera
+  jugada y no tocó las once siguientes). Con `A` y `B` como **entradas del grafo**, cambiar de
+  estilo en el navegador cuesta 1,6 MB y no 221, y el E2E lo comprueba pidiendo un solo `.onnx`.
+- **La representación es la mitad del resultado.** Un Qwen3 de 600 M afinado con las mismas
+  partidas pierde 160 de 160: un tercio de sus respuestas son jugadas bien escritas que la posición
+  no permite y tres de cada cien no son jugadas, dos errores que el decoder no puede cometer. Y el
+  afinado de maestros enseña el reverso: estrechar el corpus ensancha el repertorio arriba
+  (1,7695 → 1,8850 bits) y borra el eje entre `<w2100>` y `<w2400>` (0,010 bits contra 0,107).
+
+Lo siguiente es M5, donde el modelo deja de imitar y empieza a **preferir**: un modelo de
+recompensa, pares de jugadas puntuadas por el motor, DPO y GRPO. Es también donde se ataca lo que
+este módulo no pudo: la fuerza táctica no sale de la cabecera, y la pregunta de M5 es de dónde sí.
+La envoltura `PreTrainedModel` que has construido aquí es lo que deja esa puerta abierta: con ella,
+`DPOTrainer` y `GRPOTrainer` funcionan sobre tu decoder. M5 terminó escribiendo los dos a mano —una
+completación de una sola jugada colapsa las dos pérdidas a unas pocas líneas— pero esa fue una
+elección, y las elecciones necesitan que las dos opciones existan.
+
+<RepoTag tag="p4" at="final" module="M4" />
+
+La cheatsheet del módulo, con su pregunta y su respuesta corta, está justo debajo.

@@ -224,7 +224,7 @@ export const labRoutes: Record<string, LabRoute[]> = {
       skip: 'rukh pull encoder-mmm-v4 y rukh pull encoder-v4',
     },
   ],
-  'm4/03-labs-de-afinado': [
+  'm4/10-labs-de-afinado': [
     {
       lab: 'Lab 1',
       what: 'Mirar el corpus antes de culpar al modelo',

@@ -1,0 +1,1293 @@
+---
+title: 'Estilo y texto PGN: los dos cortes del corpus'
+description:
+  'data/style.py entero —los cortes por primera jugada con campos tipados en vez de SQL en un
+  YAML— y data/pgn_text.py —las mismas partidas escritas como las lee un humano, con el SAN
+  reconstruido desde la raíz y un prompt que nunca acaba en espacio—, más los tests que sostienen
+  las dos afirmaciones y las cuatro configuraciones que los usan.'
+module: m4
+order: 4
+duration: 175
+runtime: 20
+level: medio
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - estilo
+  - adaptador
+  - SAN
+  - PGN
+  - DuckDB
+  - inyección SQL
+artifacts:
+  - kind: adapter
+    label: chorcat/rukh-lora-e4
+  - kind: adapter
+    label: chorcat/rukh-lora-d4
+---
+
+Lección 4 de 10 del módulo «Fine-tuning e instrucción». Viene de «LoRA escrita a mano» y sigue en
+«QLoRA con `transformers`».
+
+## Qué vas a construir
+
+Dos módulos de datos que no se parecen en nada y comparten una propiedad: los dos cortan el mismo
+corpus de una manera que hace comparable lo que sale.
+
+`src/rukh/data/style.py` saca las partidas que empiezan por una jugada concreta, que es lo que un
+adaptador de estilo aprende a sonar. `src/rukh/data/pgn_text.py` escribe esas mismas partidas como
+las leería un humano —`1. e4 e5 2. Nf3`— para que un modelo general pueda afinarse con ellas y
+entrar en el mismo harness que el decoder.
+
+Trescientas sesenta líneas entre los dos, y en cada uno hay una decisión que decide si la medición
+posterior significa algo: el suelo de Elo del corte de estilo, y el espacio que el prompt de PGN no
+lleva al final.
+
+## `style.py`: cortar sin escribir SQL en un YAML
+
+```python title="src/rukh/data/style.py"
+"""Style slices of the corpus: the games one LoRA adapter is meant to sound like.
+
+An adapter is only interesting if you can *see* it work, and the cheapest visible axis in this
+data is the opening. A model whose adapter was trained on games that begin ``1. e4`` opens with
+``1. e4``; swap the adapter and it opens ``1. d4``. That is two megabytes changing the behaviour
+of a 115 M model, in front of the reader, with a number behind it (the share of first moves) and
+a cost that can be measured (the Elo of the adapted model against the base).
+
+The slice is defined by **typed fields**, not by a SQL string in the YAML. A predicate written in
+a config file is an injection waiting to happen and, worse, it is undocumented: nobody reading
+`configs/` would know that `eco` is a column or what shape it has. `first_move` and `eco_prefix`
+say what they select, and the manifest records them, so a published adapter can state exactly
+which games made it.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+from pydantic import Field, model_validator
+
+from rukh.config import BaseConfig
+from rukh.data.db import DuckDbConfig, connect
+from rukh.data.manifest import FileHash, Manifest
+from rukh.data.uci import month_dirs, sha256_file
+from rukh.paths import resolve
+
+log = logging.getLogger(__name__)
+
+__all__ = ["StyleConfig", "StyleSpec", "build_styles", "predicate_of"]
+```
+
+<Src file="src/rukh/data/style.py" tag="p4" lines="1-31" />
+
+El docstring tiene dos mitades y las dos son decisiones del curso tanto como del proyecto.
+
+La primera: el eje de estilo es la **apertura** porque es el eje visible más barato que hay en estos
+datos. Un adaptador solo es interesante si se le puede **ver** funcionar, y aquí se ve: cargas uno y
+el modelo abre `1. e4`; cargas el otro y abre `1. d4`. Con un número detrás (la proporción de
+primeras jugadas) y un coste medible (el Elo del modelo adaptado frente a la base). Un adaptador que
+moviera algo real pero invisible sería mejor aprendizaje automático y peor enseñanza.
+
+La segunda: el corte se define con **campos tipados** y no con una cadena de SQL en el YAML. Un
+predicado escrito en una configuración es una inyección esperando a ocurrir y, peor, no está
+documentado: nadie que lea `configs/` sabría que `eco` es una columna ni qué forma tiene.
+
+El `__all__` de cuatro nombres al final del bloque es la superficie del módulo: dos configuraciones,
+la función que corta y la que construye el predicado. Que `predicate_of` sea pública es lo que
+permite que un test compruebe el SQL sin escribir un parquet.
+
+```python title="src/rukh/data/style.py"
+class StyleSpec(BaseConfig):
+    """One adapter's worth of games."""
+
+    name: str = Field(min_length=1, pattern=r"^[a-z0-9-]+$")
+    first_move: str | None = None
+    """UCI of White's first move, e.g. ``e2e4``. Matched on the prefix of the ``uci`` column."""
+    eco_prefix: list[str] = []
+    """ECO codes the game may have, by prefix: ``["B2", "B3"]`` is most of the Sicilian."""
+    min_elo: int | None = None
+    """Both players at least this strong, so a style adapter is not also a weakness adapter."""
+    n_games: int = Field(default=200_000, ge=1)
+
+    @model_validator(mode="after")
+    def _check(self) -> StyleSpec:
+        if self.first_move is None and not self.eco_prefix:
+            raise ValueError(f"style {self.name!r} selects nothing: give first_move or eco_prefix")
+        if self.first_move is not None and len(self.first_move) not in (4, 5):
+            raise ValueError(f"first_move {self.first_move!r} is not a UCI move")
+        return self
+
+
+class StyleConfig(BaseConfig):
+    """Where the games come from and which slices to cut out of them."""
+
+    sources: list[str] = ["data/uci"]
+    out_dir: str = "data/style"
+    seed: int = 42
+    styles: list[StyleSpec] = []
+    duckdb: DuckDbConfig = Field(default_factory=DuckDbConfig)
+
+    @model_validator(mode="after")
+    def _check(self) -> StyleConfig:
+        names = [style.name for style in self.styles]
+        if len(names) != len(set(names)):
+            raise ValueError(f"duplicate style names: {names}")
+        return self
+```
+
+<Src file="src/rukh/data/style.py" tag="p4" lines="34-69" />
+
+Cuatro campos por estilo, y el validador que impide el error que cuesta una hora: **un estilo que no
+selecciona nada**. Sin `first_move` ni `eco_prefix`, el predicado sale vacío, el `WHERE` se queda
+colgando y —según cómo se construya la consulta— o revienta el SQL o selecciona el corpus entero.
+Las dos formas de fallar son peores que el `ValueError`.
+
+`min_elo` no es decorativo, y su docstring lo dice en una línea: si las partidas de `1. d4` vinieran
+de jugadores más flojos, «el adaptador cambió la apertura» y «el adaptador lo empeoró» serían la
+misma medición y no habría manera de separarlas después.
+
+El `pattern=r"^[a-z0-9-]+$"` del nombre está porque el nombre acaba siendo un nombre de fichero
+(`e4.parquet`) y un nombre de corrida. Un estilo llamado `../../etc` no es una inyección de SQL pero
+sí es una ruta.
+
+Y el validador de `StyleConfig` rechaza nombres duplicados: dos estilos con el mismo nombre se
+escribirían encima el uno del otro y el segundo ganaría en silencio.
+
+```python title="src/rukh/data/style.py"
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def predicate_of(spec: StyleSpec) -> str:
+    """The WHERE clause of one style, built from its typed fields and nothing else."""
+    parts: list[str] = []
+    if spec.first_move is not None:
+        # `uci` is space-separated moves, so the first one is everything up to the first space.
+        parts.append(f"split_part(uci, ' ', 1) = {_sql_string(spec.first_move)}")
+    if spec.eco_prefix:
+        matches = " OR ".join(
+            f"eco LIKE {_sql_string(prefix + '%')}" for prefix in sorted(spec.eco_prefix)
+        )
+        parts.append(f"({matches})")
+    if spec.min_elo is not None:
+        parts.append(f"white_elo >= {int(spec.min_elo)} AND black_elo >= {int(spec.min_elo)}")
+    return " AND ".join(parts)
+```
+
+<Src file="src/rukh/data/style.py" tag="p4" lines="72-89" />
+
+Dieciocho líneas que son todo el lenguaje de consulta que esta configuración puede expresar. Tres
+condiciones posibles, unidas por `AND`, y ninguna manera de escribir una cuarta desde un fichero.
+
+`split_part(uci, ' ', 1) = 'e2e4'` y no `uci LIKE 'e2e4%'`: la columna `uci` son jugadas separadas
+por espacios, así que comparar el **primer token** es exacto mientras que el prefijo colaría
+`e2e4e...` si alguna vez existiera una jugada de cinco caracteres que empezara igual. Hay un test
+que lo comprueba desde el otro lado, con `d2d4` y `d2d3`.
+
+`sorted(spec.eco_prefix)` antes de unir los `OR` no cambia lo que selecciona y sí cambia el
+predicado que el manifiesto guarda: dos configuraciones con los mismos prefijos en distinto orden
+producen el mismo texto, y por tanto el mismo corpus reproducible.
+
+`_sql_string` escapa las comillas duplicándolas. Es el mecanismo de siempre y aquí es la **red de
+seguridad**, no la defensa: la defensa es que los campos sean tipados. Un test comprueba que una
+comilla en un prefijo de ECO no se sale del literal.
+
+```python title="src/rukh/data/style.py"
+def build_styles(cfg: StyleConfig) -> dict[str, Manifest]:
+    """Write one parquet per style under ``out_dir`` and return their manifests."""
+    if not cfg.styles:
+        raise ValueError("no styles configured")
+    months: list[tuple[str, Path]] = []
+    for source in cfg.sources:
+        found = month_dirs(resolve(source))
+        if not found:
+            raise FileNotFoundError(f"no games under {resolve(source)}")
+        months.extend(found)
+    files = ", ".join(f"'{path.as_posix()}'" for _, path in months)
+    out_dir = resolve(cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    manifests: dict[str, Manifest] = {}
+    con = connect(cfg.duckdb)
+    try:
+        for spec in cfg.styles:
+            target = out_dir / f"{spec.name}.parquet"
+            where = predicate_of(spec)
+            log.info("style %s: %s", spec.name, where)
+            con.execute(
+                f"""
+                COPY (
+                  SELECT * FROM read_parquet([{files}], hive_partitioning = false,
+                                             union_by_name = true)
+                  WHERE {where}
+                  ORDER BY hash(game_id) + {cfg.seed}
+                  LIMIT {int(spec.n_games)}
+                ) TO '{target.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                """
+            )
+            row = con.execute(
+                f"SELECT count(*) FROM read_parquet('{target.as_posix()}')"
+            ).fetchone()
+            count = int(row[0]) if row else 0
+            manifests[spec.name] = Manifest(
+                dataset="Lichess/standard-chess-games",
+                months=sorted({month for month, _ in months}),
+                filters={
+                    "style": spec.model_dump(mode="json"),
+                    "sources": list(cfg.sources),
+                    "predicate": where,
+                    "seed": cfg.seed,
+                },
+                counts={spec.name: count},
+                files=[
+                    FileHash(
+                        path=target.name,
+                        sha256=sha256_file(target),
+                        bytes=target.stat().st_size,
+                    )
+                ],
+            )
+            (out_dir / f"{spec.name}.manifest.json").write_text(
+                manifests[spec.name].model_dump_json(indent=2) + "\n", "utf-8"
+            )
+    finally:
+        con.close()
+    return manifests
+```
+
+<Src file="src/rukh/data/style.py" tag="p4" lines="92-151" />
+
+Sesenta líneas, un `COPY` por estilo, y tres cosas que merecen nombre.
+
+`ORDER BY hash(game_id) + seed` con `LIMIT` es el mismo muestreo determinista de `elo_bins`: la
+misma semilla da el mismo corte, y no hay que cargar las partidas en memoria para elegirlas. Un
+`LIMIT` sin `ORDER BY` daría las primeras del fichero, que en un parquet ordenado por mes son las
+del principio del mes.
+
+El `log.info` con el predicado es lo que permite leer en el log **qué se seleccionó** en vez de
+deducirlo del recuento. Es el mismo predicado que va al manifiesto, y es el que una card publicada
+tendrá que citar.
+
+Y el manifiesto guarda tres cosas en `filters`: la especificación tal cual, el predicado ya
+construido y la semilla. Con eso, una card puede decir «entrenado con las 200 000 partidas de
+`data/uci` que cumplen `split_part(uci, ' ', 1) = 'e2e4' AND white_elo >= 1800 AND black_elo >=
+1800`», que es una afirmación comprobable en vez de «entrenado con partidas de `1. e4`».
+
+### Los tests del corte
+
+```python title="tests/unit/test_style.py"
+"""Tests for rukh.data.style: the game slices a LoRA adapter is trained to sound like."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import polars as pl
+import pydantic
+import pytest
+
+from rukh.data.style import StyleConfig, StyleSpec, build_styles, predicate_of
+
+pytestmark = pytest.mark.unit
+
+
+def _stage(rukh_home: Path) -> None:
+    """One month with three openings and two rating levels, all replayable."""
+    rows = [
+        ("e2e4 e7e5 g1f3", "C40", 2000),
+        ("e2e4 c7c5 g1f3", "B20", 2100),
+        ("e2e4 e7e6 d2d4", "C00", 1850),
+        ("d2d4 d7d5 c2c4", "D06", 2000),
+        ("d2d4 g8f6 c2c4", "E00", 1900),
+        ("c2c4 e7e5", "A20", 2200),
+    ]
+    frame = pl.DataFrame(
+        {
+            "game_id": list(range(len(rows))),
+            "uci": [uci for uci, _, _ in rows],
+            "n_plies": [len(uci.split()) for uci, _, _ in rows],
+            "white_elo": [elo for _, _, elo in rows],
+            "black_elo": [elo for _, _, elo in rows],
+            "result": ["1-0"] * len(rows),
+            "time_control": ["300+0"] * len(rows),
+            "eco": [eco for _, eco, _ in rows],
+            "month": ["2025-01"] * len(rows),
+        }
+    )
+    target = rukh_home / "data" / "uci" / "year=2025" / "month=01" / "games.parquet"
+    target.parent.mkdir(parents=True)
+    frame.write_parquet(target.as_posix())
+
+
+def _read(rukh_home: Path, name: str) -> pl.DataFrame:
+    return pl.read_parquet((rukh_home / "data" / "style" / f"{name}.parquet").as_posix())
+```
+
+<Src file="tests/unit/test_style.py" tag="p4" lines="1-45" />
+
+El montaje es un mes de seis partidas escritas a mano, con tres aperturas y dos niveles de fuerza.
+Seis filas bastan porque lo que se comprueba son **predicados**, no estadística: un corte que deja
+fuera la partida de 1850 con `min_elo=1900` está bien o está mal, y no hace falta un corpus para
+verlo.
+
+Fíjate en que las seis partidas son jugables de verdad y llevan su `eco`: el esquema del parquet
+tiene que ser el mismo que el del corpus real, o el test comprobaría una consulta contra otra tabla.
+
+```python title="tests/unit/test_style.py"
+def test_the_first_move_slice_only_holds_games_that_open_with_it(rukh_home: Path) -> None:
+    """The axis the demo shows: swap the adapter, the model opens differently."""
+    _stage(rukh_home)
+    manifests = build_styles(
+        StyleConfig(styles=[StyleSpec(name="e4", first_move="e2e4", n_games=10)])
+    )
+    frame = _read(rukh_home, "e4")
+    assert frame.height == 3
+    assert all(uci.startswith("e2e4 ") for uci in frame["uci"])
+    assert manifests["e4"].counts == {"e4": 3}
+
+
+def test_a_first_move_prefix_does_not_leak_into_another_move(rukh_home: Path) -> None:
+    """`d2d4` must not also collect `d2d4` games that began `d2d3`; the match is on the token."""
+    _stage(rukh_home)
+    build_styles(StyleConfig(styles=[StyleSpec(name="d4", first_move="d2d4", n_games=10)]))
+    frame = _read(rukh_home, "d4")
+    assert sorted(frame["eco"].to_list()) == ["D06", "E00"]
+
+
+def test_eco_prefixes_select_a_family_of_openings(rukh_home: Path) -> None:
+    _stage(rukh_home)
+    build_styles(StyleConfig(styles=[StyleSpec(name="sicilian", eco_prefix=["B2"], n_games=10)]))
+    assert _read(rukh_home, "sicilian")["eco"].to_list() == ["B20"]
+
+
+def test_a_rating_floor_keeps_a_style_adapter_from_being_a_weakness_adapter(
+    rukh_home: Path,
+) -> None:
+    _stage(rukh_home)
+    build_styles(
+        StyleConfig(styles=[StyleSpec(name="e4", first_move="e2e4", min_elo=1900, n_games=10)])
+    )
+    assert _read(rukh_home, "e4").height == 2  # the 1850 game is out
+
+
+def test_the_cap_limits_how_many_games_a_style_gets(rukh_home: Path) -> None:
+    _stage(rukh_home)
+    manifests = build_styles(
+        StyleConfig(styles=[StyleSpec(name="e4", first_move="e2e4", n_games=2)])
+    )
+    assert manifests["e4"].counts == {"e4": 2}
+
+
+def test_the_manifest_records_the_predicate_a_published_adapter_has_to_state(
+    rukh_home: Path,
+) -> None:
+    _stage(rukh_home)
+    manifests = build_styles(
+        StyleConfig(styles=[StyleSpec(name="e4", first_move="e2e4", n_games=10)])
+    )
+    filters = manifests["e4"].filters
+    assert "split_part(uci, ' ', 1) = 'e2e4'" in str(filters["predicate"])
+    assert filters["style"]["first_move"] == "e2e4"  # type: ignore[index]
+```
+
+<Src file="tests/unit/test_style.py" tag="p4" lines="48-101" />
+
+Seis tests, uno por decisión del predicado.
+
+El primero es el eje que enseña la demo. El segundo es el que evita el fallo del prefijo: `d2d4` no
+debe recoger partidas que empezaron `d2d3`, y la aserción se escribe sobre los ECO porque eso hace
+visible **qué** partidas entraron, no solo cuántas.
+
+El del suelo de Elo comprueba la frase del docstring: con `min_elo=1900` la partida de 1850 se queda
+fuera, y con ella se va la confusión entre estilo y debilidad.
+
+Y el del manifiesto comprueba que el predicado que se guarda es el que una card publicada tendrá que
+citar, literalmente, con la cadena dentro.
+
+```python title="tests/unit/test_style.py"
+def test_several_styles_are_cut_in_one_pass(rukh_home: Path) -> None:
+    _stage(rukh_home)
+    manifests = build_styles(
+        StyleConfig(
+            styles=[
+                StyleSpec(name="e4", first_move="e2e4", n_games=10),
+                StyleSpec(name="d4", first_move="d2d4", n_games=10),
+            ]
+        )
+    )
+    assert set(manifests) == {"e4", "d4"}
+    assert (rukh_home / "data" / "style" / "d4.manifest.json").is_file()
+
+
+def test_the_slice_is_deterministic_for_a_seed(rukh_home: Path) -> None:
+    _stage(rukh_home)
+    spec = StyleSpec(name="e4", first_move="e2e4", n_games=2)
+    build_styles(StyleConfig(styles=[spec], seed=1))
+    first = _read(rukh_home, "e4")
+    build_styles(StyleConfig(styles=[spec], seed=1))
+    assert _read(rukh_home, "e4").equals(first)
+
+
+def test_a_style_that_selects_nothing_is_refused() -> None:
+    with pytest.raises(pydantic.ValidationError, match="selects nothing"):
+        StyleSpec(name="empty")
+
+
+def test_a_first_move_that_is_not_a_uci_move_is_refused() -> None:
+    with pytest.raises(pydantic.ValidationError, match="not a UCI move"):
+        StyleSpec(name="bad", first_move="e4")
+
+
+def test_duplicate_style_names_are_refused() -> None:
+    with pytest.raises(pydantic.ValidationError, match="duplicate style names"):
+        StyleConfig(
+            styles=[
+                StyleSpec(name="e4", first_move="e2e4"),
+                StyleSpec(name="e4", first_move="d2d4"),
+            ]
+        )
+
+
+def test_a_quote_in_a_field_cannot_break_out_of_the_predicate() -> None:
+    """Typed fields are the reason the config cannot carry SQL; the escaping is the backstop."""
+    spec = StyleSpec(name="odd", eco_prefix=["B'2"])
+    assert "'B''2%'" in predicate_of(spec)
+
+
+def test_no_styles_is_refused(rukh_home: Path) -> None:
+    with pytest.raises(ValueError, match="no styles configured"):
+        build_styles(StyleConfig())
+```
+
+<Src file="tests/unit/test_style.py" tag="p4" lines="104-155" />
+
+Y los siete que cierran los bordes: varios estilos en una pasada, el determinismo por semilla, las
+tres validaciones de configuración, el corte vacío, y el de la comilla.
+
+El de la comilla vale la pena leerlo dos veces. `eco_prefix=["B'2"]` no es algo que nadie vaya a
+escribir; es la forma de comprobar que, **si** alguien lo escribe, la comilla se duplica y el
+literal no se rompe. El docstring del test dice exactamente qué defiende qué: los campos tipados son
+la razón de que la configuración no pueda llevar SQL, y el escapado es el respaldo.
+
+<Transfer
+  concept="Un lenguaje de consulta pequeño en vez de uno grande"
+  where="Filtros en la URL de una API, reglas de alerta en un fichero de configuración, permisos por recurso."
+>
+  La tentación, cuando un filtro se queda corto, es dejar pasar una expresión del lenguaje de abajo:
+  una cadena de SQL, un fragmento de regex, un trozo de Python en un `eval`. Es rápido de escribir y
+  caro de todo lo demás: no se puede validar, no se puede documentar, no se puede cambiar de motor y
+  no se puede publicar en un manifiesto sin publicar además cómo funciona el motor. Tres campos
+  tipados cubren el 95 % de los casos y el 5 % restante se resuelve añadiendo un cuarto campo, que
+  es el momento de pararse a pensar si de verdad hace falta.
+</Transfer>
+
+## Las configuraciones de los cortes
+
+{/* prettier-ignore */}
+```yaml title="configs/data/pipeline-style.yaml"
+# The two style slices the LoRA adapters of M4 are trained on, and their token packs.
+#
+# The axis is White's first move, for one reason above the others: it is *visible*. A reader can
+# load the demo, pick an adapter and watch the model open `1. e4`, then pick the other and watch
+# it open `1. d4`. An adapter that shifted something real but invisible would be a better piece of
+# machine learning and a worse piece of teaching.
+#
+# `min_elo: 1800` on both sides so a style adapter is not secretly a weakness adapter: if the
+# `1. d4` games came from weaker players, "the adapter changed the opening" and "the adapter made
+# it worse" would be the same measurement.
+duckdb:
+  memory_limit: 32GB
+  threads: 0
+style:
+  sources: [data/uci]
+  out_dir: data/style
+  seed: 42
+  styles:
+    - name: e4
+      first_move: e2e4
+      min_elo: 1800
+      n_games: 200000
+    - name: d4
+      first_move: d2d4
+      min_elo: 1800
+      n_games: 200000
+```
+
+<Src file="configs/data/pipeline-style.yaml" tag="p4" lines="1-26" />
+
+Los dos estilos en una sola pasada sobre el corpus, con los campos tipados de la sección anterior.
+Los diez primeros comentarios son las dos decisiones que ya conoces —la apertura como eje visible, el
+suelo de Elo para que el estilo no sea debilidad— escritas donde alguien que abra el YAML las va a
+leer.
+
+Después hacen falta dos packs de tokens, uno por corte, y son el mismo fichero con dos palabras
+cambiadas:
+
+{/* prettier-ignore */}
+```yaml title="configs/data/pipeline-style-e4.yaml"
+# Token pack of the `e4` style slice, for `configs/train/lora-e4.yaml`.
+#
+# The validation split is the project's own -- the first 100 000 games of 2025-02 -- and its
+# remainder does **not** join training: an adapter trained on one opening has to be measured
+# against the same held-out games as everything else, and topping it up with a general corpus
+# would dilute the very slice that defines the style.
+tokenize:
+  uci_dir: data/uci
+  out_dir: data/tokens-style-e4
+  train_months: []
+  extra_train_parquets: ['data/style/e4.parquet']
+  val_month: '2025-02'
+  val_games: 100000
+  val_remainder_trains: false
+  stats_games: data/uci/year=2025/month=01/games.parquet
+  max_len: 200
+```
+
+<Src file="configs/data/pipeline-style-e4.yaml" tag="p4" lines="1-16" />
+
+{/* prettier-ignore */}
+```yaml title="configs/data/pipeline-style-d4.yaml"
+# Token pack of the `d4` style slice, for `configs/train/lora-d4.yaml`.
+```
+
+<Src file="configs/data/pipeline-style-d4.yaml" tag="p4" lines="1-1" />
+
+{/* prettier-ignore */}
+```yaml title="configs/data/pipeline-style-d4.yaml"
+  out_dir: data/tokens-style-d4
+  train_months: []
+  extra_train_parquets: ['data/style/d4.parquet']
+```
+
+<Src file="configs/data/pipeline-style-d4.yaml" tag="p4" lines="9-11" />
+
+Tres líneas de diferencia: el comentario del título, el directorio de salida y el parquet de
+entrada. `val_remainder_trains: false` está en los dos, y por la misma razón que en el corpus plano
+aunque el motivo sea distinto: un adaptador entrenado sobre una sola apertura tiene que medirse
+contra las mismas partidas reservadas que todo lo demás, y rellenarle el entrenamiento con un corpus
+general diluiría justo la rebanada que define el estilo.
+
+```bash title="Terminal"
+uv run rukh data style --config configs/data/pipeline-style.yaml
+uv run rukh data tokenize --config configs/data/pipeline-style-e4.yaml --scheme uci --pack
+uv run rukh data tokenize --config configs/data/pipeline-style-d4.yaml --scheme uci --pack
+```
+
+## `pgn_text.py`: las mismas partidas, en otro idioma
+
+```python title="src/rukh/data/pgn_text.py"
+"""Games as plain text, the way a general language model would be shown them.
+
+The comparison M4 owes the reader is: a 115 M decoder built for this one job against a 0.6 B
+general model fine-tuned on the same games. For that to mean anything the *data* has to be the
+same games and the *metric* has to be the same harness; only the representation may differ, and
+here it differs as much as it can. The decoder reads a fixed vocabulary where one token is one
+legal move. Qwen reads the movetext a human would paste into a chess site -- `1. e4 e5 2. Nf3` --
+tokenised into whatever pieces its BPE happens to cut it into, with nothing stopping it from
+writing `Nf9` or a sentence.
+
+Two consequences are the lesson, not an accident of the setup:
+
+- The move numbers and the SAN spelling are tokens the model has to spend capacity predicting,
+  and they carry no chess. The specialist never sees them.
+- SAN is *contextual*: `Nf3` names a different move depending on where the knights are, and a
+  legal-looking string can be illegal or ambiguous. That is why the evaluation counts moves it
+  could not parse as its own number rather than folding them into "illegal".
+
+The header keeps the two Elo tags because that is exactly what the decoder's `<wXXXX> <bXXXX>`
+tokens are, so the conditioning question can be asked of both models in their own language.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import chess
+from pydantic import Field
+
+from rukh.config import BaseConfig
+from rukh.data.manifest import FileHash, Manifest
+from rukh.data.uci import sha256_file
+from rukh.paths import resolve
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+log = logging.getLogger(__name__)
+
+TRAIN_FILE = "train.jsonl"
+VAL_FILE = "val.jsonl"
+```
+
+<Src file="src/rukh/data/pgn_text.py" tag="p4" lines="1-44" />
+
+El docstring plantea la comparación entera del módulo. Para que signifique algo, los **datos** tienen
+que ser las mismas partidas y la **métrica** el mismo harness; lo único que puede cambiar es la
+representación, y aquí cambia todo lo que puede cambiar.
+
+Las dos consecuencias que el docstring llama «la lección, no un accidente del montaje» son las que
+hay que tener delante al leer la tabla de la lección 9. Los números de jugada y la grafía
+de <Term id="san">SAN</Term> son tokens que el modelo gasta capacidad en predecir y no llevan
+ajedrez dentro; el especialista no los ve nunca. Y SAN es **contextual**: `Nf3` nombra una jugada
+distinta según dónde estén los caballos, y una cadena con pinta de legal puede ser ilegal o ambigua.
+Por eso la evaluación cuenta aparte las jugadas que no pudo interpretar en vez de meterlas en
+«ilegal».
+
+La cabecera conserva las dos etiquetas de Elo porque eso es exactamente lo que son los tokens
+`<wXXXX> <bXXXX>` del decoder: la pregunta del condicionamiento se le puede hacer a los dos modelos,
+cada uno en su idioma.
+
+Y el bloque incluye los imports, que dicen una cosa del fichero: `chess` está arriba y `polars` no.
+Este módulo se usa desde dos sitios —el constructor del corpus y el evaluador, que llama a
+`prompt_for` en cada jugada—, y el segundo no necesita `polars` para nada.
+
+```python title="src/rukh/data/pgn_text.py"
+class PgnTextConfig(BaseConfig):
+    """Which games become text, how many, and how long each one is allowed to be."""
+
+    train_games: str = "data/uci/year=2025/month=01/games.parquet"
+    val_games: str = "data/uci/year=2025/month=02/games.parquet"
+    out_dir: str = "data/pgn-text"
+    n_train: int = Field(default=100_000, ge=1)
+    n_val: int = Field(default=2_000, ge=1)
+    max_plies: int = Field(default=120, ge=2)
+    """Sixty moves a side. Past that the text runs longer than the context is worth spending."""
+    val_offset: int = Field(default=0, ge=0)
+    """Rows to skip in the validation month, so the split can avoid the evaluation pool."""
+    seed: int = 42
+```
+
+<Src file="src/rukh/data/pgn_text.py" tag="p4" lines="47-59" />
+
+`max_plies: 120` son sesenta jugadas por bando, y el comentario dice el criterio: a partir de ahí el
+texto ocupa más contexto del que vale la pena gastar. Las partidas largas se **cortan**, no se
+descartan, y la configuración de la lección 10 explica por qué: un corpus que excluye las partidas
+largas en silencio es un corpus que enseña partidas cortas.
+
+`val_offset` existe para que la validación pueda saltarse las filas sobre las que evalúa el harness.
+Es la misma familia de precaución que el conjunto reservado de siempre, aplicada a un corpus que se
+construye aparte.
+
+```python title="src/rukh/data/pgn_text.py"
+def movetext(board: chess.Board, max_plies: int | None = None) -> str:
+    """The moves played on ``board`` as SAN movetext with numbers: ``1. e4 e5 2. Nf3``.
+
+    Replayed from the board's root rather than read off the stack, because SAN depends on the
+    position it is written in: the same move is ``Nf3`` or ``Ngf3`` depending on where the other
+    knight is, and only the position at that moment knows which.
+    """
+    replay = board.root()
+    parts: list[str] = []
+    moves = list(board.move_stack)
+    if max_plies is not None:
+        moves = moves[:max_plies]
+    for move in moves:
+        if replay.turn == chess.WHITE:
+            parts.append(f"{replay.fullmove_number}.")
+        elif not parts:
+            parts.append(f"{replay.fullmove_number}...")
+        parts.append(replay.san(move))
+        replay.push(move)
+    return " ".join(parts)
+
+
+def header(white_elo: int, black_elo: int, fen: str | None = None) -> str:
+    """The PGN tags the prompt carries: the two ratings, and a FEN when the game is not a game.
+
+    The ratings are here for the same reason the decoder has `<wXXXX> <bXXXX>`: so the
+    conditioning question can be put to both models in the language each one reads.
+    """
+    tags = [f'[WhiteElo "{white_elo}"]', f'[BlackElo "{black_elo}"]']
+    if fen is not None:
+        tags.append(f'[FEN "{fen}"]')
+    return " ".join(tags)
+```
+
+<Src file="src/rukh/data/pgn_text.py" tag="p4" lines="62-93" />
+
+`movetext` vuelve a jugar la partida **desde la raíz** en vez de leer la pila de jugadas, y el
+docstring dice por qué en una frase: SAN depende de la posición en la que se escribe. La misma
+jugada es `Nf3` o `Ngf3` según dónde esté el otro caballo, y solo la posición de ese momento lo
+sabe. Hay un test con las dos posiciones.
+
+El `elif not parts` es el caso raro y necesario: una partida que empieza con las negras —lo que pasa
+cuando se parte de un FEN— necesita el marcador `17...`, porque si no el texto empezaría con una
+jugada sin número y ningún lector de PGN sabría de quién es.
+
+`header` es trivial salvo por el FEN opcional, que es la mitad de la siguiente función.
+
+```python title="src/rukh/data/pgn_text.py"
+def prompt_for(board: chess.Board, white_elo: int = 1800, black_elo: int = 1800) -> str:
+    """The text a model is asked to continue: the header, the movetext so far, and a space.
+
+    A position reached from a FEN (a puzzle) carries the FEN tag, so the model is not asked to
+    guess a history that never happened.
+    """
+    root = board.root()
+    fen = None if root.fen() == chess.STARTING_FEN else root.fen()
+    played = movetext(board)
+    line = f"{header(white_elo, black_elo, fen)}\n{played}".rstrip()
+    if board.turn == chess.WHITE:
+        line = f"{line} {board.fullmove_number}."
+    elif not played:
+        # Black to move at the very start of a FEN position needs the "17..." marker; after a
+        # white move the number is already in the text and the model only has to answer.
+        line = f"{line} {board.fullmove_number}..."
+    # Never end on a space. A BPE writes moves as " Nc6" with the space attached, so a prompt
+    # that already carries it forces the model onto the spelling it almost never saw in training.
+    return line.rstrip()
+```
+
+<Src file="src/rukh/data/pgn_text.py" tag="p4" lines="96-114" />
+
+Diecinueve líneas y dos decisiones, las dos con test.
+
+La primera: una posición que viene de un FEN —un puzle— lleva su etiqueta `[FEN ...]`, para que al
+modelo no se le pida adivinar una historia que nunca ocurrió. Un puzle no tiene partida detrás, y
+pedirle al modelo que continúe un movetext inventado es hacerle otra pregunta.
+
+La segunda está en el comentario de las dos últimas líneas y es la que más fácilmente se publica
+mal: **el prompt nunca termina en espacio**. Un BPE escribe una jugada como `" Nc6"`, con el espacio
+pegado delante; un prompt que ya lo lleva empuja al modelo hacia la grafía que casi nunca vio en
+entrenamiento. El resultado sale en la tabla como un modelo peor, cuando lo que es peor es el
+prompt.
+
+<Callout kind="roto" title="Un espacio de más es una métrica de menos">
+  Este es el error que habría invalidado la comparación del módulo sin dar ninguna señal. El modelo
+  contestaría, las respuestas serían jugadas plausibles, la tasa de legalidad bajaría unos puntos, y
+  la conclusión —«un modelo general escribe muchas jugadas ilegales»— sería exactamente la que
+  esperábamos encontrar. Un sesgo que confirma lo que buscabas es el que menos se investiga. La
+  defensa aquí es un test de cuatro líneas que recorre los cinco prefijos de una partida y comprueba
+  que ninguno acaba en espacio.
+</Callout>
+
+```python title="src/rukh/data/pgn_text.py"
+def game_text(uci: str, white_elo: int, black_elo: int, result: str, max_plies: int) -> str | None:
+    """One whole game as the training sample: header, movetext, result. None if it will not replay.
+
+    A game that does not replay is dropped rather than repaired: the UCI corpus was validated
+    with python-chess in P1, so anything that fails here is a bug worth seeing in the counts and
+    not a row worth guessing at.
+    """
+    board = chess.Board()
+    try:
+        for index, token in enumerate(uci.split()):
+            if index >= max_plies:
+                break
+            board.push(chess.Move.from_uci(token))
+    except (ValueError, AssertionError):
+        return None
+    if not board.move_stack:
+        return None
+    body = movetext(board)
+    return f"{header(white_elo, black_elo)}\n{body} {result}"
+```
+
+<Src file="src/rukh/data/pgn_text.py" tag="p4" lines="117-135" />
+
+Una partida entera como muestra de entrenamiento: cabecera, movetext y resultado. Y una política que
+el docstring hace explícita: una partida que no se puede volver a jugar se **descarta**, no se
+repara. El corpus UCI se validó con python-chess en M1, así que cualquier cosa que falle aquí es un
+fallo que merece verse en los recuentos y no una fila que merezca adivinarse.
+
+El `except (ValueError, AssertionError)` captura las dos maneras en que python-chess protesta ante
+una jugada imposible, y el `if not board.move_stack` descarta la partida vacía, que es la otra forma
+de tener cero información.
+
+```python title="src/rukh/data/pgn_text.py"
+def _rows(path: Path, limit: int, offset: int = 0) -> Iterator[dict[str, object]]:
+    import polars as pl
+
+    frame = (
+        pl.scan_parquet(path.as_posix())
+        .select(["uci", "white_elo", "black_elo", "result"])
+        .slice(offset, limit)
+        .collect()
+    )
+    yield from frame.rows(named=True)
+
+
+def _write_split(
+    source: Path, target: Path, limit: int, max_plies: int, offset: int = 0
+) -> tuple[int, int]:
+    """Write one JSONL split; return ``(written, dropped)``."""
+    written = dropped = 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8", newline="\n") as fh:
+        for row in _rows(source, limit, offset):
+            text = game_text(
+                str(row["uci"]),
+                int(row["white_elo"] or 0),
+                int(row["black_elo"] or 0),
+                str(row["result"]),
+                max_plies,
+            )
+            if text is None:
+                dropped += 1
+                continue
+            fh.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+            written += 1
+    return written, dropped
+```
+
+<Src file="src/rukh/data/pgn_text.py" tag="p4" lines="138-170" />
+
+El `import polars` va dentro de la función por lo de siempre: es una dependencia pesada que el resto
+del módulo —`movetext`, `prompt_for`, `header`— no necesita, y esas tres se usan desde el evaluador,
+que corre en otro contexto.
+
+`_write_split` devuelve `(escritas, descartadas)`, las dos, porque el manifiesto publica las dos. Un
+corpus que dice cuántas filas tiene y no cuántas perdió por el camino esconde justo el número que
+avisaría de un problema aguas arriba.
+
+`newline="\n"` explícito al abrir el fichero: en Windows, un `\n` escrito en modo texto se convierte
+en `\r\n`, y un JSONL con retornos de carro es un JSONL que algunos lectores parten mal.
+
+```python title="src/rukh/data/pgn_text.py"
+def build(cfg: PgnTextConfig) -> Manifest:
+    """Write ``train.jsonl`` and ``val.jsonl`` plus the manifest that says what went in."""
+    out_dir = resolve(cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    train_source = resolve(cfg.train_games)
+    val_source = resolve(cfg.val_games)
+    for path in (train_source, val_source):
+        if not path.is_file():
+            raise FileNotFoundError(f"games not found at {path}")
+    train_written, train_dropped = _write_split(
+        train_source, out_dir / TRAIN_FILE, cfg.n_train, cfg.max_plies
+    )
+    val_written, val_dropped = _write_split(
+        val_source, out_dir / VAL_FILE, cfg.n_val, cfg.max_plies, cfg.val_offset
+    )
+    log.info("wrote %s train and %s val samples", train_written, val_written)
+    files = [
+        FileHash(
+            path=name, sha256=sha256_file(out_dir / name), bytes=(out_dir / name).stat().st_size
+        )
+        for name in (TRAIN_FILE, VAL_FILE)
+    ]
+    manifest = Manifest(
+        dataset="rukh-pgn-text",
+        months=[],
+        filters={
+            "train_games": cfg.train_games,
+            "val_games": cfg.val_games,
+            "max_plies": cfg.max_plies,
+            "val_offset": cfg.val_offset,
+            "dropped": {"train": train_dropped, "val": val_dropped},
+        },
+        counts={"train": train_written, "val": val_written},
+        files=files,
+    )
+    (out_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2) + "\n", "utf-8")
+    return manifest
+```
+
+<Src file="src/rukh/data/pgn_text.py" tag="p4" lines="173-209" />
+
+La comprobación de que los dos parquet existen se hace **antes** de escribir nada, y el mensaje dice
+dónde se buscó. Es medio minuto de escribir y ahorra la variante en la que el split de entrenamiento
+se escribe entero y la corrida muere al llegar al de validación.
+
+`filters["dropped"]` lleva los dos recuentos de descartes dentro del manifiesto, y no en el log: un
+log se pierde, un manifiesto viaja con los datos.
+
+### Los tests del formato
+
+```python title="tests/unit/test_pgn_text.py"
+"""Tests for rukh.data.pgn_text: the same games, spelled the way a general LLM reads them."""
+
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+
+import chess
+import polars as pl
+import pytest
+
+from rukh.data.pgn_text import PgnTextConfig, build, game_text, movetext, prompt_for
+
+pytestmark = pytest.mark.unit
+
+RUY_LOPEZ = ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]
+
+
+def _board(moves: list[str]) -> chess.Board:
+    board = chess.Board()
+    for uci in moves:
+        board.push(chess.Move.from_uci(uci))
+    return board
+
+
+def test_movetext_is_numbered_san() -> None:
+    assert movetext(_board(RUY_LOPEZ)) == "1. e4 e5 2. Nf3 Nc6 3. Bb5"
+
+
+def test_san_is_disambiguated_by_the_position_it_is_written_in() -> None:
+    """The whole reason the movetext is replayed instead of read off the move stack.
+
+    With both knights able to reach the square, the same move is `Nbd2`, not `Nd2`; only the
+    position at that moment knows which letter is needed.
+    """
+    board = _board(["g1f3", "d7d5", "d2d4", "g8f6", "b1d2"])
+    assert movetext(board).endswith("Nbd2")
+```
+
+<Src file="tests/unit/test_pgn_text.py" tag="p4" lines="1-38" />
+
+La Española de cinco plies como partida de prueba, y el test que justifica la decisión de diseño más
+cara del módulo: con los dos caballos capaces de llegar a la casilla, la jugada es `Nbd2` y no
+`Nd2`. Leer la pila de jugadas daría la grafía sin desambiguar, y el corpus enseñaría a escribir SAN
+ambiguo.
+
+```python title="tests/unit/test_pgn_text.py"
+def test_a_game_carries_its_ratings_and_its_result() -> None:
+    text = game_text(" ".join(RUY_LOPEZ), 1800, 1900, "1-0", 120)
+    assert text is not None
+    assert text.startswith('[WhiteElo "1800"] [BlackElo "1900"]\n')
+    assert text.endswith(" 1-0")
+    assert "1. e4 e5" in text
+
+
+def test_a_game_longer_than_the_cap_is_cut_not_dropped() -> None:
+    text = game_text(" ".join(RUY_LOPEZ), 1800, 1800, "1-0", 4)
+    assert text is not None
+    assert text.rstrip(" 1-0").endswith("Nc6")
+
+
+def test_an_unplayable_game_is_dropped_rather_than_repaired() -> None:
+    assert game_text("e2e4 e2e4", 1800, 1800, "1-0", 120) is None
+    assert game_text("", 1800, 1800, "1-0", 120) is None
+
+
+def test_the_prompt_never_ends_on_a_space() -> None:
+    """A BPE writes a move as " Nc6" with the space attached.
+
+    A prompt that already carries the space forces the model onto the spelling it almost never
+    saw in training, which would show up as a worse model rather than as a worse prompt.
+    """
+    for plies in range(len(RUY_LOPEZ) + 1):
+        prompt = prompt_for(_board(RUY_LOPEZ[:plies]))
+        assert prompt == prompt.rstrip()
+
+
+def test_the_prompt_ends_with_the_move_number_when_white_is_to_move() -> None:
+    assert prompt_for(_board(RUY_LOPEZ[:4])).endswith("Nc6 3.")
+
+
+def test_the_prompt_ends_after_the_white_move_when_black_is_to_move() -> None:
+    assert prompt_for(_board(RUY_LOPEZ)).endswith("3. Bb5")
+
+
+def test_a_position_from_a_fen_carries_the_fen_and_the_ellipsis() -> None:
+    """A puzzle has no history; asking the model to invent one is asking a different question."""
+    fen = "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 5 4"
+    prompt = prompt_for(chess.Board(fen), 2000, 2000)
+    assert f'[FEN "{fen}"]' in prompt
+    assert prompt.endswith("4...")
+
+
+def test_the_start_position_carries_no_fen_tag() -> None:
+    assert "FEN" not in prompt_for(chess.Board())
+
+
+def test_the_ratings_asked_for_are_the_ratings_written() -> None:
+    assert '[WhiteElo "1200"] [BlackElo "2400"]' in prompt_for(chess.Board(), 1200, 2400)
+```
+
+<Src file="tests/unit/test_pgn_text.py" tag="p4" lines="41-92" />
+
+Nueve tests sobre la forma exacta del texto, y los cuatro del prompt son los importantes.
+
+El del espacio recorre **todos** los prefijos de la partida, del vacío al completo, porque el caso
+que falla depende de a quién le toque mover y de si ya hay movetext. Comprobar uno solo dejaría tres
+caminos sin mirar.
+
+Los dos siguientes fijan la forma en las dos situaciones: con las blancas a mover, el prompt termina
+en el número (`3.`) para que el modelo solo tenga que escribir la jugada; con las negras, termina en
+la jugada blanca.
+
+Y el del FEN comprueba las dos mitades a la vez: que la etiqueta está y que el prompt acaba en
+`4...`, que es la forma de pedir una jugada de las negras sin una historia que no existe.
+
+```python title="tests/unit/test_pgn_text.py"
+def test_build_writes_both_splits_and_counts_what_it_dropped(
+    rukh_home: Path, repo_root: Path
+) -> None:
+    src = repo_root / "tests" / "fixtures" / "games.parquet"
+    for month in ("01", "02"):
+        target = rukh_home / "data" / "uci" / "year=2025" / f"month={month}" / "games.parquet"
+        target.parent.mkdir(parents=True)
+        shutil.copy(src, target)
+    rows = pl.read_parquet(src.as_posix()).height
+
+    manifest = build(PgnTextConfig(n_train=rows, n_val=3))
+    out = rukh_home / "data" / "pgn-text"
+    train = [json.loads(line) for line in (out / "train.jsonl").read_text("utf-8").splitlines()]
+    val = [json.loads(line) for line in (out / "val.jsonl").read_text("utf-8").splitlines()]
+    assert manifest.counts == {"train": len(train), "val": len(val)}
+    assert len(val) <= 3
+    assert all(set(sample) == {"text"} for sample in train)
+    assert all(sample["text"].startswith("[WhiteElo ") for sample in train)
+    assert manifest.filters["dropped"] == {"train": 0, "val": 0}
+
+
+def test_the_validation_split_can_skip_the_rows_the_harness_evaluates_on(
+    rukh_home: Path, repo_root: Path
+) -> None:
+    src = repo_root / "tests" / "fixtures" / "games.parquet"
+    for month in ("01", "02"):
+        target = rukh_home / "data" / "uci" / "year=2025" / f"month={month}" / "games.parquet"
+        target.parent.mkdir(parents=True)
+        shutil.copy(src, target)
+    plain = build(PgnTextConfig(n_train=2, n_val=2)).counts["val"]
+    out = rukh_home / "data" / "pgn-text"
+    first = (out / "val.jsonl").read_text("utf-8")
+    build(PgnTextConfig(n_train=2, n_val=2, val_offset=2))
+    assert plain == 2
+    assert (out / "val.jsonl").read_text("utf-8") != first
+
+
+def test_missing_games_say_where_they_were_looked_for(rukh_home: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="games not found"):
+        build(PgnTextConfig())
+```
+
+<Src file="tests/unit/test_pgn_text.py" tag="p4" lines="95-134" />
+
+Y los tres de integración, sobre el parquet de prueba del repositorio. El primero comprueba la forma
+del JSONL —una clave, `text`, y nada más— y que el manifiesto cuadra con lo escrito, incluidos los
+cero descartes. El segundo comprueba que `val_offset` cambia de verdad lo que sale. El tercero, que
+un fichero ausente dice dónde se buscó.
+
+{/* prettier-ignore */}
+```yaml title="configs/data/pipeline-pgn.yaml"
+# The same games as PGN text, for the general-model side of the M4 comparison.
+#
+# Training reads 2025-01 and the harness measures on 2025-02, which is the split every other run
+# in the project uses -- so Qwen is trained on the same games the decoder was and evaluated on
+# positions neither of them has seen. `val.jsonl` exists for a validation loss and is not what
+# the comparison is read from: that is `rukh eval qwen`, on the harness's own positions.
+#
+# 120 plies covers the great majority of the games whole; the longest few are cut rather than
+# dropped, because a corpus that quietly excludes long games is a corpus that teaches short ones.
+pgn_text:
+  train_games: data/uci/year=2025/month=01/games.parquet
+  val_games: data/uci/year=2025/month=02/games.parquet
+  out_dir: data/pgn-text
+  n_train: 100000
+  n_val: 2000
+  max_plies: 120
+  val_offset: 20000
+  seed: 42
+```
+
+<Src file="configs/data/pipeline-pgn.yaml" tag="p4" lines="1-18" />
+
+El reparto es el mismo que usa todo el proyecto: se entrena con 2025-01 y se mide sobre 2025-02, así
+que Qwen se entrena con las mismas partidas que el decoder y se evalúa sobre posiciones que ninguno
+de los dos ha visto. El `val.jsonl` existe para tener una pérdida de validación y **no** es de donde
+se lee la comparación: eso es `rukh eval qwen`, sobre las posiciones del propio harness.
+
+```bash title="Terminal"
+uv run rukh data pgn-text --config configs/data/pipeline-pgn.yaml
+```
+
+Una muestra de lo que escribe, con las dos etiquetas de Elo que son la cabecera del decoder dicha en
+PGN:
+
+```text
+[WhiteElo "2015"] [BlackElo "2028"]
+1. e4 c6 2. d4 d5 3. exd5 cxd5 4. Bd3 Nf6 5. h3 Nc6 6. c3 e5 ... 1-0
+```
+
+## Los dos ficheros que el hito toca de pasada
+
+```python title="src/rukh/data/pipeline.py"
+    train_months: list[str] = Field(default_factory=lambda: ["2025-01"])
+    val_month: str = "2025-02"
+    val_games: int = Field(default=0, ge=0)
+    extra_train_parquets: list[str] = Field(default_factory=list)
+    """UCI parquets appended to the training split, outside the ``year=/month=`` layout."""
+    val_remainder_trains: bool = True
+    """Whether the part of ``val_month`` that is not held out joins the training split.
+
+    Off for a corpus whose shape is the point: the Elo-balanced sample of M4 has the same number
+    of games per rating band on purpose, and 2.85 M games of rated-1800+ play poured on top would
+    undo it."""
+    """Games of ``val_month`` held out; the rest of it trains. 0 = the whole month validates."""
+```
+
+<Src file="src/rukh/data/pipeline.py" tag="p4" lines="32-43" />
+
+`TokenizeConfig` gana cuatro claves en este hito, y las cuatro se han visto ya trabajando: `train_months`
+en plural, `val_games`, `extra_train_parquets` y `val_remainder_trains`. El docstring de la última es
+el que cuenta la historia del corpus plano.
+
+<Callout kind="roto" title="Un docstring de campo que se quedó huérfano">
+  Mira la última línea del bloque: `"""Games of ``val_month`` held out; the rest of it trains. 0 =
+  the whole month validates."""` está **después** del docstring de `val_remainder_trains`, no
+  después de `val_games`, que es a quien describe. Python no se queja —es una cadena suelta, una
+  expresión sin efecto— y pydantic no la recoge, así que `val_games` se queda sin descripción en el
+  esquema y el texto no aparece en ninguna parte. Es un error real del repositorio en la etiqueta
+  `p4` y está aquí a propósito: un docstring de atributo es sintaxis por convención, no por el
+  lenguaje, y moverlo una línea lo convierte en nada sin que ninguna herramienta lo note.
+</Callout>
+
+```python title="src/rukh/data/pipeline.py"
+DUCKDB_STEPS = ("positions", "evals", "puzzles", "elo_bins", "style")
+
+
+class PipelineConfig(BaseConfig):
+    """All step configs; each step reads only its own section.
+
+    ``duckdb:`` is shared: the top-level settings are copied into every step that opens a
+    DuckDB connection unless that step declares its own.
+    """
+
+    duckdb: DuckDbConfig = Field(default_factory=DuckDbConfig)
+    uci: UciConfig = Field(default_factory=UciConfig)
+    tokenize: TokenizeConfig = Field(default_factory=TokenizeConfig)
+    positions: PositionsConfig = Field(default_factory=PositionsConfig)
+    evals: EvalsConfig = Field(default_factory=EvalsConfig)
+    puzzles: PuzzlesConfig = Field(default_factory=PuzzlesConfig)
+    pairs: PairsConfig = Field(default_factory=PairsConfig)
+    elite: EliteConfig = Field(default_factory=EliteConfig)
+    elo_bins: EloBinsConfig = Field(default_factory=EloBinsConfig)
+    style: StyleConfig = Field(default_factory=StyleConfig)
+    pgn_text: PgnTextConfig = Field(default_factory=PgnTextConfig)
+    publish: PublishConfig = Field(default_factory=PublishConfig)
+```
+
+<Src file="src/rukh/data/pipeline.py" tag="p4" lines="51-72" />
+
+Y el registro de pasos: `style` entra en `DUCKDB_STEPS` —la lista de pasos que abren una conexión y
+por tanto heredan la sección `duckdb:` común— y las dos configuraciones nuevas se cuelgan de
+`PipelineConfig`. Añadir un paso al pipeline son dos líneas, y eso es lo que permite que
+`pipeline-style.yaml` solo declare lo suyo.
+
+```python title="src/rukh/data/pairs.py"
+def build_pairs(evals: Path, min_delta_cp: int) -> pl.DataFrame:
+    """One pair per FEN, reading the evaluations parquet batch by batch."""
+    reader = pq.ParquetFile(evals)
+    rows: list[dict[str, object]] = []
+    columns = ["fen", "phase", "pvs", "game_id", "ply"]
+    for batch in reader.iter_batches(batch_size=BATCH_ROWS, columns=columns):
+        records = zip(
+            batch.column("fen").to_pylist(),
+            batch.column("phase").to_pylist(),
+            batch.column("pvs").to_pylist(),
+            batch.column("game_id").to_pylist(),
+            batch.column("ply").to_pylist(),
+            strict=True,
+        )
+        for fen, ph, pvs, game_id, ply in records:
+            pair = make_pair(fen, pvs, min_delta_cp)
+            if pair is not None:
+                pair["phase"] = ph
+                # Provenance, and the only way the decoder can use a pair at all: it reads a move
+                # sequence, not a board, so a pair is useless to it without the prefix that led
+                # there. ``game_id`` and ``ply`` are what join a pair back to its game (D-070).
+                pair["game_id"] = game_id
+                pair["ply"] = ply
+                rows.append(pair)
+    schema = {
+        "fen": pl.String,
+        "chosen": pl.String,
+        "rejected": pl.String,
+        "cp_chosen": pl.Int32,
+        "cp_rejected": pl.Int32,
+        "phase": pl.String,
+        "game_id": pl.String,
+        "ply": pl.Int32,
+    }
+    return pl.DataFrame(rows, schema=schema)
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p4" lines="95-129" />
+
+Este cambio no es de M4: es la preparación de M5 que vino en la misma etiqueta. Cada par de
+preferencia gana `game_id` y `ply`, y el comentario dice por qué es imprescindible y no una mejora
+de trazabilidad: el decoder lee una **secuencia de jugadas**, no un tablero, así que un par sin el
+prefijo que llevó hasta esa posición no le sirve de nada. `game_id` y `ply` son lo que permite unir
+un par con su partida.
+
+Lo mismo vale para `src/rukh/train/dpo.py`, que ya está en la etiqueta `p4` y pertenece a M5: se
+escribió aquí y se explica allí.
+
+## Las dos órdenes de la CLI
+
+Cada orden de `rukh` es una cáscara fina sobre la librería: parsear opciones, llamar a una función,
+imprimir. Las dos de este módulo son un buen ejemplo de qué se hace en la cáscara y qué no.
+
+```python title="src/rukh/cli.py"
+@data_app.command("pgn-text")
+def data_pgn_text(config: PipelineOption = None, as_json: JsonOption = False) -> None:
+    """Render the same games as PGN text, for the general-model comparison of M4."""
+    from rukh.data.pgn_text import PgnTextConfig, build
+    from rukh.data.pipeline import load_pipeline
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    cfg = load_pipeline(config).pgn_text if config is not None else PgnTextConfig()
+    try:
+        manifest = build(cfg)
+    except FileNotFoundError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    _echo_manifest(manifest, as_json, cfg.out_dir)
+
+
+@data_app.command("style")
+def data_style(config: PipelineOption = None, as_json: JsonOption = False) -> None:
+    """Cut one parquet per style: the games a LoRA adapter is trained to sound like."""
+    from rukh.data.pipeline import load_pipeline
+    from rukh.data.style import build_styles
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    cfg = load_pipeline(config).style
+    try:
+        manifests = build_styles(cfg)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if as_json:
+        typer.echo("[" + ", ".join(m.model_dump_json(indent=2) for m in manifests.values()) + "]")
+        return
+    typer.echo(f"out_dir:  {cfg.out_dir}")
+    typer.echo("styles:")
+    for name, manifest in manifests.items():
+        typer.echo(f"  {name}: {manifest.counts[name]:,} games")
+```
+
+<Src file="src/rukh/cli.py" tag="p4" lines="300-335" />
+
+Los `import` están **dentro** de las funciones, y eso es la regla del fichero entero: `rukh --help`
+tiene que responder sin cargar `polars`, `chess` ni `duckdb`. Con treinta órdenes, importar todo
+arriba convertiría la ayuda en dos segundos de espera.
+
+El `try/except` traduce las excepciones de la librería a un mensaje y un código de salida. Lo que se
+captura es concreto —`FileNotFoundError` y `ValueError`— y no `Exception`: un fallo que nadie previó
+tiene que salir con su traza, porque una traza es información y «error: algo pasó» no lo es.
+
+Y `data_style` imprime a mano en vez de reutilizar `_echo_manifest` porque devuelve **varios**
+manifiestos, uno por estilo. Es la única diferencia entre las dos órdenes.
+
+## Qué has aprendido
+
+Dos maneras de cortar el mismo corpus, y en cada una la decisión que hace comparable el resultado.
+En el corte de estilo, campos tipados en vez de SQL —lo que permite publicar el predicado en el
+manifiesto y en la card— y un suelo de Elo que impide confundir estilo con debilidad. En el texto
+PGN, el SAN reconstruido desde la raíz porque la grafía depende de la posición, y un prompt que no
+termina en espacio porque el BPE escribe el espacio pegado a la jugada.
+
+Se mide con los manifiestos: `data/style/e4.manifest.json` dice cuántas partidas entraron y con qué
+predicado, y `data/pgn-text/manifest.json` dice cuántas se escribieron y cuántas se descartaron.
+
+Lo siguiente es el modelo general que lee ese texto, y la envoltura que mete el decoder en el mismo
+ecosistema para poder compararlos. Sigue en «QLoRA con `transformers`».
