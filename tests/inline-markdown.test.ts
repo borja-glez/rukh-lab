@@ -1,6 +1,16 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { getCollection } from 'astro:content';
 import { inlineMarkdown } from '../src/lib/inline-markdown';
+
+/**
+ * Read the definitions off disk rather than with `getCollection`: the content store is built by
+ * `astro sync`, and CI runs the tests before any build, so the collection comes back empty there
+ * and the walk below would pass over nothing.
+ */
+const terms = JSON.parse(
+  readFileSync(resolve(__dirname, '../src/content/glossary/terms.json'), 'utf8'),
+) as { id: string; definition: string }[];
 
 describe('inlineMarkdown', () => {
   it('renders the three marks the definitions use', () => {
@@ -41,11 +51,10 @@ describe('inlineMarkdown', () => {
 });
 
 describe('the glossary as it is written', () => {
-  it('closes every backtick and every pair of asterisks', async () => {
-    const terms = await getCollection('glossary');
+  it('closes every backtick and every pair of asterisks', () => {
     expect(terms.length).toBeGreaterThan(100);
     for (const term of terms) {
-      const definition = term.data.definition;
+      const definition = term.definition;
       expect(
         [...definition].filter((char) => char === '`').length % 2,
         `${term.id}: unclosed backtick`,
@@ -54,10 +63,9 @@ describe('the glossary as it is written', () => {
     }
   });
 
-  it('renders every definition without leaving a mark behind', async () => {
-    const terms = await getCollection('glossary');
+  it('renders every definition without leaving a mark behind', () => {
     for (const term of terms) {
-      const html = inlineMarkdown(term.data.definition);
+      const html = inlineMarkdown(term.definition);
       expect(html, `${term.id}: backtick reached the page`).not.toContain('`');
       expect(html, `${term.id}: asterisk reached the page`).not.toContain('*');
     }
