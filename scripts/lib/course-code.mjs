@@ -121,9 +121,17 @@ function srcAfter(lines, from) {
   if (i >= lines.length) return null;
   const tag = /^\s*<Src\s([^>]*?)\/>\s*$/.exec(lines[i]);
   if (!tag) return null;
+  /** @type {Record<string, string>} */
   const attrs = {};
   for (const m of tag[1].matchAll(/([a-z]+)="([^"]*)"/g)) attrs[m[1]] = m[2];
-  return { ...attrs, line: i + 1 };
+  return {
+    file: attrs.file,
+    tag: attrs.tag,
+    lines: attrs.lines,
+    repo: attrs.repo,
+    note: attrs.note,
+    line: i + 1,
+  };
 }
 
 const cache = new Map();
@@ -132,7 +140,7 @@ const cache = new Map();
 export function fileAt(workspace, repo, ref, path) {
   const key = `${repo}@${ref}:${path}`;
   if (cache.has(key)) return cache.get(key);
-  let text = null;
+  let text;
   try {
     text = execFileSync('git', ['-C', resolve(workspace, repo), 'show', `${ref}:${path}`], {
       encoding: 'utf8',
@@ -160,6 +168,32 @@ export function parseRange(lines) {
   if (span) return [Number(span[1]), Number(span[2])];
   const one = /^(\d+)$/.exec(lines ?? '');
   return one ? [Number(one[1]), Number(one[1])] : null;
+}
+
+/**
+ * Where a block sits in its file when indentation is ignored, and the file's own lines for it.
+ *
+ * Prettier used to reformat the code inside a fence it recognised (`embeddedLanguageFormatting` is
+ * now `off`), and the most common damage was de-indenting a block taken from inside a function. The
+ * content was still the file's, one indent level short, which no reader would notice and the
+ * checker would reject. This finds those and hands back the real lines.
+ */
+export function findDedented(fileText, code) {
+  const haystack = normalise(fileText).split('\n');
+  const needle = normalise(code).split('\n');
+  const bare = (s) => s.trim();
+  for (let i = 0; i + needle.length <= haystack.length; i += 1) {
+    let ok = true;
+    for (let j = 0; j < needle.length; j += 1) {
+      if (bare(haystack[i + j]) !== bare(needle[j])) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok)
+      return { from: i + 1, to: i + needle.length, lines: haystack.slice(i, i + needle.length) };
+  }
+  return null;
 }
 
 /** Where a block sits in its file, so a wrong `lines=` can be corrected instead of guessed. */

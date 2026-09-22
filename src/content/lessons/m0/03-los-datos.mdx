@@ -1,0 +1,979 @@
+---
+title: 'Los datos: seis mil millones de partidas y un recorte justificado'
+description: 'Filtrar Lichess en remoto con DuckDB sobre parquet y traer solo lo que pasa el filtro. El constructor de la consulta, el plan que se puede leer antes de descargar, el manifiesto con hashes y conteos, y los tests que ejercitan el pipeline entero sin tocar la red.'
+module: m0
+order: 3
+duration: 130
+runtime: 100
+level: base
+status: vigente
+updated: 2026-09-22
+keywords:
+  - Lichess
+  - DuckDB
+  - parquet
+  - predicate pushdown
+  - manifiesto
+  - CC0
+artifacts:
+  - kind: repo
+    label: borja-glez/rukh
+    href: https://github.com/borja-glez/rukh/tree/p0
+---
+
+## Qué vas a construir
+
+El recorte de datos con el que se entrena todo el curso, y —más importante— la prueba de qué entró
+en él. Son 230 líneas de código y una consulta SQL que se puede leer **antes** de descargar nada.
+
+Lichess publica todo lo que se juega en su servidor. Los volcados mensuales, las copias en Hugging
+Face (`Lichess/standard-chess-games`, más de 6 700 millones de partidas), los seis millones de puzles
+y los casi 400 millones de posiciones evaluadas con Stockfish están bajo <Term id="cc0">CC0</Term>:
+dominio público. Es la razón por la que este curso no necesita pedir permiso a nadie.
+
+Un mes reciente ocupa unos 73 GB en <Term id="parquet">parquet</Term>. No vamos a descargarlo.
+
+## La configuración: diez líneas que son el recorte
+
+{/* prettier-ignore */}
+```yaml title="configs/data/lichess-2025-01-02.yaml"
+# Two recent months of rated standard games, filtered remotely (see docs/spec/01-datos.md).
+dataset: Lichess/standard-chess-games
+months: ["2025-01", "2025-02"]
+min_elo: 1800
+min_base_seconds: 180
+terminations: ["Normal", "Time forfeit"]
+min_plies: 20
+exclude_variants: true
+out_dir: data/raw
+limit: null
+```
+
+<Src file="configs/data/lichess-2025-01-02.yaml" tag="p0" lines="1-10" />
+
+Cada clave es una decisión que condiciona lo que el modelo va a aprender, y conviene tenerlas claras
+antes de leer el código que las aplica:
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Filtro                                     | Por qué                                                                                                                                                                        |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `min_elo: 1800` (a los dos jugadores)      | Calidad: por debajo de 1800 abundan los errores groseros y el modelo los imitaría. Los Elo de Lichess son Glicko-2; a este nivel la diferencia con Elo clásico es irrelevante. |
+| `min_base_seconds: 180`                    | `TimeControl` es `base+incremento`. Excluye bullet, donde se juega a ciegas contra el reloj. Blitz (3+0) y superiores tienen jugadas pensadas.                                 |
+| `terminations: ["Normal", "Time forfeit"]` | Excluye abandonos, desconexiones y partidas anuladas por trampas (`Rules infraction`, `Abandoned`).                                                                            |
+| `min_plies: 20`                            | Una partida de cinco jugadas no enseña nada. **No se aplica aquí**: se aplica en M1, y el código de abajo explica por qué.                                                     |
+| `exclude_variants: true`                   | Chess960, crazyhouse o atomic tienen otras reglas y romperían la <Term id="legalidad">legalidad</Term> que queremos medir.                                                     |
+| `months: ["2025-01", "2025-02"]`           | Dos meses dan entre tres y seis millones de partidas, unos 2-3 GB de texto UCI. Y el _split_ se hará **por mes**, no al azar: enero entrena, febrero valida.                   |
+
+</div>
+
+Ese último punto es el que evita la <Term id="fuga-de-datos">fuga</Term> más tonta de este dominio.
+Si se partiera al azar, las partidas de los mismos jugadores con las mismas aperturas caerían a los
+dos lados, y la validación mediría "¿reconoces a este jugador?" en vez de "¿sabes jugar?".
+
+<Callout kind="hoy" title="Así se hace hoy: filtrar en remoto, materializar poco">
+  Hace unos años el flujo era descargar el `.pgn.zst` de 30 GB, descomprimirlo y filtrar con
+  scripts. Hoy, con datos en parquet particionado y motores como <Term id="duckdb">DuckDB</Term> o
+  Polars que hablan `hf://`, el filtro viaja al fichero y solo baja lo que pasa (
+  <Term id="predicate-pushdown">predicate pushdown</Term>: pedirle al almacén que te mande solo las
+  cajas rojas, en vez de traer el camión entero a tu garaje y separarlas allí). La misma consulta
+  sirve para explorar (`LIMIT 1000`) y para producir el recorte completo.
+</Callout>
+
+## `manifest.py`: la procedencia, como un modelo
+
+Antes del código que descarga, el que registra. Treinta y tres líneas.
+
+```python title="src/rukh/data/manifest.py"
+"""Manifest written next to fetched data: what was asked for, what came back."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from rukh import __version__
+
+
+class FileHash(BaseModel):
+    """One materialized file with its content hash and size."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    bytes: int = Field(ge=0)
+
+
+class Manifest(BaseModel):
+    """Provenance record for a fetched dataset slice."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dataset: str
+    months: list[str]
+    filters: dict[str, object]
+    counts: dict[str, int]
+    files: list[FileHash]
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    rukh_version: str = __version__
+```
+
+<Src file="src/rukh/data/manifest.py" tag="p0" lines="1-33" />
+
+Los tres campos del medio hacen el trabajo, y son la diferencia entre un dataset y un dataset del que
+se puede responder.
+
+`filters` son los parámetros con los que el paso **corrió de verdad**, no los que dice el README.
+`counts` es cuántas filas salieron por mes, que es lo que convierte "descartamos las partidas cortas"
+en algo comprobable en vez de afirmado. Y `files` es un sha256 por salida, que es lo que convierte
+"el mismo dataset" en una afirmación que un test puede tumbar.
+
+Dos detalles pequeños con consecuencias:
+
+`sha256: str = Field(pattern=r"^[0-9a-f]{64}$")` valida la **forma** del hash. Parece innecesario
+—lo escribe nuestro propio código— y no lo es: el día que alguien construya un manifiesto a mano o
+lo edite para "arreglar" algo, el modelo lo rechaza. Un manifiesto con un hash inventado es peor que
+no tener manifiesto, porque miente con autoridad.
+
+`datetime.now(UTC)` y no `datetime.now()`. Una fecha sin zona horaria en un fichero que se va a
+comparar entre máquinas es una fecha que no se puede comparar.
+
+```python title="src/rukh/data/__init__.py"
+"""Data pipeline: fetch, filter and describe Lichess games."""
+```
+
+<Src file="src/rukh/data/__init__.py" tag="p0" lines="1-1" />
+
+El paquete `data` empieza con una línea. En M1 se llenará con doce módulos; aquí solo declara que
+existe.
+
+## `fetch.py`: la consulta, el plan y la descarga
+
+```python title="src/rukh/data/fetch.py"
+"""Fetch a filtered slice of ``Lichess/standard-chess-games`` with DuckDB over ``hf://``.
+
+Only the games that pass the filters are materialized locally (predicate pushdown on the
+remote parquet files). The ply count (``min_plies``) is not applied here: it is enforced in P1
+once ``movetext`` has been converted to UCI with python-chess, because counting plies from SAN
+with comments (``%clk``, ``%eval``) in SQL is unreliable. The manifest therefore records it as
+``min_plies_deferred``. Variant exclusion by ``Event`` is a coarse first pass that P1 refines.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from pathlib import Path
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from rukh import paths
+from rukh.config import BaseConfig
+from rukh.data.manifest import FileHash, Manifest
+
+MONTH_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p0" lines="1-22" />
+
+El docstring es el sitio donde vive la decisión más importante del fichero, y merece leerse como
+prosa y no como comentario: **`min_plies` no se aplica aquí**. Contar medias jugadas
+(<Term id="ply">plies</Term>) desde el `movetext` en SQL es poco fiable, porque el texto trae
+comentarios (`%clk`, `%eval`) que hay que quitar y una notación <Term id="san">SAN</Term> que hay que
+parsear. Se aplicará en M1, con `python-chess`, después de convertir a <Term id="uci">UCI</Term>. Y
+—esta es la parte que importa— el manifiesto lo dirá: el filtro se guarda como
+`min_plies_deferred`, no como `min_plies`, para que nadie lea el manifiesto y crea que ya se aplicó.
+
+Un filtro que se documenta como aplicado y no lo está es exactamente la clase de error que un
+manifiesto existe para no cometer.
+
+`MONTH_RE` valida `YYYY-MM` con los meses reales: `(0[1-9]|1[0-2])` rechaza `2025-13` y `2025-00`,
+que un `\d{2}` aceptaría.
+
+```python title="src/rukh/data/fetch.py"
+
+
+class FetchConfig(BaseConfig):
+    """What to fetch and how to filter it."""
+
+    dataset: str = "Lichess/standard-chess-games"
+    months: list[str] = Field(min_length=1)
+    min_elo: int = Field(default=1800, ge=0)
+    min_base_seconds: int = Field(default=180, ge=0)
+    terminations: list[str] = Field(default=["Normal", "Time forfeit"], min_length=1)
+    min_plies: int = Field(default=20, ge=0)
+    exclude_variants: bool = True
+    out_dir: str = "data/raw"
+    limit: int | None = Field(default=None, ge=1)
+
+    @field_validator("months")
+    @classmethod
+    def _check_months(cls, months: list[str]) -> list[str]:
+        for month in months:
+            if not MONTH_RE.match(month):
+                raise ValueError(f"month {month!r} must look like YYYY-MM")
+        return months
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p0" lines="23-44" />
+
+Hereda de `BaseConfig`, así que una clave que no esté aquí es un error. Y cada campo lleva su
+restricción: `ge=0` en los tres umbrales, `min_length=1` en las dos listas, `ge=1` en `limit`.
+
+Esas restricciones parecen defensivas y son pedagógicas: dicen qué valores tienen sentido.
+`min_length=1` en `terminations` porque una lista vacía produciría `Termination IN ()`, que es SQL
+inválido. `ge=1` en `limit` porque `LIMIT 0` no devuelve nada y casi siempre es una errata, no una
+intención. `Field(default=[...])` con una lista mutable como valor por defecto es seguro en pydantic
+—copia el valor por instancia— y sería un error clásico en una `dataclass`.
+
+El `field_validator` de `months` valida cada mes con la expresión regular. Nótese que la regex
+**también** se usa después para partir el mes en año y mes; validar y parsear con el mismo patrón
+evita que se separen.
+
+```python title="src/rukh/data/fetch.py"
+
+
+class FetchPlan(BaseModel):
+    """Everything ``run`` would do, without doing it.
+
+    ``out_dir`` is the absolute output directory; ``out_paths`` and ``manifest_path`` are
+    relative to it, in POSIX form, so plans and manifests do not leak machine paths.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    months: list[str]
+    out_dir: str
+    out_paths: list[str]
+    manifest_path: str
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p0" lines="45-60" />
+
+La existencia de este modelo es la decisión de diseño del fichero: **el plan es un objeto, no un
+efecto secundario**. `run(cfg, dry_run=True)` devuelve exactamente el mismo `FetchPlan` que
+`run(cfg, dry_run=False)` va a ejecutar, así que lo que imprime el ensayo no puede diferir de lo que
+hace la descarga. Un `--dry-run` que construye su propia descripción es un `--dry-run` que
+eventualmente miente.
+
+El detalle de las rutas relativas en POSIX está explicado en el docstring y vale para todo el
+proyecto: el manifiesto y el plan se publican, y una ruta absoluta de Windows dentro de un fichero
+que va a Hugging Face es ruido que además delata la máquina de quien lo generó.
+
+```python title="src/rukh/data/fetch.py"
+
+
+def _split_month(month: str) -> tuple[str, str]:
+    match = MONTH_RE.match(month)
+    if match is None:
+        raise ValueError(f"month {month!r} must look like YYYY-MM")
+    return match.group(1), match.group(2)
+
+
+def _source(cfg: FetchConfig, month: str) -> str:
+    year, mm = _split_month(month)
+    return f"hf://datasets/{cfg.dataset}/data/year={year}/month={mm}/*.parquet"
+
+
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p0" lines="61-76" />
+
+`_source` construye la URL `hf://`, que es el protocolo con el que DuckDB lee parquet remoto del Hub
+sin descargarlo entero. La ruta refleja el particionado del dataset: `data/year=2025/month=01/`.
+
+`_sql_string` duplica las comillas simples. Son tres líneas de higiene: los valores que se interpolan
+en la SQL vienen de una configuración, no de un usuario anónimo, pero un nombre de dataset con un
+apóstrofo rompería la consulta de una forma que cuesta diagnosticar. Y el hábito de no interpolar
+cadenas en SQL sin escaparlas conviene tenerlo también donde no hay atacante.
+
+Que `_source` sea una función y no una cadena en línea tiene un efecto que se ve en los tests: se
+puede sustituir por una que apunte a un parquet local, y con eso el pipeline entero se prueba sin
+red.
+
+```python title="src/rukh/data/fetch.py"
+
+
+def build_query(cfg: FetchConfig) -> str:
+    """Build the DuckDB SQL that selects the filtered games, one ``read_parquet`` per month.
+
+    ``TRY_CAST`` drops rows whose base time is not an integer (correspondence games export
+    ``TimeControl = '-'``). ``hive_partitioning = false`` stops DuckDB from injecting ``year``
+    and ``month`` columns from the path, which would collide with the explicit ``month`` alias.
+    """
+    conditions = [
+        f"WhiteElo >= {cfg.min_elo} AND BlackElo >= {cfg.min_elo}",
+        f"TRY_CAST(split_part(TimeControl, '+', 1) AS INTEGER) >= {cfg.min_base_seconds}",
+        "Termination IN (" + ", ".join(_sql_string(t) for t in cfg.terminations) + ")",
+    ]
+    if cfg.exclude_variants:
+        conditions.append("Event NOT ILIKE '%variant%'")
+    where = "\n    AND ".join(conditions)
+    selects = [
+        "SELECT *, "
+        + _sql_string(month)
+        + " AS month\n"
+        + f"FROM read_parquet({_sql_string(_source(cfg, month))}, hive_partitioning = false)\n"
+        + f"WHERE {where}"
+        for month in cfg.months
+    ]
+    sql = "\nUNION ALL\n".join(selects)
+    if cfg.limit is not None:
+        sql += f"\nLIMIT {cfg.limit}"
+    return sql
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p0" lines="77-105" />
+
+El constructor de la consulta, y los dos detalles del docstring son de los que cuestan una tarde
+cuando no se conocen.
+
+**`TRY_CAST` y no `CAST`.** Las partidas por correspondencia llegan con `TimeControl = '-'`. Un
+`CAST('-' AS INTEGER)` **aborta la consulta entera**: seis mil millones de filas y una que no se
+puede convertir, y no obtienes nada. Con `TRY_CAST` esa fila da `NULL`, `NULL >= 180` es falso, y la
+partida se descarta, que es justo lo que queremos. La diferencia entre las dos funciones es la
+diferencia entre un filtro y un fallo.
+
+**`hive_partitioning = false`.** DuckDB reconoce los nombres de carpeta `year=2025/month=01` de la
+ruta y, si no se lo impides, los inyecta como columnas `year` y `month`. La consulta ya añade su
+propia columna `month` con el alias (`'2025-01' AS month`), así que habría dos columnas con el mismo
+nombre: DuckDB renombra una a `month_1` y el resultado tiene un `month` que es `01` y un `month_1` que
+es `2025-01`, o al revés según la versión. Hay un test que comprueba exactamente eso, y está más
+abajo.
+
+La columna `month` se añade a mano en el `SELECT` porque el `split` del curso es por mes, y después de
+unir los dos meses con `UNION ALL` hace falta saber de cuál viene cada partida.
+
+El `LIMIT` se pone al final y es opcional. Sirve para explorar: la misma consulta con `limit: 1000`
+baja mil partidas en segundos, y es lo que se usa en M1 para mirar distribuciones antes de
+comprometerse con el recorte completo.
+
+```python title="src/rukh/data/fetch.py"
+
+
+def _out_dir(cfg: FetchConfig) -> Path:
+    out = Path(cfg.out_dir)
+    return out if out.is_absolute() else paths.root() / out
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p0" lines="106-110" />
+
+Una ruta relativa en la configuración se resuelve contra la raíz del proyecto, no contra el
+directorio desde el que lanzaste la orden. Es la razón de ser de `paths.py`: `rukh data fetch` da el
+mismo resultado desde `src/` que desde la raíz.
+
+```python title="src/rukh/data/fetch.py"
+
+
+def plan(cfg: FetchConfig) -> FetchPlan:
+    """Describe the query, months, output directory, relative output files and manifest."""
+    out_dir = _out_dir(cfg)
+    out_paths = []
+    for month in cfg.months:
+        year, mm = _split_month(month)
+        target = out_dir / f"year={year}" / f"month={mm}" / "games.parquet"
+        out_paths.append(target.relative_to(out_dir).as_posix())
+    return FetchPlan(
+        query=build_query(cfg),
+        months=list(cfg.months),
+        out_dir=out_dir.as_posix(),
+        out_paths=out_paths,
+        manifest_path=(out_dir / "manifest.json").relative_to(out_dir).as_posix(),
+    )
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p0" lines="111-127" />
+
+La salida reproduce el particionado del origen: `year=2025/month=01/games.parquet`. No es estética.
+Un directorio con ese formato lo lee DuckDB (y pandas, y polars) como una tabla particionada, así que
+M1 puede consultar los dos meses juntos o uno solo con la misma expresión.
+
+El `relative_to(out_dir).as_posix()` es lo que mantiene la promesa del `FetchPlan`: nada de rutas
+absolutas en lo que se publica.
+
+```python title="src/rukh/data/fetch.py"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p0" lines="128-135" />
+
+Por trozos de un mega (`1 << 20`) y no `path.read_bytes()`: estos parquet pesan gigabytes y leerlos
+enteros en memoria para hashearlos es innecesario. El `iter(callable, sentinel)` es el modismo de la
+biblioteca estándar para "llama a esto hasta que devuelva `b''`".
+
+```python title="src/rukh/data/fetch.py"
+
+
+def run(cfg: FetchConfig, dry_run: bool = False) -> FetchPlan:
+    """Plan the fetch and, unless ``dry_run``, execute it month by month.
+
+    With ``dry_run=True`` nothing touches the network or the disk. Otherwise each month is
+    materialized as ``<out_dir>/year=YYYY/month=MM/games.parquet`` (so ``limit`` applies per
+    month) and a ``manifest.json`` with filters, counts and file hashes is written last. The
+    manifest stores file paths relative to ``out_dir`` and ``min_plies`` as
+    ``min_plies_deferred`` because plies are only filtered in P1, after UCI conversion.
+    """
+    fetch_plan = plan(cfg)
+    if dry_run:
+        return fetch_plan
+
+    import duckdb
+
+    out_dir = Path(fetch_plan.out_dir)
+    counts: dict[str, int] = {}
+    files: list[FileHash] = []
+    con = duckdb.connect()
+    try:
+        for month, out_path in zip(cfg.months, fetch_plan.out_paths, strict=True):
+            target = out_dir / out_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            month_query = build_query(cfg.model_copy(update={"months": [month]}))
+            target_sql = _sql_string(target.as_posix())
+            con.execute(f"COPY ({month_query}) TO {target_sql} (FORMAT PARQUET)")
+            row = con.execute(
+                f"SELECT count(*) FROM read_parquet({target_sql}, hive_partitioning = false)"
+            ).fetchone()
+            counts[month] = int(row[0]) if row else 0
+            files.append(
+                FileHash(path=out_path, sha256=_sha256(target), bytes=target.stat().st_size)
+            )
+    finally:
+        con.close()
+
+    filters = cfg.model_dump(exclude={"dataset", "months", "out_dir", "min_plies"})
+    filters["min_plies_deferred"] = cfg.min_plies
+    manifest = Manifest(
+        dataset=cfg.dataset,
+        months=list(cfg.months),
+        filters=filters,
+        counts=counts,
+        files=files,
+    )
+    manifest_path = out_dir / fetch_plan.manifest_path
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    return fetch_plan
+```
+
+<Src file="src/rukh/data/fetch.py" tag="p0" lines="136-186" />
+
+La función que descarga, y seis decisiones dentro.
+
+**`if dry_run: return fetch_plan`** en la tercera línea. El ensayo no es un camino alternativo: es el
+mismo camino, cortado antes del primer efecto. Por eso no puede divergir.
+
+**Un `COPY` por mes**, no uno con la consulta entera. La consulta completa tiene el `UNION ALL` de
+todos los meses, y si se ejecutara de una vez el `limit` se aplicaría al total en vez de por mes, y
+el resultado no se podría partir por mes. Se reconstruye la consulta de cada mes con
+`cfg.model_copy(update={"months": [month]})`, que devuelve una copia del modelo con un campo
+cambiado y deja el original intacto.
+
+**`zip(..., strict=True)`.** Si `cfg.months` y `fetch_plan.out_paths` tuvieran longitudes distintas
+—porque alguien cambió `plan()` y no esto—, un `zip` normal recortaría en silencio y se descargarían
+menos meses de los pedidos. Con `strict=True` es un `ValueError`. En Python 3.10+ no hay motivo para
+escribir un `zip` sin él cuando las dos secuencias deben tener el mismo tamaño.
+
+**El conteo se lee del fichero escrito**, no del resultado del `COPY`. Es una comprobación de verdad:
+cuenta las filas que hay **en disco**, así que un `COPY` que escribiera mal daría un número
+incoherente en vez de pasar inadvertido.
+
+**El `try/finally` alrededor de la conexión.** Una excepción a mitad de un mes (la red se cae, el
+disco se llena) cierra la conexión igual. Lo que **no** hay es limpieza de ficheros a medias: si
+falla, quedan los meses ya escritos y **no** queda manifiesto. Eso es deliberado y es la propiedad
+útil: el manifiesto se escribe al final, así que su presencia significa "esto terminó". Un directorio
+con parquet y sin `manifest.json` es una descarga interrumpida, y se ve de un vistazo.
+
+**`exclude={"dataset", "months", "out_dir", "min_plies"}`** al volcar los filtros. Los tres primeros
+no son filtros (van en sus propios campos del manifiesto) y el cuarto se renombra en la línea
+siguiente. Es el código que cumple la promesa del docstring.
+
+```bash title="Terminal"
+uv run rukh data fetch --config configs/data/lichess-2025-01-02.yaml --dry-run
+```
+
+Salida real en la máquina de referencia (RTX 5090, 2026-09-18); `<repo>` es la carpeta donde hayas
+clonado `rukh`:
+
+```text
+$ uv run rukh data fetch --config configs/data/lichess-2025-01-02.yaml --dry-run
+dataset:  Lichess/standard-chess-games
+months:   2025-01, 2025-02
+mode:     dry-run (nothing written)
+query:
+  SELECT *, '2025-01' AS month
+  FROM read_parquet('hf://datasets/Lichess/standard-chess-games/data/year=2025/month=01/*.parquet', hive_partitioning = false)
+  WHERE WhiteElo >= 1800 AND BlackElo >= 1800
+      AND TRY_CAST(split_part(TimeControl, '+', 1) AS INTEGER) >= 180
+      AND Termination IN ('Normal', 'Time forfeit')
+      AND Event NOT ILIKE '%variant%'
+  UNION ALL
+  SELECT *, '2025-02' AS month
+  FROM read_parquet('hf://datasets/Lichess/standard-chess-games/data/year=2025/month=02/*.parquet', hive_partitioning = false)
+  WHERE WhiteElo >= 1800 AND BlackElo >= 1800
+      AND TRY_CAST(split_part(TimeControl, '+', 1) AS INTEGER) >= 180
+      AND Termination IN ('Normal', 'Time forfeit')
+      AND Event NOT ILIKE '%variant%'
+out_dir:  <repo>/data/raw
+outputs:
+  year=2025/month=01/games.parquet
+  year=2025/month=02/games.parquet
+manifest: manifest.json
+```
+
+Los cuatro filtros están ahí, legibles, antes de que nada se descargue. Eso es lo que hace que la
+tabla de arriba sea una afirmación comprobable y no una descripción.
+
+<Exercise n="01" title="Lee el plan antes de descargar">
+  Ejecuta el `--dry-run` y localiza en la SQL los cuatro filtros. Después copia el YAML, cambia
+  `min_elo` a `2000` y vuelve a ejecutarlo: ¿qué cambia en la consulta? ¿Qué pasa si añades una clave
+  que no existe, por ejemplo `min_rating`? ¿Y si pones `exclude_variants: false`?
+
+<Solution>
+  Con `min_elo: 2000` solo cambia la comparación de `WhiteElo` y `BlackElo`; el resto de la consulta
+  es idéntico. Una clave desconocida hace que `rukh` falle **antes de tocar la red** con un error de
+  validación de pydantic, porque `FetchConfig` hereda de `BaseConfig` y ese tiene `extra="forbid"`.
+  Con `exclude_variants: false` desaparece la línea `Event NOT ILIKE '%variant%'` entera, no se
+  queda una condición vacía: el `if` de `build_query` la añade o no la añade.
+</Solution>
+</Exercise>
+
+## Los tests: el pipeline entero, sin red
+
+`tests/unit/test_fetch.py` es el test más instructivo de M0, porque prueba de verdad un código cuyo
+trabajo es hablar con un servidor remoto, y lo hace sin red y en milisegundos.
+
+```python title="tests/unit/test_fetch.py"
+"""Tests for rukh.data.fetch: query builder, dry-run plan and local execution."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+from typer.testing import CliRunner
+
+from rukh.cli import app
+from rukh.config import load_yaml
+from rukh.data.fetch import FetchConfig, FetchPlan, build_query, plan, run
+
+pytestmark = pytest.mark.unit
+
+MONTHS = ["2025-01", "2025-02"]
+
+# Columns: Event, WhiteElo, BlackElo, TimeControl, Termination. Exactly one row passes the
+# default filters; the '-' time control is what Lichess exports for correspondence games.
+FAKE_ROWS = """
+    SELECT * FROM (VALUES
+      ('Rated Blitz game', 1900, 1850, '300+0', 'Normal'),
+      ('Rated Bullet game', 1900, 1850, '60+0', 'Normal'),
+      ('Rated Blitz game', 1500, 1850, '300+0', 'Normal'),
+      ('Rated Blitz game', 1900, 1850, '300+0', 'Abandoned'),
+      ('Rated Atomic variant game', 1900, 1850, '300+0', 'Normal'),
+      ('Rated Correspondence game', 1900, 1850, '-', 'Normal')
+    ) AS t(Event, WhiteElo, BlackElo, TimeControl, Termination)
+"""
+```
+
+<Src file="tests/unit/test_fetch.py" tag="p0" lines="1-31" />
+
+Seis filas, y cada una está ahí para caer por un filtro distinto: la primera pasa, la segunda es
+bullet, la tercera tiene un jugador por debajo de 1800, la cuarta está abandonada, la quinta es una
+variante y la sexta es la de correspondencia con `TimeControl = '-'` que reventaría un `CAST`.
+
+Ese es el patrón que merece copiarse: **un dato de prueba por rama del filtro**, con el comentario
+que dice cuántas filas deben quedar. Con seis filas se cubre lo que con seis millones no se cubriría
+mejor.
+
+```python title="tests/unit/test_fetch.py"
+
+
+def _cfg(**overrides: object) -> FetchConfig:
+    return FetchConfig(months=MONTHS, **overrides)  # type: ignore[arg-type]
+
+
+def _write_hive_source(rukh_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Write the fake rows under the real ``year=YYYY/month=MM`` layout; point ``_source`` at it."""
+    import duckdb
+
+    from rukh.data import fetch as fetch_module
+
+    source_dir = rukh_home / "source" / "year=2025" / "month=01"
+    source_dir.mkdir(parents=True)
+    duckdb.sql(FAKE_ROWS).write_parquet((source_dir / "part-0.parquet").as_posix())
+    monkeypatch.setattr(
+        fetch_module, "_source", lambda cfg, month: (source_dir / "*.parquet").as_posix()
+    )
+    return source_dir
+
+
+def _read_output(path: Path) -> tuple[list[str], list[tuple[object, ...]]]:
+    import duckdb
+
+    rel = duckdb.sql(f"SELECT * FROM read_parquet('{path.as_posix()}', hive_partitioning = false)")
+    return list(rel.columns), rel.fetchall()
+```
+
+<Src file="tests/unit/test_fetch.py" tag="p0" lines="32-57" />
+
+Aquí está la técnica. `_write_hive_source` escribe las seis filas como un parquet local **bajo la
+misma estructura de carpetas** que el dataset remoto (`year=2025/month=01/`) y sustituye `_source` por
+una función que devuelve esa ruta. A partir de ahí, `run()` ejecuta su SQL de verdad, con DuckDB de
+verdad, sobre parquet de verdad: lo único falso es de dónde sale el fichero.
+
+Que la estructura de carpetas sea la real no es un detalle: es lo que permite que el test detecte el
+problema del `hive_partitioning`, que solo aparece cuando la ruta tiene el formato `clave=valor`.
+
+```python title="tests/unit/test_fetch.py"
+
+
+def test_fetch_config_defaults_match_spec() -> None:
+    cfg = _cfg()
+    assert cfg.dataset == "Lichess/standard-chess-games"
+    assert cfg.min_elo == 1800
+    assert cfg.min_base_seconds == 180
+    assert cfg.terminations == ["Normal", "Time forfeit"]
+    assert cfg.min_plies == 20
+    assert cfg.exclude_variants is True
+    assert cfg.out_dir == "data/raw"
+    assert cfg.limit is None
+
+
+def test_fetch_config_rejects_unknown_key() -> None:
+    with pytest.raises(ValidationError):
+        FetchConfig(months=MONTHS, min_rating=1800)  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize("bad", ["2025-1", "2025/01", "202501", "2025-13", ""])
+def test_fetch_config_rejects_bad_month(bad: str) -> None:
+    with pytest.raises(ValidationError):
+        FetchConfig(months=[bad])
+
+
+def test_fetch_config_requires_at_least_one_month() -> None:
+    with pytest.raises(ValidationError):
+        FetchConfig(months=[])
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"terminations": []},
+        {"limit": 0},
+        {"min_elo": -1},
+        {"min_base_seconds": -1},
+        {"min_plies": -1},
+    ],
+    ids=["empty-terminations", "limit-zero", "negative-elo", "negative-base", "negative-plies"],
+)
+def test_fetch_config_rejects_out_of_range_values(overrides: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        FetchConfig(months=MONTHS, **overrides)  # type: ignore[arg-type]
+```
+
+<Src file="tests/unit/test_fetch.py" tag="p0" lines="58-101" />
+
+El primero fija los valores por defecto **como contrato**: cambiar `min_elo` a 1600 sin querer rompe
+un test en vez de cambiar en silencio lo que el modelo aprende. Es la clase de test que parece
+tautológico y no lo es, porque los valores por defecto de una configuración de datos son decisiones
+publicadas.
+
+`test_fetch_config_rejects_unknown_key` usa `min_rating` a propósito: es la errata plausible de
+`min_elo`, la que alguien escribiría de verdad.
+
+Los dos `parametrize` merecen fijarse en el argumento `ids`: sin él, el informe de pytest dice
+`test_fetch_config_rejects_out_of_range_values[overrides3]`; con él dice `[negative-elo]`. Cuando el
+test falle dentro de seis meses, esa palabra es la diferencia entre saber qué se rompió y tener que
+contar posiciones en una lista.
+
+```python title="tests/unit/test_fetch.py"
+
+
+def test_build_query_has_filters_and_both_months() -> None:
+    sql = build_query(_cfg())
+    for month in ("month=01", "month=02"):
+        assert f"hf://datasets/Lichess/standard-chess-games/data/year=2025/{month}/*.parquet" in sql
+    assert sql.count("read_parquet(") == 2
+    assert sql.count("hive_partitioning = false") == 2
+    assert "UNION ALL" in sql
+    assert "WhiteElo >= 1800 AND BlackElo >= 1800" in sql
+    assert "TRY_CAST(split_part(TimeControl, '+', 1) AS INTEGER) >= 180" in sql
+    assert "Termination IN ('Normal', 'Time forfeit')" in sql
+    assert "Event NOT ILIKE '%variant%'" in sql
+    assert "LIMIT" not in sql
+
+
+def test_build_query_optional_parts() -> None:
+    sql = build_query(_cfg(exclude_variants=False, limit=1000))
+    assert "ILIKE" not in sql
+    assert sql.rstrip().endswith("LIMIT 1000")
+```
+
+<Src file="tests/unit/test_fetch.py" tag="p0" lines="102-121" />
+
+La consulta se comprueba por **trozos que importan**, no comparándola entera con una cadena esperada.
+La diferencia es de mantenimiento: un test que compara la SQL completa falla cada vez que alguien
+cambia un salto de línea, y la gente acaba actualizándolo sin leerlo. Este falla solo cuando
+desaparece un filtro.
+
+`assert "LIMIT" not in sql` es la mitad que se olvida: no basta con comprobar que algo está cuando se
+pide, hay que comprobar que **no** está cuando no se pide.
+
+```python title="tests/unit/test_fetch.py"
+
+
+def test_plan_lists_relative_output_paths_and_manifest(rukh_home: Path) -> None:
+    fetch_plan = plan(_cfg())
+    assert isinstance(fetch_plan, FetchPlan)
+    assert fetch_plan.months == MONTHS
+    assert fetch_plan.out_dir == (rukh_home / "data" / "raw").as_posix()
+    assert fetch_plan.out_paths == [
+        "year=2025/month=01/games.parquet",
+        "year=2025/month=02/games.parquet",
+    ]
+    assert fetch_plan.manifest_path == "manifest.json"
+    assert fetch_plan.query == build_query(_cfg())
+
+
+def test_run_dry_does_not_touch_disk(rukh_home: Path) -> None:
+    result = run(_cfg(), dry_run=True)
+    assert result == plan(_cfg())
+    assert not (rukh_home / "data").exists()
+
+
+def test_shipped_config_loads(repo_root: Path) -> None:
+    cfg = load_yaml(repo_root / "configs" / "data" / "lichess-2025-01-02.yaml", FetchConfig)
+    assert cfg.months == MONTHS
+```
+
+<Src file="tests/unit/test_fetch.py" tag="p0" lines="122-145" />
+
+Tres tests cortos y los tres valen su sitio.
+
+`assert fetch_plan.query == build_query(_cfg())` es la promesa del `FetchPlan` convertida en aserción:
+la consulta del plan **es** la del constructor, no una copia.
+
+`test_run_dry_does_not_touch_disk` comprueba las dos mitades de "no toca nada": que el resultado es
+igual al plan, y que el directorio no existe. La segunda es la importante y la que casi nadie
+escribe.
+
+`test_shipped_config_loads` valida el YAML que va en el repositorio. Es el test que evita el ridículo
+de publicar una configuración de ejemplo que no carga, y cuesta tres líneas.
+
+```python title="tests/unit/test_fetch.py"
+
+
+def test_cli_data_fetch_dry_run_prints_plan(rukh_home: Path, repo_root: Path) -> None:
+    config = repo_root / "configs" / "data" / "lichess-2025-01-02.yaml"
+    result = CliRunner().invoke(app, ["data", "fetch", "--config", str(config), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "read_parquet(" in result.output
+    assert "2025-01" in result.output and "2025-02" in result.output
+    assert (rukh_home / "data" / "raw").as_posix() in result.output
+    assert "  year=2025/month=01/games.parquet" in result.output
+    assert "manifest.json" in result.output
+    assert not (rukh_home / "data").exists()
+
+
+def test_cli_data_fetch_dry_run_json(rukh_home: Path, repo_root: Path) -> None:
+    config = repo_root / "configs" / "data" / "lichess-2025-01-02.yaml"
+    result = CliRunner().invoke(
+        app, ["data", "fetch", "--config", str(config), "--dry-run", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["months"] == MONTHS
+    assert payload["out_paths"] == [
+        "year=2025/month=01/games.parquet",
+        "year=2025/month=02/games.parquet",
+    ]
+```
+
+<Src file="tests/unit/test_fetch.py" tag="p0" lines="146-171" />
+
+Los dos tests de la CLI: el humano y el JSON. Nótese el `"  year=2025/month=01/games.parquet"` con
+**dos espacios delante** en el primero: comprueba la sangría con la que la CLI imprime la lista de
+salidas. Es el nivel de detalle que hace que la salida pegada en esta lección siga siendo cierta
+dentro de un año.
+
+```python title="tests/unit/test_fetch.py"
+
+
+def test_run_writes_parquet_and_manifest_from_local_source(
+    rukh_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rukh.data.manifest import Manifest
+
+    _write_hive_source(rukh_home, monkeypatch)
+
+    cfg = FetchConfig(months=["2025-01"])
+    fetch_plan = run(cfg, dry_run=False)
+
+    out_dir = rukh_home / "data" / "raw"
+    assert fetch_plan.out_paths == ["year=2025/month=01/games.parquet"]
+    out = out_dir / fetch_plan.out_paths[0]
+    assert out.is_file()
+    columns, rows = _read_output(out)
+    assert len(rows) == 1
+    assert columns.count("month") == 1
+    assert "month_1" not in columns
+    assert "year" not in columns
+
+    manifest = Manifest.model_validate_json((out_dir / "manifest.json").read_text("utf-8"))
+    assert manifest.counts == {"2025-01": 1}
+    assert manifest.files[0].path == "year=2025/month=01/games.parquet"
+    assert manifest.filters["min_elo"] == 1800
+    assert manifest.filters["min_plies_deferred"] == 20
+    assert "min_plies" not in manifest.filters
+
+
+def test_run_drops_correspondence_games_instead_of_aborting(
+    rukh_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_hive_source(rukh_home, monkeypatch)
+
+    fetch_plan = run(FetchConfig(months=["2025-01"], min_elo=0), dry_run=False)
+
+    columns, rows = _read_output(rukh_home / "data" / "raw" / fetch_plan.out_paths[0])
+    events = [row[columns.index("Event")] for row in rows]
+    assert events == ["Rated Blitz game", "Rated Blitz game"]
+```
+
+<Src file="tests/unit/test_fetch.py" tag="p0" lines="172-211" />
+
+Los dos tests finales ejecutan el pipeline completo y comprueban las tres cosas que este módulo
+promete.
+
+**Que el filtro filtra**: `len(rows) == 1`, la única de las seis filas que pasa.
+
+**Que `hive_partitioning = false` hace su trabajo**: `columns.count("month") == 1`,
+`"month_1" not in columns`, `"year" not in columns`. Tres aserciones para un argumento de una
+función, y son las que impiden que alguien lo borre por parecer superfluo. Sin ellas, el error sería
+un dataset con una columna `month` que vale `01` en vez de `2025-01`, y el _split_ por mes de M1
+fallaría por un motivo que no se parece a su causa.
+
+**Que el manifiesto no miente**: `min_plies_deferred` está y `min_plies` no. La promesa del docstring,
+comprobada.
+
+El último test es mi favorito del fichero, y su nombre es la razón: `drops_correspondence_games_
+instead_of_aborting`. Con `min_elo=0` pasan las dos partidas de blitz y **la de correspondencia no
+revienta la consulta**: `TRY_CAST` la convierte en `NULL` y el filtro la descarta. Ese test es la
+única cosa que impide que alguien cambie `TRY_CAST` por `CAST` porque "queda más limpio", y descubra
+el problema seis mil millones de filas después.
+
+```python title="tests/unit/test_manifest.py"
+"""Tests for rukh.data.manifest."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import pytest
+from pydantic import ValidationError
+
+from rukh import __version__
+from rukh.data.manifest import FileHash, Manifest
+
+pytestmark = pytest.mark.unit
+```
+
+<Src file="tests/unit/test_manifest.py" tag="p0" lines="1-13" />
+
+```python title="tests/unit/test_manifest.py"
+
+
+def _manifest() -> Manifest:
+    return Manifest(
+        dataset="Lichess/standard-chess-games",
+        months=["2025-01", "2025-02"],
+        filters={"min_elo": 1800, "terminations": ["Normal", "Time forfeit"]},
+        counts={"2025-01": 10, "2025-02": 12},
+        files=[
+            FileHash(path="data/raw/year=2025/month=01/games.parquet", sha256="ab" * 32, bytes=1)
+        ],
+        created_at=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+    )
+
+
+def test_manifest_json_roundtrip_is_idempotent() -> None:
+    m = _manifest()
+    again = Manifest.model_validate_json(m.model_dump_json())
+    assert again == m
+    assert again.model_dump_json() == m.model_dump_json()
+
+
+def test_manifest_defaults_rukh_version() -> None:
+    assert _manifest().rukh_version == __version__
+
+
+def test_manifest_forbids_unknown_keys() -> None:
+    with pytest.raises(ValidationError):
+        Manifest.model_validate({**_manifest().model_dump(), "extra": 1})
+
+
+def test_file_hash_validates_sha256() -> None:
+    with pytest.raises(ValidationError):
+        FileHash(path="x", sha256="not-a-hash", bytes=0)
+```
+
+<Src file="tests/unit/test_manifest.py" tag="p0" lines="14-47" />
+
+El primero es el que importa: **el viaje de ida y vuelta por JSON es idempotente**. Un manifiesto
+serializado, leído y vuelto a serializar da byte por byte lo mismo. Sin esa propiedad, un manifiesto
+no sirve para comparar dos descargas, que es su único trabajo: cualquier diferencia de formato
+—el orden de las claves, cómo se escribe la fecha— produciría diferencias falsas.
+
+`created_at=datetime(2026, 9, 18, 12, 0, tzinfo=UTC)` con una fecha fija: un modelo con
+`default_factory=datetime.now` no se puede comparar consigo mismo si cada instancia trae una fecha
+distinta. `sha256="ab" * 32` son 64 caracteres hexadecimales, el mínimo que pasa el patrón.
+
+## La descarga de verdad
+
+```bash title="Terminal"
+uv run rukh data fetch --config configs/data/lichess-2025-01-02.yaml
+```
+
+Tarda entre una y dos horas en la máquina de referencia y depende sobre todo de tu conexión: DuckDB
+lee los parquet remotos, aplica los filtros y escribe solo lo que pasa. Se lanza al terminar esta
+lección y se recoge en M1, donde el manifiesto tendrá los conteos por mes.
+
+Mientras corre, la lección siguiente no necesita datos: es el tablero de la demo, que en este hito
+funciona sin modelo.
+
+<Callout kind="roto" title="Lo que este código todavía no tiene">
+  `FetchConfig` no tiene `max_elo`, y en M4 hará falta. Al entrenar el modelo condicionado por Elo
+  se descubrió que `min_elo: 1800` aplicado a los dos jugadores dejaba **doce tokens de Elo sin un
+  solo gradiente**: no había ninguna partida por debajo de 1800 en el corpus, así que los tokens que
+  representan esos tramos nunca aparecían. La solución fue traer también la mitad baja del eje con
+  un `max_elo`, y de paso una propiedad que un test puede comprobar sin tocar la red: `low.max_elo +
+  1 == high.min_elo`, es decir, que las dos mitades embaldosen el rango sin solaparse ni dejar
+  hueco. Aquí no está porque aquí no estaba: el `fetch.py` de M4 tiene 350 líneas y M4 las enseña.
+</Callout>
+
+## Qué has aprendido
+
+El recorte de datos y, sobre todo, la disciplina que lo acompaña: los filtros se leen antes de
+descargar, se aplican desde un único sitio, y lo que se aplicó de verdad queda en un manifiesto con
+conteos y hashes. El filtro que **no** se aplica se llama distinto en el manifiesto para que nadie
+crea que sí.
+
+**Cómo se mide**: el `--dry-run` imprime la SQL con los cuatro filtros; `uv run pytest -m unit -q`
+pasa los veintitantos tests de `fetch` y `manifest`, incluidos los dos que ejecutan el pipeline
+completo sobre un parquet local; y cuando la descarga termine, `data/raw/manifest.json` tendrá
+`counts` por mes, un `sha256` por fichero y `min_plies_deferred: 20`.
+
+Lo siguiente es el tablero: la demo donde acabarás jugando contra tu propio modelo, que en este hito
+ya sabe las reglas aunque no haya modelo ninguno.

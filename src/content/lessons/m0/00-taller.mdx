@@ -1,34 +1,24 @@
 ---
-title: 'Taller: repo, entorno, datos y tablero'
-description: 'Qué vas a construir en trece módulos, cómo se estudia este curso, y el taller del módulo 0: uv con CUDA, Stockfish verificado, MLflow local, el recorte de datos de Lichess con sus filtros explicados y un tablero que solo acepta jugadas legales.'
+title: 'Qué vas a construir, y cómo se estudia'
+description: 'El modelo de lenguaje de ajedrez que vas a escribir en trece módulos, por qué el ajedrez es el dominio para aprender esto, cómo se estudia el curso, cómo se mide cada etapa desde el primer día, y el mapa del taller del módulo 0.'
 module: m0
 order: 0
-duration: 220
-runtime: 30
+duration: 55
 level: base
 status: vigente
-updated: 2026-09-21
+updated: 2026-09-22
 keywords:
   - modelo de lenguaje
   - ajedrez
-  - uv
-  - Stockfish
-  - MLflow
-  - Lichess
-  - DuckDB
-  - cm-chessboard
+  - curso
+  - cómo se mide
+  - tabla única
+  - criterios de aceptación
 artifacts:
   - kind: repo
     label: borja-glez/rukh
     href: https://github.com/borja-glez/rukh
-  - kind: demo
-    label: Tablero con jugadas legales
-    href: https://rukh.borjaglez.com/?mock=1
-demo: '?mock=1'
 ---
-
-import DemoFlow from '../../../components/figures/DemoFlow.astro';
-import VerifySpectrum from '../../../components/figures/VerifySpectrum.astro';
 
 ## Qué vas a construir
 
@@ -176,601 +166,74 @@ cerrar la fase 1 en cinco semanas. Los entrenamientos largos se lanzan al final 
 recogen en la siguiente; mientras corren, se escribe la lección del módulo. El progreso de las
 lecciones lo guarda tu navegador (botón "Marcar completada" al final), sin cuentas ni servidores.
 
-## El entorno
+## El taller del módulo 0
 
-El proyecto vive en tres repositorios independientes: `rukh` (Python: datos, modelo, entrenamiento,
-evaluación, agentes), `rukh-lab` (este sitio) y `rukh-web` (la demo para jugar). No comparten
-paquetes: lo que necesitan en común (tokens CSS, tokenizador en TypeScript, JSON precomputado) se
-copia con un script y un test de hash vigila que no diverja.
+M0 no entrena nada, y eso es a propósito. Lo que construye es lo que casi nadie tiene cuando empieza
+un proyecto de ML: un entorno reproducible, un juez verificado, un sistema de registro, un recorte de
+datos con cada filtro justificado, y una demo en la que la legalidad está resuelta antes de que exista
+el modelo.
 
-### Python 3.12 con uv
-
-`uv` gestiona la versión de Python, el entorno virtual y el fichero de bloqueo. El proyecto fija
-Python 3.12 en `.python-version` y dos extras excluyentes para PyTorch: `cpu` (para la CI) y `cu128`
-(CUDA 12.8, la que necesita una RTX 5090).
-
-```bash title="Terminal"
-git clone https://github.com/borja-glez/rukh
-cd rukh
-uv sync --extra cu128 --group dev
-uv run rukh info
-```
-
-Salida real en la máquina de referencia (RTX 5090, 2026-09-18); `<repo>` es la carpeta donde hayas
-clonado `rukh`:
-
-```text
-$ uv run rukh info
-python      3.12.11
-platform    Windows-11-AMD64
-torch       2.11.0+cu128
-cuda        True
-gpu         NVIDIA GeForce RTX 5090
-stockfish   <repo>\tools\stockfish\stockfish.exe
-mlflow_uri  sqlite:///<repo>/mlruns/mlflow.db
-data_dir    <repo>\data
-mlruns_dir  <repo>\mlruns
-```
-
-`rukh info --json` devuelve lo mismo como JSON, que es lo que usan los tests. Si `cuda` sale
-`False`, lo primero que hay que mirar es que el extra instalado sea `cu128` y no `cpu`: el fichero
-`uv.lock` fija `torch==2.11.0` para los dos índices, y un test (`test_lock_guard.py`) falla si alguien
-cambia la restricción en uno solo.
-
-Los tests unitarios no necesitan GPU ni Stockfish y son la comprobación rápida de que el entorno
-está bien:
-
-```bash title="Terminal"
-uv run pytest -m unit -q
-```
-
-Salida real en la máquina de referencia (RTX 5090, 2026-09-18):
-
-```text
-$ uv run pytest -m unit -q
-.........................................................                [100%]
-57 passed, 2 deselected in 4.78s
-```
-
-Los dos tests deseleccionados son los que no llevan la marca `unit`; el filtro `-m unit` los deja
-fuera a propósito.
-
-<Callout kind="roto" title="Dos extras de torch en el mismo entorno">
-  `uv sync --extra cpu --extra cu128` no funciona, y no debe: los dos extras están declarados en
-  conflicto (`tool.uv.conflicts`) porque instalan el mismo paquete desde índices distintos. Si te
-  pasa, borra `.venv` y sincroniza con uno solo.
-</Callout>
-
-### Stockfish
-
-Stockfish es el juez del curso: no juega por el modelo, lo evalúa. El script `scripts/get_stockfish.py`
-descarga la versión 19 oficial a `tools/stockfish/` (carpeta ignorada por git) y `rukh engine check`
-abre el motor por el protocolo <Term id="uci">UCI</Term>, lee el rango de `UCI_Elo`, lo limita a un Elo
-concreto y juega unas cuantas medias jugadas contra un jugador aleatorio para comprobar que todo
-responde.
-
-```bash title="Terminal"
-uv run python scripts/get_stockfish.py
-uv run rukh engine check --elo 1400 --plies 40
-```
-
-Salida real en la máquina de referencia (RTX 5090, 2026-09-18):
-
-```text
-$ uv run rukh engine check --elo 1400 --plies 40
-path          <repo>\tools\stockfish\stockfish.exe
-name          Stockfish 19
-uci_elo_min   1320
-uci_elo_max   3190
-elo           1400
-plies_played  35
-result        1-0
-nodes_hint    40736
-```
-
-Los campos significan lo siguiente: `uci_elo_min` y `uci_elo_max` son el rango de `UCI_Elo` que
-Stockfish acepta, `elo` la fuerza que le hemos pedido, `plies_played` las medias jugadas que se han
-jugado antes del mate o del límite (`--plies 40`) y `nodes_hint` la suma de nodos que el motor ha
-declarado buscar. `plies_played`, `result` y `nodes_hint` cambian de una ejecución a otra: la
-búsqueda de Stockfish está limitada por tiempo (50 ms por jugada), y el rival aleatorio tampoco
-repite partida.
-
-Los dos números que importan son `uci_elo_min 1320` y `uci_elo_max 3190`: es el rango en el que
-podemos pedirle a Stockfish que juegue peor de lo que sabe. Con eso estimaremos el Elo de cada
-modelo jugando veinte partidas por escalón en ocho escalones (por debajo de 1320 se usa
-`Skill Level`, y M2 cuenta lo que costó calibrarlo).
-
-<Transfer concept="Oráculo verificable" where="La primera pregunta de cualquier proyecto de IA: ¿quién dice si esta salida estuvo bien, cuánto cuesta preguntárselo y cuánto te puedes fiar de la respuesta?">
-  El ajedrez es un dominio privilegiado y conviene saber por qué, porque el tuyo probablemente no lo
-  sea. Aquí hay un **oráculo**: algo que, para cualquier salida del modelo, dice si fue legal y cómo
-  de buena fue, en milisegundos, gratis y sin discutir. Eso es lo que permite que este curso mida
-  todo lo que mide.
-
-Casi ningún proyecto tiene eso. Si mañana montas un asistente que resume informes, nadie te va a
-decir en un milisegundo si el resumen es bueno, y ahí es donde se decide si tu proyecto se puede
-evaluar o solo se puede opinar sobre él.
-
-<Figure
-  n="01"
-  caption="Dónde cae tu dominio. El coste es lo que pagas por cada juicio; la fiabilidad, cuánto se parece ese juicio al que de verdad importa. Las posiciones son un juicio, no una medida: nadie está en la esquina buena salvo los juegos, las matemáticas y, con reservas, el código."
->
-  <VerifySpectrum />
-</Figure>
-
-Las opciones cuando no hay motor, de más barata a más cara:
-
-- **Reglas y esquemas.** ¿El JSON valida? ¿La cita existe en el documento? Detecta la forma rota,
-  no el contenido malo. Es el equivalente de la máscara de legalidad de este proyecto.
-- **Tests.** En código son un oráculo casi tan bueno como un motor, con la trampa de que solo ven
-  lo que cubren.
-- **Un LLM como juez.** Barato y escalable, y con sesgos que hay que medir: prefiere respuestas
-  largas, prefiere su propio estilo, y si le enseñas dos respuestas se deja llevar por el orden.
-  Sirve **si** lo calibras contra un puñado de juicios humanos y publicas ese acuerdo.
-- **Personas.** Lo más caro, lo más lento y lo único que mide de verdad lo que te importa. Por eso
-  se usa en pequeño: para calibrar los otros tres.
-
-La regla práctica: **no elijas el oráculo más barato, elige el más barato que se parezca a la
-decisión real**, y mide en qué se diferencian. Un proyecto que solo valida la forma acabará
-optimizando la forma.
-
-</Transfer>
-
-<Callout kind="entrevista" title="¿Por qué no usas Stockfish para jugar y ya está?">
-  Porque el objetivo no es jugar bien, sino aprender cómo un modelo de lenguaje llega a jugar bien
-  sin que nadie le programe las reglas. Stockfish calcula; el modelo predice. La gracia (y lo que se
-  puede medir) es cuánto de lo que calcula el primero acaba emergiendo en el segundo solo por leer
-  partidas. En la práctica, además, un modelo pequeño corre en el navegador y un motor completo no
-  cabe en una demo estática.
-</Callout>
-
-### MLflow
-
-Cada entrenamiento se registra en <Term id="mlflow">MLflow</Term> con su configuración, sus métricas
-por paso y sus artefactos, en una base SQLite local. Las model cards de los módulos siguientes se
-generan desde ahí, para que ningún número de la tabla única se escriba a mano.
-
-```bash title="Terminal"
-uv run rukh mlflow ui
-# abre http://127.0.0.1:5000 sobre sqlite:///<repo>/mlruns/mlflow.db
-```
-
-### Node 24 y pnpm 10 para las webs
-
-Las dos webs son sitios estáticos hechos con Astro. Necesitas Node 24 y pnpm 10 (`corepack enable`
-lo activa). En cada repo web, `pnpm install` y `pnpm dev`; `pnpm check`, `pnpm lint`, `pnpm test`,
-`pnpm build`, `pnpm e2e` y `pnpm lighthouse` son la cadena completa que también corre en la CI.
-
-<Exercise n="01" title="Comprueba tu entorno">
-  Ejecuta `uv run rukh info --json` y responde: ¿qué versión de torch tienes, con qué índice, y qué
-  ruta de Stockfish detecta? Si `stockfish` es `null`, ejecuta el script de descarga y vuelve a mirar.
-  Después, `uv run pytest -m unit -q` tiene que estar en verde.
-
-  <Solution>
-    La clave `torch` termina en `+cu128` cuando el extra correcto está instalado (`+cpu` en la CI).
-    `stockfish` se resuelve en este orden: variable de entorno `RUKH_STOCKFISH`, después
-    `tools/stockfish/stockfish(.exe)`, después `stockfish` en el `PATH`. Si sigue en `null`, la
-    causa más habitual en Windows es que el zip se descomprimió con una carpeta intermedia: el
-    script lo normaliza, pero comprueba que el ejecutable está exactamente en `tools/stockfish/`.
-  </Solution>
-</Exercise>
-
-## Los datos
-
-Lichess es el servidor de ajedrez libre más grande del mundo y publica todo lo que se juega en él.
-Sus volcados mensuales, las copias en Hugging Face (`Lichess/standard-chess-games`, más de 6 700
-millones de partidas), los seis millones de puzles y los casi 400 millones de posiciones evaluadas
-con Stockfish están bajo CC0: dominio público. Es la razón por la que este curso no necesita pedir
-permiso a nadie.
-
-Un mes reciente ocupa unos 73 GB en <Term id="parquet">parquet</Term>. No vamos a descargarlo. El
-recorte de trabajo se hace con <Term id="duckdb">DuckDB</Term> leyendo los ficheros en remoto
-(`hf://…`) y aplicando los filtros antes de traer nada: solo se materializa lo que pasa el filtro
-(_predicate pushdown_: pedirle al almacén que te mande solo las cajas rojas, en vez de traer el
-camión entero a tu garaje y separarlas allí). Con dos meses salen entre tres y seis millones de partidas, unos 2-3 GB de
-texto UCI, del orden del volumen con el que Karvonen entrenó modelos de 25-50M (16M partidas para el
-de 50M), los modelos públicos que usaremos como referencia.
-
-```bash title="Terminal"
-uv run rukh data fetch --config configs/data/lichess-2025-01-02.yaml --dry-run
-```
-
-Salida real en la máquina de referencia (RTX 5090, 2026-09-18):
-
-```text
-$ uv run rukh data fetch --config configs/data/lichess-2025-01-02.yaml --dry-run
-dataset:  Lichess/standard-chess-games
-months:   2025-01, 2025-02
-mode:     dry-run (nothing written)
-query:
-  SELECT *, '2025-01' AS month
-  FROM read_parquet('hf://datasets/Lichess/standard-chess-games/data/year=2025/month=01/*.parquet', hive_partitioning = false)
-  WHERE WhiteElo >= 1800 AND BlackElo >= 1800
-      AND TRY_CAST(split_part(TimeControl, '+', 1) AS INTEGER) >= 180
-      AND Termination IN ('Normal', 'Time forfeit')
-      AND Event NOT ILIKE '%variant%'
-  UNION ALL
-  SELECT *, '2025-02' AS month
-  FROM read_parquet('hf://datasets/Lichess/standard-chess-games/data/year=2025/month=02/*.parquet', hive_partitioning = false)
-  WHERE WhiteElo >= 1800 AND BlackElo >= 1800
-      AND TRY_CAST(split_part(TimeControl, '+', 1) AS INTEGER) >= 180
-      AND Termination IN ('Normal', 'Time forfeit')
-      AND Event NOT ILIKE '%variant%'
-out_dir:  <repo>/data/raw
-outputs:
-  year=2025/month=01/games.parquet
-  year=2025/month=02/games.parquet
-manifest: manifest.json
-```
-
-Dos detalles de la consulta no son filtros pero evitan sorpresas. `TRY_CAST` en vez de `CAST`: las
-partidas por correspondencia llegan con `TimeControl = '-'`, y un `CAST` a entero abortaría la
-consulta entera; con `TRY_CAST` dan `NULL`, no pasan el `>= 180` y se descartan, que es lo que
-queremos. Y `hive_partitioning = false`: DuckDB reconoce los nombres de carpeta `year=…/month=…` de
-la ruta y, si no se lo impides, los inyecta como columnas `year` y `month`, que chocarían con el
-alias `'2025-01' AS month` con el que etiquetamos cada partida.
-
-Cada filtro tiene una razón, y conviene tenerlas claras porque son decisiones que condicionan lo que
-el modelo aprende:
+Va en cuatro lecciones, y cada una deja algo que funciona:
 
 <div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
 
-| Filtro                                                      | Por qué                                                                                                                                                                        |
-| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `WhiteElo >= 1800 AND BlackElo >= 1800`                     | Calidad: por debajo de 1800 abundan los errores groseros y el modelo los imitaría. Los Elo de Lichess son Glicko-2; a este nivel la diferencia con Elo clásico es irrelevante. |
-| Base de tiempo ≥ 180 s (`TimeControl` es `base+incremento`) | Excluye bullet, donde se juega a ciegas contra el reloj. Blitz (3+0) y superiores tienen jugadas pensadas.                                                                     |
-| `Termination IN ('Normal', 'Time forfeit')`                 | Excluye abandonos, desconexiones y partidas anuladas por trampas (`Rules infraction`, `Abandoned`).                                                                            |
-| ≥ 20 <Term id="ply">plies</Term>                            | Una partida de cinco jugadas no enseña nada; el conteo se hace en M1 después de convertir a UCI, porque hay que parsear el `movetext`.                                         |
-| Sin `Event` de variantes                                    | Chess960, crazyhouse o atomic tienen otras reglas y romperían la legalidad que queremos medir.                                                                                 |
+| Lección                                                          | Qué se escribe                                                                         | Qué funciona al terminar                                        |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| [1 · El repositorio](/curso/m0/01-el-repositorio/)               | `pyproject.toml`, `paths.py`, `config.py`, `cli.py`, la CI y los dos tests del entorno | `rukh --help` y `rukh --version`, ruff y pytest en verde        |
+| [2 · El juez y el cuaderno](/curso/m0/02-el-juez-y-el-cuaderno/) | `get_stockfish.py`, `engine.py`, `env.py`, `tracking.py`                               | `rukh info` con `cuda: True` y `rukh engine check` con su rango |
+| [3 · Los datos](/curso/m0/03-los-datos/)                         | `fetch.py`, `manifest.py` y la configuración del recorte                               | El `--dry-run` imprime la SQL; la descarga deja su manifiesto   |
+| [4 · El tablero](/curso/m0/04-el-tablero/)                       | `game.ts`, `opponent.ts`, `Board.tsx`, `App.tsx` en el repositorio de la demo          | Una partida completa contra "primera jugada legal", en móvil    |
 
 </div>
 
-{/* prettier-ignore */}
-Además, se eliminan los comentarios `%clk` y `%eval` del `movetext` y las jugadas pasan
-de <Term id="san">SAN</Term> a UCI con `python-chess`, verificando la legalidad de cada una (una
-partida corrupta se descarta entera). El resultado se guarda en `data/raw/` con
-un <Term id="manifiesto">manifiesto</Term> JSON: filtros exactos, meses, conteos y hash de cada
-fichero.
+Las tres primeras son el repositorio `rukh` (Python); la cuarta es `rukh-web` (la demo). El proyecto
+vive en tres repositorios independientes: `rukh` (datos, modelo, entrenamiento, evaluación, agentes),
+`rukh-lab` (este sitio) y `rukh-web` (la demo para jugar). No comparten paquetes: lo que necesitan en
+común (tokens CSS, tokenizador en TypeScript, JSON precomputado) se copia con un script y un test de
+hash vigila que no diverja.
 
-<Callout kind="hoy" title="Así se hace hoy: filtrar en remoto, materializar poco">
-  Hace unos años el flujo era descargar el `.pgn.zst` de 30 GB, descomprimirlo y filtrar con
-  scripts. Hoy, con datos en parquet particionado y motores como DuckDB o Polars que hablan `hf://`,
-  el filtro viaja al fichero y solo baja lo que pasa. La misma consulta sirve para explorar (`LIMIT
-  1000`) y para producir el recorte completo. En M1 la usaremos también para mirar distribuciones de
-  Elo, duración y aperturas.
-</Callout>
+### Lo que necesitas instalado antes de empezar
 
-La descarga real tarda entre una y dos horas: se lanza al terminar esta lección y se recoge en M1.
-Los splits se hacen por **mes** (enero entrena, febrero valida), no al azar, para evitar fugas por
-partidas repetidas de los mismos jugadores.
+Solo dos cosas, y las dos se instalan una vez:
 
-<Exercise n="02" title="Lee el plan antes de descargar">
-  Ejecuta el `--dry-run` y localiza en la SQL los cuatro filtros. Después cambia `min_elo` a `2000` en
-  una copia del YAML y vuelve a ejecutarlo: ¿qué cambia en la consulta? ¿Qué pasa si añades una clave
-  que no existe, por ejemplo `min_rating`?
+- **[`uv`](https://docs.astral.sh/uv/)**, que se encarga de Python. No hace falta instalar Python: `uv`
+  lee la versión de `.python-version` y se la descarga si no la tiene.
+- **Node 24 y pnpm 10** (`corepack enable` activa pnpm), solo para la lección 4 y para las webs.
 
-  <Solution>
-    Solo cambia la comparación de `WhiteElo` y `BlackElo`; el resto de la consulta es idéntico.
-    Una clave desconocida hace que `rukh` falle antes de tocar la red con un error de validación:
-    las configuraciones son modelos pydantic con `extra="forbid"`, y es intencionado. Una errata en
-    un fichero de configuración que se ignora en silencio es la forma más cara de perder una noche
-    de GPU.
-  </Solution>
-</Exercise>
+Una GPU NVIDIA con CUDA 12.8 hace falta desde M2, no aquí. Todo M0 funciona en una máquina sin GPU con
+el extra `cpu`, y las lecciones dicen dónde cambia algo.
 
-## El tablero
-
-La demo (`rukh.borjaglez.com`) es una sola pantalla: tablero, panel del modelo y lista de jugadas.
-En este hito no hay modelo todavía; el rival es "primera jugada legal", un oponente de mentira que
-sirve para probar todo lo demás. Se activa con `?mock=1` y es el que usa la CI.
-
-<Callout kind="hoy" title="La misma pantalla, con tu modelo dentro">
-  El panel de la demo tiene un campo **«Tu propio modelo»**: eliges el `.onnx` que deje tu
-  `rukh export` y juegas contra él en esa misma pantalla, sin publicar nada y sin clonar nada. El
-  fichero no se sube: lo lee el navegador, se lo pasa al worker y se va al recargar la página.
-
-Todavía no tienes ninguno —el primero sale en M2— pero conviene saberlo desde ahora, porque
-cambia lo que significan los módulos siguientes: cada vez que el curso dice «y ya juega en la
-demo», habla de **tu** modelo, no del publicado. Los de `chorcat/rukh-*` siguen ahí para
-comparar, que es justo para lo que sirven.
-
-</Callout>
-
-Dos librerías hacen el trabajo:
-
-- **cm-chessboard** dibuja el tablero en SVG, responsive, con las casillas en los tokens de color del
-  tema (las piezas son el sprite estándar de la librería), y gestiona la entrada con ratón y con el
-  dedo (tocar-tocar y arrastrar).
-- **chess.js** conoce las reglas: genera las jugadas legales de una posición, aplica una jugada,
-  detecta jaque mate, tablas y promociones, y exporta <Term id="pgn">PGN</Term> y
-  <Term id="fen">FEN</Term>.
-
-<Figure
-  n="02"
-  caption="Quién decide qué en la demo: el modelo produce logits (una puntuación bruta por token antes de convertirla en probabilidades); el navegador los filtra con las reglas y muestrea."
->
-  <DemoFlow />
-</Figure>
-
-La decisión de diseño importante es esta: **la legalidad la decide el navegador, el modelo solo
-propone**. El modelo devuelve un <Term id="logits">logit</Term> por token, una puntuación bruta que se
-convierte en una distribución de probabilidad sobre todo su vocabulario (unas 1 900 jugadas UCI
-posibles). Los logits son las notas que cada jurado apunta antes de convertirlas en porcentajes:
-sirven para ordenar, no para leerlas como probabilidad; el softmax de M2 es el paso que las convierte.
-chess.js calcula cuáles son legales en la posición actual, el navegador pone a cero las
-demás y muestrea entre las que quedan. Así el modelo nunca hace una jugada ilegal en la
-demo, aunque la proponga.
-
-Y como la propone, se puede medir. El modo "sin máscara" de la demo (a partir de M2) enseña la
-jugada cruda que el modelo quería hacer y la marca si es ilegal; la tasa de legalidad sin máscara es
-la primera columna de la tabla única precisamente porque mide cuánto ha aprendido las reglas un
-modelo al que nadie se las ha programado.
-
-<Callout kind="teoria" title="Enmascarar no es hacer trampa">
-  Poner a cero la probabilidad de los tokens que no pueden aparecer es una técnica general de
-  decodificación (*constrained decoding*): se usa para forzar JSON válido, gramáticas o llamadas a
-  herramientas bien formadas en LLMs de texto. La máscara no cambia lo que el modelo sabe; cambia lo
-  que le dejamos decir. Por eso se mide siempre con y sin ella.
-</Callout>
-
-<DemoEmbed
-  query="?mock=1"
-  title="Tablero con jugadas legales contra 'primera jugada legal'"
-  note="Sin modelo todavía: el rival elige la primera jugada legal que devuelve chess.js. Sirve para probar el tablero, la lista de jugadas, deshacer, nueva partida y exportar PGN."
-/>
-
-<Exercise n="03" title="Gana en cuatro jugadas al rival de mentira">
-  Abre la demo con `?mock=1` y juega. El rival hace siempre la primera jugada legal en el orden que
-  devuelve `chess.js`. ¿Puedes darle mate en pocas jugadas? Exporta el PGN y mira las cabeceras.
-
-  <Solution>
-    `chess.js` enumera las jugadas legales recorriendo el tablero desde a8 hacia h1, así que la
-    primera pieza negra que encuentra con jugada es el caballo de b8: tras `1. e4` responde `Nc6`, y
-    después mueve la torre de a8 adelante y atrás (`Rb8`, `Ra8`) mientras nadie se lo impida. Con
-    `1. e4 Nc6 2. Bc4 Rb8 3. Qh5 Ra8 4. Qxf7#` hay mate en cuatro (comprobado con `chess.js`). El PGN
-    lleva `[White "Humano"]`, `[Black "Primera jugada legal"]` y el resultado `1-0`. Que el rival de
-    mentira se deje ganar así de fácil es exactamente el punto de partida: en M2 se sustituye por el
-    decoder entrenado y la partida deja de ser tan fácil.
-  </Solution>
-</Exercise>
-
-## El código del taller
-
-Hasta aquí has visto lo que imprimen cuatro comandos y no lo que hay dentro. Son pocas líneas y
-conviene leerlas, porque las tres decisiones del módulo —qué es un entorno reproducible, quién
-juzga y qué datos entran— viven ahí y no en la prosa.
-
-### `rukh info`: seis líneas que evitan cuarenta minutos perdidos
-
-Lo único que hace es preguntar y ordenar. Lo que arregla es concreto: `cuda: True` es la
-diferencia entre haber instalado el extra `cu128` y el `cpu`, y enterarse de eso después de
-entrenar durante cuarenta y dos minutos es enterarse tarde.
-
-```python title="src/rukh/env.py"
-def find_stockfish() -> Path | None:
-    """`RUKH_STOCKFISH`, después `tools/stockfish/`, después el `PATH`. None si en ningún sitio."""
-    env = os.environ.get("RUKH_STOCKFISH")
-    if env and Path(env).is_file():
-        return Path(env).resolve()
-    for name in ("stockfish.exe", "stockfish"):
-        candidate = paths.resolve("tools/stockfish") / name
-        if candidate.is_file():
-            return candidate.resolve()
-    found = shutil.which("stockfish")
-    return Path(found).resolve() if found else None
-
-
-def info() -> dict[str, object]:
-    """Todo lo que imprime `rukh info`; `--json` lo vuelca tal cual."""
-    try:
-        import torch
-
-        torch_version, cuda = torch.__version__, bool(torch.cuda.is_available())
-        gpu = torch.cuda.get_device_name(0) if cuda else None
-    except Exception:  # un torch que falta es información, no una caída
-        torch_version, cuda, gpu = None, False, None
-    engine = find_stockfish()
-    return {
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-        "torch": torch_version,
-        "cuda": cuda,
-        "gpu": gpu,
-        "stockfish": engine.as_posix() if engine else None,
-        "mlflow_uri": f"sqlite:///{(paths.resolve('mlruns') / 'mlflow.db').as_posix()}",
-        "data_dir": paths.data_dir().as_posix(),
-        "mlruns_dir": paths.resolve("mlruns").as_posix(),
-    }
+```bash title="Terminal"
+uv --version
+node --version && pnpm --version
 ```
 
-El orden de búsqueda de Stockfish es parte del contrato, no una comodidad: un repo que trae su
-propio motor tiene que ganarle al que haya instalado la máquina, o dos ordenadores miden con dos
-jueces distintos y las tablas dejan de ser comparables.
+Nada más. La lección 1 empieza con un directorio vacío.
 
-### `extra="forbid"`: por qué una errata en un YAML falla
+<Callout kind="hoy" title="Todo el código está en el curso, y hay un script que lo comprueba">
+  Este curso no te manda a un repositorio a buscar ficheros que nunca se nombraron. Cada fichero que
+  hay que escribir está en la lección, entero, con su explicación, y debajo de cada bloque hay un
+  enlace a la línea exacta de GitHub en la etiqueta del módulo.
 
-La promesa del ejercicio 2 —«una clave que no existe hace que `rukh` falle antes de tocar la
-red»— es exactamente esta clase y nada más. Todas las configuraciones del proyecto heredan de
-ella.
+Y no es una promesa: es una comprobación. `pnpm verify:code` en el repositorio de este sitio lee todos
+los bloques de código de todas las lecciones y los compara con el fichero que dicen ser, en la
+etiqueta que citan. Si alguien reescribe una función "para que quede más clara en la lección", el
+script falla y dice en qué línea. Existe porque la primera versión de la fase 1 tenía **84 de sus 91
+bloques de código parafraseados**, y dos de ellos citaban un fichero que no existía.
 
-```python title="src/rukh/config.py"
-class BaseConfig(BaseModel):
-    """Un modelo pydantic que rechaza las claves que no declara."""
+Lo único que se enlaza en vez de pegarse son los ficheros generados (`uv.lock`), los inertes
+(`LICENSE`, las fixtures de los tests) y parte de la suite de tests, y cuando eso pasa la lección lo
+dice y dice por qué.
 
-    model_config = ConfigDict(extra="forbid")
-
-    @classmethod
-    def from_yaml(cls, path: str | Path):
-        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-        if not isinstance(data, dict):
-            raise ValueError(f"{path}: se esperaba un mapa en el nivel superior")
-        return cls.model_validate(data)
-```
-
-Una clave mal escrita que se ignora en silencio es la forma más cara de perder una noche de GPU:
-el entrenamiento arranca, la configuración _parece_ correcta, y el número que produce responde a
-una pregunta que nadie hizo.
-
-### `rukh engine check`: los dos números que sostienen la evaluación
-
-```python title="src/rukh/engine.py"
-def limit_strength(engine, elo: int) -> None:
-    """Pedirle al motor que juegue a `elo`.
-
-    Hacen falta las dos opciones y el orden importa: `UCI_LimitStrength` es lo que enciende el
-    debilitamiento, y `UCI_Elo` a solas se ignora mientras esté apagado. Poner el Elo y olvidar
-    el interruptor es la forma clásica de medir un motor a plena fuerza y publicarlo como un 1500.
-    """
-    engine.configure({"UCI_LimitStrength": True, "UCI_Elo": int(elo)})
-
-
-def check(elo: int = 1400, plies: int = 40, seed: int = 0) -> EngineCheck:
-    path = find_stockfish()
-    if path is None:
-        raise FileNotFoundError("Stockfish no encontrado: scripts/get_stockfish.py o RUKH_STOCKFISH")
-    rng = random.Random(seed)
-    with chess.engine.SimpleEngine.popen_uci(str(path)) as engine:
-        low, high = int(engine.options["UCI_Elo"].min), int(engine.options["UCI_Elo"].max)
-        limit_strength(engine, max(low, min(high, elo)))
-        board, nodes, played = chess.Board(), 0, 0
-        while played < plies and not board.is_game_over():
-            if board.turn == chess.WHITE:
-                info = engine.play(board, chess.engine.Limit(time=0.05), info=chess.engine.INFO_ALL)
-                nodes += int(info.info.get("nodes", 0) or 0)
-                move = info.move
-            else:
-                move = rng.choice(list(board.legal_moves))
-            board.push(move)
-            played += 1
-        return EngineCheck(path=path, name=engine.id.get("name", "unknown"),
-                           uci_elo_min=low, uci_elo_max=high, elo=elo, plies_played=played,
-                           result=board.result(claim_draw=True) if board.is_game_over() else "*",
-                           nodes_hint=nodes)
-```
-
-`uci_elo_min` y `uci_elo_max` no se escriben a mano: se leen de la tabla de opciones que el propio
-motor declara por UCI. Es la diferencia entre saber el suelo de `UCI_Elo` y suponerlo, y M2 cuenta
-lo que cuesta suponerlo.
-
-### El constructor de la consulta
-
-La SQL que imprime el `--dry-run` no se escribe a mano en ningún sitio: se construye aquí, y el
-mismo `where_clause` lo usan el ensayo y la descarga real.
-
-```python title="src/rukh/data/fetch.py"
-def where_clause(cfg: FetchConfig) -> str:
-    """El filtro, construido una vez y usado dos veces: en el ensayo y en cada shard descargado."""
-    conditions = [f"WhiteElo >= {cfg.min_elo} AND BlackElo >= {cfg.min_elo}"]
-    if cfg.max_elo is not None:  # la mitad baja del eje de Elo; la necesita M4
-        conditions.append(f"WhiteElo <= {cfg.max_elo} AND BlackElo <= {cfg.max_elo}")
-    conditions.append(
-        f"TRY_CAST(split_part(TimeControl, '+', 1) AS INTEGER) >= {cfg.min_base_seconds}"
-    )
-    quoted = ", ".join(f"'{t}'" for t in cfg.terminations)
-    conditions.append(f"Termination IN ({quoted})")
-    conditions.append(f"Event NOT ILIKE '{cfg.exclude_event_like}'")
-    return "\n      AND ".join(conditions)
-
-
-def month_query(cfg: FetchConfig, month: str) -> str:
-    year, mm = month.split("-")
-    source = f"hf://datasets/{cfg.dataset}/data/year={year}/month={mm}/*.parquet"
-    return (
-        f"  SELECT *, '{month}' AS month\n"
-        f"  FROM read_parquet('{source}', hive_partitioning = false)\n"
-        f"  WHERE {where_clause(cfg)}"
-    )
-
-
-def build_query(cfg: FetchConfig) -> str:
-    """Un `SELECT` por mes unidos por `UNION ALL`: la consulta entera que imprime el ensayo."""
-    cfg.check()
-    return "\n  UNION ALL\n".join(month_query(cfg, month) for month in cfg.months)
-```
-
-Que el filtro se construya en un sitio y se use en dos no es pulcritud. El ensayo es lo que esta
-lección publica como «estos son los filtros»; si la descarga construyera el suyo, el filtro
-documentado y el aplicado podrían separarse y nadie se enteraría hasta tener un corpus ya
-entrenado encima.
-
-### Dos piezas de una línea que sostienen todo lo demás
-
-`paths.py` existe para que ningún módulo adivine dónde está la raíz del repo. Son diez líneas y
-evitan la clase de bug en la que un script escribe en `data/` y otro lee de `../data/` según desde
-dónde lo lances.
-
-```python title="src/rukh/paths.py"
-def repo_root() -> Path:
-    """La raíz del checkout, o `RUKH_ROOT` cuando está puesta (los tests la ponen)."""
-    env = os.environ.get("RUKH_ROOT")
-    if env:
-        return Path(env).resolve()
-    return Path(__file__).resolve().parents[2]
-
-
-def resolve(path: str | Path) -> Path:
-    """Una ruta absoluta: las relativas se leen contra la raíz del repositorio."""
-    candidate = Path(path)
-    return candidate if candidate.is_absolute() else repo_root() / candidate
-```
-
-Y el manifiesto, que es la frase «cada paso deja un `manifest.json` con sus filtros, conteos y
-hashes» convertida en un modelo:
-
-```python title="src/rukh/data/manifest.py"
-class FileHash(BaseModel):
-    """Un fichero materializado con el hash de su contenido y su tamaño."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    path: str
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    bytes: int = Field(ge=0)
-
-
-class Manifest(BaseModel):
-    """El registro de procedencia de la salida de un paso."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    dataset: str
-    months: list[str]
-    filters: dict[str, object]   # los parámetros con los que corrió, no los que dice el README
-    counts: dict[str, int]       # filas leídas y conservadas, desglosadas por motivo
-    files: list[FileHash]        # un sha256 por salida
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    rukh_version: str = __version__
-```
-
-Los tres campos del medio hacen el trabajo. `filters` son los parámetros con los que el paso
-**corrió de verdad**; `counts` es cuántas filas entraron y cuántas salieron, desglosado por motivo,
-que es lo que convierte «descartamos 103 251 partidas por cortas» en algo comprobable en vez de
-afirmado; y `files` es un sha256 por salida, que es lo que convierte «el mismo dataset» en una
-afirmación que un test puede tumbar.
-
-<Callout kind="roto" title="El `max_elo` que no existía todavía">
-  Ese `max_elo` no estaba aquí en M0: se añadió en M4, cuando se descubrió que `min_elo: 1800`
-  aplicado a los dos jugadores dejaba **doce tokens de Elo sin un solo gradiente**. Se muestra ya
-  para que la función esté entera, y con él viene la propiedad que un test puede comprobar sin tocar
-  la red: `low.max_elo + 1 == high.min_elo`, es decir, que las dos mitades del eje embaldosen el
-  rango sin solaparse ni dejar hueco.
 </Callout>
 
 ## Qué has aprendido
 
-En este módulo no has entrenado nada, y eso es a propósito. Lo que tienes ahora es lo que casi
-nadie tiene cuando empieza un proyecto de ML: un entorno reproducible (`uv.lock` con torch fijado y
-vigilado por un test), un juez verificado (Stockfish con `UCI_Elo` en 1320-3190), un sistema de
-registro (MLflow local), un recorte de datos con cada filtro justificado y un manifiesto, y una demo
-en la que la legalidad está resuelta antes de que exista el modelo.
+Qué vas a construir, cómo se estudia y —lo que decide todo lo demás— cómo se mide: cuatro columnas
+desde M0, escritas antes de medir nada.
 
-**Cómo se mide el módulo 0**: `uv run rukh info` muestra `cuda: True`; `uv run pytest -m unit -q` en
-verde; `uv run rukh engine check` devuelve el rango de `UCI_Elo`; el `--dry-run` imprime la SQL con
-los cuatro filtros; y la demo permite jugar una partida completa contra "primera jugada legal" en
-ordenador y en móvil. Cuando la descarga real termine, el manifiesto tendrá los conteos por mes.
-
-Lo siguiente es M1: de la partida en SAN a tensores. Ahí aparece la primera decisión de modelado
-del curso, qué es un token, y se compara con datos, no con opiniones.
-
-<RepoTag tag="p0" at="final" module="M0" />
+Lo siguiente es el directorio vacío. La lección 1 lo convierte en un paquete instalable con una orden
+que funciona, y por el camino deja fijado el intérprete, el índice del que sale `torch` y la regla que
+hace que una errata en un YAML falle antes de tocar la GPU.
 
 La cheatsheet del módulo, ocho preguntas con su respuesta corta, está justo debajo.

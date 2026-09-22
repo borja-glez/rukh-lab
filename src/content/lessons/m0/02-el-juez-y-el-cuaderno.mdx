@@ -1,0 +1,1332 @@
+---
+title: 'El juez y el cuaderno: Stockfish y MLflow'
+description: 'Descargar Stockfish y verificarlo por UCI, el informe de entorno que evita cuarenta minutos perdidos, y el registro local de MLflow donde queda cada corrida con su configuración y su SHA de git. Con los tests que prueban un binario externo sin necesitar el binario.'
+module: m0
+order: 2
+duration: 165
+runtime: 5
+level: base
+status: vigente
+updated: 2026-09-22
+keywords:
+  - Stockfish
+  - UCI
+  - MLflow
+  - SQLite
+  - oráculo
+  - reproducibilidad
+artifacts:
+  - kind: repo
+    label: borja-glez/rukh
+    href: https://github.com/borja-glez/rukh/tree/p0
+---
+
+import VerifySpectrum from '../../../components/figures/VerifySpectrum.astro';
+
+## Qué vas a construir
+
+Las dos piezas sin las que ningún número de este curso significaría nada: el <Term id="oraculo">oráculo</Term>
+que dice si una jugada fue legal y cómo de buena, y el cuaderno
+donde queda anotado con qué código y qué configuración salió cada medida. En código son cuatro
+ficheros y 402 líneas, y al terminar `rukh info` funciona y `rukh engine check` juega una partida
+contra Stockfish con la fuerza limitada.
+
+El orden importa: primero se decide **quién juzga** y **dónde se anota**, y solo después se entrena
+algo. Al revés, acabas con un modelo y ninguna forma de decir si es mejor que el anterior.
+
+## Traer el motor: `scripts/get_stockfish.py`
+
+Stockfish no es una dependencia de Python: es un ejecutable. El script lo descarga de las
+_releases_ oficiales de GitHub y lo deja en `tools/stockfish/`, que está en el `.gitignore`.
+
+```python title="scripts/get_stockfish.py"
+"""Download Stockfish 19 into ``tools/stockfish/`` (gitignored). Idempotent.
+
+Usage: ``uv run python scripts/get_stockfish.py [--force]``
+
+Windows gets ``stockfish-windows-x86-64-universal.zip`` (sf_19 ships no separate avx2 build; the
+universal binary picks the best code path at runtime). Linux gets
+``stockfish-ubuntu-x86-64-avx2.tar``. The executable ends up as ``tools/stockfish/stockfish.exe``
+or ``tools/stockfish/stockfish``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import os
+import platform
+import shutil
+import stat
+import sys
+import tarfile
+import urllib.request
+import zipfile
+from pathlib import Path
+
+RELEASE = "sf_19"
+BASE_URL = f"https://github.com/official-stockfish/Stockfish/releases/download/{RELEASE}"
+ASSETS = {
+    "Windows": "stockfish-windows-x86-64-universal.zip",
+    "Linux": "stockfish-ubuntu-x86-64-avx2.tar",
+}
+```
+
+<Src file="scripts/get_stockfish.py" tag="p0" lines="1-30" />
+
+Todo con la biblioteca estándar: `urllib.request` en vez de `requests`, `zipfile` y `tarfile` en vez
+de una herramienta externa. Es un script que se ejecuta una vez por máquina y no merece una
+dependencia.
+
+La versión está clavada en `RELEASE = "sf_19"`, no es "la última". Un juez que cambia de versión
+entre dos medidas convierte una comparación en un misterio: Stockfish gana decenas de Elo por
+versión, así que la misma escalera de `UCI_Elo` medida con sf_19 y con sf_20 no da lo mismo.
+
+```python title="scripts/get_stockfish.py"
+
+
+def repo_root() -> Path:
+    home = os.environ.get("RUKH_HOME")
+    return Path(home).expanduser().resolve() if home else Path(__file__).resolve().parents[1]
+
+
+def target_path(dest: Path) -> Path:
+    return dest / ("stockfish.exe" if platform.system() == "Windows" else "stockfish")
+
+
+def download(url: str) -> bytes:
+    print(f"downloading {url}")
+    request = urllib.request.Request(url, headers={"User-Agent": "rukh/get_stockfish"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return response.read()
+```
+
+<Src file="scripts/get_stockfish.py" tag="p0" lines="31-46" />
+
+`repo_root()` repite la lógica de `paths.root()` en vez de importarla, y es a propósito: este script
+se ejecuta con `uv run python scripts/...`, que no necesita que el paquete `rukh` esté instalado. Un
+script cuyo único trabajo es preparar el entorno no debería depender del entorno que prepara.
+
+El `User-Agent` explícito no es cortesía: la API de GitHub rechaza peticiones sin él.
+
+```python title="scripts/get_stockfish.py"
+
+
+def is_executable_member(name: str) -> bool:
+    """True for the engine binary inside the release archive, never for a ``src/`` file.
+
+    Windows archives ship ``stockfish-<variant>.exe``; the others ship a plain binary with no
+    extension. Both archives also contain the sources under ``src/``, which must be skipped.
+    """
+    path = Path(name)
+    if "src" in path.parts or not path.name.startswith("stockfish"):
+        return False
+    if platform.system() == "Windows":
+        return path.suffix == ".exe"
+    return path.suffix == ""
+```
+
+<Src file="scripts/get_stockfish.py" tag="p0" lines="47-60" />
+
+Esta función existe porque el archivo de Stockfish trae **el ejecutable y las fuentes**. Dentro de
+`src/` hay un fichero llamado `stockfish.cpp` cuyo nombre empieza por `stockfish`, así que un filtro
+por prefijo a secas se lo lleva. En Linux, además, el ejecutable no tiene extensión y `stockfish.cpp`
+sí: de ahí las dos ramas por plataforma.
+
+Es el tipo de detalle que no se descubre leyendo: se descubre cuando `rukh engine check` falla con
+un error de UCI porque intentó lanzar un fichero de C++ como si fuera un motor.
+
+```python title="scripts/get_stockfish.py"
+
+
+def extract_executable(asset: str, payload: bytes, target: Path) -> None:
+    """Pull the single ``stockfish*`` executable out of the archive into ``target``."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if asset.endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            names = [
+                n for n in archive.namelist() if not n.endswith("/") and is_executable_member(n)
+            ]
+            if not names:
+                raise SystemExit(f"no stockfish executable inside {asset}")
+            with archive.open(names[0]) as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+    else:
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as archive:
+            members = [
+                m for m in archive.getmembers() if m.isfile() and is_executable_member(m.name)
+            ]
+            if not members:
+                raise SystemExit(f"no stockfish executable inside {asset}")
+            src = archive.extractfile(members[0])
+            if src is None:
+                raise SystemExit(f"cannot read {members[0].name} from {asset}")
+            with src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+    if platform.system() != "Windows":
+        target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+```
+
+<Src file="scripts/get_stockfish.py" tag="p0" lines="61-88" />
+
+El archivo se descomprime **en memoria** (`io.BytesIO(payload)`) y se copia solo el miembro que
+interesa: nada de extraer 60 MB de fuentes al disco para borrarlas después. Y en Linux hay que poner
+el bit de ejecución a mano, porque ni `zipfile` ni `tarfile` conservan permisos cuando se copia el
+contenido de un miembro a un fichero nuevo. Sin esa última línea, `popen_uci` falla con un
+`PermissionError` que no dice nada.
+
+```python title="scripts/get_stockfish.py"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--force", action="store_true", help="Re-download even if present.")
+    parser.add_argument(
+        "--dest",
+        type=Path,
+        default=repo_root() / "tools" / "stockfish",
+        help="Destination directory (default: <repo>/tools/stockfish).",
+    )
+    args = parser.parse_args(argv)
+
+    system = platform.system()
+    asset = ASSETS.get(system)
+    if asset is None:
+        print(f"unsupported platform {system!r}; download Stockfish manually", file=sys.stderr)
+        return 2
+
+    target = target_path(args.dest)
+    if target.is_file() and not args.force:
+        print(f"already present: {target}")
+        return 0
+
+    payload = download(f"{BASE_URL}/{asset}")
+    print(f"received {len(payload) / 1e6:.1f} MB")
+    extract_executable(asset, payload, target)
+    print(f"installed {target}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+<Src file="scripts/get_stockfish.py" tag="p0" lines="89-121" />
+
+`main(argv=None)` con los argumentos como parámetro, y el `__main__` como una línea que solo llama:
+así el test puede ejecutar el script entero en proceso, sin lanzar un subproceso ni tocar la red.
+`argparse` y no `typer` porque no forma parte de la CLI del paquete.
+
+Es **idempotente**: si el binario ya está, no descarga. Eso lo hace seguro de poner en cualquier
+script de arranque.
+
+```bash title="Terminal"
+uv run python scripts/get_stockfish.py
+```
+
+Salida real en la máquina de referencia (RTX 5090, 2026-09-18):
+
+```text
+$ uv run python scripts/get_stockfish.py
+downloading https://github.com/official-stockfish/Stockfish/releases/download/sf_19/stockfish-windows-x86-64-universal.zip
+received 68.6 MB
+installed <repo>\tools\stockfish\stockfish.exe
+```
+
+<Callout kind="hoy" title="Un test que prueba una descarga sin descargar">
+  `tests/unit/test_get_stockfish.py` (84 líneas, [en
+  GitHub](https://github.com/borja-glez/rukh/blob/p0/tests/unit/test_get_stockfish.py)) es el único
+  fichero de M0 que esta lección enlaza en vez de pegar, porque lo que enseña es una técnica de test
+  y no una decisión del proyecto: construye un `.zip` y un `.tar` de mentira en memoria, con un
+  `src/stockfish.cpp` dentro para comprobar que `is_executable_member` lo descarta, sustituye
+  `download` por una función que devuelve esos bytes, y comprueba que el ejecutable acaba en su
+  sitio y que una segunda llamada no vuelve a "descargar". Sin red, en milisegundos, y cubre el caso
+  que de verdad se rompió.
+</Callout>
+
+## `engine.py`: encontrar el motor y comprobar que es Stockfish
+
+```python title="src/rukh/engine.py"
+"""Stockfish: locate the binary and play a short sanity game at a limited ``UCI_Elo``."""
+
+from __future__ import annotations
+
+import os
+import random
+import shutil
+from pathlib import Path
+
+import chess
+import chess.engine
+from pydantic import BaseModel, ConfigDict
+
+from rukh import paths
+
+MOVE_TIME_SECONDS = 0.05
+
+
+class EngineNotFound(RuntimeError):
+    """No Stockfish binary could be located."""
+
+
+class EngineError(ValueError):
+    """The engine started but does not behave like Stockfish (no usable ``UCI_Elo``)."""
+```
+
+<Src file="src/rukh/engine.py" tag="p0" lines="1-24" />
+
+Dos excepciones y no una, y la jerarquía está elegida: `EngineNotFound` hereda de `RuntimeError`
+(falta algo en la máquina, se arregla instalando) y `EngineError` de `ValueError` (lo que hay no vale,
+se arregla cambiando la configuración). Quien las captura las trata distinto, y la CLI las distingue
+en el mensaje.
+
+`MOVE_TIME_SECONDS = 0.05` es una constante del módulo porque va a aparecer en la evaluación de M2:
+el tiempo por jugada es parte de la fuerza del motor, y un número mágico repetido en dos sitios es
+una forma silenciosa de medir con dos jueces distintos.
+
+```python title="src/rukh/engine.py"
+
+
+class EngineCheckResult(BaseModel):
+    """Outcome of ``engine_check``: what engine answered and how the test game went."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    name: str
+    uci_elo_min: int
+    uci_elo_max: int
+    elo: int
+    plies_played: int
+    result: str
+    nodes_hint: int | None
+```
+
+<Src file="src/rukh/engine.py" tag="p0" lines="25-39" />
+
+Un modelo pydantic para un resultado, no un diccionario. Con eso, `--json` sale de
+`model_dump_json()` sin escribir el serializador, la CLI calcula el ancho de la columna recorriendo
+`model_fields`, y los tests comprueban campos con nombre en vez de claves de un diccionario.
+
+```python title="src/rukh/engine.py"
+
+
+def find_stockfish() -> Path | None:
+    """Locate Stockfish: ``RUKH_STOCKFISH``, then ``tools/stockfish/``, then ``PATH``.
+
+    When ``RUKH_STOCKFISH`` is set it wins outright and must point at an existing file;
+    otherwise ``EngineNotFound`` is raised instead of silently falling through.
+    """
+    env = os.environ.get("RUKH_STOCKFISH")
+    if env:
+        candidate = Path(env)
+        if not candidate.is_file():
+            raise EngineNotFound(f"RUKH_STOCKFISH={env} is not a file")
+        return candidate
+    tools = paths.tools_dir() / "stockfish"
+    for pattern in ("stockfish*.exe", "stockfish"):
+        for candidate in sorted(tools.glob(pattern)):
+            if candidate.is_file():
+                return candidate
+    which = shutil.which("stockfish")
+    return Path(which) if which else None
+```
+
+<Src file="src/rukh/engine.py" tag="p0" lines="40-60" />
+
+El orden de búsqueda es parte del contrato del proyecto, no una comodidad: **la variable de entorno
+gana, después el binario del repositorio, y solo al final el del sistema**. Un repositorio que trae
+su propio motor tiene que ganarle al que haya instalado la máquina, o dos ordenadores miden con dos
+jueces distintos y las tablas dejan de ser comparables.
+
+El detalle que parece inconsistente y no lo es: si `RUKH_STOCKFISH` está puesta y **no** apunta a un
+fichero, la función **lanza** en vez de seguir buscando. Devolver `None` sería tratar una errata en
+una variable de entorno como "no hay motor", y el usuario acabaría midiendo con el Stockfish del
+sistema creyendo que usa el que él eligió. Que una ruta explícita y equivocada sea un error, y una
+ausencia de motor no lo sea, es la distinción correcta.
+
+`sorted(tools.glob(pattern))` ordena porque `glob` no garantiza orden y en una carpeta con
+`stockfish-avx2.exe` y `stockfish.exe` querrías siempre el mismo.
+
+```python title="src/rukh/engine.py"
+
+
+def engine_check(elo: int = 1400, plies: int = 40, seed: int = 0) -> EngineCheckResult:
+    """Open Stockfish, limit it to ``elo`` and play ``plies`` half-moves against a random mover.
+
+    Stockfish plays White, the seeded random player plays Black. Raises ``EngineNotFound`` when
+    no binary is available, ``EngineError`` when the binary does not expose ``UCI_Elo`` and
+    ``ValueError`` when ``elo`` is outside the engine's range.
+    """
+    path = find_stockfish()
+    if path is None:
+        raise EngineNotFound(
+            "Stockfish not found: run `uv run python scripts/get_stockfish.py` "
+            "or set RUKH_STOCKFISH"
+        )
+
+    rng = random.Random(seed)
+    board = chess.Board()
+    nodes_hint: int | None = None
+    plies_played = 0
+
+    with chess.engine.SimpleEngine.popen_uci(str(path)) as engine:
+        name = str(engine.id.get("name", "unknown"))
+        try:
+            option = engine.options["UCI_Elo"]
+            uci_elo_min, uci_elo_max = int(option.min), int(option.max)
+        except (
+            KeyError,
+            TypeError,
+            chess.engine.EngineError,
+            chess.engine.EngineTerminatedError,
+        ) as exc:
+            raise EngineError(f"{path} ({name}) does not expose UCI_Elo; is it Stockfish?") from exc
+        if not uci_elo_min <= elo <= uci_elo_max:
+            raise ValueError(f"UCI_Elo {elo} outside [{uci_elo_min}, {uci_elo_max}]")
+        engine.configure({"UCI_LimitStrength": True, "UCI_Elo": elo})
+```
+
+<Src file="src/rukh/engine.py" tag="p0" lines="61-96" />
+
+Aquí están los dos números que sostienen toda la evaluación del curso, y la línea que más
+entrenamientos ha estropeado en la historia de este tipo de proyectos.
+
+**Los dos números.** `uci_elo_min` y `uci_elo_max` no se escriben a mano: se **leen** de la tabla de
+opciones que el propio motor declara al arrancar, por el protocolo <Term id="uci">UCI</Term>. En
+sf_19 salen 1320 y 3190. Ese es el rango en el que se le puede pedir a Stockfish que juegue peor de
+lo que sabe, y con él se estima el <Term id="elo-estimado">Elo</Term> de cada modelo en M2. La
+diferencia entre leerlo y suponerlo es la diferencia entre una escalera calibrada y una tabla que
+hay que rehacer: M2 cuenta lo que costó descubrir que el suelo son 1320 y no 1000.
+
+**La línea.** `engine.configure({"UCI_LimitStrength": True, "UCI_Elo": elo})` necesita **las dos**
+opciones. `UCI_LimitStrength` es el interruptor que enciende el debilitamiento; `UCI_Elo` a solas se
+ignora mientras el interruptor esté apagado. Poner el Elo y olvidar el interruptor es la forma
+clásica de medir un motor a plena fuerza y publicar el resultado como un rival de 1500: tu modelo
+pierde 20-0 y la conclusión que sacas es sobre el modelo.
+
+<Callout kind="roto" title="Cuatro excepciones para una consulta">
+  Ese `except (KeyError, TypeError, chess.engine.EngineError, chess.engine.EngineTerminatedError)`
+  no es paranoia. Preguntar por `UCI_Elo` a un ejecutable que no es Stockfish falla de cuatro
+  maneras según qué sea: un motor UCI de verdad sin esa opción da `KeyError`; uno que la declara sin
+  rango da `TypeError` al convertir `None` a `int`; un binario que habla UCI mal da `EngineError`; y
+  un ejecutable que no habla UCI en absoluto se muere y da `EngineTerminatedError`. Las cuatro
+  significan lo mismo para quien llama —"esto no es Stockfish"— y las cuatro deben decírselo con esa
+  frase, no con una traza.
+</Callout>
+
+```python title="src/rukh/engine.py"
+
+        while plies_played < plies and not board.is_game_over(claim_draw=True):
+            if board.turn == chess.WHITE:
+                played = engine.play(
+                    board, chess.engine.Limit(time=MOVE_TIME_SECONDS), info=chess.engine.INFO_BASIC
+                )
+                if played.move is None:
+                    break
+                move = played.move
+                nodes = played.info.get("nodes")
+                if isinstance(nodes, int):
+                    nodes_hint = nodes
+            else:
+                move = rng.choice(list(board.legal_moves))
+            board.push(move)
+            plies_played += 1
+
+    return EngineCheckResult(
+        path=str(path),
+        name=name,
+        uci_elo_min=uci_elo_min,
+        uci_elo_max=uci_elo_max,
+        elo=elo,
+        plies_played=plies_played,
+        result=board.result(claim_draw=True),
+        nodes_hint=nodes_hint,
+    )
+```
+
+<Src file="src/rukh/engine.py" tag="p0" lines="97-123" />
+
+La partida de prueba: Stockfish con las blancas contra un jugador aleatorio con semilla. No mide
+nada —el rival es aleatorio— pero recorre el camino completo: abrir el motor, configurarlo, pedirle
+jugadas, aplicarlas, detectar el final. Si algo de eso está roto, se sabe aquí y no a mitad de una
+evaluación de 160 partidas.
+
+`board.is_game_over(claim_draw=True)` y `board.result(claim_draw=True)` con el mismo argumento en
+los dos sitios. `claim_draw` incluye las tablas que hay que **reclamar** (triple repetición, regla
+de las cincuenta jugadas) además de las automáticas. Si el bucle terminara con `claim_draw=True` y
+el resultado se leyera con el valor por defecto, una partida acabada por repetición saldría como
+`*`, sin resultado.
+
+`rng = random.Random(seed)` es un generador propio, no `random.seed()` global: dos llamadas con la
+misma semilla dan la misma partida, y ninguna de las dos altera el estado aleatorio del resto del
+proceso.
+
+```bash title="Terminal"
+uv run rukh engine check --elo 1400 --plies 40
+```
+
+Salida real en la máquina de referencia (RTX 5090, 2026-09-18); `<repo>` es la carpeta donde hayas
+clonado `rukh`:
+
+```text
+$ uv run rukh engine check --elo 1400 --plies 40
+path          <repo>\tools\stockfish\stockfish.exe
+name          Stockfish 19
+uci_elo_min   1320
+uci_elo_max   3190
+elo           1400
+plies_played  35
+result        1-0
+nodes_hint    40736
+```
+
+`plies_played`, `result` y `nodes_hint` cambian de una ejecución a otra: la búsqueda está limitada
+por tiempo (50 ms por jugada), y el reloj no es determinista. `uci_elo_min` y `uci_elo_max` no
+cambian nunca mientras no cambie la versión del motor, y son los que importan.
+
+<Transfer concept="Oráculo verificable" where="La primera pregunta de cualquier proyecto de IA: ¿quién dice si esta salida estuvo bien, cuánto cuesta preguntárselo y cuánto te puedes fiar de la respuesta?">
+  El ajedrez es un dominio privilegiado y conviene saber por qué, porque el tuyo probablemente no lo
+  sea. Aquí hay un **oráculo**: algo que, para cualquier salida del modelo, dice si fue legal y cómo
+  de buena fue, en milisegundos, gratis y sin discutir. Eso es lo que permite que este curso mida
+  todo lo que mide.
+
+Casi ningún proyecto tiene eso. Si mañana montas un asistente que resume informes, nadie te va a
+decir en un milisegundo si el resumen es bueno, y ahí es donde se decide si tu proyecto se puede
+evaluar o solo se puede opinar sobre él.
+
+<Figure
+  n="01"
+  caption="Dónde cae tu dominio. El coste es lo que pagas por cada juicio; la fiabilidad, cuánto se parece ese juicio al que de verdad importa. Las posiciones son un juicio, no una medida: nadie está en la esquina buena salvo los juegos, las matemáticas y, con reservas, el código."
+>
+  <VerifySpectrum />
+</Figure>
+
+Las opciones cuando no hay motor, de más barata a más cara:
+
+- **Reglas y esquemas.** ¿El JSON valida? ¿La cita existe en el documento? Detecta la forma rota,
+  no el contenido malo. Es el equivalente de la máscara de legalidad de este proyecto.
+- **Tests.** En código son un oráculo casi tan bueno como un motor, con la trampa de que solo ven
+  lo que cubren.
+- **Un LLM como juez.** Barato y escalable, y con sesgos que hay que medir: prefiere respuestas
+  largas, prefiere su propio estilo, y si le enseñas dos respuestas se deja llevar por el orden.
+  Sirve **si** lo calibras contra un puñado de juicios humanos y publicas ese acuerdo.
+- **Personas.** Lo más caro, lo más lento y lo único que mide de verdad lo que te importa. Por eso
+  se usa en pequeño: para calibrar los otros tres.
+
+La regla práctica: **no elijas el oráculo más barato, elige el más barato que se parezca a la
+decisión real**, y mide en qué se diferencian. Un proyecto que solo valida la forma acabará
+optimizando la forma.
+
+</Transfer>
+
+<Callout kind="entrevista" title="¿Por qué no usas Stockfish para jugar y ya está?">
+  Porque el objetivo no es jugar bien, sino aprender cómo un modelo de lenguaje llega a jugar bien
+  sin que nadie le programe las reglas. Stockfish calcula; el modelo predice. La gracia (y lo que se
+  puede medir) es cuánto de lo que calcula el primero acaba emergiendo en el segundo solo por leer
+  partidas. En la práctica, además, un modelo pequeño corre en el navegador y un motor completo no
+  cabe en una demo estática.
+</Callout>
+
+## `tracking.py`: el cuaderno de laboratorio
+
+<Term id="mlflow">MLflow</Term> guarda cada corrida con su configuración, sus métricas por paso y
+sus artefactos. Aquí se usa en su modo más simple: una base SQLite en `mlruns/mlflow.db`, sin
+servidor.
+
+```python title="src/rukh/tracking.py"
+"""Local MLflow tracking: SQLite store under ``mlruns/`` and a run helper."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from typing import Any
+
+from rukh import __version__, paths
+
+EXPERIMENT = "rukh"
+
+
+def tracking_uri(create: bool = True) -> str:
+    """SQLite tracking URI ``sqlite:///<MLRUNS_DIR>/mlflow.db``; creates the directory if asked."""
+    mlruns = paths.mlruns_dir()
+    if create:
+        mlruns.mkdir(parents=True, exist_ok=True)
+    return f"sqlite:///{(mlruns / 'mlflow.db').as_posix()}"
+```
+
+<Src file="src/rukh/tracking.py" tag="p0" lines="1-21" />
+
+Un solo experimento (`EXPERIMENT = "rukh"`) para todo el proyecto, y los modelos y etapas se
+distinguen por el nombre de la corrida y las etiquetas. Con trece módulos, la alternativa —un
+experimento por módulo— parece más ordenada y es peor: comparar `rukh-small` con `rukh-medium-v4-dpo`
+requeriría cruzar dos experimentos, y la tabla única del curso compara justamente eso.
+
+El parámetro `create` existe por un motivo concreto: `rukh info` llama a `tracking_uri(create=False)`
+para **informar** de dónde está la base sin crear el directorio. Un comando de diagnóstico que
+modifica el disco es un comando de diagnóstico roto.
+
+`as_posix()` en la URI porque SQLite quiere barras hacia delante también en Windows.
+
+```python title="src/rukh/tracking.py"
+
+
+def flatten(config: Mapping[str, Any], prefix: str = "") -> dict[str, str]:
+    """Flatten nested mappings into ``a.b=value`` string params (lists become their repr)."""
+    flat: dict[str, str] = {}
+    for key, value in config.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, Mapping):
+            flat.update(flatten(value, prefix=f"{name}."))
+        else:
+            flat[name] = str(value)
+    return flat
+```
+
+<Src file="src/rukh/tracking.py" tag="p0" lines="22-33" />
+
+MLflow solo acepta parámetros planos: clave y cadena. Las configuraciones del proyecto son YAML con
+secciones anidadas (`model.layers`, `optim.lr`), así que hay que aplanarlas. Una lista se guarda como
+su `repr` (`"[1, 2]"`), que no es bonito pero es fiel y se puede leer.
+
+Que **toda** la configuración vaya a MLflow y no una selección es la decisión. La alternativa
+—registrar los hiperparámetros "importantes"— falla siempre igual: seis semanas después, la
+diferencia entre dos corridas está en el campo que no parecía importante.
+
+```python title="src/rukh/tracking.py"
+
+
+def git_sha() -> str | None:
+    """Full SHA of the source tree (``paths.package_root()``), or None when it is not a git repo.
+
+    The source tree is used on purpose: ``RUKH_HOME`` may point at a data directory that is
+    not a checkout, and the tag must identify the code that produced the run.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=paths.package_root(),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = out.stdout.strip()
+    return sha or None
+```
+
+<Src file="src/rukh/tracking.py" tag="p0" lines="34-54" />
+
+Aquí se cobra la separación de las dos raíces de `paths.py`. El SHA se pide en `package_root()` —el
+árbol de fuentes— y no en `root()`, porque `RUKH_HOME` puede apuntar a un disco de datos que no es un
+repositorio. La etiqueta tiene que identificar **el código que produjo la corrida**.
+
+Devuelve `None` en vez de fallar cuando no hay git, y captura `OSError` (git no instalado) y
+`SubprocessError` (el `check=True` cuando el directorio no es un repositorio, y el `timeout`). Que
+una corrida no tenga SHA es información; que no se pueda entrenar sin git instalado sería una
+decisión absurda.
+
+```python title="src/rukh/tracking.py"
+
+
+@contextmanager
+def start_run(
+    name: str,
+    config: Mapping[str, Any],
+    tags: Mapping[str, str] | None = None,
+) -> Iterator[Any]:
+    """Start an MLflow run in the local store with ``config`` logged as flattened params.
+
+    Tags always include ``rukh_version`` and, when the project lives in a git repo, ``git_sha``.
+    Yields the active ``mlflow.ActiveRun``.
+    """
+    import mlflow
+
+    mlflow.set_tracking_uri(tracking_uri())
+    mlflow.set_experiment(EXPERIMENT)
+    run_tags: dict[str, str] = {"rukh_version": __version__}
+    sha = git_sha()
+    if sha:
+        run_tags["git_sha"] = sha
+    if tags:
+        run_tags.update(tags)
+    with mlflow.start_run(run_name=name, tags=run_tags) as run:
+        params = flatten(config)
+        if params:
+            mlflow.log_params(params)
+        yield run
+```
+
+<Src file="src/rukh/tracking.py" tag="p0" lines="55-82" />
+
+Un único sitio por el que se abre una corrida en todo el proyecto, y la firma obliga a pasar la
+configuración. No es una comodidad: es lo que hace imposible entrenar algo sin registrar con qué se
+entrenó. Las <Term id="model-card">model cards</Term> de M6 se generan leyendo de aquí, así que
+"ningún número se escribe a mano" empieza en esta función.
+
+`import mlflow` dentro, como en la CLI: importar MLflow cuesta más de un segundo, y `rukh info` lo
+llama solo para construir una cadena.
+
+Dos etiquetas automáticas, `rukh_version` y `git_sha`, y las que pase quien llama por encima. El
+orden del `update` permite que una corrida sobrescriba una etiqueta automática, lo cual es raro pero
+no está prohibido a propósito.
+
+```python title="src/rukh/tracking.py"
+
+
+def ui_command(host: str = "127.0.0.1", port: int = 5000) -> list[str]:
+    """Argv for ``mlflow ui`` against the local store, run through the current interpreter."""
+    return [
+        sys.executable,
+        "-m",
+        "mlflow",
+        "ui",
+        "--backend-store-uri",
+        tracking_uri(),
+        "--host",
+        host,
+        "--port",
+        str(port),
+    ]
+
+
+def serve_ui(host: str = "127.0.0.1", port: int = 5000) -> int:
+    """Run ``mlflow ui`` in the foreground and return its exit code."""
+    return subprocess.call(ui_command(host=host, port=port))
+```
+
+<Src file="src/rukh/tracking.py" tag="p0" lines="83-103" />
+
+La orden se construye en una función que **solo devuelve una lista**, y el efecto (lanzarla) está en
+otra de una línea. Así el test comprueba la orden entera sin arrancar un servidor.
+
+`sys.executable -m mlflow` y no `mlflow` a secas: el ejecutable del entorno virtual puede no estar en
+el `PATH` del proceso, y el que sí esté puede ser de otro entorno. Ejecutar el módulo con el
+intérprete actual garantiza que la interfaz que se abre es la del MLflow instalado aquí.
+
+```bash title="Terminal"
+uv run rukh mlflow ui
+# abre http://127.0.0.1:5000 sobre sqlite:///<repo>/mlruns/mlflow.db
+```
+
+## `env.py`: seis líneas que evitan cuarenta minutos perdidos
+
+```python title="src/rukh/env.py"
+"""Environment report: what Python, torch, GPU and tools this machine has."""
+
+from __future__ import annotations
+
+import platform
+
+from pydantic import BaseModel, ConfigDict
+
+from rukh import paths
+from rukh.engine import find_stockfish
+from rukh.tracking import tracking_uri
+
+
+class EnvReport(BaseModel):
+    """Snapshot of the runtime environment as seen by ``rukh info``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    python: str
+    platform: str
+    torch: str | None
+    cuda: bool
+    gpu: str | None
+    stockfish: str | None
+    mlflow_uri: str
+    data_dir: str
+    mlruns_dir: str
+```
+
+<Src file="src/rukh/env.py" tag="p0" lines="1-27" />
+
+Tres campos son `str | None` y uno es `bool`: `torch`, `gpu` y `stockfish` pueden faltar
+legítimamente, y el tipo lo dice. `cuda` no es opcional porque la respuesta a "¿hay CUDA?" siempre es
+sí o no.
+
+```python title="src/rukh/env.py"
+
+
+def _torch_info() -> tuple[str | None, bool, str | None]:
+    """Return (torch version, cuda available, gpu name); all empty if torch is missing."""
+    try:
+        import torch
+    except ImportError:
+        return None, False, None
+    cuda = bool(torch.cuda.is_available())
+    gpu = torch.cuda.get_device_name(0) if cuda else None
+    return torch.__version__, cuda, gpu
+```
+
+<Src file="src/rukh/env.py" tag="p0" lines="28-38" />
+
+Se captura `ImportError` y nada más. Un `torch` que falta es información que el informe tiene que
+poder dar; un `torch` que está y revienta al importarse es un problema real que debe verse con su
+traza. Capturar `Exception` aquí convertiría una instalación corrupta en un `torch: null` silencioso,
+y el usuario buscaría el problema en el sitio equivocado.
+
+`torch.cuda.get_device_name(0)` solo si `cuda` es cierto: llamarlo sin GPU lanza.
+
+```python title="src/rukh/env.py"
+
+
+def collect() -> EnvReport:
+    """Collect the environment report. Never raises because torch or Stockfish are absent."""
+    torch_version, cuda, gpu = _torch_info()
+    stockfish = find_stockfish()
+    return EnvReport(
+        python=platform.python_version(),
+        platform=f"{platform.system()}-{platform.release()}-{platform.machine()}",
+        torch=torch_version,
+        cuda=cuda,
+        gpu=gpu,
+        stockfish=str(stockfish) if stockfish else None,
+        mlflow_uri=tracking_uri(create=False),
+        data_dir=str(paths.data_dir()),
+        mlruns_dir=str(paths.mlruns_dir()),
+    )
+```
+
+<Src file="src/rukh/env.py" tag="p0" lines="39-55" />
+
+Todo lo que hace es preguntar y ordenar. Lo que arregla es concreto: `cuda: True` es la diferencia
+entre haber instalado el extra `cu128` y el `cpu`, y enterarse de eso después de entrenar durante
+cuarenta y dos minutos es enterarse tarde.
+
+```bash title="Terminal"
+uv run rukh info
+```
+
+Salida real en la máquina de referencia (RTX 5090, 2026-09-18):
+
+```text
+$ uv run rukh info
+python      3.12.11
+platform    Windows-11-AMD64
+torch       2.11.0+cu128
+cuda        True
+gpu         NVIDIA GeForce RTX 5090
+stockfish   <repo>\tools\stockfish\stockfish.exe
+mlflow_uri  sqlite:///<repo>/mlruns/mlflow.db
+data_dir    <repo>\data
+mlruns_dir  <repo>\mlruns
+```
+
+Si `cuda` sale `False`, lo primero que hay que mirar es que el extra instalado sea `cu128` y no
+`cpu`; el sufijo de `torch` lo dice. Si `stockfish` sale `null`, falta el script de descarga.
+
+<Exercise n="01" title="Comprueba tu entorno">
+  Ejecuta `uv run rukh info --json` y responde: ¿qué versión de torch tienes, con qué índice, y qué
+  ruta de Stockfish detecta? Si `stockfish` es `null`, ejecuta el script de descarga y vuelve a
+  mirar. Después pon `RUKH_STOCKFISH` a una ruta que no existe y vuelve a ejecutar `rukh info`: ¿qué
+  pasa, y por qué no es lo mismo que no tener motor?
+
+<Solution>
+  La clave `torch` termina en `+cu128` cuando el extra correcto está instalado (`+cpu` en la CI).
+  `stockfish` se resuelve en el orden `RUKH_STOCKFISH` → `tools/stockfish/` → `PATH`.
+
+Con `RUKH_STOCKFISH` apuntando a un fichero que no existe, `rukh info` **falla** con
+`RUKH_STOCKFISH=... is not a file` en vez de decir `stockfish: null`, porque `find_stockfish`
+lanza `EngineNotFound` en ese caso. Es lo correcto: una ruta explícita y equivocada es un error
+del usuario, y tratarla como "no hay motor" acabaría midiendo con el Stockfish del sistema
+mientras tú crees que usas otro.
+
+</Solution>
+</Exercise>
+
+## Los tests: probar un binario externo sin el binario
+
+```python title="tests/unit/test_engine.py"
+"""Tests for rukh.engine: Stockfish detection and the engine check."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from rukh import engine
+from rukh.cli import app
+from rukh.engine import (
+    EngineCheckResult,
+    EngineError,
+    EngineNotFound,
+    engine_check,
+    find_stockfish,
+)
+
+# The two live tests carry only `engine`, so `-m unit` never needs the Stockfish binary.
+unit = pytest.mark.unit
+```
+
+<Src file="tests/unit/test_engine.py" tag="p0" lines="1-22" />
+
+Este fichero es el único del repositorio que **no** usa `pytestmark` al nivel del módulo: mezcla
+tests `unit` (que no necesitan nada) con tests `engine` (que necesitan el binario), así que la marca
+va test por test. El alias `unit = pytest.mark.unit` es para que eso no llene el fichero de
+`@pytest.mark.unit`.
+
+```python title="tests/unit/test_engine.py"
+
+
+@unit
+def test_find_stockfish_honours_env(rukh_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = rukh_home / "sf.exe"
+    fake.write_bytes(b"")
+    monkeypatch.setenv("RUKH_STOCKFISH", str(fake))
+    assert find_stockfish() == fake
+
+
+@unit
+def test_find_stockfish_env_missing_file_raises(
+    rukh_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = rukh_home / "missing.exe"
+    monkeypatch.setenv("RUKH_STOCKFISH", str(missing))
+    monkeypatch.setattr(engine.shutil, "which", lambda _name: None)
+    with pytest.raises(EngineNotFound, match=r"RUKH_STOCKFISH=.*missing\.exe is not a file"):
+        find_stockfish()
+
+
+@unit
+def test_find_stockfish_looks_in_tools(rukh_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RUKH_STOCKFISH", raising=False)
+    monkeypatch.setattr(engine.shutil, "which", lambda _name: None)
+    assert find_stockfish() is None
+    tools = rukh_home / "tools" / "stockfish"
+    tools.mkdir(parents=True)
+    binary = tools / "stockfish.exe"
+    binary.write_bytes(b"")
+    assert find_stockfish() == binary
+
+
+@unit
+def test_find_stockfish_falls_back_to_path(
+    rukh_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("RUKH_STOCKFISH", raising=False)
+    monkeypatch.setattr(engine.shutil, "which", lambda _name: str(rukh_home / "on-path"))
+    assert find_stockfish() == rukh_home / "on-path"
+
+
+@unit
+def test_engine_check_without_binary_raises(
+    rukh_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("RUKH_STOCKFISH", raising=False)
+    monkeypatch.setattr(engine.shutil, "which", lambda _name: None)
+    with pytest.raises(EngineNotFound):
+        engine_check()
+
+
+@unit
+def test_cli_engine_check_without_binary_fails_cleanly(
+    rukh_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("RUKH_STOCKFISH", raising=False)
+    monkeypatch.setattr(engine.shutil, "which", lambda _name: None)
+    result = CliRunner().invoke(app, ["engine", "check"])
+    assert result.exit_code == 1
+    assert "Stockfish" in result.output
+```
+
+<Src file="tests/unit/test_engine.py" tag="p0" lines="23-83" />
+
+El truco de todo el fichero está en dos líneas que se repiten: un fichero vacío hace de binario
+(`fake.write_bytes(b"")`, porque `find_stockfish` solo comprueba que exista) y
+`monkeypatch.setattr(engine.shutil, "which", lambda _name: None)` corta la última rama de búsqueda.
+Sin esa segunda línea, el test pasaría en tu máquina y fallaría en la de alguien que tenga Stockfish
+instalado en el `PATH`: la clase de test que "funciona aquí" y es peor que no tenerlo.
+
+Fíjate en que se parchea `engine.shutil`, es decir, el `shutil` **tal como lo ve el módulo**, no
+`shutil.which` global. Es la forma correcta: si mañana `engine.py` importara `which` directamente,
+este parche dejaría de aplicarse y el test fallaría en vez de pasar por accidente.
+
+Los cuatro primeros tests comprueban las cuatro ramas de la función en orden, incluida la que
+distingue una ruta explícita equivocada (excepción) de no tener motor (`None`).
+
+```python title="tests/unit/test_engine.py"
+
+
+class _FakeEngine:
+    """Stand-in for ``SimpleEngine``: speaks UCI but is not Stockfish (no ``UCI_Elo``)."""
+
+    def __init__(self) -> None:
+        self.id = {"name": "not-stockfish"}
+        self.options: dict[str, object] = {}
+
+    def __enter__(self) -> _FakeEngine:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _use_fake_engine(rukh_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    binary = rukh_home / "not-stockfish.exe"
+    binary.write_bytes(b"")
+    monkeypatch.setenv("RUKH_STOCKFISH", str(binary))
+    monkeypatch.setattr(
+        engine.chess.engine.SimpleEngine, "popen_uci", staticmethod(lambda *_a, **_k: _FakeEngine())
+    )
+    return binary
+
+
+@unit
+def test_engine_check_without_uci_elo_raises_engine_error(
+    rukh_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_fake_engine(rukh_home, monkeypatch)
+    with pytest.raises(EngineError, match="does not expose UCI_Elo; is it Stockfish?"):
+        engine_check()
+
+
+@unit
+def test_engine_error_is_a_value_error() -> None:
+    assert issubclass(EngineError, ValueError)
+
+
+@unit
+def test_cli_engine_check_without_uci_elo_fails_cleanly(
+    rukh_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_fake_engine(rukh_home, monkeypatch)
+    result = CliRunner().invoke(app, ["engine", "check"])
+    assert result.exit_code == 1
+    assert "does not expose UCI_Elo" in result.output
+    assert "Traceback" not in result.output
+```
+
+<Src file="tests/unit/test_engine.py" tag="p0" lines="84-132" />
+
+`_FakeEngine` es un motor de mentira de doce líneas: tiene un `id`, un diccionario de opciones vacío
+y el protocolo de gestor de contexto. Con eso cubre el caso "es un ejecutable que arranca pero no es
+Stockfish", que es el que produce el error más confuso en la vida real.
+
+El último `assert` del fichero es el que más valor tiene y el que casi nadie escribe:
+`assert "Traceback" not in result.output`. Comprueba que el error **llega como mensaje y no como
+traza**. Es la única forma de que "la CLI falla limpiamente" sea una propiedad verificada y no una
+intención.
+
+`test_engine_error_is_a_value_error` parece trivial y no lo es: la jerarquía de excepciones es parte
+del contrato público (quien llame puede capturar `ValueError` y recoger las dos formas de "esto no
+vale"), y un refactor que la cambie rompe a quien dependa de ella sin que nada más lo note.
+
+```python title="tests/unit/test_engine.py"
+
+
+@pytest.mark.engine
+@pytest.mark.skipif(find_stockfish() is None, reason="Stockfish binary not found")
+def test_engine_check_plays_a_short_game() -> None:
+    result = engine_check(elo=1400, plies=10, seed=0)
+    assert isinstance(result, EngineCheckResult)
+    assert result.uci_elo_min == 1320
+    assert result.uci_elo_max == 3190
+    assert result.elo == 1400
+    assert 0 < result.plies_played <= 10
+    assert result.name.lower().startswith("stockfish")
+    assert result.result in {"1-0", "0-1", "1/2-1/2", "*"}
+
+
+@pytest.mark.engine
+@pytest.mark.skipif(find_stockfish() is None, reason="Stockfish binary not found")
+def test_cli_engine_check_json() -> None:
+    args = ["engine", "check", "--elo", "1400", "--plies", "6", "--json"]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["uci_elo_min"] == 1320
+    assert payload["plies_played"] > 0
+```
+
+<Src file="tests/unit/test_engine.py" tag="p0" lines="133-156" />
+
+Los dos únicos tests del fichero que necesitan el motor de verdad, y lo dicen dos veces: con la marca
+`engine` (para que `-m unit` no los coja) y con un `skipif` (para que `-m engine` no falle si el
+binario no está). Las dos hacen falta: la marca es para elegir la suite, el `skipif` para que elegir
+la suite equivocada dé "saltado" en vez de "roto".
+
+Y comprueban los dos números exactos, 1320 y 3190. Ese es el test que avisaría de que la versión de
+Stockfish ha cambiado, porque el rango de `UCI_Elo` cambia con ella y toda la escalera de Elo de M2
+está calibrada contra él. Lo demás se comprueba por forma (`plies_played` en un rango, `result` en un
+conjunto), porque es lo único determinista en una partida limitada por tiempo.
+
+```python title="tests/unit/test_env.py"
+"""Tests for rukh.env and the `rukh info` command."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from rukh import paths
+from rukh.cli import app
+from rukh.env import EnvReport, collect
+
+pytestmark = pytest.mark.unit
+```
+
+<Src file="tests/unit/test_env.py" tag="p0" lines="1-15" />
+
+```python title="tests/unit/test_env.py"
+
+
+def test_collect_returns_report_with_python_and_mlflow(rukh_home: Path) -> None:
+    report = collect()
+    assert isinstance(report, EnvReport)
+    assert report.python.startswith("3.12")
+    assert report.mlflow_uri.startswith("sqlite:///")
+    assert report.data_dir == str(rukh_home / "data")
+    assert report.mlruns_dir == str(rukh_home / "mlruns")
+    assert isinstance(report.cuda, bool)
+
+
+def test_collect_survives_missing_torch(rukh_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "torch" or name.startswith("torch."):
+            raise ImportError("torch is not installed")
+        return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    report = collect()
+    assert report.torch is None
+    assert report.cuda is False
+    assert report.gpu is None
+```
+
+<Src file="tests/unit/test_env.py" tag="p0" lines="16-42" />
+
+El segundo test es la técnica que conviene conocer: para probar el camino "no hay torch" en una
+máquina que sí lo tiene, se sustituye `builtins.__import__` por una función que lanza `ImportError`
+solo para `torch`. Es intrusivo y está acotado a un test, y es lo único que ejercita de verdad ese
+`except ImportError` de `_torch_info`. La alternativa —confiar en que funcione— deja sin probar
+exactamente la rama que alguien va a ver el primer día en una máquina sin GPU.
+
+Nótese que el primer test comprueba `report.python.startswith("3.12")`: es la tercera vez que 3.12
+aparece en el repositorio (`.python-version`, `requires-python`, aquí). Un intérprete distinto rompe
+el test, que es lo que se quiere.
+
+```python title="tests/unit/test_env.py"
+
+
+def test_paths_follow_rukh_home(rukh_home: Path) -> None:
+    assert paths.root() == rukh_home
+    assert paths.data_dir() == rukh_home / "data"
+    assert paths.mlruns_dir() == rukh_home / "mlruns"
+    assert paths.tools_dir() == rukh_home / "tools"
+
+
+def test_paths_default_to_repo_root(monkeypatch: pytest.MonkeyPatch, repo_root: Path) -> None:
+    monkeypatch.delenv("RUKH_HOME", raising=False)
+    assert paths.root() == repo_root
+```
+
+<Src file="tests/unit/test_env.py" tag="p0" lines="43-54" />
+
+Los dos tests de `paths.py`, y están aquí y no en un `test_paths.py` porque prueban la misma
+propiedad que el informe de entorno: que `RUKH_HOME` mueve el proyecto entero. El segundo es el que
+comprueba que la variable **se lee en cada llamada**: si `paths.py` la hubiera cacheado al importarse,
+`delenv` no tendría efecto y el test fallaría.
+
+```python title="tests/unit/test_env.py"
+
+
+def test_info_json_is_parseable(rukh_home: Path) -> None:
+    result = CliRunner().invoke(app, ["info", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert set(EnvReport.model_fields) <= set(payload)
+    assert payload["python"].startswith("3.12")
+    assert payload["mlflow_uri"].startswith("sqlite:///")
+
+
+def test_info_human_output_mentions_python(rukh_home: Path) -> None:
+    result = CliRunner().invoke(app, ["info"])
+    assert result.exit_code == 0, result.output
+    assert "python" in result.output
+    assert "3.12" in result.output
+```
+
+<Src file="tests/unit/test_env.py" tag="p0" lines="55-70" />
+
+`set(EnvReport.model_fields) <= set(payload)` comprueba que el JSON trae **todos** los campos del
+modelo sin enumerarlos: añadir un campo al informe no obliga a tocar el test, pero olvidarse de
+serializarlo sí lo rompe. Y `assert result.exit_code == 0, result.output` con la salida como mensaje:
+cuando falle, el informe de pytest enseñará el error de la CLI en vez de `assert 1 == 0`.
+
+```python title="tests/unit/test_tracking.py"
+"""Tests for rukh.tracking: local MLflow store and run helper."""
+
+from __future__ import annotations
+
+import re
+import shutil
+import sys
+from pathlib import Path
+
+import mlflow
+import pytest
+
+from rukh import __version__
+from rukh.tracking import flatten, git_sha, start_run, tracking_uri, ui_command
+
+pytestmark = pytest.mark.unit
+```
+
+<Src file="tests/unit/test_tracking.py" tag="p0" lines="1-16" />
+
+```python title="tests/unit/test_tracking.py"
+
+
+def test_tracking_uri_points_to_sqlite_under_mlruns(rukh_home: Path) -> None:
+    uri = tracking_uri(create=False)
+    assert uri == f"sqlite:///{(rukh_home / 'mlruns' / 'mlflow.db').as_posix()}"
+    assert not (rukh_home / "mlruns").exists()
+    tracking_uri()
+    assert (rukh_home / "mlruns").is_dir()
+
+
+def test_flatten_nested_dict() -> None:
+    assert flatten({"a": {"b": 1, "c": {"d": "x"}}, "e": [1, 2]}) == {
+        "a.b": "1",
+        "a.c.d": "x",
+        "e": "[1, 2]",
+    }
+
+
+def test_start_run_logs_flattened_params_and_tags(rukh_home: Path) -> None:
+    with start_run("t", {"a": {"b": 1}}, tags={"purpose": "test"}) as run:
+        run_id = run.info.run_id
+    assert (rukh_home / "mlruns" / "mlflow.db").is_file()
+
+    mlflow.set_tracking_uri(tracking_uri())
+    runs = mlflow.search_runs(experiment_names=["rukh"], output_format="list")
+    found = [r for r in runs if r.info.run_id == run_id]
+    assert len(found) == 1
+    logged = found[0]
+    assert logged.info.run_name == "t"
+    assert logged.data.params["a.b"] == "1"
+    assert logged.data.tags["rukh_version"] == __version__
+    assert logged.data.tags["purpose"] == "test"
+    assert logged.info.status == "FINISHED"
+```
+
+<Src file="tests/unit/test_tracking.py" tag="p0" lines="17-49" />
+
+El primero comprueba las dos mitades del parámetro `create`: con `create=False` la URI se construye y
+el directorio **no existe**; con la llamada por defecto, existe. Es la propiedad que hace que
+`rukh info` sea inocuo.
+
+El tercero es el test más caro del fichero y el que más cubre: abre una corrida de verdad contra una
+base SQLite de verdad (en el directorio temporal de la fixture), y después **la lee con MLflow** para
+comprobar que los parámetros llegaron aplanados, que las dos etiquetas automáticas están y que la
+corrida quedó en `FINISHED`. Ese último `assert` es el que detecta que el gestor de contexto no cierra
+bien: una corrida que se queda en `RUNNING` para siempre no falla nada, solo ensucia el cuaderno.
+
+```python title="tests/unit/test_tracking.py"
+
+
+def test_git_sha_is_the_source_tree_sha_even_with_rukh_home_elsewhere(
+    rukh_home: Path, repo_root: Path
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    if not (repo_root / ".git").exists():
+        pytest.skip("source tree is not a git checkout")
+    assert not (rukh_home / ".git").exists()
+    sha = git_sha()
+    assert sha is not None and re.fullmatch(r"[0-9a-f]{40}", sha), sha
+
+
+def test_ui_command_uses_the_current_interpreter() -> None:
+    argv = ui_command(host="0.0.0.0", port=5001)
+    assert argv[:4] == [sys.executable, "-m", "mlflow", "ui"]
+    assert argv[argv.index("--host") + 1] == "0.0.0.0"
+    assert argv[argv.index("--port") + 1] == "5001"
+```
+
+<Src file="tests/unit/test_tracking.py" tag="p0" lines="50-68" />
+
+El nombre del primero es el test entero: con `RUKH_HOME` apuntando a un directorio temporal que **no
+es** un repositorio git, `git_sha()` sigue devolviendo el SHA del árbol de fuentes. Eso es lo que
+prueba que la separación entre `package_root()` y `root()` sirve para algo. Los dos `skip` son
+honestos: sin git instalado o en un tarball sin `.git`, la propiedad no se puede comprobar, y saltar
+es mejor que fallar por el motivo equivocado.
+
+```python title="tests/unit/test_tracking.py"
+
+
+def test_cli_has_mlflow_ui_command() -> None:
+    from typer.testing import CliRunner
+
+    from rukh.cli import app
+
+    result = CliRunner().invoke(app, ["mlflow", "ui", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "--port" in result.output
+```
+
+<Src file="tests/unit/test_tracking.py" tag="p0" lines="69-78" />
+
+Se invoca `--help` y no la orden: `rukh mlflow ui` bloquea hasta que lo mates. Comprobar que la orden
+está registrada y acepta `--port` es todo lo que se puede comprobar sin arrancar un servidor, y es
+suficiente: lo que la orden hace ya está cubierto por `test_ui_command_uses_the_current_interpreter`.
+
+<Exercise n="02" title="Registra tu primera corrida">
+  Desde `uv run python`, abre una corrida a mano y míralo en la interfaz:
+
+```python
+from rukh.tracking import start_run
+
+with start_run("hola", {"modelo": {"capas": 4}, "lr": 3e-4}) as run:
+    print(run.info.run_id)
+```
+
+Después `uv run rukh mlflow ui` y busca la corrida. ¿Qué parámetros tiene y con qué nombres? ¿Qué
+etiquetas? ¿Y qué pasa si el bloque `with` lanza una excepción a mitad?
+
+<Solution>
+  Los parámetros son `modelo.capas = "4"` y `lr = "0.0003"`: aplanados con punto y convertidos a
+  cadena, que es lo único que MLflow acepta. Las etiquetas incluyen `rukh_version` (`0.0.1`) y
+  `git_sha` con el commit de tu checkout.
+
+Si el bloque lanza, `mlflow.start_run` marca la corrida como `FAILED` al salir del gestor de
+contexto y la excepción se propaga. Eso es justo lo que se quiere: una corrida interrumpida se
+distingue de una terminada en la interfaz, y por eso el test comprueba `status == "FINISHED"` en el
+camino bueno.
+
+</Solution>
+</Exercise>
+
+## Qué has aprendido
+
+El proyecto ya tiene juez y cuaderno. Stockfish está en disco, verificado por UCI, y el rango en el
+que se le puede pedir que juegue peor se **lee** del motor y no se supone: 1320-3190. Cada corrida
+que se abra a partir de ahora deja su configuración completa y el SHA del código que la produjo en
+una base local, y las model cards de M6 se generarán desde ahí.
+
+**Cómo se mide**: `uv run rukh info` muestra `cuda: True` y una ruta en `stockfish`;
+`uv run rukh engine check` devuelve `uci_elo_min 1320` y `uci_elo_max 3190`;
+`uv run pytest -m unit -q` pasa (los dos tests con marca `engine` quedan fuera del filtro) y
+`uv run pytest -m engine -q` pasa con el binario instalado.
+
+Lo siguiente son los datos: seis mil millones de partidas de las que hay que traerse unos pocos
+gigabytes, con cada filtro justificado y un manifiesto que permita comprobar después qué entró de
+verdad.

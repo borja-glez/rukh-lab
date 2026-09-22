@@ -1,0 +1,1045 @@
+---
+title: 'El repositorio: del directorio vacío a `rukh info`'
+description: 'El esqueleto del proyecto, fichero a fichero: la versión de Python, el pyproject con los dos extras de torch en conflicto, el paquete, las rutas, las configuraciones estrictas, la CLI de typer y los dos tests que impiden que el entorno se degrade en silencio.'
+module: m0
+order: 1
+duration: 135
+level: base
+status: vigente
+updated: 2026-09-22
+keywords:
+  - uv
+  - pyproject
+  - pydantic
+  - typer
+  - ruff
+  - pytest
+artifacts:
+  - kind: repo
+    label: borja-glez/rukh
+    href: https://github.com/borja-glez/rukh/tree/p0
+---
+
+## Qué vas a construir
+
+Un repositorio vacío convertido en un paquete instalable con una orden que funciona: `rukh info`.
+Son trece ficheros y unas 540 líneas, y al terminar tendrás lo que hace falta para que todo lo
+demás del curso sea reproducible: una versión de Python fijada, un `torch` que no se instala del
+índice equivocado, configuraciones que se niegan a ignorar una errata, y una CLI donde cada módulo
+siguiente enchufará sus órdenes.
+
+Todo el código de esta lección está aquí, entero, tal como está en el repositorio en la etiqueta
+`p0`. Cada bloque lleva debajo su enlace a GitHub con las líneas exactas, y un script del curso
+comprueba que no se han separado (`pnpm verify:code`). Si copias los bloques en ese orden, tienes el
+repositorio.
+
+<Callout kind="hoy" title="Empieza con el directorio vacío, no con un clon">
+  Puedes clonar `rukh` en la etiqueta `p0` y leer, pero no es lo mismo. La primera vez que un
+  `pyproject.toml` te falla porque los dos extras de torch se pisan, aprendes algo que leerlo no
+  enseña. El clon está ahí para comparar cuando algo no salga:
+
+```sh
+git clone --branch p0 https://github.com/borja-glez/rukh rukh-p0
+```
+
+</Callout>
+
+## La versión de Python, en un fichero de una línea
+
+```text title=".python-version"
+3.12
+```
+
+<Src file=".python-version" tag="p0" lines="1-1" />
+
+<Term id="uv">uv</Term> lee este fichero y usa ese intérprete sin preguntar; si no lo tiene
+instalado, se lo descarga. Es la diferencia entre "funciona en mi máquina" y "funciona": nadie
+ejecuta el proyecto con 3.11 por accidente.
+
+3.12 y no 3.13 por dos motivos. El primero es que `torch` 2.11 con CUDA 12.8 publica ruedas para
+3.12 y a veces tarda semanas en publicarlas para la versión nueva. El segundo aparece en
+`config.py`, más abajo: la sintaxis de genéricos de PEP 695 (`def load_yaml[T: BaseModel]`) necesita
+3.12 como mínimo.
+
+## `pyproject.toml`: el fichero donde viven las decisiones
+
+Es el más largo de la lección y el que más veces vas a volver a abrir. Va por partes.
+
+```toml title="pyproject.toml"
+[project]
+name = "rukh"
+version = "0.0.1"
+description = "Rukh: a chess language model built from scratch (data, training, evaluation, agents)."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Borja González" }]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "typer>=0.27",
+  "pydantic>=2.13",
+  "pyyaml>=6",
+  "mlflow>=3.16",
+  "python-chess>=1.999",
+  "duckdb>=1.5",
+  "polars>=1.44",
+  "pyarrow>=25",
+  "zstandard>=0.25",
+  "numpy>=2",
+  "huggingface_hub>=1.32",
+  "datasets>=5",
+]
+```
+
+<Src file="pyproject.toml" tag="p0" lines="1-22" />
+
+Doce dependencias, y ninguna es un framework de entrenamiento. Eso es deliberado: el decoder de M2
+y el encoder de M3 se escriben a mano con `torch`, y no hay `transformers` hasta M4, donde entra
+porque el módulo trata precisamente de ese ecosistema. Las que hay se agrupan en tres oficios:
+
+- **La caja de herramientas de la línea de órdenes**: `typer` (la CLI), `pydantic` (validar
+  configuraciones), `pyyaml` (leerlas).
+- **El ajedrez y los datos**: `python-chess` (reglas, SAN, UCI, hablar con Stockfish por
+  <Term id="uci">UCI</Term>), `duckdb` para consultar <Term id="parquet">parquet</Term> remoto,
+  `polars` y `pyarrow` para la parte tabular, `zstandard` porque los volcados de Lichess vienen
+  comprimidos así, `numpy` para todo lo demás.
+- **Lo que sale del repo**: `mlflow` para registrar cada corrida, `huggingface_hub` y `datasets`
+  para publicar.
+
+`requires-python = ">=3.12,<3.13"` cierra la puerta por arriba además de por abajo. Un `>=3.12` a
+secas deja que `uv` resuelva con 3.14 el día que exista y que `torch` todavía no tenga ruedas.
+
+```toml title="pyproject.toml"
+
+[project.optional-dependencies]
+cpu = ["torch>=2.11,<2.12"]
+cu128 = ["torch>=2.11,<2.12"]
+
+[project.urls]
+Repository = "https://github.com/borja-glez/rukh"
+Course = "https://lab.rukh.borjaglez.com"
+Demo = "https://rukh.borjaglez.com"
+Models = "https://huggingface.co/chorcat"
+
+[project.scripts]
+rukh = "rukh.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rukh"]
+```
+
+<Src file="pyproject.toml" tag="p0" lines="23-42" />
+
+Los dos extras declaran **el mismo rango** de `torch`. No es una redundancia: es la condición que
+un test comprueba más abajo. Lo que los diferencia no es la versión, es el índice del que sale la
+rueda, y eso se configura a continuación.
+
+`[project.scripts]` es lo que convierte `rukh` en una orden. Apunta al objeto `app` de
+`rukh.cli`, así que el día que la CLI crezca a cincuenta órdenes esta línea no cambia.
+
+`packages = ["src/rukh"]` con el paquete dentro de `src/` (el _src layout_) evita un fallo clásico:
+sin `src/`, el directorio del repositorio está en `sys.path` al ejecutar `pytest`, y los tests
+importan el código del árbol de fuentes en vez del paquete instalado. Cuando se rompe el empaquetado
+—un fichero de datos que no se copia en la rueda, por ejemplo— los tests siguen en verde y se
+descubre al publicar.
+
+```toml title="pyproject.toml"
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "cu128" }]]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu128", extra = "cu128" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+```
+
+<Src file="pyproject.toml" tag="p0" lines="43-61" />
+
+Estas diecinueve líneas son el corazón de "entorno reproducible" y merecen leerse despacio.
+
+`torch` no vive en PyPI en una sola versión: hay una rueda por combinación de CUDA. La de CUDA 12.8
+(la que necesita una RTX 5090, arquitectura sm_120) está en `download.pytorch.org/whl/cu128`, y la
+de CPU —la que usa la CI, que no tiene GPU— en `/whl/cpu`.
+`[tool.uv.sources]` dice de qué índice sale `torch` según el extra activo.
+
+`explicit = true` en cada índice significa "de aquí solo se instala lo que se pida por nombre". Sin
+eso, `uv` buscaría **todas** las dependencias en los índices de PyTorch, y ahí hay copias antiguas
+de paquetes comunes que acabarían ganando a las de PyPI.
+
+`conflicts` declara que los dos extras son mutuamente excluyentes. Si se pudieran instalar juntos,
+el entorno tendría dos ruedas del mismo paquete desde dos sitios distintos, y qué `torch` acaba
+importado depende del orden de resolución: a veces GPU, a veces CPU, sin avisar.
+
+<Callout kind="roto" title="`uv sync --extra cpu --extra cu128`">
+  Falla, y tiene que fallar. `uv` rechaza la combinación porque está declarada como conflicto. Si te
+  pasa —lo normal es llegar aquí desde un `--extra cpu` de prueba— borra `.venv` y sincroniza con
+  uno solo. El síntoma de no haberlo hecho es peor que el error: `rukh info` dice `cuda False` en
+  una máquina que tiene GPU, y te enteras cuarenta minutos después de lanzar un entrenamiento.
+</Callout>
+
+```toml title="pyproject.toml"
+
+[dependency-groups]
+dev = ["pytest>=9", "ruff>=0.16"]
+
+[tool.pytest.ini_options]
+markers = [
+  "unit: fast CPU tests",
+  "gpu: needs CUDA",
+  "slow: long",
+  "engine: needs Stockfish binary",
+]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+```
+
+<Src file="pyproject.toml" tag="p0" lines="62-80" />
+
+`dev` es un grupo de dependencias, no un extra: no se publica con el paquete y no participa en el
+conflicto de arriba. Dos herramientas, `pytest` y `ruff` (que hace de linter y de formateador).
+
+Las cuatro **marcas** de pytest son la decisión que más se nota en el día a día. Cada test declara
+qué necesita para correr, y eso permite tres suites distintas del mismo código:
+
+| Marca    | Qué necesita       | Cuándo se ejecuta                          |
+| -------- | ------------------ | ------------------------------------------ |
+| `unit`   | nada, CPU y rápido | siempre: en la CI y cada vez que guardas   |
+| `engine` | Stockfish en disco | en tu máquina, cuando toques la evaluación |
+| `gpu`    | CUDA               | en tu máquina                              |
+| `slow`   | paciencia          | a mano                                     |
+
+`uv run pytest -m unit -q` tarda segundos y no toca red ni GPU. Es la orden que vas a escribir cien
+veces en el curso.
+
+Las reglas de ruff son las seis que atrapan errores de verdad y no discuten de estilo: `E`/`F`
+(pyflakes y pycodestyle: nombres sin usar, imports muertos), `I` (orden de imports), `UP` (sintaxis
+que ya se puede escribir mejor en 3.12), `B` (bugbear: el mutable como valor por defecto y sus
+primos), `SIM` (simplificaciones). `line-length = 100` y no 88 porque las firmas con anotaciones de
+tipo de este proyecto no caben en 88 sin partirlas en sitios feos.
+
+## El paquete
+
+```text title=".gitignore"
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Project data and runs (never in git)
+/data/
+/mlruns/
+/tools/
+/checkpoints/
+/checkpoints/**/*.bin
+/artifacts/**/*.bin
+# Model weights never belong in git, wherever they are
+*.onnx
+*.safetensors
+*.pt
+
+# Local env
+.env
+.env.*
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+```
+
+<Src file=".gitignore" tag="p0" lines="1-34" />
+
+El bloque del medio es el que importa. `/data/`, `/mlruns/`, `/tools/` y `/checkpoints/` llevan
+barra inicial: solo la raíz, para que un `src/rukh/data/` (que sí se versiona) no caiga dentro. Y
+las tres extensiones de pesos (`*.onnx`, `*.safetensors`, `*.pt`) se ignoran **en cualquier sitio**,
+sin barra, porque el día que exportes un modelo a una carpeta nueva nadie se va a acordar de volver
+aquí. Un `.pt` de 200 MB en la historia de git no se quita: se reescribe la historia o se vive con
+él.
+
+```python title="src/rukh/__init__.py"
+"""Rukh: a chess language model built from scratch."""
+
+__version__ = "0.0.1"
+```
+
+<Src file="src/rukh/__init__.py" tag="p0" lines="1-3" />
+
+Una constante de tres líneas que va a aparecer en sitios inesperados: en el <Term id="manifiesto">manifiesto</Term>
+de los datos, en las etiquetas de cada corrida de MLflow y en las <Term id="model-card">model
+cards</Term>. Es la respuesta a "¿con qué versión del código salió este número?".
+
+### `paths.py`: nadie adivina dónde está la raíz
+
+```python title="src/rukh/paths.py"
+"""Project directories.
+
+Every accessor reads the environment at call time so tests (and users) can point the whole
+project elsewhere with ``RUKH_HOME`` without re-importing the package.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+_PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+
+
+def package_root() -> Path:
+    """Source tree root (the parent of ``src/``), regardless of ``RUKH_HOME``."""
+    return _PACKAGE_ROOT
+
+
+def root() -> Path:
+    """Repository root: ``RUKH_HOME`` if set, otherwise the parent of ``src/``."""
+    home = os.environ.get("RUKH_HOME")
+    return Path(home).expanduser().resolve() if home else _PACKAGE_ROOT
+
+
+def data_dir() -> Path:
+    """Where raw and derived datasets live (gitignored)."""
+    return root() / "data"
+
+
+def mlruns_dir() -> Path:
+    """Where the local MLflow store lives (gitignored)."""
+    return root() / "mlruns"
+
+
+def tools_dir() -> Path:
+    """Where downloaded binaries such as Stockfish live (gitignored)."""
+    return root() / "tools"
+```
+
+<Src file="src/rukh/paths.py" tag="p0" lines="1-38" />
+
+Treinta y ocho líneas que existen para evitar una clase entera de fallos: el script que escribe en
+`data/` y el que lee de `../data/` según desde dónde lo lances.
+
+Dos detalles son decisiones y no gusto personal.
+
+El primero: `root()` lee `os.environ` **en cada llamada**, no al importar el módulo. Si la ruta se
+calculara una vez en el `import`, un test que ponga `RUKH_HOME` con `monkeypatch` no tendría efecto
+sobre un módulo ya importado, y no hay forma limpia de arreglarlo desde el test. Leerla cada vez
+cuesta un acceso a un diccionario.
+
+El segundo: hay **dos** raíces distintas y no una. `package_root()` es el árbol de fuentes, fijo.
+`root()` es donde viven los datos, y `RUKH_HOME` la mueve. Se separan porque hacen falta las dos a
+la vez: en M2 querrás entrenar con los datos en otro disco (`RUKH_HOME=D:\rukh`) mientras el SHA de
+git que se registra en la corrida sigue siendo el del checkout donde está el código. Si hubiera una
+sola raíz, `RUKH_HOME` te dejaría con corridas etiquetadas con el commit de un directorio que no es
+un repositorio.
+
+### `config.py`: veintiocho líneas que salvan noches de GPU
+
+```python title="src/rukh/config.py"
+"""Strict pydantic configs loaded from YAML."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+from pydantic import BaseModel, ConfigDict
+
+
+class BaseConfig(BaseModel):
+    """Base class for every config: unknown keys are an error, never silently ignored."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def load_yaml[T: BaseModel](path: Path, model: type[T]) -> T:
+    """Load ``path`` as YAML and validate it against ``model``.
+
+    Raises ``ValueError`` when the document is not a mapping and
+    ``pydantic.ValidationError`` when it does not match the model.
+    """
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: expected a YAML mapping, got {type(raw).__name__}")
+    return model.model_validate(raw)
+```
+
+<Src file="src/rukh/config.py" tag="p0" lines="1-28" />
+
+Toda configuración del proyecto —los datos, los entrenamientos, las evaluaciones— hereda de
+`BaseConfig`, y `extra="forbid"` es lo único que hace. Con eso, una clave mal escrita en un YAML
+**revienta antes de tocar la red o la GPU** en vez de quedarse sin aplicar.
+
+Es la decisión con mejor relación entre líneas y disgustos evitados de todo el repositorio. El
+escenario que evita: escribes `learnig_rate: 0.0003` en el YAML de un entrenamiento de cuarenta
+minutos. Con `extra="ignore"` (el comportamiento por defecto de pydantic) el entrenamiento arranca,
+usa el valor por defecto, y produce un número perfectamente creíble que responde a una pregunta que
+nadie hizo. La forma más cara de perder una noche de GPU no es que algo falle: es que algo funcione
+midiendo otra cosa.
+
+`load_yaml[T: BaseModel]` es la sintaxis de genéricos de 3.12 (PEP 695). Sirve para que el tipo que
+sale sea el que entró: `load_yaml(path, FetchConfig)` devuelve un `FetchConfig` y no un `BaseModel`,
+así que el editor y el comprobador de tipos conocen los campos.
+
+Los dos casos raros están tratados a propósito. Un YAML vacío da `None` y se convierte en `{}`, para
+que una configuración cuyos campos tienen todos valor por defecto se pueda escribir como un fichero
+en blanco. Un YAML que es una lista da un `ValueError` con la ruta dentro del mensaje: el error de
+pydantic para ese caso menciona el modelo pero no el fichero, y con veinte configuraciones en el
+repositorio lo que necesitas saber es cuál.
+
+<Transfer concept="Configuración estricta" where="Cualquier sistema que se configure con un fichero: un pipeline de datos, un agente con herramientas, un despliegue.">
+  La regla general es **fallar al cargar, no al usar**. Un sistema que acepta claves que no conoce
+  te está prometiendo que las ha entendido. Cuanto más tarde falle, más caro sale: en un
+  entrenamiento el coste es una noche de GPU; en un agente que llama a herramientas, una
+  configuración de `temperature` que nunca se aplicó y doscientas respuestas que hay que tirar.
+
+En el ecosistema de LLMs esto aparece exactamente igual con otro nombre: la validación del esquema
+de los argumentos de una herramienta. Si el modelo te manda `{"citiy": "Madrid"}` y tu código lo
+acepta y usa el valor por defecto, has convertido un error detectable en una respuesta plausible.
+`extra="forbid"` es la misma regla, un nivel más abajo.
+
+</Transfer>
+
+### `cli.py`: una orden por cada cosa que el proyecto sabe hacer
+
+La CLI es el único punto de entrada al proyecto. Al final del curso tendrá unas cuarenta órdenes;
+aquí tiene cuatro. Empieza por el andamio.
+
+```python title="src/rukh/cli.py"
+"""Command-line interface: ``info``, ``data fetch``, ``engine check`` and ``mlflow ui``."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Annotated
+
+import typer
+
+from rukh import __version__
+
+app = typer.Typer(
+    name="rukh",
+    help="Rukh: chess language model toolkit.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+data_app = typer.Typer(help="Datasets: fetch and describe Lichess games.", no_args_is_help=True)
+app.add_typer(data_app, name="data")
+mlflow_app = typer.Typer(help="Local MLflow tracking.", no_args_is_help=True)
+app.add_typer(mlflow_app, name="mlflow")
+engine_app = typer.Typer(help="Stockfish engine utilities.", no_args_is_help=True)
+app.add_typer(engine_app, name="engine")
+```
+
+<Src file="src/rukh/cli.py" tag="p0" lines="1-23" />
+
+Un `Typer` por grupo de órdenes, montado en el principal con `add_typer`. Así `rukh data fetch`,
+`rukh engine check` y `rukh mlflow ui` son subgrupos de verdad y cada uno tiene su propia ayuda.
+`no_args_is_help=True` en todos: escribir `rukh data` sin más imprime las órdenes disponibles en vez
+de un error.
+
+```python title="src/rukh/cli.py"
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"rukh {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_version_callback,
+            is_eager=True,
+            help="Print the package version and exit.",
+        ),
+    ] = False,
+) -> None:
+    """Rukh: chess language model toolkit."""
+
+```
+
+<Src file="src/rukh/cli.py" tag="p0" lines="24-44" />
+
+`is_eager=True` es lo que hace que `rukh --version` funcione sin subcomando: typer procesa esa
+opción antes de exigir uno. El `raise typer.Exit()` dentro del callback es la forma que tiene typer
+de salir con éxito a media ejecución.
+
+```python title="src/rukh/cli.py"
+
+
+@app.command()
+def info(
+    as_json: Annotated[bool, typer.Option("--json", help="Print the report as JSON only.")] = False,
+) -> None:
+    """Report Python, torch, CUDA, GPU, Stockfish and project directories."""
+    from rukh.env import EnvReport, collect
+
+    report = collect()
+    if as_json:
+        typer.echo(report.model_dump_json(indent=2))
+        return
+    width = max(len(key) for key in EnvReport.model_fields)
+    for key, value in report.model_dump().items():
+        typer.echo(f"{key:<{width}}  {value if value is not None else 'null'}")
+
+```
+
+<Src file="src/rukh/cli.py" tag="p0" lines="45-60" />
+
+Tres cosas de este bloque se repiten en todas las órdenes del proyecto y conviene verlas la primera
+vez.
+
+**El `import` está dentro de la función**, no arriba. Es a propósito: `rukh info` tiene que arrancar
+en milisegundos, y `rukh.env` arrastra `mlflow`, que tarda más de un segundo en importarse. Con
+cuarenta órdenes, importar todo arriba significa que `rukh --help` tarde varios segundos. La regla
+del proyecto es que `cli.py` solo importa `typer` en el nivel del módulo, y cada orden importa lo
+suyo cuando se ejecuta.
+
+**Todas las órdenes tienen `--json`.** La salida legible es para ti; la JSON es la que consumen los
+tests y los scripts. Si solo hubiera la legible, cualquier test tendría que parsear texto alineado
+en columnas, y cambiar el formato rompería los tests por el motivo equivocado.
+
+**El ancho de la columna se calcula**, no se escribe: `max(len(key) for key in
+EnvReport.model_fields)`. El día que el informe gane un campo largo, la salida sigue alineada sin que
+nadie la toque.
+
+```python title="src/rukh/cli.py"
+
+
+@data_app.command("fetch")
+def data_fetch(
+    config: Annotated[
+        Path,
+        typer.Option("--config", exists=True, dir_okay=False, readable=True, help="YAML config."),
+    ],
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Print the plan; touch neither network nor disk.")
+    ] = False,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the plan as JSON only.")] = False,
+) -> None:
+    """Fetch filtered Lichess games as parquet files plus a manifest."""
+    from rukh.config import load_yaml
+    from rukh.data.fetch import FetchConfig, run
+
+    cfg = load_yaml(config, FetchConfig)
+    fetch_plan = run(cfg, dry_run=dry_run)
+    if as_json:
+        typer.echo(fetch_plan.model_dump_json(indent=2))
+        return
+    typer.echo(f"dataset:  {cfg.dataset}")
+    typer.echo(f"months:   {', '.join(fetch_plan.months)}")
+    typer.echo(f"mode:     {'dry-run (nothing written)' if dry_run else 'fetched'}")
+    typer.echo("query:")
+    for line in fetch_plan.query.splitlines():
+        typer.echo(f"  {line}")
+    typer.echo(f"out_dir:  {fetch_plan.out_dir}")
+    typer.echo("outputs:")
+    for path in fetch_plan.out_paths:
+        typer.echo(f"  {path}")
+    typer.echo(f"manifest: {fetch_plan.manifest_path}")
+
+```
+
+<Src file="src/rukh/cli.py" tag="p0" lines="61-93" />
+
+`exists=True, dir_okay=False, readable=True` en la opción `--config`: typer comprueba el fichero
+antes de entrar en la función. Un `--config configs/data/lichess.yaml` con una errata en el nombre
+falla con un mensaje sobre el fichero, no con un `FileNotFoundError` en medio de una traza.
+
+El `--dry-run` no es una comodidad. La consulta SQL que esta orden imprime es la que la
+
+<a href="/curso/m0/03-los-datos/">lección de los datos</a> publica como "estos son los filtros", y
+sale del mismo código que la descarga de verdad. Lo veremos en `fetch.py`: el plan y la ejecución
+comparten el constructor de la consulta, así que el filtro documentado y el aplicado no pueden
+separarse.
+
+```python title="src/rukh/cli.py"
+
+
+@mlflow_app.command("ui")
+def mlflow_ui(
+    host: Annotated[str, typer.Option("--host", help="Interface to bind.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Port to listen on.")] = 5000,
+) -> None:
+    """Open the MLflow UI on the local SQLite store (blocks until stopped)."""
+    from rukh.tracking import serve_ui, tracking_uri
+
+    typer.echo(f"mlflow ui on http://{host}:{port} (store {tracking_uri()})")
+    raise typer.Exit(code=serve_ui(host=host, port=port))
+
+
+@engine_app.command("check")
+def engine_check_cmd(
+    elo: Annotated[int, typer.Option("--elo", help="UCI_Elo to configure.")] = 1400,
+    plies: Annotated[int, typer.Option("--plies", help="Half-moves to play.")] = 40,
+    seed: Annotated[int, typer.Option("--seed", help="Seed for the random opponent.")] = 0,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the result as JSON only.")] = False,
+) -> None:
+    """Locate Stockfish, set UCI_Elo and play a short game against a random mover."""
+    from rukh.engine import EngineCheckResult, EngineError, EngineNotFound, engine_check
+
+    try:
+        result = engine_check(elo=elo, plies=plies, seed=seed)
+    except (EngineNotFound, EngineError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if as_json:
+        typer.echo(result.model_dump_json(indent=2))
+        return
+    width = max(len(key) for key in EngineCheckResult.model_fields)
+    for key, value in result.model_dump().items():
+        typer.echo(f"{key:<{width}}  {value if value is not None else 'null'}")
+```
+
+<Src file="src/rukh/cli.py" tag="p0" lines="94-128" />
+
+`host = "127.0.0.1"` y no `0.0.0.0`: la interfaz de MLflow no tiene autenticación, y un valor por
+defecto que la publica en la red local es una mala idea que nadie recuerda haber tomado.
+
+En `engine check`, las tres excepciones esperadas se capturan y se convierten en un mensaje en
+`stderr` más código de salida 1. Una traza de Python con veinte líneas de `chess.engine` no le dice
+a nadie que le falta descargar Stockfish; `error: Stockfish not found: run ...` sí. Y `raise ...
+from exc` conserva la causa para cuando el problema no sea el esperado.
+
+<Exercise n="01" title="Instala el paquete y mira la ayuda">
+  Con los ficheros de arriba en su sitio, ejecuta:
+
+```sh
+uv sync --extra cu128 --group dev   # --extra cpu si no tienes GPU NVIDIA
+uv run rukh --help
+uv run rukh --version
+```
+
+`rukh info` todavía falla: importa `rukh.env`, que no existe hasta la lección siguiente. ¿Qué
+imprime `rukh data` sin más? ¿Y por qué `rukh --version` funciona aunque no haya ningún subcomando?
+
+<Solution>
+  `rukh data` imprime la ayuda del subgrupo en vez de un error de uso, porque su `Typer` se creó
+  con `no_args_is_help=True`. `rukh --version` funciona porque la opción lleva `is_eager=True`: typer
+  ejecuta su callback antes de comprobar que hay un subcomando, y el callback sale con
+  `typer.Exit()`.
+
+Si `uv sync` protesta por `[tool.uv.sources]`, tu `uv` es anterior a la versión que entiende
+índices por extra; actualízalo con `uv self update`.
+
+</Solution>
+</Exercise>
+
+## Los tests que impiden que el entorno se degrade
+
+Dos ficheros, cien líneas, y son los únicos tests del proyecto que no comprueban código sino
+**configuración**. Los dos existen porque lo que vigilan se rompe en silencio.
+
+```python title="tests/conftest.py"
+"""Shared pytest fixtures for the rukh test suite."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture
+def repo_root() -> Path:
+    """Absolute path to the repository root (the folder containing pyproject.toml)."""
+    return REPO_ROOT
+
+
+@pytest.fixture
+def rukh_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point RUKH_HOME at a temporary directory so tests never touch the real data/mlruns."""
+    monkeypatch.setenv("RUKH_HOME", str(tmp_path))
+    return tmp_path
+```
+
+<Src file="tests/conftest.py" tag="p0" lines="1-22" />
+
+`rukh_home` es la fixture más usada del repositorio y es la razón por la que `paths.root()` lee el
+entorno en cada llamada. Cualquier test que la pida trabaja contra un directorio temporal: nada
+escribe en el `data/` ni en el `mlruns/` de verdad, y no hay estado compartido entre tests. Un test
+que se olvide de pedirla y escriba en `mlruns/` deja la base de MLflow sucia y el siguiente falla
+por un motivo que no tiene nada que ver.
+
+```python title="tests/unit/test_config.py"
+"""Tests for rukh.config: strict pydantic configs loaded from YAML."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from rukh.config import BaseConfig, load_yaml
+
+pytestmark = pytest.mark.unit
+
+
+class DemoConfig(BaseConfig):
+    name: str
+    steps: int = 10
+
+
+def test_base_config_forbids_unknown_keys() -> None:
+    with pytest.raises(ValidationError):
+        DemoConfig(name="x", unknown=1)  # type: ignore[call-arg]
+
+
+def test_load_yaml_returns_model(tmp_path: Path) -> None:
+    path = tmp_path / "demo.yaml"
+    path.write_text("name: demo\nsteps: 3\n", encoding="utf-8")
+    cfg = load_yaml(path, DemoConfig)
+    assert cfg == DemoConfig(name="demo", steps=3)
+
+
+def test_load_yaml_rejects_unknown_keys(tmp_path: Path) -> None:
+    path = tmp_path / "demo.yaml"
+    path.write_text("name: demo\ntypo: 1\n", encoding="utf-8")
+    with pytest.raises(ValidationError):
+        load_yaml(path, DemoConfig)
+
+
+def test_load_yaml_rejects_non_mapping(tmp_path: Path) -> None:
+    path = tmp_path / "demo.yaml"
+    path.write_text("- just\n- a list\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="mapping"):
+        load_yaml(path, DemoConfig)
+```
+
+<Src file="tests/unit/test_config.py" tag="p0" lines="1-43" />
+
+`pytestmark = pytest.mark.unit` al nivel del módulo marca todos los tests del fichero de una vez; es
+el patrón de todo el repositorio. `DemoConfig` es un modelo de juguete que solo existe aquí: se
+prueba `BaseConfig`, no una configuración concreta, y cuando `FetchConfig` cambie estos tests no se
+tienen que tocar.
+
+El tercer test es el que corresponde a la promesa de la lección: una clave que no existe es un
+error. El cuarto comprueba que el mensaje menciona `mapping`, es decir, que el error del YAML que es
+una lista sigue siendo el nuestro (con la ruta) y no el de pydantic.
+
+```python title="tests/unit/test_lock_guard.py"
+"""Guard the torch pin: both extras must resolve the same torch range and lock the same version."""
+
+from __future__ import annotations
+
+import re
+import tomllib
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.unit
+
+TORCH_SPEC_PREFIX = "torch>=2.11,<2.12"
+
+
+def _torch_spec(extras: dict[str, list[str]], name: str) -> str:
+    specs = [dep for dep in extras[name] if re.match(r"^torch\b", dep)]
+    assert len(specs) == 1, f"extra {name!r} must declare exactly one torch requirement"
+    return specs[0]
+
+
+def test_extras_pin_the_same_torch_range(repo_root: Path) -> None:
+    pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = pyproject["project"]["optional-dependencies"]
+    cpu = _torch_spec(extras, "cpu")
+    cu128 = _torch_spec(extras, "cu128")
+    assert cpu == cu128
+    assert cpu.startswith(TORCH_SPEC_PREFIX)
+
+
+def test_extras_are_declared_as_conflicting(repo_root: Path) -> None:
+    pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    conflicts = pyproject["tool"]["uv"]["conflicts"]
+    assert [{"extra": "cpu"}, {"extra": "cu128"}] in conflicts
+```
+
+<Src file="tests/unit/test_lock_guard.py" tag="p0" lines="1-34" />
+
+```python title="tests/unit/test_lock_guard.py"
+
+
+def test_lock_has_torch_2_11_for_both_indexes(repo_root: Path) -> None:
+    lock = tomllib.loads((repo_root / "uv.lock").read_text(encoding="utf-8"))
+    torch_entries = [pkg for pkg in lock["package"] if pkg["name"] == "torch"]
+    assert torch_entries, "uv.lock has no torch entry"
+    by_index: dict[str, set[str]] = {"cpu": set(), "cu128": set()}
+    for entry in torch_entries:
+        index_url = entry.get("source", {}).get("registry", "")
+        if index_url.endswith("/whl/cpu"):
+            by_index["cpu"].add(entry["version"])
+        elif index_url.endswith("/whl/cu128"):
+            by_index["cu128"].add(entry["version"])
+    assert by_index["cpu"], "no torch entry locked from the pytorch-cpu index"
+    assert by_index["cu128"], "no torch entry locked from the pytorch-cu128 index"
+    assert any(v.endswith("+cpu") for v in by_index["cpu"]), by_index
+    assert any(v.endswith("+cu128") for v in by_index["cu128"]), by_index
+    for index, versions in by_index.items():
+        for version in versions:
+            assert version.startswith("2.11."), f"torch from {index} locked at {version}"
+```
+
+<Src file="tests/unit/test_lock_guard.py" tag="p0" lines="35-54" />
+
+Este es el test que más raro parece y más veces ha servido. Lee `pyproject.toml` y `uv.lock` como
+datos, con `tomllib` de la biblioteca estándar, y comprueba tres cosas que ninguna herramienta
+comprueba por ti:
+
+1. Los dos extras declaran **exactamente una** dependencia de `torch` y **el mismo** rango. El fallo
+   que evita: alguien sube `cu128` a `torch>=2.12` para probar algo, la CI sigue en verde porque
+   usa `cpu`, y a partir de ahí las dos mitades del proyecto miden con versiones distintas.
+2. Los dos extras siguen declarados como conflicto, es decir, nadie ha borrado esa línea de
+   `[tool.uv]` para que dejara de molestar.
+3. El fichero de bloqueo tiene una entrada de `torch` de **cada** índice, con la versión local
+   correspondiente (`+cpu`, `+cu128`), y las dos en la serie 2.11.
+
+Que el tercero mire el `uv.lock` y no el entorno instalado es lo que lo hace útil en la CI: el
+`uv.lock` es un fichero de texto versionado, así que el test falla en el _pull request_ que lo
+degrada y no tres semanas después en la máquina de alguien.
+
+<Callout kind="mundo-real" title="Un test sobre el fichero de bloqueo">
+  Cuesta cincuenta líneas y no prueba ninguna función. Es, con diferencia, el test con mejor
+  relación coste/beneficio del repositorio, porque el fallo que atrapa —dos mitades del proyecto
+  midiendo con versiones distintas de la librería que produce los números— no da ningún síntoma
+  hasta que dos resultados no cuadran y ya no se sabe por qué.
+
+La versión general: **si una propiedad de tu proyecto vive en un fichero de configuración y
+romperla no falla nada, escribe el test que la lee**. Suele ser una tarde y evita una arqueología.
+
+</Callout>
+
+## La CI, que es la misma orden que tú escribes
+
+{/* prettier-ignore */}
+```yaml title=".github/workflows/ml.yml"
+name: ml
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    name: lint and unit tests (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync (CPU torch, dev group)
+        run: uv sync --extra cpu --group dev
+
+      - name: Ruff check
+        run: uv run ruff check .
+
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+      - name: Unit tests
+        run: uv run pytest -m unit -q
+```
+
+<Src file=".github/workflows/ml.yml" tag="p0" lines="1-37" />
+
+Un solo trabajo, en CPU, y las tres órdenes son literalmente las que ejecutas en tu máquina. Eso es
+la propiedad que importa: una CI que corre algo distinto de lo que corres tú es una CI que falla por
+motivos que no puedes reproducir.
+
+`--extra cpu` porque los ejecutores de GitHub no tienen GPU, y de ahí que el test del fichero de
+bloqueo sea necesario: la CI nunca instala `cu128`, así que nunca se enteraría de que ese extra se
+ha degradado.
+
+`concurrency` con `cancel-in-progress` cancela la ejecución anterior de la misma rama cuando
+empujas otra vez. `timeout-minutes: 15` mata el trabajo colgado en vez de dejarlo consumiendo
+minutos.
+
+No hay trabajo de GPU, y es una decisión: los tests marcados `gpu`, `engine` y `slow` corren en la
+máquina de referencia, a mano, cuando se toca lo que cubren. Alquilar un ejecutor con GPU para cada
+_pull request_ de un proyecto de una persona no se paga.
+
+## El README, que es el índice del repositorio
+
+{/* prettier-ignore */}
+````markdown title="README.md"
+# rukh
+
+Rukh is a chess language model built from scratch, and the machine-learning half of a course on
+generative and agentic AI. This repository holds the data pipeline, the models, the training and
+evaluation code, the export to ONNX and, in phase 2, the agents. The course lives in
+[`rukh-lab`](https://github.com/borja-glez/rukh-lab) (published at
+[lab.rukh.borjaglez.com](https://lab.rukh.borjaglez.com)) and the playable demo in
+[`rukh-web`](https://github.com/borja-glez/rukh-web)
+([rukh.borjaglez.com](https://rukh.borjaglez.com)). Everything trained is published on Hugging
+Face under [`chorcat`](https://huggingface.co/chorcat) as `rukh-*`.
+
+The name is Persian for the rook.
+
+## What is in here
+
+```
+src/rukh/            the `rukh` package and its `rukh` CLI
+  cli.py             typer app: info · data fetch · engine check · mlflow ui
+  env.py             environment report (Python, torch, CUDA, GPU, Stockfish, MLflow, dirs)
+  paths.py           project directories; RUKH_HOME overrides the root
+  config.py          strict pydantic configs (extra="forbid") loaded from YAML
+  data/              fetch.py (DuckDB over hf:// parquet) · manifest.py (provenance record)
+  engine.py          Stockfish detection and a short UCI_Elo sanity game
+  tracking.py        local MLflow store (SQLite) and run helper
+configs/             YAML configs (configs/data/lichess-2025-01-02.yaml)
+scripts/             get_stockfish.py (downloads Stockfish 19 into tools/, gitignored)
+tests/unit/          fast CPU tests (`pytest -m unit`); `engine` tests need Stockfish
+labs/                thin notebooks behind each lesson; export JSON to artifacts/web/
+artifacts/web/       small JSON the course site renders (versioned)
+gold/                golden files for evaluation
+docs/spec/           the binding design docs (Spanish); docs/decisiones-de-ejecucion.md is the
+                     decision ledger; adr/, runbooks/, model-cards/, benchmarks.md, backlog.md
+data/ mlruns/ tools/ local datasets, MLflow store and binaries (gitignored)
+```
+
+## Quickstart
+
+Requirements: Python 3.12 managed by [`uv`](https://docs.astral.sh/uv/) (the repo pins it in
+`.python-version`), and an NVIDIA GPU with CUDA 12.8 for the `cu128` extra. The `cpu` extra is what
+CI uses; the two extras are mutually exclusive and lock the same `torch>=2.11,<2.12` range.
+
+```sh
+uv sync --extra cu128 --group dev      # or --extra cpu on a machine without a GPU
+uv run rukh info                       # Python, torch, CUDA, GPU, Stockfish, MLflow store
+uv run python scripts/get_stockfish.py # Stockfish 19 into tools/stockfish/ (idempotent)
+uv run rukh engine check               # plays 40 plies at UCI_Elo 1400 against a random mover
+uv run rukh data fetch --config configs/data/lichess-2025-01-02.yaml --dry-run
+uv run rukh mlflow ui                  # MLflow UI on the local SQLite store
+uv run pytest -m unit -q               # fast tests; add `or engine` once Stockfish is installed
+```
+
+`rukh info --json`, `rukh engine check --json` and `rukh data fetch --json` print machine-readable
+output. Set `RUKH_HOME` to move `data/`, `mlruns/` and `tools/` elsewhere, and `RUKH_STOCKFISH` to
+point at a specific binary.
+
+## Development
+
+- `uv run ruff check .` and `uv run ruff format .` must be clean; CI runs them plus
+  `pytest -m unit` on CPU (`.github/workflows/ml.yml`).
+- Configs are pydantic models with `extra="forbid"`: an unknown key is an error.
+- Test markers: `unit` (fast, CPU, no network), `engine` (needs Stockfish), `gpu`, `slow`.
+- Commits follow Conventional Commits in English; the design docs and the course are in Spanish.
+
+## Licenses and attribution
+
+- Code: [MIT](LICENSE).
+- Model weights published on Hugging Face: Apache-2.0.
+- Data: derived from the [Lichess open database](https://database.lichess.org/) and its mirrors
+  on Hugging Face (`Lichess/standard-chess-games`, `Lichess/chess-puzzles`,
+  `Lichess/chess-position-evaluations`, `Lichess/chess-openings`), released under CC0 1.0. The
+  derived datasets are published under CC0 with attribution to Lichess.
+- Stockfish (GPL-3) and python-chess (GPL-3) are used as external tools/libraries on the training
+  side only; neither is redistributed with the web demo.
+- Course content (in `rukh-lab`): CC BY-NC-SA 4.0.
+````
+
+<Src file="README.md" tag="p0" lines="1-74" />
+
+Está en inglés, como todo el código y las model cards del proyecto; el curso y los documentos de
+diseño están en español. El mapa de `src/` de arriba va a crecer en cada módulo, y es el sitio donde
+se mira cuando no te acuerdas de qué fichero hace qué.
+
+La sección de licencias no es burocracia y conviene entenderla antes de publicar nada. Son cuatro
+licencias distintas conviviendo:
+
+- El **código** es MIT.
+- Los **pesos** que se publiquen, Apache-2.0.
+- Los **datos** derivan de Lichess, que es <Term id="cc0">CC0</Term>, y se republican como CC0
+  citando el origen.
+- Stockfish y `python-chess` son **GPL-3**, y ahí está la decisión: se usan como herramienta externa
+  en el lado del entrenamiento (un proceso aparte con el que se habla por UCI), y **no se
+  redistribuyen con la demo**. Empaquetar un binario GPL-3 en una web propietaria es el error que
+  esta línea del README existe para no cometer.
+
+## Los dos ficheros que el curso no muestra
+
+`LICENSE` es el texto de MIT tal cual. `uv.lock` es el <Term id="fichero-de-bloqueo">fichero de bloqueo</Term>: 2 193 líneas generadas por `uv sync` con la
+versión exacta y el hash de cada paquete: se versiona (es lo que hace reproducible el entorno) y no
+se edita a mano nunca. Están enlazados y no pegados porque leerlos no enseña nada; lo que hay que
+saber del `uv.lock` es lo que comprueba `test_lock_guard.py`, que sí está entero arriba.
+
+<Exercise n="02" title="Rompe el fichero de bloqueo y mira quién se queja">
+  En una copia del repositorio, cambia el extra `cu128` a `torch>=2.12,<2.13` en `pyproject.toml` y
+  ejecuta `uv run pytest -m unit -q`. ¿Qué test falla y con qué mensaje? Después déjalo como estaba
+  y cambia `line-length` de ruff a 88: ¿qué orden se queja y cuántos ficheros?
+
+<Solution>
+  Falla `test_extras_pin_the_same_torch_range`, en el `assert cpu == cu128`, antes de llegar a
+  comprobar el prefijo. El mensaje de pytest enseña los dos especificadores, que es exactamente lo
+  que necesitas ver. Nótese que **`uv sync` no se queja**: es una combinación perfectamente
+  instalable, solo que incoherente, y por eso hace falta el test.
+
+Con `line-length = 88`, `uv run ruff format --check .` falla y lista los ficheros que reformatearía
+(en `p0`, prácticamente todos los de `src/`). `ruff check .` también avisa de las líneas que pasan
+de 88 con la regla `E501`.
+
+</Solution>
+</Exercise>
+
+## Qué has aprendido
+
+El esqueleto del proyecto, y las tres decisiones que lleva dentro: un intérprete fijado y un `torch`
+que sale del índice correcto o falla; configuraciones que rechazan lo que no entienden; y una CLI
+donde cada módulo enchufa sus órdenes sin que arranque más lento.
+
+**Cómo se mide**: `uv run rukh --help` lista los cuatro grupos de órdenes, `uv run rukh --version`
+imprime `rukh 0.0.1`, `uv run ruff check .` y `uv run ruff format --check .` están limpios, y
+`uv run pytest -m unit -q` pasa los siete tests que hay hasta ahora (cuatro de `config`, tres de
+`lock_guard`).
+
+Lo siguiente es el juez. `rukh info` todavía no funciona porque le falta `env.py`, y `env.py`
+necesita saber dónde está Stockfish y cuál es la base de MLflow: las dos cosas que hacen que un
+número de este curso se pueda comparar con otro.

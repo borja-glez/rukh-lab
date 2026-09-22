@@ -45,20 +45,51 @@ def collect() -> EnvReport:
 Bloques con cuatro acentos graves cuando el contenido lleva tres (las plantillas Jinja de las model
 cards llevan bloques Markdown dentro).
 
+### Dos trampas de formato que rompen el código sin que se note
+
+**Prettier reescribe el código de un bloque cuyo lenguaje conoce.** Python y TOML no los conoce, así
+que la mayor parte del curso está a salvo; YAML, TypeScript, JSON, CSS y Markdown sí, y los reformatea
+en silencio (comillas simples por dobles, sangría perdida). El bloque deja de ser el fichero y el
+lector no lo puede saber. La guarda va **en la línea de encima** de la apertura del bloque:
+
+````mdx
+{/* prettier-ignore */}
+```yaml title="configs/data/pipeline.yaml"
+````
+
+`pnpm verify:code` la exige en todo bloque de un lenguaje que Prettier conozca, y la lista está en
+`scripts/course-code.mjs`. No se pone en los bloques de Python: sobra y ensucia.
+
+**Prettier recorta las líneas en blanco de los extremos de un bloque.** Un bloque escrito para
+empezar en la línea vacía que separa dos definiciones empieza una línea más tarde en cuanto se
+formatea, y el `lines` deja de cuadrar. Por eso el flujo de trabajo es **escribir, formatear,
+`fix`, verificar**, y `fix` reescribe los rangos por ti:
+
+```bash
+pnpm format && pnpm fix:code && pnpm verify:code
+```
+
+Nadie cuenta líneas a mano.
+
+**Un componente en línea nunca empieza una línea.** MDX lee una línea que empieza por `<` como un
+elemento de bloque, así que una frase cortada antes de un `<Term>` se renderiza como dos párrafos con
+la frase partida por la mitad. Se junta con la línea anterior, aunque pase de 100 columnas: en
+Markdown la anchura no se aplica a la prosa. El verificador también comprueba esto.
+
 ## Qué se muestra y qué se enlaza
 
 `docs/cobertura-de-codigo.md` lleva la cuenta. La política:
 
-| Qué                                              | Cómo                                                             |
-| ------------------------------------------------ | ---------------------------------------------------------------- |
-| `src/rukh/**/*.py`                               | Íntegro, en el curso. Es el motor: sin él no hay proyecto.        |
-| `configs/**`, `pyproject.toml`, `.python-version` | Íntegros. Son cortos y cada clave es una decisión.               |
-| `labs/**`                                        | Íntegros, en la lección de labs del módulo.                      |
-| `src/rukh/data/cards/*.jinja`                    | La primera entera; las variantes, por diferencia.                |
-| `tests/**`                                       | Los que enseñan un contrato, enteros; el resto, tabla con enlace. |
-| `scripts/**`, `.github/workflows/ml.yml`          | Íntegros.                                                        |
-| `uv.lock`, `LICENSE`, `tests/fixtures/**`, `gold/` | Solo enlace. Son generados o inertes.                          |
-| `rukh-web`                                       | Lo que toca al modelo (tokenizador, worker ONNX, tablero); el resto, enlace. |
+| Qué                                                | Cómo                                                                         |
+| -------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `src/rukh/**/*.py`                                 | Íntegro, en el curso. Es el motor: sin él no hay proyecto.                   |
+| `configs/**`, `pyproject.toml`, `.python-version`  | Íntegros. Son cortos y cada clave es una decisión.                           |
+| `labs/**`                                          | Íntegros, en la lección de labs del módulo.                                  |
+| `src/rukh/data/cards/*.jinja`                      | La primera entera; las variantes, por diferencia.                            |
+| `tests/**`                                         | Los que enseñan un contrato, enteros; el resto, tabla con enlace.            |
+| `scripts/**`, `.github/workflows/ml.yml`           | Íntegros.                                                                    |
+| `uv.lock`, `LICENSE`, `tests/fixtures/**`, `gold/` | Solo enlace. Son generados o inertes.                                        |
+| `rukh-web`                                         | Lo que toca al modelo (tokenizador, worker ONNX, tablero); el resto, enlace. |
 
 Cuando un fichero se enlaza en vez de mostrarse, la lección **lo dice y dice por qué**. Un enlace
 sin esa frase es una laguna disfrazada.
@@ -74,6 +105,7 @@ había antes. El verificador comprueba el trozo contra la etiqueta nueva, así q
 
 ```bash
 pnpm verify:code                                   # todos los bloques, contra su etiqueta
+pnpm fix:code                                      # reescribe los `lines` al rango real
 node scripts/course-code.mjs show p2 src/rukh/models/decoder.py    # el fichero numerado
 node scripts/course-code.mjs split p2 src/rukh/models/decoder.py   # MDX ya cortado en bloques
 node scripts/course-code.mjs coverage --all --top=60               # qué queda sin mostrar

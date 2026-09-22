@@ -20,6 +20,7 @@ import {
   REPOS,
   blocksIn,
   fileAt,
+  findDedented,
   findRange,
   lessonFiles,
   looksLikeRepoFile,
@@ -46,12 +47,86 @@ const LINKED_ONLY = [
 
 const isLinkedOnly = (path) => LINKED_ONLY.some((re) => re.test(path));
 
+/** Which policy a file falls under, for the breakdown the headline number would hide. */
+function groupOf(path) {
+  if (path.startsWith('src/rukh/data/cards/')) return 'cards';
+  if (path.startsWith('src/')) return 'src/rukh';
+  if (path.startsWith('tests/')) return 'tests';
+  if (path.startsWith('configs/')) return 'configs';
+  if (path.startsWith('labs/')) return 'labs';
+  if (path.startsWith('scripts/')) return 'scripts';
+  return 'raíz';
+}
+
 function requireSiblings() {
   const missing = Object.keys(REPOS).filter((r) => !existsSync(resolve(workspace, r)));
   if (missing.length > 0) {
-    console.log(`course-code: sibling repo(s) not found (${missing.join(', ')}), nothing to check.`);
+    console.log(
+      `course-code: sibling repo(s) not found (${missing.join(', ')}), nothing to check.`,
+    );
     process.exit(0);
   }
+}
+
+/**
+ * Rewrites every `<Src lines="…">` to the range where its block actually sits.
+ *
+ * Nobody counts lines by hand, and after `pnpm format` nobody could: Prettier trims the blank
+ * lines at the edges of a code block, so a block written to start on the blank line before a
+ * definition starts one line later once it is formatted. The workflow is write, format, `fix`,
+ * `verify`; a block whose content is not in the file at all is reported, never "fixed".
+ */
+function fix() {
+  requireSiblings();
+  let changed = 0;
+  let reindented = 0;
+  const problems = [];
+  for (const rel of lessonFiles(root)) {
+    const lesson = readLesson(root, rel);
+    const lines = lesson.mdx.split('\n');
+    for (const block of blocksIn(lesson.mdx)) {
+      if (!looksLikeRepoFile(block.title) || !block.src) continue;
+      const repo = block.src.repo ?? 'rukh';
+      const tag = REPOS[repo]?.tagged
+        ? (block.src.tag ?? tagForModule(lesson.module))
+        : (block.src.tag ?? 'main');
+      const text = tag ? fileAt(workspace, repo, tag, block.src.file) : null;
+      if (text === null) {
+        problems.push(`${rel}:${block.openLine} ${repo}@${tag} has no ${block.src.file}`);
+        continue;
+      }
+      let found = findRange(text, block.code);
+      if (found === null) {
+        /* Same content, wrong indentation: restore the file's own lines and keep going. */
+        const dedented = findDedented(text, block.code);
+        if (dedented === null) {
+          problems.push(`${rel}:${block.openLine} ${block.src.file}: the block is not in the file`);
+          continue;
+        }
+        const open = lines.findIndex((l, i) => i >= block.openLine - 1 && /^\s*`{3,}/.test(l));
+        let close = open + 1;
+        while (close < lines.length && !/^\s*`{3,}\s*$/.test(lines[close])) close += 1;
+        lines.splice(open + 1, close - open - 1, ...dedented.lines);
+        reindented += 1;
+        found = [dedented.from, dedented.to];
+      }
+      const wanted = `${found[0]}-${found[1]}`;
+      const at = block.src.line - 1;
+      const before = lines[at];
+      const after = /lines="[^"]*"/.test(before)
+        ? before.replace(/lines="[^"]*"/, `lines="${wanted}"`)
+        : before.replace('/>', `lines="${wanted}" />`);
+      if (after !== before) {
+        lines[at] = after;
+        changed += 1;
+      }
+    }
+    const next = lines.join('\n');
+    if (next !== lesson.mdx) writeFileSync(resolve(root, 'src/content/lessons', rel), next);
+  }
+  console.log(`course-code: rewrote ${changed} line range(s), reindented ${reindented} block(s)`);
+  for (const p of problems) console.error(`  ✗ ${p}`);
+  if (problems.length > 0) process.exit(1);
 }
 
 /** Every citation in the course: one entry per block that claims to be a repo file. */
@@ -67,9 +142,86 @@ function citations() {
   return out;
 }
 
+/**
+ * An inline component at the start of a line splits the paragraph in two.
+ *
+ * MDX reads a line that begins with `<` as a JSX block, so a sentence broken before a `<Term>` —
+ * which is what a 100-column wrap does naturally — renders as two paragraphs with the sentence cut
+ * in half, and `pnpm format` then makes the split permanent by inserting the blank line itself.
+ * Indented lines are fine (a list item, a callout body), so only column zero is checked.
+ */
+function inlineAtLineStart() {
+  const problems = [];
+  /* A heading, another component or a finished sentence above means the component opens a new
+     paragraph, which is fine. Anything else means the sentence above runs into it. */
+  const opensAParagraph = (line) =>
+    line === undefined || line.startsWith('#') || /[>.:!?]$/.test(line.trim());
+  for (const rel of lessonFiles(root)) {
+    const lines = readLesson(root, rel).mdx.split('\n');
+    lines.forEach((line, i) => {
+      if (!/^<(Term|ModelBadge|NotebookLink)\b/.test(line)) return;
+      let above = i - 1;
+      while (above >= 0 && lines[above].trim() === '') above -= 1;
+      if (opensAParagraph(lines[above])) return;
+      const name = /^<(\w+)/.exec(line)[1];
+      problems.push(`${rel}:${i + 1} a sentence runs into a <${name}> that starts the line`);
+    });
+  }
+  return problems;
+}
+
+/**
+ * A fence in a language Prettier knows has to be guarded, or Prettier rewrites the code inside it.
+ *
+ * `embeddedLanguageFormatting` is on because turning it off changes how the MDX printer treats a
+ * JSX element at the start of a line and de-indents list continuations. So the guard is per block:
+ * `{/* prettier-ignore *\/}` on the line above. Python and TOML need none — Prettier does not know
+ * them — which is why this only bit the YAML configs, the TypeScript of the demo and the README.
+ */
+const PRETTIER_KNOWS = new Set([
+  'css',
+  'graphql',
+  'handlebars',
+  'html',
+  'js',
+  'json',
+  'jsonc',
+  'jsx',
+  'less',
+  'markdown',
+  'md',
+  'mdx',
+  'mjs',
+  'scss',
+  'ts',
+  'tsx',
+  'vue',
+  'yaml',
+  'yml',
+]);
+
+function unguardedFences() {
+  const problems = [];
+  for (const rel of lessonFiles(root)) {
+    const { mdx } = readLesson(root, rel);
+    const lines = mdx.split('\n');
+    for (const block of blocksIn(mdx)) {
+      if (!looksLikeRepoFile(block.title)) continue;
+      if (!PRETTIER_KNOWS.has(block.lang.toLowerCase())) continue;
+      const above = lines[block.openLine - 2]?.trim();
+      if (above !== '{/* prettier-ignore */}') {
+        problems.push(
+          `${rel}:${block.openLine} a ${block.lang} block with no {/* prettier-ignore */}`,
+        );
+      }
+    }
+  }
+  return problems;
+}
+
 function verify() {
   requireSiblings();
-  const problems = [];
+  const problems = [...inlineAtLineStart(), ...unguardedFences()];
   const all = citations();
   for (const { lesson, module, block } of all) {
     const where = `${lesson}:${block.openLine}`;
@@ -104,7 +256,9 @@ function verify() {
     }
     const claimed = parseRange(src.lines);
     if (claimed === null) {
-      problems.push(`${where} ${src.file}: lines="${src.lines ?? ''}" is not a range; it is ${found[0]}-${found[1]}`);
+      problems.push(
+        `${where} ${src.file}: lines="${src.lines ?? ''}" is not a range; it is ${found[0]}-${found[1]}`,
+      );
       continue;
     }
     if (claimed[0] !== found[0] || claimed[1] !== found[1]) {
@@ -113,7 +267,9 @@ function verify() {
       );
     }
   }
-  console.log(`course-code: ${all.length} code citation(s) in ${lessonFiles(root).length} lesson(s)`);
+  console.log(
+    `course-code: ${all.length} code citation(s) in ${lessonFiles(root).length} lesson(s)`,
+  );
   if (problems.length > 0) {
     for (const p of problems) console.error(`  ✗ ${p}`);
     console.error(`course-code: ${problems.length} problem(s).`);
@@ -150,22 +306,34 @@ function coverage() {
   const rows = [];
   for (let n = 0; n <= 6; n += 1) {
     const tag = `p${n}`;
-    const files = execFileSync('git', ['-C', resolve(workspace, 'rukh'), 'ls-tree', '-r', '--name-only', tag], {
-      encoding: 'utf8',
-      maxBuffer: 32 * 1024 * 1024,
-    })
+    const files = execFileSync(
+      'git',
+      ['-C', resolve(workspace, 'rukh'), 'ls-tree', '-r', '--name-only', tag],
+      {
+        encoding: 'utf8',
+        maxBuffer: 32 * 1024 * 1024,
+      },
+    )
       .split('\n')
       .map((s) => s.trim())
       .filter((s) => s.length > 0 && !s.startsWith('artifacts/') && !isLinkedOnly(s));
     for (const file of files) {
       const text = fileAt(workspace, 'rukh', tag, file);
       if (text === null) continue;
-      const total = normalise(text).split('\n').length;
+      /* Blank lines are not code, and they cannot be covered: Prettier trims them off the edges
+         of a block, so the two that separate one definition from the next never belong to
+         either block. Counting them would put a ceiling below 100 % for a reason that teaches
+         the reader nothing. */
+      const body = normalise(text).split('\n');
+      const code = new Set();
+      body.forEach((line, i) => {
+        if (line.trim() !== '') code.add(i + 1);
+      });
       const byModule = shown.get(`rukh:${file}`) ?? new Map();
       const upTo = new Set();
       for (const [index, set] of byModule) if (index <= n) for (const l of set) upTo.add(l);
-      const covered = [...upTo].filter((l) => l <= total).length;
-      rows.push({ module: `m${n}`, file, total, covered });
+      const covered = [...upTo].filter((l) => code.has(l)).length;
+      rows.push({ module: `m${n}`, file, total: code.size, covered });
     }
   }
   const wanted = rest.includes('--all') ? rows : rows.filter((r) => r.module === 'm6');
@@ -177,7 +345,23 @@ function coverage() {
   console.log(
     `course-code: ${totals.covered}/${totals.total} lines shown (${((100 * totals.covered) / totals.total).toFixed(1)} %)`,
   );
-  for (const r of missing.slice(0, Number(rest.find((a) => /^--top=/.test(a))?.split('=')[1] ?? 40))) {
+  /* By group, because the policy is not the same for all of them: the engine is inlined whole, the
+     test suite only where a test teaches a contract. One number hides which of the two slipped. */
+  const groups = new Map();
+  for (const r of wanted) {
+    const group = groupOf(r.file);
+    const acc = groups.get(group) ?? { total: 0, covered: 0 };
+    groups.set(group, { total: acc.total + r.total, covered: acc.covered + r.covered });
+  }
+  for (const [group, acc] of [...groups].sort((a, b) => b[1].total - a[1].total)) {
+    const pct = ((100 * acc.covered) / acc.total).toFixed(1);
+    console.log(`  ${group.padEnd(16)} ${acc.covered}/${acc.total} (${pct} %)`);
+  }
+  console.log('');
+  for (const r of missing.slice(
+    0,
+    Number(rest.find((a) => /^--top=/.test(a))?.split('=')[1] ?? 40),
+  )) {
     console.log(`  ${r.module} ${r.file}: ${r.covered}/${r.total}`);
   }
   if (rest.includes('--json')) {
@@ -199,7 +383,18 @@ function show() {
     .forEach((line, i) => console.log(`${String(i + 1).padStart(5)}  ${line}`));
 }
 
-const LANG = { py: 'python', yaml: 'yaml', yml: 'yaml', toml: 'toml', json: 'json', ts: 'ts', tsx: 'tsx', mjs: 'js', jinja: 'markdown', md: 'markdown' };
+const LANG = {
+  py: 'python',
+  yaml: 'yaml',
+  yml: 'yaml',
+  toml: 'toml',
+  json: 'json',
+  ts: 'ts',
+  tsx: 'tsx',
+  mjs: 'js',
+  jinja: 'markdown',
+  md: 'markdown',
+};
 
 function split() {
   requireSiblings();
@@ -214,7 +409,11 @@ function split() {
   /* Cut before every top-level definition, then merge cuts that would leave tiny blocks. */
   const cuts = [0];
   lines.forEach((line, i) => {
-    if (/^(def |class |@|[A-Z_]+ = |if __name__)/.test(line) && i > 0 && lines[i - 1].trim() === '') {
+    if (
+      /^(def |class |@|[A-Z_]+ = |if __name__)/.test(line) &&
+      i > 0 &&
+      lines[i - 1].trim() === ''
+    ) {
       cuts.push(i);
     }
   });
@@ -237,9 +436,11 @@ function split() {
   }
 }
 
-const commands = { verify, coverage, show, split };
+const commands = { verify, coverage, show, split, fix };
 if (!commands[command]) {
-  console.error(`course-code: unknown command "${command}". One of ${Object.keys(commands).join(', ')}.`);
+  console.error(
+    `course-code: unknown command "${command}". One of ${Object.keys(commands).join(', ')}.`,
+  );
   process.exit(1);
 }
 commands[command]();
