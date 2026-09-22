@@ -298,6 +298,23 @@ Una constante de tres líneas que va a aparecer en sitios inesperados: en el <Te
 de los datos, en los tags de cada ejecución de MLflow y en las <Term id="model-card">model
 cards</Term>. Es la respuesta a "¿con qué versión del código salió este número?".
 
+<Callout kind="ejecuta" title="Sincroniza el entorno por primera vez">
+  Con `.python-version`, `pyproject.toml` y `src/rukh/__init__.py` ya hay un paquete que instalar.
+  Crea también un `README.md` (basta una línea): el `pyproject.toml` lo declara con `readme =` y
+  hatchling se niega a construir el paquete si no existe.
+
+```sh
+uv sync --extra cu128 --group dev   # --extra cpu si no tienes GPU NVIDIA
+uv run python -c "import rukh; print(rukh.__version__)"
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+La primera orden crea `.venv` y el `uv.lock`; la segunda tiene que imprimir `0.0.1`. En la tercera
+fíjate en el sufijo de la versión: `+cu128` y `True` si el extra salió del índice correcto, `+cpu`
+si sincronizaste con `--extra cpu`.
+
+</Callout>
+
 ### `paths.py`: nadie adivina dónde está la raíz
 
 ```python title="src/rukh/paths.py"
@@ -635,17 +652,24 @@ En `engine check`, las tres excepciones esperadas se capturan y se convierten en
 a nadie que le falta descargar Stockfish; `error: Stockfish not found: run ...` sí. Y `raise ...
 from exc` conserva la causa para cuando el problema no sea el esperado.
 
-<Exercise n="01" title="Instala el paquete y mira la ayuda">
-  Con los ficheros de arriba en su sitio, ejecuta:
+<Callout kind="ejecuta" title="La CLI ya responde">
+  Con `cli.py` en su sitio, `rukh` es una orden de verdad:
 
 ```sh
-uv sync --extra cu128 --group dev   # --extra cpu si no tienes GPU NVIDIA
 uv run rukh --help
 uv run rukh --version
+uv run rukh data
 ```
 
-`rukh info` todavía falla: importa `rukh.env`, que no existe hasta la lección siguiente. ¿Qué
-imprime `rukh data` sin más? ¿Y por qué `rukh --version` funciona aunque no haya ningún subcomando?
+`--help` tiene que listar los grupos `data`, `engine` y `mlflow` y la orden `info`; `--version`
+imprime `rukh 0.0.1`. `rukh info` todavía falla: importa `rukh.env`, que no existe hasta la
+lección siguiente.
+
+</Callout>
+
+<Exercise n="01" title="Lee lo que acabas de ejecutar">
+  ¿Por qué `rukh data` sin más imprime la ayuda y no un error? ¿Y por qué `rukh --version` funciona
+  aunque no haya ningún subcomando?
 
 <Solution>
   `rukh data` imprime la ayuda del subgrupo en vez de un error de uso, porque su `Typer` se creó
@@ -845,171 +869,21 @@ romperla no falla nada, escribe el test que la lee**. Suele ser una tarde y evit
 
 </Callout>
 
-## La CI, que es la misma orden que tú escribes
-
-{/* prettier-ignore */}
-```yaml title=".github/workflows/ml.yml"
-name: ml
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-jobs:
-  cpu:
-    name: lint and unit tests (CPU)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
-
-      - name: Install Python 3.12
-        run: uv python install 3.12
-
-      - name: Sync (CPU torch, dev group)
-        run: uv sync --extra cpu --group dev
-
-      - name: Ruff check
-        run: uv run ruff check .
-
-      - name: Ruff format
-        run: uv run ruff format --check .
-
-      - name: Unit tests
-        run: uv run pytest -m unit -q
-```
-
-<Src file=".github/workflows/ml.yml" tag="p0" lines="1-37" />
-
-Un solo trabajo, en CPU, y las tres órdenes son literalmente las que ejecutas en tu máquina. Eso es
-la propiedad que importa: una CI que corre algo distinto de lo que corres tú es una CI que falla por
-motivos que no puedes reproducir.
-
-`--extra cpu` porque los runners de GitHub no tienen GPU, y de ahí que el test del fichero de
-bloqueo sea necesario: la CI nunca instala `cu128`, así que nunca se enteraría de que ese extra se
-ha degradado.
-
-`concurrency` con `cancel-in-progress` cancela la ejecución anterior de la misma branch cuando
-vuelves a hacer push. `timeout-minutes: 15` mata el job colgado en vez de dejarlo consumiendo
-minutos.
-
-No hay job de GPU, y es una decisión: los tests marcados `gpu`, `engine` y `slow` corren en la
-máquina de referencia, a mano, cuando se toca lo que cubren. Alquilar un runner con GPU para cada
-_pull request_ de un proyecto de una persona no se paga.
-
-## El README, que es el índice del repositorio
-
-{/* prettier-ignore */}
-````markdown title="README.md"
-# rukh
-
-Rukh is a chess language model built from scratch, and the machine-learning half of a course on
-generative and agentic AI. This repository holds the data pipeline, the models, the training and
-evaluation code, the export to ONNX and, in phase 2, the agents. The course lives in
-[`rukh-lab`](https://github.com/borja-glez/rukh-lab) (published at
-[lab.rukh.borjaglez.com](https://lab.rukh.borjaglez.com)) and the playable demo in
-[`rukh-web`](https://github.com/borja-glez/rukh-web)
-([rukh.borjaglez.com](https://rukh.borjaglez.com)). Everything trained is published on Hugging
-Face under [`chorcat`](https://huggingface.co/chorcat) as `rukh-*`.
-
-The name is Persian for the rook.
-
-## What is in here
-
-```
-src/rukh/            the `rukh` package and its `rukh` CLI
-  cli.py             typer app: info · data fetch · engine check · mlflow ui
-  env.py             environment report (Python, torch, CUDA, GPU, Stockfish, MLflow, dirs)
-  paths.py           project directories; RUKH_HOME overrides the root
-  config.py          strict pydantic configs (extra="forbid") loaded from YAML
-  data/              fetch.py (DuckDB over hf:// parquet) · manifest.py (provenance record)
-  engine.py          Stockfish detection and a short UCI_Elo sanity game
-  tracking.py        local MLflow store (SQLite) and run helper
-configs/             YAML configs (configs/data/lichess-2025-01-02.yaml)
-scripts/             get_stockfish.py (downloads Stockfish 19 into tools/, gitignored)
-tests/unit/          fast CPU tests (`pytest -m unit`); `engine` tests need Stockfish
-labs/                thin notebooks behind each lesson; export JSON to artifacts/web/
-artifacts/web/       small JSON the course site renders (versioned)
-gold/                golden files for evaluation
-docs/spec/           the binding design docs (Spanish); docs/decisiones-de-ejecucion.md is the
-                     decision ledger; adr/, runbooks/, model-cards/, benchmarks.md, backlog.md
-data/ mlruns/ tools/ local datasets, MLflow store and binaries (gitignored)
-```
-
-## Quickstart
-
-Requirements: Python 3.12 managed by [`uv`](https://docs.astral.sh/uv/) (the repo pins it in
-`.python-version`), and an NVIDIA GPU with CUDA 12.8 for the `cu128` extra. The `cpu` extra is what
-CI uses; the two extras are mutually exclusive and lock the same `torch>=2.11,<2.12` range.
+<Callout kind="ejecuta" title="Los primeros tests y el linter">
+  Con `conftest.py`, `test_config.py` y `test_lock_guard.py` escritos, pasa la suite y el linter:
 
 ```sh
-uv sync --extra cu128 --group dev      # or --extra cpu on a machine without a GPU
-uv run rukh info                       # Python, torch, CUDA, GPU, Stockfish, MLflow store
-uv run python scripts/get_stockfish.py # Stockfish 19 into tools/stockfish/ (idempotent)
-uv run rukh engine check               # plays 40 plies at UCI_Elo 1400 against a random mover
-uv run rukh data fetch --config configs/data/lichess-2025-01-02.yaml --dry-run
-uv run rukh mlflow ui                  # MLflow UI on the local SQLite store
-uv run pytest -m unit -q               # fast tests; add `or engine` once Stockfish is installed
+uv run pytest -m unit -q
+uv run pytest -m unit -q tests/unit/test_lock_guard.py -v
+uv run ruff check .
+uv run ruff format --check .
 ```
 
-`rukh info --json`, `rukh engine check --json` and `rukh data fetch --json` print machine-readable
-output. Set `RUKH_HOME` to move `data/`, `mlruns/` and `tools/` elsewhere, and `RUKH_STOCKFISH` to
-point at a specific binary.
+La primera tiene que pasar siete tests (cuatro de `config`, tres de `lock_guard`); con `-v` ves el
+nombre de cada uno de los tres que vigilan `torch`. Las dos órdenes de ruff tienen que salir
+limpias: son las mismas que ejecuta la CI del repositorio, en CPU, en cada _push_.
 
-## Development
-
-- `uv run ruff check .` and `uv run ruff format .` must be clean; CI runs them plus
-  `pytest -m unit` on CPU (`.github/workflows/ml.yml`).
-- Configs are pydantic models with `extra="forbid"`: an unknown key is an error.
-- Test markers: `unit` (fast, CPU, no network), `engine` (needs Stockfish), `gpu`, `slow`.
-- Commits follow Conventional Commits in English; the design docs and the course are in Spanish.
-
-## Licenses and attribution
-
-- Code: [MIT](LICENSE).
-- Model weights published on Hugging Face: Apache-2.0.
-- Data: derived from the [Lichess open database](https://database.lichess.org/) and its mirrors
-  on Hugging Face (`Lichess/standard-chess-games`, `Lichess/chess-puzzles`,
-  `Lichess/chess-position-evaluations`, `Lichess/chess-openings`), released under CC0 1.0. The
-  derived datasets are published under CC0 with attribution to Lichess.
-- Stockfish (GPL-3) and python-chess (GPL-3) are used as external tools/libraries on the training
-  side only; neither is redistributed with the web demo.
-- Course content (in `rukh-lab`): CC BY-NC-SA 4.0.
-````
-
-<Src file="README.md" tag="p0" lines="1-74" />
-
-Está en inglés, como todo el código y las model cards del proyecto; el curso y los documentos de
-diseño están en español. El mapa de `src/` de arriba va a crecer en cada módulo, y es el sitio donde
-se mira cuando no te acuerdas de qué fichero hace qué.
-
-La sección de licencias no es burocracia y conviene entenderla antes de publicar nada. Son cuatro
-licencias distintas conviviendo:
-
-- El **código** es MIT.
-- Los **pesos** que se publiquen, Apache-2.0.
-- Los **datos** derivan de Lichess, que es <Term id="cc0">CC0</Term>, y se republican como CC0
-  citando el origen.
-- Stockfish y `python-chess` son **GPL-3**, y ahí está la decisión: se usan como herramienta externa
-  en el lado del entrenamiento (un proceso aparte con el que se habla por UCI), y **no se
-  redistribuyen con la demo**. Empaquetar un binario GPL-3 en una web propietaria es el error que
-  esta línea del README existe para no cometer.
-
-## Los dos ficheros que el curso no muestra
-
-`LICENSE` es el texto de MIT tal cual. `uv.lock` es el <Term id="fichero-de-bloqueo">fichero de bloqueo</Term>: 2 193 líneas generadas por `uv sync` con la
-versión exacta y el hash de cada paquete: se versiona (es lo que hace reproducible el entorno) y no
-se edita a mano nunca. Están enlazados y no pegados porque leerlos no enseña nada; lo que hay que
-saber del `uv.lock` es lo que comprueba `test_lock_guard.py`, que sí está entero arriba.
+</Callout>
 
 <Exercise n="02" title="Rompe el fichero de bloqueo y mira quién se queja">
   En una copia del repositorio, cambia el extra `cu128` a `torch>=2.12,<2.13` en `pyproject.toml` y

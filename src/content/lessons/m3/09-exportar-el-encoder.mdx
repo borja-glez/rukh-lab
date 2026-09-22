@@ -1120,6 +1120,26 @@ correcto: no había nada que comprobar.
 La salida menciona el sidecar y sus columnas. Es una línea que existe para que nadie se lleve solo el
 `.npy`.
 
+<Callout kind="ejecuta" title="El exportador, para las dos familias">
+  El escritor de grafos es ahora compartido, así que lo primero es comprobar que el decoder sigue
+  exportándose igual; lo segundo, exportar un encoder de verdad. La segunda orden necesita un
+  checkpoint de las cabezas (el de la tirada corta de la lección 6 basta para probar el camino; el
+  que se publica sale del lab 3) y, para la paridad, `data/evals/positions-eval.parquet`.
+
+```sh
+uv run pytest -m unit -q tests/unit/test_export.py
+uv run rukh export --ckpt checkpoints/encoder-heads-<fecha>/best.pt --out artifacts/onnx/encoder --kind encoder --fp16 --int8 --check-parity
+ls artifacts/onnx/encoder
+```
+
+La primera son los tests de exportación de M2, sin cambiar ninguno: `23 passed`. La segunda tiene
+que imprimir `kind:     encoder -> value, blunder`, una línea por fichero con su tamaño y tres líneas
+`parity …` que hablan de «the blunder decisions», no de logits. Si en vez de eso sale un `warning:`
+de paridad, no encontró las etiquetas y no midió nada. `ls` tiene que listar `model.onnx`,
+`model-fp16.onnx` y `model-int8.onnx`. La salida real con el checkpoint publicado está en el lab 5.
+
+</Callout>
+
 ## Publicar: dos clases de modelo, un camino
 
 ```python title="src/rukh/publish/model.py"
@@ -1583,8 +1603,8 @@ porque un `MultiHead` no tiene tabla de posiciones que descontar. La alternativa
 
 ## La plantilla de la model card
 
-Ciento setenta y ocho líneas de Jinja que son el documento que la gente va a leer en el Hub. Se pega
-entera porque las decisiones están en sus condicionales.
+Ciento setenta y ocho líneas de Jinja que son el documento que la gente va a leer en el Hub, y
+las decisiones están en sus condicionales.
 
 {/* prettier-ignore */}
 ````jinja title="src/rukh/data/cards/encoder.md.jinja"
@@ -1810,18 +1830,35 @@ entrenar.
 
 ## Los tests de la exportación
 
-`tests/unit/test_export_encoder.py` son 459 líneas y no se pegan aquí: montan un encoder de juguete,
-lo exportan, lo cuantizan y corren el fichero con `onnxruntime`, así que la mitad del fichero es
-andamio y lo que enseña es el mismo contrato que esta lección explica. Lo que garantizan, en una frase
-cada uno de sus bloques: que el grafo exportado tiene **exactamente** las salidas `value` y `blunder`
-y que sus metadatos dicen `rukh_kind=encoder`; que el fichero corre con **dos** filas y con una, que
-es la comprobación de la especialización 0/1; que el esquema de casillas no declara eje de secuencia
-dinámico y el de jugadas sí, verificado corriéndolo; que `encoder_parity` detecta un desacuerdo
-inventado y lo cuenta en `mismatches`; que la paridad se salta con un aviso cuando no hay etiquetas, en
-vez de medirse sobre un tablero aleatorio; y que `publish_model` de un checkpoint de encoder escribe
-la card del encoder, el vocabulario de casillas y un `config.json` con `architectures:
-["PositionEncoder"]`. Está entero en
-[`tests/unit/test_export_encoder.py`](https://github.com/borja-glez/rukh/blob/p3/tests/unit/test_export_encoder.py).
+`tests/unit/test_export_encoder.py` monta un encoder de juguete, lo exporta, lo cuantiza y corre el
+fichero con `onnxruntime`. Lo que garantiza: que el grafo exportado tiene **exactamente** las salidas
+`value` y `blunder` y que sus metadatos dicen `rukh_kind=encoder`; que el fichero corre con **dos**
+filas y con una, que es la comprobación de la especialización 0/1; que el esquema de casillas no
+declara eje de secuencia dinámico y el de jugadas sí, verificado corriéndolo; que `encoder_parity`
+detecta un desacuerdo inventado y lo cuenta en `mismatches`; que la paridad se salta con un aviso
+cuando no hay etiquetas, en vez de medirse sobre un tablero aleatorio; y que `publish_model` de un
+checkpoint de encoder escribe la card del encoder, el vocabulario de casillas y un `config.json` con
+`architectures: ["PositionEncoder"]`.
+
+<Callout kind="ejecuta" title="La exportación y la publicación, sin red">
+  Con `publish/model.py` y la plantilla en su sitio, pasa los tests del encoder junto con los de la
+  publicación de M2, y después prepara la carpeta del Hub sin subir nada. La tercera orden necesita el
+  checkpoint y la carpeta ONNX de la caja anterior.
+
+```sh
+uv run pytest -m unit -q tests/unit/test_export_encoder.py tests/unit/test_publish_model.py
+uv run rukh publish model --ckpt checkpoints/encoder-heads-<fecha>/best.pt --repo rukh-encoder --onnx artifacts/onnx/encoder --dry-run
+```
+
+Los tests tienen que dar `36 passed`: veinte del encoder y los dieciséis de la publicación de M2, sin
+cambiar ninguno (alguna advertencia de `onnxconverter_common` al convertir a fp16 es normal). La
+publicación tiene que decir `dry-run (staged, nothing uploaded)`, `encoder` como clase de modelo y
+dejar la carpeta en `artifacts/publish/chorcat/rukh-encoder/` con `README.md`, `config.json`,
+`tokenizer/vocab.json`, los pesos y la carpeta `onnx/`. Abre el `README.md`: es la card de la plantilla
+de arriba ya rellenada; si ejecutaste antes `rukh eval encoder --stage encoder` (lab 4), lleva sus
+cifras, y si no, la sección de resultados dice «Not evaluated yet» en vez de inventarse una tabla.
+
+</Callout>
 
 <Exercise n="01" title="Por qué la paridad del encoder no tiene respaldo y la del decoder sí">
   El decoder, cuando no encuentra las partidas de validación, mide la paridad sobre paseos legales

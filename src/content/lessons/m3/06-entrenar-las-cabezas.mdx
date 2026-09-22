@@ -1606,7 +1606,22 @@ La lista ordenada alfabéticamente y con las mayúsculas primero es la que `ruff
 módulo: once, de los que cinco son cargadores de checkpoint.
 
 La superficie pública del paquete de entrenamiento después del módulo: tres bucles donde había uno.
-Una frase basta.
+
+<Callout kind="ejecuta" title="El preentrenamiento ya se puede probar">
+  Con este `__init__.py`, `rukh.train` exporta por fin `MmmConfig`, `train_mmm` y `load_encoder`, así
+  que los tests del enmascarado de la lección anterior, y la orden `rukh train encoder` que los usa,
+  funcionan por primera vez. Pásalos junto con los de los checkpoints:
+
+```sh
+uv run pytest -m unit -q tests/unit/test_mmm.py tests/unit/test_checkpoint.py tests/unit/test_loop.py
+```
+
+Tienen que dar `34 passed` en CPU: trece del enmascarado, cuatro de los checkpoints y los diecisiete
+del bucle del decoder. Entre los de `test_mmm.py` está el que invoca `rukh train encoder` con la
+configuración que se distribuye; si ese falla y los demás no, mira la CLI de la lección 5 y
+`configs/train/encoder-mmm.yaml`.
+
+</Callout>
 
 ## Las dos configuraciones, y la única diferencia que importa
 
@@ -1688,8 +1703,9 @@ input: moves
 <Src file="configs/train/encoder-heads-moves.yaml" tag="p3" lines="8-9" />
 
 El checkpoint de masked move modeling y el esquema que le corresponde. Y sí, hay una doble barra en
-esa ruta: es una errata del fichero que no rompe nada —`Path` la normaliza— y que está pegada aquí
-tal cual porque el curso muestra el repositorio y no una versión mejorada de él.
+esa ruta: es una errata del fichero que no rompe nada —`Path` la normaliza—. Lo que sí tienes que
+cambiar es la fecha: la carpeta es la de la tirada de referencia, y la tuya tendrá otra
+(`ls -td checkpoints/encoder-mmm-*/ | head -1` te dice cuál).
 
 {/* prettier-ignore */}
 ```yaml title="configs/train/encoder-heads-moves.yaml"
@@ -1920,16 +1936,23 @@ docstring: en `probe`, el modelo entrena y el encoder no; en `full`, los dos; en
 bloque está en `eval` y el último y la norma final en `train`. Es un test de una propiedad que no
 tiene nada que ver con los pesos y que decide si el probe mide lo que dice medir.
 
-El resto de `test_heads.py` —el dataset, el probe que deja el tronco idéntico bit a bit, la tirada
-corta y la curva— necesita construir un `positions-eval.parquet` de juguete y correr el bucle entero,
-así que enseña el bucle y no las cabezas. Lo que garantiza, en una frase cada uno: que un ítem del
-dataset son 69 tokens y tres etiquetas con sus tipos, y que el esquema `moves` sin partidas lanza con
-un mensaje que dice qué falta; que una tirada en modo `probe` deja **todos** los tensores del encoder
-idénticos con `torch.equal` mientras las cabezas sí se mueven, y que en `full` no; y que ocho pasos
-bajan la pérdida y escriben el checkpoint. Están enteros en
-[`tests/unit/test_heads.py`](https://github.com/borja-glez/rukh/blob/p3/tests/unit/test_heads.py), y
-las filas de juguete que usan varios de ellos, en
-[`tests/unit/helpers_labels.py`](https://github.com/borja-glez/rukh/blob/p3/tests/unit/helpers_labels.py).
+<Callout kind="ejecuta" title="Las etiquetas y las cabezas, en verde">
+  Con `labels.py`, `heads.py` y sus tests escritos, pasa los dos ficheros. El `test_heads.py`
+  completo del tag `p3` añade a los de arriba los que corren el bucle entero sobre un
+  `positions-eval.parquet` de juguete: que un ítem del dataset son 69 tokens y tres etiquetas, que
+  una tirada en modo `probe` deja **todos** los tensores del encoder idénticos con `torch.equal`
+  mientras las cabezas se mueven, que ocho pasos bajan la pérdida y escriben el checkpoint, y que la
+  curva entrena una tirada por fracción.
+
+```sh
+uv run pytest -m unit -q tests/unit/test_labels.py tests/unit/test_heads.py
+```
+
+Tiene que dar `30 passed` con los dos ficheros completos (once de las etiquetas y diecinueve casos
+de las cabezas, contando los tres modos del `parametrize`), sin GPU y sin datos reales: las tablas
+son de juguete y se escriben en un `RUKH_HOME` temporal.
+
+</Callout>
 
 ## La orden
 
@@ -2004,6 +2027,24 @@ script que encadena órdenes.
 Y `--json` imprime la lista entera de `HeadsResult`, que es lo que hace que la curva se pueda leer
 desde otro proceso sin parsear texto alineado en columnas.
 
+<Callout kind="ejecuta" title="Una tirada corta de las cabezas, con datos de verdad">
+  La orden ya responde. Antes de los afinados de cuatro mil pasos de los labs, una tirada de humo
+  sobre el esquema de casillas, que no depende de ningún checkpoint (`encoder_ckpt: null`). Necesita
+  `data/evals/positions-eval.parquet` de M1; la GPU es opcional pero sin ella va lenta.
+
+```sh
+uv run rukh train heads --config configs/train/encoder-heads.yaml --max-steps 50
+```
+
+La tabla supervisada se construye en memoria a partir de `positions-eval.parquet` antes del primer
+paso, así que la espera inicial es esa. Al acabar tiene que imprimir `mode:       probe`, la línea
+`100% of the labels (… rows)` con el tamaño del conjunto de entrenamiento, las siete métricas
+`val/…` y la ruta del checkpoint en `checkpoints/encoder-heads-<fecha>/`. Las cifras de cincuenta
+pasos no significan nada; lo que se comprueba es que el camino entero, de la tabla al checkpoint,
+funciona.
+
+</Callout>
+
 <Exercise n="01" title="Comprueba el signo con una partida de verdad">
   `tests/unit/helpers_labels.py` construye una partida real con un error garrafal: 1.e4 e5 2.Dh5 Cc6
   3.Dxf7+?? Rxf7. Escribe las filas de esa partida con evaluaciones plausibles —digamos 20, 10, 30,
@@ -2038,7 +2079,7 @@ subconjuntos **anidados** y guardar la curva dentro del checkpoint, porque un n�
 existido en un registro es un número que nadie puede poner en una tabla.
 
 **Cómo se mide**: `uv run pytest tests/unit/test_labels.py tests/unit/test_heads.py -q` pasa los
-veinte tests, entre ellos el que exige que ningún `game_id` cruce el reparto y el que exige que un
+treinta tests, entre ellos el que exige que ningún `game_id` cruce el reparto y el que exige que un
 `probe` deje el tronco idéntico bit a bit.
 `uv run rukh train heads --config configs/train/encoder-heads-moves.yaml --mode probe` imprime las
 siete métricas de validación. Las cifras de las tiradas reales están en la lección 11.

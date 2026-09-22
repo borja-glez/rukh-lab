@@ -29,10 +29,12 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const workspace = resolve(root, '..');
 const write = process.argv.includes('--write');
 
-/** Quoted by link on purpose: generated, inert, or the project's own notebook. */
+/** Left out on purpose: generated, inert, or about the repository rather than the project. */
 const LINKED_ONLY = [
   /^uv\.lock$/,
   /^LICENSE$/,
+  /(^|\/)README\.md$/,
+  /^\.github\//,
   /^tests\/fixtures\//,
   /^gold\//,
   /^mlflow\.db$/,
@@ -169,7 +171,7 @@ lines.push(`| **Total** | **${all.covered}** | **${all.total}** | **${pct(all)}*
 lines.push('');
 lines.push('Fuera de la cuenta, por política y no por olvido: `uv.lock` (generado), `LICENSE`,');
 lines.push(
-  '`tests/fixtures/`, `gold/` y `docs/`. Están enlazados desde la lección que los menciona.',
+  'los `README.md`, `.github/`, `tests/fixtures/`, `gold/` y `docs/`. No enseñan nada del proyecto.',
 );
 lines.push('');
 lines.push('## Por hito: lo que el lector tiene escrito al cerrar cada módulo');

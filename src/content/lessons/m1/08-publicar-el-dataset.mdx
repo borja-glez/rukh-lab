@@ -69,10 +69,9 @@ plantilla de esta; y `requests`, la descarga de los zips de la base Elite. Nada 
 el camino caliente del entrenamiento, y las tres son dependencias normales y no extras porque el
 pipeline de datos no es opcional: sin él no hay nada que entrenar.
 
-Las tres arrastran 33 líneas nuevas al `uv.lock`, que **se enlaza y no se pega**, igual que en M0: son
-2 226 líneas generadas por `uv sync` con la versión exacta y el hash de cada paquete, se versionan
-porque son lo que hace reproducible el entorno, y no se editan a mano nunca. Lo que hay que saber de
-ese fichero es lo que comprueba `tests/unit/test_lock_guard.py`, que está entero en M0.
+Si añadiste `tokenizers` en la lección de los vocabularios, faltan las otras dos:
+`uv add --no-sync "jinja2>=3.1" "requests>=2.32"` y después el `uv sync` con tu extra de siempre. El
+`uv.lock` se actualiza solo y, como en M0, no se edita a mano.
 
 ## `publish.py`: el registro
 
@@ -651,6 +650,47 @@ salir de un fichero que el proceso escribió, no de tu memoria.
 
 </Transfer>
 
+<Callout kind="ejecuta" title="La CLI, completa por fin">
+  `pipeline.py` importaba la configuración de todos los pasos, y `PublishConfig` era la última que
+  faltaba. Con `publish.py` escrito, las órdenes de `rukh data` y los tests que pasan por
+  `pipeline.py` funcionan por primera vez:
+
+```sh
+uv run rukh data --help
+uv run pytest -m unit -q tests/unit/test_db.py tests/unit/test_loader.py tests/unit/test_uci.py tests/unit/test_positions.py
+```
+
+La ayuda tiene que listar las diez órdenes del grupo: `fetch`, `uci`, `tokenize`, `positions`,
+`evals`, `puzzles`, `pairs`, `elite`, `elo-bins` y `publish`. Los tests son 26 en verde, incluidos
+los dos que invocan la CLI (`test_cli_data_uci`, `test_cli_positions`) y que hasta ahora dejabas
+fuera con `-k`.
+
+</Callout>
+
+<Callout kind="ejecuta" title="Los tokens, empaquetados">
+  Ya se pueden lanzar los tres comandos de la lección anterior, en su orden, y con ellos los tests que
+  comparan contra los artefactos versionados. Copia también
+  [`tests/unit/test_pack.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_pack.py): fija
+  los bytes de un pack con un hash y comprueba que `meta.json` es coherente con los arrays
+  (`n_tokens == len(tokens)`, `n_games == len(starts)`), que es lo primero que hay que mirar si un
+  pack sale raro.
+
+```sh
+uv run rukh data tokenize --scheme bpe --pack
+uv run rukh data tokenize --scheme san --pack   # opcional: hora y media
+uv run rukh data tokenize --scheme uci --stats --export-fixture --pack
+uv run pytest -m unit -q tests/unit/test_uci_vocab.py tests/unit/test_bpe.py tests/unit/test_san_chars.py tests/unit/test_pack.py
+```
+
+El BPE tarda unos minutos y el UCI entre cinco y diez; el último imprime `vocab_size: 2030` y deja
+`artifacts/tokenizer/vocab.json`, `fixtures/games.json`, `artifacts/web/tokenizer-stats.json` y
+`data/tokens/uci/`. Los tests son 44, ya sin `-k`: `test_committed_vocab_matches` comprueba que tu
+`vocab.json` tiene el sha256 del de referencia. Si el que falla es el hash BPE de
+`test_pack_month_bytes_are_stable`, tu `bpe.json` no salió idéntico al de referencia: mira que el
+BPE se entrenara sobre las mismas 200 000 partidas de enero.
+
+</Callout>
+
 ## La plantilla
 
 ```jinja title="src/rukh/data/cards/dataset.md.jinja"
@@ -763,7 +803,7 @@ líneas de `src/rukh/__init__.py` que M0 escribió y que entonces parecía que n
   Lichess, y usa Stockfish y `python-chess`, que son GPL-3. La línea que hay que tener clara es la
   última: se usan como **herramienta externa en el lado del entrenamiento** —un proceso aparte con el
   que se habla por UCI— y **no se redistribuyen con la demo**. Empaquetar un binario GPL-3 en una web
-  propietaria es el error que la sección de licencias del README existe para no cometer.
+  propietaria es el error que esa separación existe para no cometer.
 
 Para los datos, lo que hay que hacer es lo que hace `LICHESS_CC0`: republicar con la misma licencia,
 citar el origen, y decir por qué. Y cuando el origen no declara licencia, como la base Elite, decirlo
@@ -835,6 +875,25 @@ información que hay que ver cuando uno no se acuerda de si puso la bandera.
   los filtros y los conteos son los que esperabas, y entonces repetir sin la bandera.
 </Callout>
 
+<Callout kind="ejecuta" title="La publicación, sin red, y la suite entera">
+  Copia [`tests/unit/test_publish.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_publish.py):
+  cambia `_api` por un doble que registra las llamadas y comprueba que los siete nombres del registro
+  están completos (falla en cuanto una entrada nueva se deja un campo), que la card lleva la cabecera
+  YAML, los hashes y los filtros, que `--dry-run` no toca la red y que los dos datasets grandes van
+  por `upload_large_folder`. Tres de sus casos publican el tokenizador, cuya card es
+  `artifacts/tokenizer/README.md`, un texto escrito a mano: descárgalo también.
+
+```sh
+curl -L -o artifacts/tokenizer/README.md https://github.com/borja-glez/rukh/raw/p1/artifacts/tokenizer/README.md
+uv run pytest -m unit -q tests/unit/test_publish.py
+uv run pytest -m unit -q
+```
+
+Diez tests en verde en la primera. La segunda es todo lo que hay en el repositorio: M0 y M1 enteros
+en verde, con los tests de Stockfish deseleccionados, y ninguno necesita red.
+
+</Callout>
+
 <Exercise n="01" title="Lee una card antes de publicarla">
   Ejecuta `uv run rukh data publish --list` y después
   `uv run rukh data publish --name rukh-games-1800 --dry-run`. Abre la card generada y responde: ¿qué
@@ -859,20 +918,6 @@ veces más grande de lo que es.
 
 </Solution>
 </Exercise>
-
-## El test que se queda en un enlace
-
-<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
-
-| Fichero                                                                                               | Líneas | Qué garantiza                                                                                                                                                                                                                                                                                                                 |
-| ----------------------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`tests/unit/test_publish.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_publish.py) | 218    | Que los siete nombres del registro tienen directorio y patrones; que la card renderizada lleva la cabecera YAML, la tabla de ficheros con sus hashes y los filtros del manifiesto; que `--dry-run` no llama a la red; que `exclude_counts` se respeta; y que un `large` usa `upload_large_folder` cuando el cliente lo tiene. |
-
-</div>
-
-Se queda fuera por tamaño: 218 líneas de las que más de la mitad son el doble de `HfApi` que registra
-las llamadas para comprobarlas después. Merece abrirlo si vas a añadir un artefacto al registro,
-porque el primer test recorre `DATASETS` entero y falla en cuanto una entrada nueva se deja un campo.
 
 ## Qué has aprendido
 

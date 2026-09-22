@@ -65,71 +65,10 @@ se lean. Debajo de cada comando va la salida real de la tirada de referencia, si
 
 <LabRoutes lesson="m3/11-labs-del-encoder" />
 
-Los dos scripts y lo que necesita cada uno están además en el README de la carpeta, que es lo
-primero que se lee al clonar el repositorio:
-
-{/* prettier-ignore */}
-````markdown title="labs/m3/README.md"
-# M3 labs
-
-Scripts referenced by the M3 lesson (`rukh-lab`, `curso/m3/01-el-encoder`). Run them from the
-repository root.
-
-| Script | Needs | Lesson lab |
-|---|---|---|
-| `bidirectional.py` | nothing | 1 · el encoder bidireccional y el enmascarado |
-| `value_bar_export.py` | the heads checkpoint and Stockfish | visualización · `artifacts/web/value-bar.json` |
-
-Both are copies of the code blocks in the lesson: if you edit one, edit the other. The only
-deliberate difference is one wrapped line in `bidirectional.py` (the lesson prints the three
-masking shares on a single line, which is 106 columns and this repository's ruff limit is 100);
-the output is identical.
-
-`artifacts/web/value-bar.json` is copied into the course with `pnpm sync:data`, like the two
-JSON files of M2.
-
-## `bidirectional.py`
-
-Three checks, no checkpoint and no data — it builds its own toy encoder:
-
-1. **It is not causal.** Change the last token of a sequence and the hidden state of the *first*
-   one moves. This is the exact opposite of the assertion M2's `causal_mask.py` makes about the
-   decoder, and running the two next to each other is the point.
-2. **Padding does not leak.** The same three real tokens give the same hidden states whether or
-   not `<pad>` travels with them, as long as the mask does.
-3. **The 80/10/10 recipe is counted, not trusted**, over 10 000 tokens.
-
-```bash
-uv run python labs/m3/bidirectional.py
-```
-
-The `kept` share it prints is an upper bound on the real 10 %: a "random" replacement can draw
-the token that was already there, and this counts that as kept.
-
-## `value_bar_export.py`
-
-Walks Byrne–Fischer (New York, 1956) up to 17...Be6, evaluates every position with the encoder's
-heads **and** with Stockfish, and writes `artifacts/web/value-bar.json` (schema
-`rukh-value-bar/1`, documented in `rukh-lab/src/data/README.md`) for the `ValueBar` island.
-
-```bash
-uv run python labs/m3/value_bar_export.py
-```
-
-It needs `checkpoints/encoder-heads-full/best.pt` and a Stockfish binary
-(`scripts/get_stockfish.py`, or `RUKH_STOCKFISH`): both curves on one chart is the whole figure,
-so it refuses to run with only one of them rather than writing half a file.
-````
-
-<Src file="labs/m3/README.md" tag="p3" lines="1-49" />
-
-Dos cosas de este README han quedado desfasadas y se pegan tal cual porque el curso muestra el
-repositorio y no una versión mejorada de él. La primera: apunta a `curso/m3/01-el-encoder`, que
-ahora es la lección de apertura y no la de labs. La segunda es más de fondo: dice que los dos
-scripts son «copias de los bloques de código de la lección», y desde esta reescritura es al revés
-—la lección muestra el fichero del repositorio, literal, con su enlace a GitHub—. La nota sobre la
-línea partida por el límite de 100 columnas de ruff sigue siendo exacta y se ve arriba en
-`shares`.
+Los labs son dos scripts de `labs/m3/`, que se ejecutan desde la raíz del repositorio:
+`bidirectional.py` no necesita ni checkpoint ni datos, porque construye su propio encoder de
+juguete, y `value_bar_export.py` necesita un checkpoint de las cabezas y Stockfish, y escribe
+`artifacts/web/value-bar.json`, que llega a este sitio con `pnpm sync:data`.
 
 ### Lab 1 · El encoder bidireccional y el enmascarado
 
@@ -225,6 +164,22 @@ dos sorteos independientes explicados. Lo que conviene tener a mano aquí es el 
 bloque del script: un `ignore_index` mal elegido **no lanza ninguna excepción**, simplemente deja de
 puntuar un puñado de posiciones o puntúa algunas que no debía, y la curva de pérdida sale preciosa.
 De ahí que este lab cuente en vez de creerse el código.
+
+<Callout kind="ejecuta" title="Una tirada de humo antes de los dieciséis minutos">
+  El preentrenamiento necesita GPU y `data/tokens/uci/` de M1. Antes de comprometer la tarjeta,
+  la misma configuración cortada a veinte pasos:
+
+```sh
+uv run rukh train encoder --config configs/train/encoder-mmm.yaml --max-steps 20
+```
+
+La primera parte se va en `torch.compile`, que compila con un paso de prueba antes del bucle. El
+último paso siempre evalúa y guarda, así que tiene que acabar con una línea `step 20  val/loss …
+val/top1 …`, el resumen `input: moves` / `masking: 15% at 80%/10%/10%` / `steps: 20` y un
+`checkpoint:` dentro de una carpeta `checkpoints/encoder-mmm-<fecha>/` nueva. Si falla al abrir el
+pack, el problema es `tokens_dir` y no el modelo. Esa carpeta de humo se puede borrar después.
+
+</Callout>
 
 Y ahora el preentrenamiento. Doce mil pasos, lotes de 96 secuencias de 200 tokens con acumulación de
 gradiente 3 —288 secuencias efectivas—, `bf16` y `torch.compile`, sobre el mismo flujo empaquetado
@@ -362,6 +317,25 @@ Y la curva por etiquetas necesita una tercera pieza, los subconjuntos anidados d
 dentro del 100 %. Con cuatro muestras independientes, un bache en el punto del 50 % podría ser un
 sorteo desafortunado, y lo que estarías midiendo es la varianza del muestreo en vez del valor de los
 datos.
+
+<Callout kind="ejecuta" title="Apunta las cabezas a tu preentrenamiento">
+  `configs/train/encoder-heads-moves.yaml` trae en `encoder_ckpt` la carpeta con fecha de la tirada
+  de referencia, que en tu disco no existe. Busca la tuya, escríbela en esa línea y haz una tirada
+  corta antes de los cuatro mil pasos (GPU, `data/evals/positions-eval.parquet` y las partidas de
+  `data/uci/`, de donde salen los prefijos):
+
+```sh
+ls -td checkpoints/encoder-mmm-*/ | head -1
+uv run rukh train heads --config configs/train/encoder-heads-moves.yaml --mode probe --max-steps 50
+```
+
+La primera orden da la carpeta más reciente; si es la de la tirada de humo, usa la anterior, la de
+doce mil pasos. La segunda tiene que imprimir `mode:       probe`, las siete métricas `val/…` y un
+checkpoint en `checkpoints/encoder-heads-moves-<fecha>/`. Si se queja de que el checkpoint se
+entrenó en otro esquema, `encoder_ckpt` apunta a algo que no es el preentrenamiento de jugadas; si
+dice que no encuentra el fichero, la ruta sigue siendo la de referencia.
+
+</Callout>
 
 ```bash title="Terminal"
 uv run rukh train heads --config configs/train/encoder-heads-moves.yaml --mode probe
@@ -1255,51 +1229,6 @@ su <Term id="probe-lineal">probe lineal</Term> es la misma técnica con la que e
 puede
 extraer el tablero de las activaciones de un modelo de ajedrez —solo que ahora la has montado tú
 sobre tu propio modelo en vez de citarla de un artículo.
-
-## Lo que el hito tocó y no está en estas lecciones
-
-El diff de `p2` a `p3` toca sesenta y cinco ficheros y las once lecciones muestran el código del
-encoder entero: los once ficheros nuevos de `src/rukh/` íntegros, los trozos cambiados de los doce
-modificados que el encoder usa, las cinco configuraciones, los dos labs y la plantilla de la model
-card. Lo que queda fuera queda fuera por dos motivos, y los dos se dicen aquí en vez de dejarlos
-como una laguna.
-
-**Porque es de otro módulo.** El hito arrastró trabajo que pertenece al tema de otra lección del
-curso, y ahí es donde se explica:
-
-<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
-
-| Fichero                                                   | Qué cambió en `p3`                                                | Dónde se cuenta         |
-| --------------------------------------------------------- | ----------------------------------------------------------------- | ----------------------- |
-| `src/rukh/data/puzzles.py`, `src/rukh/eval/puzzles.py`    | el prefijo de partida real de los puzles y su aviso en el informe | M2, la evaluación       |
-| `src/rukh/eval/suite.py`, `src/rukh/eval/report.py`       | nombres de métrica que MLflow acepta, y la nota del prompt        | M2, la evaluación       |
-| `src/rukh/data/uci.py`, `src/rukh/data/publish.py`        | retoques del pipeline de M1                                       | M1, los datos           |
-| `configs/data/pipeline.yaml`, `configs/train/medium.yaml` | el corpus `v4` y el preajuste `medium`                            | M4, que es quien lo usa |
-| `labs/m1/*.py`, `labs/m2/*.py`                            | la misma reconfiguración a UTF-8 de la consola de Windows         | M1 y M2, sus labs       |
-| `pyproject.toml`, `README.md`, `.gitignore`               | una dependencia, el mapa del paquete y tres rutas ignoradas       | M0, el repositorio      |
-
-</div>
-
-**Porque es un test cuyo contrato ya está explicado.** La política del curso es enseñar enteros los
-tests que enseñan un contrato y enlazar el resto diciendo qué garantiza cada uno. En este módulo van
-enteros `test_encoder.py`, `test_squares.py`, `test_heuristic.py`, la mitad del enmascarado de
-`test_mmm.py`, la mitad de las etiquetas de `test_labels.py` y los tests de forma, gradiente y
-congelación de `test_heads.py`. Quedan enlazados, con su frase, los que necesitan media página de
-andamio —un parquet de juguete, un servidor de MLflow local, una sesión de `onnxruntime`— y que
-ejercitan el bucle en vez del contrato:
-[`test_eval_encoder.py`](https://github.com/borja-glez/rukh/blob/p3/tests/unit/test_eval_encoder.py)
-(592 líneas: la suite entera sobre una tabla de juguete, incluido que el umbral se elige en `tune` y
-se mide en `score`, y que el informe imprime el aviso cuando el reparto degenera),
-[`test_export_encoder.py`](https://github.com/borja-glez/rukh/blob/p3/tests/unit/test_export_encoder.py)
-(459: el grafo, sus dos salidas, sus metadatos y la paridad),
-[`helpers_labels.py`](https://github.com/borja-glez/rukh/blob/p3/tests/unit/helpers_labels.py)
-(69: las filas de una partida real con un error de dama, que usan los dos anteriores) y la mitad de
-[`test_heads.py`](https://github.com/borja-glez/rukh/blob/p3/tests/unit/test_heads.py) y de
-[`test_mmm.py`](https://github.com/borja-glez/rukh/blob/p3/tests/unit/test_mmm.py) que entrena.
-
-Y solo por enlace, por la política de siempre: `uv.lock` (generado), `tests/fixtures/` y `gold/`
-(datos inertes). Leerlos no enseña nada; lo que hay que saber del `uv.lock` es lo que comprueba
-`test_lock_guard.py`, que está entero en M0.
 
 <RepoTag
   tag="p3"

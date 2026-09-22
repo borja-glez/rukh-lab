@@ -422,7 +422,7 @@ export const labRoutes: Record<string, LabRoute[]> = {
     },
     {
       lab: 'Lab 7',
-      what: 'El README maestro y el post',
+      what: 'El post del cierre',
       route: 'observar',
       clock: '—',
       gives: 'el cierre escrito del proyecto',

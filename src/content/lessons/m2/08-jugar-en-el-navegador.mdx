@@ -34,10 +34,8 @@ demo: ?stage=small-fp16
 La mitad de la demo que toca el modelo: 784 líneas de TypeScript en `rukh-web` que descargan el `.onnx` de Hugging Face, lo meten en una sesión de <Term id="onnx">ONNX</Term> Runtime dentro de un <Term id="web-worker">web worker</Term>, comprueban que el fichero es el que dice ser y contestan los logits de la siguiente jugada sin bloquear el tablero.
 
 Todo el código de esta lección es del repositorio `rukh-web`, en el commit `e228cca`, que es el que
-cerró el hito: «verificar el contrato del modelo y transmitir el progreso de la descarga». El
-tablero, el muestreador del navegador y la interfaz quedan enlazados y no pegados, porque ni tocan
-el modelo ni enseñan nada que no sea Preact; lo que sigue es exactamente la frontera entre el
-proyecto de ML y la web.
+cerró el hito: «verificar el contrato del modelo y transmitir el progreso de la descarga». Lo que
+sigue es exactamente la frontera entre el proyecto de ML y la web.
 
 <Callout kind="hoy" title="Por qué esta lección está en el módulo del decoder">
   Porque el contrato del modelo no es una propiedad del navegador: es la continuación de la
@@ -543,6 +541,22 @@ El bucle del lector, con tres detalles:
 
 El `.catch(() => undefined)` del `put` es la misma idea que el de la lectura: no poder guardar es un
 inconveniente, no un fallo.
+
+<Callout kind="ejecuta" title="Protocolo, contrato y descarga, sin navegador">
+  Los tres módulos de `src/lib/` que llevas escritos no dependen del navegador: la sesión de ORT es
+  un objeto con dos campos y `fetch` y `caches` se inyectan. Pasa sus tests en el repositorio de la
+  demo:
+
+```sh
+pnpm test tests/worker-protocol.test.ts tests/contract.test.ts tests/download.test.ts
+```
+
+Los tres ficheros en verde en unos segundos. Los de `contract.test.ts` le dan a `readContract`
+sesiones de mentira con una salida de 2 030, de otra anchura y simbólica; los de `download.test.ts`
+comprueban que la barra avanza por trozos y que la caché solo se escribe cuando la descarga ha
+terminado.
+
+</Callout>
 
 ## El worker: quien posee la sesión
 
@@ -1303,12 +1317,30 @@ El comentario de la primera línea es una trampa de nginx que conviene saberse: 
 volver a incluir el fichero entero. Es la clase de detalle que hace que una cabecera de seguridad
 esté puesta en la portada y ausente en `/ort/`, que es justo donde hacía falta.
 
-`nginx/default.conf` queda enlazado y no pegado —son setenta líneas de rutas y cachés que no tocan
-el modelo—, pero hay una que merece leerse allí: el tipo MIME de `.mjs`. El `mime.types` de nginx
+En `nginx/default.conf` hay una línea que merece conocerse: el tipo MIME de `.mjs`. El `mime.types` de nginx
 tiene entrada para `js` y no para `mjs`, así que el cargador de ORT que va junto al `.wasm` salía
 como `application/octet-stream`; con `X-Content-Type-Options: nosniff` el navegador se niega a
 evaluarlo, el `import()` dinámico del worker falla y la sesión nunca se crea. Un fallo que solo
 ocurre en producción, causado por una tabla de tipos MIME.
+
+<Callout kind="ejecuta" title="El camino entero con el modelo de juguete">
+  Con el worker, el cliente y el registro en su sitio, la demo ya carga un `.onnx` de verdad. Pasa
+  la suite unitaria completa y arranca el servidor de desarrollo:
+
+```sh
+pnpm test
+pnpm dev
+```
+
+`pnpm dev` copia antes el runtime de ORT a `public/ort/1.30.0/` y sirve la demo en
+`http://localhost:4321/`. Ábrela con `?stage=test`: el decoder de juguete de 200 KB baja, pasa el
+contrato y el panel del modelo dice qué backend usa (WebGPU, o WASM con el motivo). Después prueba
+`?stage=tiny-int8`, que ya descarga del Hub: la barra tiene que moverse desde el primer trozo, y al
+recargar la página el modelo sale de la Cache API sin volver a bajar. Las pruebas de navegador,
+incluido el proyecto que sirve la página con COOP y COEP, son `pnpm build && pnpm e2e` (la primera
+vez, `pnpm exec playwright install chromium`).
+
+</Callout>
 
 <Exercise n="01" title="¿Qué pasa si el contrato no comprueba nada?">
   Imagina que `readContract` devuelve siempre `{ block, vocab: expectedVocab }` sin comprobar la

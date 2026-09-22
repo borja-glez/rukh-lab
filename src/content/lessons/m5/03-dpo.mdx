@@ -1004,20 +1004,51 @@ lo que venga por bandera, correr. Fíjate en el diccionario por comprensión con
 una bandera que no se pasó no llega a `model_copy`, así que no puede pisar con `None` lo que el
 fichero decía.
 
-Los comandos del hito, en orden:
+<Callout kind="ejecuta" title="Prueba el constructor de pares con 40 posiciones">
+  Antes de la corrida larga (unos 35 minutos en la máquina de referencia), una de humo con
+  `--max-positions`. Necesita Stockfish (el `scripts/get_stockfish.py` de M0) y tu `medium-v4` de
+  M2: la ruta del YAML es la carpeta con fecha de la máquina de referencia, así que pasa la tuya
+  con `--checkpoint`.
 
-```bash title="Terminal"
-uv run rukh data onpolicy --config configs/data/onpolicy.yaml
-uv run rukh train dpo --config configs/train/dpo-onpolicy.yaml
-uv run rukh train dpo --config configs/train/dpo-offpolicy.yaml
+```sh
+uv run rukh data onpolicy --help
+uv run rukh data onpolicy --config configs/data/onpolicy.yaml --checkpoint checkpoints/medium-v4-<fecha>/best.pt --max-positions 40
 ```
+
+Tiene que terminar imprimiendo el manifiesto: `dataset:  rukh-pairs-onpolicy`, los contadores
+`pairs` y `positions` (este último, 40), el fichero `pairs.parquet` con su tamaño y
+`manifest: data/pairs-onpolicy/manifest.json`. Sobre el conjunto entero dio par un 46,1 % de las
+posiciones, así que con 40 espera del orden de veinte, con bastante variación. Si sale `Stockfish not found`, falta el binario; si sale `no on-policy pair survived`, el
+modelo no ha propuesto nada distinto, y con un checkpoint entrenado eso no debería pasar.
+
+</Callout>
+
+<Callout kind="ejecuta" title="El conjunto entero y el brazo dentro de política">
+  La corrida de verdad sobreescribe la de humo. Para DPO, cambia antes la línea `checkpoint:` de
+  `configs/train/dpo-onpolicy.yaml` por tu `medium-v4`: `rukh train dpo` no tiene bandera para eso.
+  Las dos necesitan GPU en la práctica.
+
+```sh
+uv run rukh data onpolicy --config configs/data/onpolicy.yaml --checkpoint checkpoints/medium-v4-<fecha>/best.pt
+uv run rukh train dpo --config configs/train/dpo-onpolicy.yaml
+```
+
+La primera registra una línea cada 250 posiciones con los pares y los dos motivos de descarte, y
+deja `data/pairs-onpolicy/pairs.parquet` con su manifiesto. La segunda registra una línea `antes:`
+y otra `después:` con pérdida, margen y aciertos sobre validación, y termina con `wrote` seguido de
+la ruta absoluta de `checkpoints/medium-v4-dpo-onpolicy/dpo.pt`. El brazo de control es la misma orden con
+`dpo-offpolicy.yaml`, y necesita que exista `data/pairs-offpolicy-matched/pairs.parquet`: los pares
+de M1 submuestreados con semilla fija al mismo número de filas que el conjunto dentro de política.
+Ninguna orden de `rukh` lo escribe en `p5`, así que ese fichero lo preparas tú.
+
+</Callout>
 
 ## Los tests que sostienen la comparación
 
 `tests/unit/test_onpolicy.py` son 131 líneas. Aquí van las tres que fijan la convención de
-puntuación, que es donde vive el fallo que no avisa; el resto —el descarte de propuestas ilegales,
-las guardas de la configuración y que el prompt sea el mismo que el de la escalera— está enlazado
-en la tabla del final de esta lección.
+puntuación, que es donde vive el fallo que no avisa; el resto comprueba que una propuesta ilegal se
+descarta y un duplicado no cuenta como segunda candidata, que `candidates: 1` y `temperature: 0` se
+rechazan, y que el prompt es el mismo que el de la escalera.
 
 ```python title="tests/unit/test_onpolicy.py"
 def test_the_score_comes_back_for_the_side_that_played_the_move():
@@ -1068,19 +1099,20 @@ Los tres son de milisegundos porque el motor es un objeto de nueve líneas que c
 mismo. Un test que necesita a Stockfish para comprobar un signo no se ejecuta en cada guardado, y
 uno que no se ejecuta no protege nada.
 
-## Lo que se enlaza en vez de pegarse
+<Callout kind="ejecuta" title="Los tests de los pares y de DPO">
+  Con el `test_onpolicy.py` completo del tag (el enlace de debajo del bloque lleva al fichero con su
+  motor falso y los tres tests de fontanería) y el `test_dpo.py` que el repositorio trae desde
+  `p4`:
 
-Tres ficheros de este bloque quedan enlazados, y conviene decir por qué cada uno:
+```sh
+uv run pytest -m unit -q tests/unit/test_onpolicy.py tests/unit/test_dpo.py
+```
 
-<div class="table-wrap">
+Doce tests en verde —siete de los pares, contando los dos casos del parametrizado, y cinco de
+DPO—, todos en CPU y sin Stockfish: el motor es el objeto falso. Si falla el del signo, revisa el
+`pov(not board.turn)` de `score_move`.
 
-| Fichero                                                                                                                | Qué garantiza                                                                                                                                                                               | Por qué no está pegado                                                                                                                                                              |
-| ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`tests/unit/test_onpolicy.py`](https://github.com/borja-glez/rukh/blob/p5/tests/unit/test_onpolicy.py), líneas 74-131 | que una propuesta ilegal se descarta y un duplicado no cuenta como segunda candidata; que `candidates: 1` y `temperature: 0` se rechazan; y que el prompt es el mismo que el de la escalera | son tres tests de fontanería sobre decisiones que la prosa de arriba ya explica, y el módulo muestra entre un tercio y la mitad de sus líneas de test eligiendo las que más enseñan |
-| [`data/pairs-onpolicy/pairs.parquet`](https://huggingface.co/datasets/chorcat/rukh-pairs-onpolicy)                     | los 6 386 pares que salieron                                                                                                                                                                | es un artefacto generado, no código: se reconstruye con el comando de arriba o se descarga con `rukh pull`                                                                          |
-| [`docs/runbooks/alineamiento.md`](https://github.com/borja-glez/rukh/blob/p5/docs/runbooks/alineamiento.md)            | la secuencia exacta de comandos del hito, con cada salida                                                                                                                                   | es documentación del repo de ML, y lo que enseña está repartido por las lecciones 8 y 9                                                                                             |
-
-</div>
+</Callout>
 
 ## Qué has aprendido
 
