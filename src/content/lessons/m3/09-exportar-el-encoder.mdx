@@ -6,7 +6,7 @@ description:
   publicación en el Hub con la plantilla de la model card del encoder.'
 module: m3
 order: 9
-duration: 220
+duration: 230
 runtime: 5
 level: avanzado
 status: vigente
@@ -1053,6 +1053,32 @@ qué fila de la matriz corresponde cada FEN.
 La orden de M2 gana una opción y nada más. El `--kind` se valida a mano con código 2 —uso incorrecto—
 antes de tocar el disco.
 
+Y llega a `export_all` como `kind=kind`, una línea nueva en una llamada que por lo demás es la de M2:
+
+```python title="src/rukh/cli.py"
+    try:
+        bundle = export_all(
+            ckpt,
+            out,
+            kind=kind,
+            opset=opset,
+            seq_len=seq_len,
+            fp16=fp16,
+            int8=int8,
+            check_parity=check_parity,
+            positions=positions,
+            games=games,
+        )
+    except (ImportError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if as_json:
+        typer.echo(bundle.model_dump_json(indent=2))
+        return
+```
+
+<Src file="src/rukh/cli.py" tag="p3" lines="773-791" />
+
 ```python title="src/rukh/cli.py"
     typer.echo(f"exporter: {bundle.onnx.exporter} (opset {bundle.onnx.opset})")
     typer.echo(f"kind:     {bundle.onnx.kind} -> {', '.join(bundle.onnx.outputs)}")
@@ -1095,6 +1121,57 @@ que imprime no se confunda con «los números son idénticos».
 `{checked}` en la línea de las formas es lo que distingue «el eje es dinámico y lo he comprobado
 corriendo el fichero» de «lo he declarado». En un esquema de casillas imprime `not verified`, y es
 correcto: no había nada que comprobar.
+
+Los embeddings son una orden nueva que no es de entrenar, ni de evaluar, ni de exportar, así que
+estrenan grupo: `rukh encoder`, el tercer `Typer` que M3 añade al principio de `cli.py`, debajo de
+`eval_app`. A diferencia de los otros dos no lleva `invoke_without_command`, sino
+`no_args_is_help=True` como `data_app`: sin subcomando no tiene nada que hacer, y lo útil es enseñar
+la ayuda.
+
+```python title="src/rukh/cli.py"
+encoder_app = typer.Typer(help="Encoder utilities: position embeddings.", no_args_is_help=True)
+app.add_typer(encoder_app, name="encoder")
+```
+
+<Src file="src/rukh/cli.py" tag="p3" lines="40-41" />
+
+La firma de `rukh encoder embed`. Las tres rutas son obligatorias, y el parquet y el checkpoint
+además tienen que existir: lo comprueba Typer (`exists=True`) antes de cargar nada. `--positions`
+pide una columna `fen`, que tienen tanto la tabla de posiciones de P1 como la de evaluaciones:
+
+```python title="src/rukh/cli.py"
+@encoder_app.command("embed")
+def encoder_embed_cmd(
+    positions: Annotated[
+        Path,
+        typer.Option(
+            "--positions",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Parquet with a `fen` column (the P1 positions or evaluations table).",
+        ),
+    ],
+    out: Annotated[Path, typer.Option("--out", help="Where to write the .npy array.")],
+    ckpt: Annotated[
+        Path,
+        typer.Option(
+            "--ckpt", exists=True, dir_okay=False, readable=True, help="Encoder checkpoint."
+        ),
+    ],
+    batch_size: Annotated[
+        int, typer.Option("--batch-size", help="Positions per forward pass.")
+    ] = 256,
+    device: Annotated[
+        str | None, typer.Option("--device", help="Where to run: cuda, cpu... ")
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the result as JSON only.")] = False,
+) -> None:
+```
+
+<Src file="src/rukh/cli.py" tag="p3" lines="824-850" />
+
+El cuerpo es una llamada a `embed_positions` y el resumen:
 
 ```python title="src/rukh/cli.py"
     """Write mean-pooled position embeddings plus the `fen4` sidecar that names their rows."""

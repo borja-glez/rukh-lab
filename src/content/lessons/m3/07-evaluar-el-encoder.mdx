@@ -6,7 +6,7 @@ description:
   esquema del checkpoint, la caché del baseline y la fila del encoder en la tabla única.'
 module: m3
 order: 7
-duration: 155
+duration: 165
 runtime: 5
 level: avanzado
 status: vigente
@@ -933,6 +933,73 @@ más veces se rompe en un proyecto que va con prisa.
 
 ## La orden
 
+`rukh eval` pasa por lo mismo que `rukh train` en la lección 5: era un comando suelto,
+`@app.command("eval")`, y para colgarle `rukh eval encoder` se convierte en un grupo. Su `Typer` va
+justo debajo del de `train_app`, también con `invoke_without_command=True` para que el decoder siga
+evaluándose sin subcomando:
+
+```python title="src/rukh/cli.py"
+eval_app = typer.Typer(
+    help="Evaluate a model: the decoder by default, a subcommand for the encoder.",
+    invoke_without_command=True,
+)
+app.add_typer(eval_app, name="eval")
+```
+
+<Src file="src/rukh/cli.py" tag="p3" lines="35-39" />
+
+Y el comando del decoder pasa a ser el callback del grupo, con los tres cambios del de `train`: el
+`ctx` para salir en cuanto hay subcomando, `--model` con `None` por defecto para que el grupo no la
+exija a `rukh eval encoder`, y la comprobación a mano de que, sin subcomando, `--model` está puesta. Es la cabeza
+de la función; de la línea `if suite not in SUITES:` hacia abajo, el cuerpo es el de M2 sin cambios:
+
+```python title="src/rukh/cli.py"
+@eval_app.callback(invoke_without_command=True)
+def eval_cmd(
+    ctx: typer.Context,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Checkpoint path or Hub id (owner/name) to evaluate."),
+    ] = None,
+    suite: Annotated[str, typer.Option("--suite", help="Suite name: full or quick.")] = "full",
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config", exists=True, dir_okay=False, readable=True, help="Suite YAML override."
+        ),
+    ] = None,
+    stage: Annotated[
+        str | None, typer.Option("--stage", help="Row name in the results table.")
+    ] = None,
+    no_cache: Annotated[
+        bool, typer.Option("--no-cache", help="Recompute every game and puzzle.")
+    ] = False,
+    device: Annotated[
+        str | None,
+        typer.Option("--device", help="Where to run: cuda, cpu... (default: the training device)."),
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the result as JSON only.")] = False,
+) -> None:
+    """Measure legality, next-move accuracy, puzzles and Elo, and write the report.
+
+    ``rukh eval --model ...`` is the decoder, exactly as it always was; the subcommands
+    evaluate the other models (``rukh eval encoder``).
+    """
+    from rukh.eval import load_suite, run_suite
+    from rukh.eval.report import elo_line
+    from rukh.eval.suite import SUITES, is_hub_id
+
+    if ctx.invoked_subcommand is not None:
+        return
+    if model is None:
+        typer.echo("error: --model is required (see rukh eval --help)", err=True)
+        raise typer.Exit(code=2)
+```
+
+<Src file="src/rukh/cli.py" tag="p3" lines="551-590" />
+
+La orden del encoder se cuelga de `eval_app`:
+
 ```python title="src/rukh/cli.py"
 @eval_app.command("encoder")
 def eval_encoder_cmd(
@@ -1057,6 +1124,24 @@ aparezcan es lo que hace comprobable de un vistazo que el reparto se hizo por pa
 ```
 
 <Src file="src/rukh/cli.py" tag="p3" lines="700-723" />
+
+<Callout kind="ejecuta" title="El grupo `eval`, antes de evaluar nada">
+  Como con `train`, la ayuda no ejecuta el cuerpo de los comandos, así que la forma de la orden se
+  puede comprobar ya, aunque la suite del encoder no esté terminada:
+
+```sh
+uv run rukh eval --help
+uv run rukh eval encoder --help
+uv run rukh eval
+```
+
+La primera enseña las opciones del decoder de M2 (`--model`, `--suite`, `--config`, `--stage`…) y
+una sección de comandos con `encoder`; la segunda, `--model` como obligatoria, `--config`,
+`--stage`, `--device`, `--no-cache` y `--json`. La tercera imprime
+`error: --model is required (see rukh eval --help)` y sale con código 2. Evaluar de verdad necesita
+un checkpoint de las cabezas y Stockfish: eso llega en los labs.
+
+</Callout>
 
 **Las notas se imprimen en el terminal, no solo en el informe.** Son siete u ocho líneas que dicen
 dónde se eligió el umbral, que el baseline no tuvo ninguno que ajustar, que la exactitud no

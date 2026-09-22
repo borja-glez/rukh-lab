@@ -67,6 +67,38 @@ todos, y eso es deliberado: los pasos no se conocen entre sí. `uci.py` no sabe 
 `elo_bins.py`; solo `pipeline.py` sabe que los dos están en el mismo YAML. Si mañana un paso
 desaparece, se borra una línea aquí y una sección del YAML.
 
+<Callout kind="hoy" title="Escríbelo entero, pero comenta lo que todavía no existe">
+  De esas diez configuraciones, hoy existen las de `db`, `uci`, `elite` y `elo_bins` (las dos
+  últimas las escribes más abajo, en esta misma lección). Las de `positions`, `evals`, `puzzles`,
+  `pairs` y `publish` llegan después, y mientras falten, todo lo que carga `pipeline.py` —las
+  órdenes de `rukh data`, `test_db.py`— se cae con un `ModuleNotFoundError`. Para que la CLI
+  funcione en cuanto la escribas, copia `pipeline.py` y `pipeline.yaml` enteros pero deja
+  comentadas con `# ` exactamente las líneas de esos cinco pasos:
+
+- las cinco importaciones (`from rukh.data.evals import EvalsConfig` y sus cuatro compañeras);
+- los cinco campos del mismo nombre en `PipelineConfig`;
+- las cinco secciones del mismo nombre en `pipeline.yaml`, con todas sus líneas (la de `evals`
+  empieza en el primer bloque y acaba en el segundo): las configuraciones son `extra="forbid"` y una
+  sección sin su campo es un error de validación;
+- la línea de `DUCKDB_STEPS`. Una tupla no se comenta a trozos y el validador hace `getattr` de cada
+  nombre, así que coméntala entera y escribe debajo una provisional, `DUCKDB_STEPS = ("elo_bins",)`.
+
+Cada lección te recuerda lo suyo en su caja «Ejecútalo»:
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla de líneas que se descomentan por lección">
+
+| Lección                   | Qué descomentas                                                                                                                     |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Posiciones y evaluaciones | Importación, campo y sección de `positions` y de `evals`; la provisional pasa a `DUCKDB_STEPS = ("positions", "evals", "elo_bins")` |
+| Puzles y pares            | Importación, campo y sección de `puzzles` y de `pairs`; borras la provisional y descomentas la original                             |
+| Publicar el dataset       | Importación, campo y sección de `publish`                                                                                           |
+
+</div>
+
+`tokenize` no necesita nada: su `TokenizeConfig` vive en este mismo fichero.
+
+</Callout>
+
 ```python title="src/rukh/data/pipeline.py"
 class TokenizeConfig(BaseConfig):
     """Where games come from, where packed tokens and tokenizer artifacts go."""
@@ -481,6 +513,22 @@ existe porque ese paso tarda horas y hay que poder pedirle un trozo.
   significa que un paso nuevo son cuatro líneas y que `--json` funciona igual en todas sin que nadie
   lo piense. El precio es un `_echo_manifest` genérico que imprime "counts" en vez de algo bonito
   para cada paso, y se paga con gusto.
+</Callout>
+
+<Callout kind="ejecuta" title="Las órdenes nuevas, registradas">
+  La ayuda de la CLI no carga `pipeline.py` (las importaciones están dentro de cada orden), así que
+  ya responde aunque `elite.py` y `elo_bins.py` todavía no existan:
+
+```sh
+uv run rukh data --help
+uv run rukh data uci --help
+```
+
+La primera tiene que listar ocho órdenes: `fetch`, de M0, y las siete de aquí (`uci`, `positions`,
+`evals`, `puzzles`, `pairs`, `elite` y `elo-bins`); `tokenize` y `publish` llegan en sus lecciones.
+La segunda enseña `--config`, `--workers` y `--json`. Para ejecutar de verdad `uci`, `elite` o
+`elo-bins` faltan los dos ficheros que vienen ahora; las otras cuatro, sus lecciones.
+
 </Callout>
 
 ## `elite.py`: descargar un zip y convertirlo con el código de ayer
@@ -1099,14 +1147,18 @@ escribe el test que la lee.
 
 <Exercise n="01" title="Añade un paso al pipeline">
   Sin escribir el paso de verdad, añade al `PipelineConfig` una sección `openings` con un
-  `OpeningsConfig` de tres campos (un `uci_dir`, un `out_dir` y un `min_games: int`), y añádelo a
-  `DUCKDB_STEPS`. Ejecuta `uv run pytest -m unit -q tests/unit/test_db.py`. ¿Qué falla y por qué?
+  `OpeningsConfig` de tres campos (un `uci_dir`, un `out_dir` y un `min_games: int`), y añade
+  `"openings"` a `DUCKDB_STEPS` (a la provisional, mientras la tengas). Ejecuta `uv run pytest -m unit -q tests/unit/test_uci.py -k cli`,
+  el test que pasa por `rukh data uci` y por tanto carga `pipeline.py`. ¿Qué falla y por qué?
   Después arréglalo de la forma mínima.
 
 <Solution>
-  Falla `test_pipeline_shares_the_duckdb_section` con un `AttributeError`, porque el bucle recorre
-  `DUCKDB_STEPS` y `OpeningsConfig` no tiene campo `duckdb`. El arreglo mínimo es darle el campo:
-  `duckdb: DuckDbConfig = Field(default_factory=DuckDbConfig)`, igual que los otros cuatro.
+  Falla `test_cli_data_uci` con un `AttributeError: 'OpeningsConfig' object has no attribute
+  'duckdb'`, porque el validador recorre `DUCKDB_STEPS` y `OpeningsConfig` no tiene campo `duckdb`.
+  Y no falla solo ese test: el validador corre cada vez que se construye un `PipelineConfig`, así que
+  cualquier orden de `rukh data` que cargue la configuración muere igual (con `test_db.py` entero,
+  desde la lección de puzles, fallan sus dos tests del pipeline). El arreglo mínimo es darle el
+  campo: `duckdb: DuckDbConfig = Field(default_factory=DuckDbConfig)`, igual que los otros cuatro.
 
 Lo interesante es el orden en que te enteras: el test falla en cuanto añades el nombre a la tupla,
 antes de que exista una línea del paso nuevo. Esa tupla es el contrato —"estos pasos abren
@@ -1116,21 +1168,24 @@ por qué tu paso nuevo vuelca al disco C: en mitad de una consulta de dos horas,
 </Solution>
 </Exercise>
 
-<Callout kind="ejecuta" title="Los dos pasos, sobre los datos de verdad">
-  La CLI de esta lección y `test_db.py` cargan `pipeline.py`, que importa las configuraciones de
-  `positions`, `evals`, `puzzles`, `pairs` y `publish`: funcionan cuando esos ficheros existan, en
-  las lecciones de posiciones, puzles y publicación. Los dos pasos de aquí no los necesitan; lánzalos
-  llamando a su `run` con la configuración por defecto, que es la del `pipeline.yaml`:
+<Callout kind="ejecuta" title="La CLI, sobre los datos de verdad">
+  Con `elite.py` y `elo_bins.py` escritos, `pipeline.py` ya carga (con sus líneas comentadas) y las
+  órdenes de esta lección funcionan. Primero los tests que pasan por él: los dos de la conexión de
+  `test_db.py` y el `test_cli_data_uci` de la lección anterior, que dejaste fuera con `-k`. Los otros
+  dos de `test_db.py` leen `cfg.evals`, `cfg.positions` y `cfg.puzzles`, y se pasan cuando
+  descomentes esos pasos. Después, los dos pasos:
 
 ```sh
-uv run python -c "from rukh.data.elo_bins import EloBinsConfig, run; print(run(EloBinsConfig()).counts)"
-uv run python -c "from rukh.data.elite import EliteConfig, run; print(run(EliteConfig()).counts)"
+uv run pytest -m unit -q tests/unit/test_db.py tests/unit/test_uci.py -k "connect or cli"
+uv run rukh data elo-bins
+uv run rukh data elite
 ```
 
-La primera lee `data/uci/` (la conversión de la lección anterior) y tarda uno o dos minutos: imprime
-un conteo por tramo, 50 000 en los tramos llenos y el número real en los que no llegan. La segunda
-necesita red, descarga los dos zips de unos 80 MB a `data/elite/` y deja `data/elite/games.parquet`
-con su `manifest.json`; si la lanzas otra vez no vuelve a descargar.
+Tres tests en verde y diez deseleccionados. `elo-bins` lee `data/uci/` (si no convertiste los dos
+meses en la lección anterior, ahora puedes hacerlo con `uv run rukh data uci`) y tarda uno o dos
+minutos: imprime su manifiesto con un conteo por tramo, 50 000 en los tramos llenos y el número real
+en los que no llegan. `elite` necesita red, descarga los dos zips de unos 80 MB a `data/elite/` y
+deja `data/elite/games.parquet` con su `manifest.json`; si la lanzas otra vez no vuelve a descargar.
 
 </Callout>
 
@@ -1144,8 +1199,9 @@ dos formas de reutilizar lo de ayer, importando el código (`elite`) o empujando
 
 **Cómo se mide**: `uv run rukh data elite` deja `data/elite/games.parquet` con el esquema de
 `uci.py`, y `uv run rukh data elo-bins` deja `data/elo-bins/games.parquet` cuyo manifiesto tiene un
-conteo por tramo de cien puntos. `uv run pytest -m unit -q tests/unit/test_db.py
-tests/unit/test_elo_bins.py tests/unit/test_elite.py` pasa en verde.
+conteo por tramo de cien puntos. `uv run pytest -m unit -q tests/unit/test_elo_bins.py
+tests/unit/test_elite.py` pasa en verde, y `tests/unit/test_db.py` entero en cuanto descomentes los
+pasos de puzles, dos lecciones más adelante.
 
 Lo siguiente son las posiciones. Hasta aquí todo han sido partidas enteras; el paso siguiente las
 abre jugada a jugada, se queda con las posiciones y las cruza con cuarenta y dos gigabytes de
