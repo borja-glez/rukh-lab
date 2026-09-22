@@ -2,7 +2,7 @@ import AxeBuilder from '@axe-core/playwright';
 import { expect, test } from '@playwright/test';
 
 /**
- * M5 is three lessons. The six figures are spread over the first two: the instrument and the
+ * M5 is nine lessons. The six figures are spread over two of them: the instrument and the
  * group baseline with the theory, the four comparisons of measured numbers with the results.
  * Five of the six are static on purpose, which is a change from M4 and worth stating: M4's
  * figures animate because the motion *is* the explanation -- an interval shrinking, a marker
@@ -33,7 +33,7 @@ async function animationsIn(page: import('@playwright/test').Page, figure: strin
 }
 
 test.describe('lesson M5 and its measured figures', () => {
-  test('the three parts chain in order, and the labs part closes with the cheatsheet', async ({
+  test('the module chains in order, and the labs lesson closes with the cheatsheet', async ({
     page,
   }) => {
     await page.goto(THEORY);
@@ -43,13 +43,14 @@ test.describe('lesson M5 and its measured figures', () => {
     await expect(page.locator('.cheat')).toHaveCount(0);
 
     await page.locator('.lesson__nav-link--next').click();
-    await expect(page).toHaveURL(new RegExp(`${RESULTS}$`));
-    await expect(page.locator('.prose h2', { hasText: 'Lo que salió' }).first()).toBeVisible();
+    await expect(page).toHaveURL(/\/curso\/m5\/02-el-reward-model\/$/);
+    await expect(page.locator('.cheat')).toHaveCount(0);
+
+    await page.goto(RESULTS);
     await expect(page.locator('.prose h2', { hasText: 'Los criterios' }).first()).toBeVisible();
     await expect(page.locator('.cheat')).toHaveCount(0);
 
-    await page.locator('.lesson__nav-link--next').click();
-    await expect(page).toHaveURL(new RegExp(`${LABS}$`));
+    await page.goto(LABS);
     await expect(page.locator('.prose h2').first()).toHaveText('Labs');
     /* Eleven labs, and the three that train something end the module with their commands. */
     expect(await page.locator('.prose h3').count()).toBeGreaterThanOrEqual(11);

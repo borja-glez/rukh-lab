@@ -1,6 +1,8 @@
 import { expect, test } from '@playwright/test';
 
 const LESSON = '/curso/m0/00-taller/';
+/* The cheatsheet hangs off the module's last lesson, which since M0 became five is the board. */
+const LAST_OF_M0 = '/curso/m0/04-el-tablero/';
 
 test.describe('course navigation', () => {
   test('landing → curso → lesson 0', async ({ page }) => {
@@ -16,8 +18,8 @@ test.describe('course navigation', () => {
       .first()
       .click();
     await expect(page).toHaveURL(new RegExp(`${LESSON}$`));
-    await expect(page.getByRole('heading', { level: 1 })).toContainText('Taller');
-    await expect(page.locator('.prose h2')).toHaveCount(7);
+    await expect(page.getByRole('heading', { level: 1 })).toContainText('Qué vas a construir');
+    await expect(page.locator('.prose h2')).toHaveCount(4);
   });
 
   test('"Marcar completada" persists after reload and shows on the map', async ({ page }) => {
@@ -34,7 +36,7 @@ test.describe('course navigation', () => {
     await expect(button).toHaveAttribute('aria-pressed', 'true');
 
     await page.goto('/');
-    await expect(page.locator('[data-progress-count][data-module="m0"]')).toHaveText('1/1');
+    await expect(page.locator('[data-progress-count][data-module="m0"]')).toHaveText('1/5');
 
     await page.goto(LESSON);
     await button.click();
@@ -117,7 +119,7 @@ test.describe('lesson layout', () => {
     // pair and the cheatsheet box ran past the paragraphs above them: 94 px at 1920, 294 px at
     // 2560. Blocks of a lesson share one column width.
     await page.setViewportSize({ width: 2560, height: 1200 });
-    await page.goto(LESSON);
+    await page.goto(LAST_OF_M0);
     const widthOf = async (selector: string) => {
       const box = (await page.locator(selector).first().boundingBox())!;
       return { x: Math.round(box.x), width: Math.round(box.width) };

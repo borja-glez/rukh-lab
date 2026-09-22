@@ -2,7 +2,7 @@ import AxeBuilder from '@axe-core/playwright';
 import { expect, test } from '@playwright/test';
 
 /**
- * M6 is three lessons and no new model: the results part carries the single table (a sortable
+ * M6 is nine lessons and no new model: the results lesson carries the single table (a sortable
  * island) and the two figures of the milestone's own measurements -- the floor of the ladder and
  * what the exports cost. Both read JSON the labs exported, so a "pendiente" state on a published
  * lesson would mean the sync was skipped: this spec insists on real numbers.
@@ -12,7 +12,7 @@ const RESULTS = '/curso/m6/08-lo-que-salio/';
 const LABS = '/curso/m6/09-labs-de-cierre/';
 
 test.describe('lesson M6, the table and its measured figures', () => {
-  test('the three parts chain in order, and the labs part closes with the cheatsheet', async ({
+  test('the module chains in order, and the labs lesson closes with the cheatsheet', async ({
     page,
   }) => {
     await page.goto(THEORY);
@@ -21,13 +21,15 @@ test.describe('lesson M6, the table and its measured figures', () => {
     await expect(page.locator('.cheat')).toHaveCount(0);
 
     await page.locator('.lesson__nav-link--next').click();
-    await expect(page).toHaveURL(new RegExp(`${RESULTS}$`));
+    await expect(page).toHaveURL(/\/curso\/m6\/02-la-escalera-calibrada\/$/);
+    await expect(page.locator('.cheat')).toHaveCount(0);
+
+    await page.goto(RESULTS);
     await expect(page.locator('.prose h2', { hasText: 'La tabla' }).first()).toBeVisible();
     await expect(page.locator('.prose h2', { hasText: 'Los criterios' }).first()).toBeVisible();
     await expect(page.locator('.cheat')).toHaveCount(0);
 
-    await page.locator('.lesson__nav-link--next').click();
-    await expect(page).toHaveURL(new RegExp(`${LABS}$`));
+    await page.goto(LABS);
     await expect(page.locator('.prose h2').first()).toHaveText('Labs');
     await expect(page.locator('.prose h3', { hasText: 'Lab 7' })).toHaveCount(1);
     await expect(page.locator('.cheat')).toHaveCount(1);

@@ -1,7 +1,10 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
-/** M3 is three lessons: the theory, the measurement, and the labs with the ValueBar island. */
+/**
+ * M3 is eleven lessons. This spec walks the three that carry something only a browser can check:
+ * the opening, the measurement lesson, and the labs with the ValueBar island and the cheatsheet.
+ */
 const THEORY = '/curso/m3/01-el-encoder/';
 const MEASURE = '/curso/m3/08-medir-sin-enganarse/';
 const LABS = '/curso/m3/11-labs-del-encoder/';
@@ -33,7 +36,7 @@ async function stateOf(island: Locator): Promise<'pending' | 'ready'> {
 }
 
 test.describe('lesson M3 and the ValueBar island', () => {
-  test('the three parts chain in order, and the labs part closes with the cheatsheet', async ({
+  test('the module chains in order, and the labs lesson closes with the cheatsheet', async ({
     page,
   }) => {
     await page.goto(THEORY);
@@ -43,13 +46,14 @@ test.describe('lesson M3 and the ValueBar island', () => {
     await expect(page.locator('.cheat')).toHaveCount(0);
 
     await page.locator('.lesson__nav-link--next').click();
-    await expect(page).toHaveURL(new RegExp(`${MEASURE}$`));
-    await expect(page.locator('.prose h2', { hasText: 'Cómo se mide' }).first()).toBeVisible();
-    await expect(page.locator('.prose h2', { hasText: 'Fuga de datos' }).first()).toBeVisible();
+    await expect(page).toHaveURL(/\/curso\/m3\/02-capas-compartidas\/$/);
     await expect(page.locator('.cheat')).toHaveCount(0);
 
-    await page.locator('.lesson__nav-link--next').click();
-    await expect(page).toHaveURL(new RegExp(`${LABS}$`));
+    await page.goto(MEASURE);
+    await expect(page.locator('.prose h2', { hasText: 'Cómo se mide' }).first()).toBeVisible();
+    await expect(page.locator('.cheat')).toHaveCount(0);
+
+    await page.goto(LABS);
     await expect(page.locator('.prose h2').first()).toHaveText('Labs');
     /* The five labs are exercises with a solution each. */
     expect(await page.locator('.prose details').count()).toBeGreaterThanOrEqual(5);
