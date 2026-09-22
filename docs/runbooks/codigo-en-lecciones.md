@@ -154,6 +154,19 @@ duration ≈ redondeo a 5 de (30 + líneas_de_código / 6 + líneas_de_prosa / 2
 `runtime` (minutos de reloj sin nadie delante) solo lo llevan las lecciones que lanzan algo:
 entrenamientos, descargas, partidas contra el motor. Sale de `rukh/docs/reproducir.md`.
 
+## Lo que una lección de código pesa
+
+Una lección con sesenta bloques renderiza unas 11 000 etiquetas y 600 KB de HTML (66 KB comprimido),
+frente a las 500 etiquetas y 14 KB de una lección conceptual. Lo produce expressive-code, que emite
+un `span` por token resaltado, y no hay forma de evitarlo sin renunciar al resaltado.
+
+Medido en la lección más grande de la fase 1 (`m4/05-qlora-con-transformers`) con Chrome DevTools:
+accesibilidad 100, buenas prácticas 100, SEO 100. **El rendimiento no está medido**: Lighthouse no
+arranca en la máquina de referencia (`EPERM` al limpiar el perfil temporal de `chrome-launcher`), y la
+lista de URLs de `lighthouserc.json` sigue cubriendo solo las lecciones de apertura, que son las
+ligeras. Antes de añadir una lección de código a esa lista hay que medirla donde Lighthouse funcione:
+el umbral es 0,95 y un DOM de 11 000 nodos puede no llegar en un ejecutor lento.
+
 ## Antes de publicar
 
 ```bash
