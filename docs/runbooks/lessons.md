@@ -14,6 +14,10 @@ final.
 - Cuando una salida de comando es necesaria, se pega la real y se antecede de la línea
   `Salida en la máquina de referencia (RTX 5090):`. Nada de salidas inventadas en una lección
   `vigente`.
+- **Se ejecuta a medida que se escribe.** En cuanto lo escrito se puede probar, una
+  `<Callout kind="ejecuta">` dice qué órdenes lanzar y qué mirar en la salida (ver abajo).
+- Nada de secciones sobre el propio curso: inventarios de lo que se enlaza en vez de pegarse, la CI,
+  el README, los ficheros generados. Ver `docs/runbooks/codigo-en-lecciones.md`.
 - Cada término técnico que aparece por primera vez enlaza al glosario con `<Term id="…">`. Si no
   existe, se añade a `src/content/glossary/terms.json` (id en kebab-case, definición con el proyecto
   delante, módulo donde se aprende, alias).
@@ -22,6 +26,29 @@ final.
 - Las visualizaciones (islas Preact) leen JSON de `src/data/`, que llega con `pnpm sync:data` desde
   `rukh/artifacts/web/`. Reservar la altura de la isla en CSS para evitar CLS.
 - Anchura de prosa 72ch; tablas anchas dentro de `<div class="table-wrap">`.
+
+## Las cajas «Ejecútalo»
+
+El lector escribe el código bloque a bloque; la caja `<Callout kind="ejecuta" title="…">` es la
+parada en la que comprueba que lo que lleva escrito funciona. No es un ejercicio (no tiene pregunta
+ni `<Solution>`): son las órdenes y lo que hay que mirar en su salida.
+
+- **Cuándo**: en los momentos en que algo nuevo ya se puede ejecutar. El primer `uv sync`, la primera
+  vez que una orden de la CLI responde, al terminar los tests de una pieza (`uv run pytest -m unit -q
+  tests/unit/test_<pieza>.py`), antes de lanzar algo largo (el `--dry-run`, una configuración de
+  humo), al terminar un entrenamiento o una exportación (la evaluación, el fichero que tiene que
+  existir), en la demo (`pnpm test`, `pnpm dev` con su query). No después de cada bloque de código:
+  una lección de código típica tiene entre dos y cinco.
+- **Qué lleva**: una frase de contexto, un bloque ` ```sh ` con las órdenes, y lo que hay que mirar:
+  qué tiene que aparecer, qué fichero tiene que existir, qué significa si sale otra cosa.
+- **Solo órdenes que existen en la etiqueta del módulo** y que funcionan en ese punto de la lección
+  (que no dependan de un fichero que llega más abajo). Si una orden necesita GPU, datos descargados
+  o un modelo entrenado, se dice.
+- **Nada de salidas inventadas**: se describe lo que se espera ("tiene que imprimir `0.0.1`", "siete
+  tests en verde") solo cuando se deduce del código o está medido; la salida real pegada sigue la
+  regla de la "Salida en la máquina de referencia".
+- Un bloque de código dentro de la caja va sin sangría y con una línea en blanco antes de
+  `</Callout>`, como en el resto de callouts con código.
 
 ## Plantilla
 
@@ -81,7 +108,7 @@ Qué se ha hecho, cómo se mide (columnas de la tabla única que cambian) y qué
 
 | Componente     | Uso                                                                     | Props                                                                       |
 | -------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `Callout`      | Aparte con etiqueta                                                     | `kind`: `teoria` · `mundo-real` · `entrevista` · `hoy` · `roto`; `title?`   |
+| `Callout`      | Aparte con etiqueta                                                     | `kind`: `teoria` · `mundo-real` · `entrevista` · `hoy` · `roto` · `ejecuta`; `title?` |
 | `Exercise`     | Ejercicio enmarcado                                                     | `title`, `n?`                                                               |
 | `Solution`     | Desplegable con la solución (dentro de `Exercise`)                      | `label?`                                                                    |
 | `Term`         | Término enlazado al glosario; popover solo con `(hover: hover)`, en táctil es un enlace | `id` (de `terms.json`)                                                      |

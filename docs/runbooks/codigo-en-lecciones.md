@@ -87,12 +87,16 @@ Markdown la anchura no se aplica a la prosa. El verificador también comprueba e
 | `labs/**`                                          | Íntegros, en la lección de labs del módulo.                                  |
 | `src/rukh/data/cards/*.jinja`                      | La primera entera; las variantes, por diferencia.                            |
 | `tests/**`                                         | Los que enseñan un contrato, enteros; el resto, tabla con enlace.            |
-| `scripts/**`, `.github/workflows/ml.yml`           | Íntegros.                                                                    |
-| `uv.lock`, `LICENSE`, `tests/fixtures/**`, `gold/` | Solo enlace. Son generados o inertes.                                        |
+| `scripts/**`                                       | Íntegros.                                                                    |
+| `uv.lock`, `LICENSE`, `tests/fixtures/**`, `gold/` | Ni se muestran ni se inventarían. Son generados o inertes.                   |
+| `README.md`, `.github/workflows/**`, `docs/**`     | Ni se muestran ni se inventarían. No enseñan nada del proyecto.              |
 | `rukh-web`                                         | Lo que toca al modelo (tokenizador, worker ONNX, tablero); el resto, enlace. |
 
-Cuando un fichero se enlaza en vez de mostrarse, la lección **lo dice y dice por qué**. Un enlace
-sin esa frase es una laguna disfrazada.
+**No hay secciones que hagan inventario de lo que no se muestra** ("Los tests que se quedan en un
+enlace", "Lo que se enlaza en vez de pegarse", "Los dos ficheros que el curso no muestra"). Hablan
+del curso, no del proyecto, y el lector no aprende nada de ellas. Si un test o un fichero no pegado
+importa para entender algo, se nombra con su enlace **en la prosa donde importa**, o se ejecuta en
+una caja «Ejecútalo»; si no importa, no se menciona.
 
 ## Ficheros que cambian en un módulo posterior
 

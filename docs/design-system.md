@@ -93,7 +93,7 @@ Las fuentes las sirve la API de fuentes de Astro (`fontProviders.fontsource()`),
 
 ## Componentes MDX (lecciones)
 
-`Callout` (`teoria`, `mundo-real`, `entrevista`, `hoy`, `roto`), `Exercise`, `Solution`, `Term`,
+`Callout` (`teoria`, `mundo-real`, `entrevista`, `hoy`, `roto`, `ejecuta`), `Exercise`, `Solution`, `Term`,
 `Figure`, `Tabs`, `NotebookLink`, `ModelBadge`, `ResultsTable`, `DemoEmbed`. Registro en
 `src/components/mdx/index.ts`; plantilla y uso en `docs/runbooks/lessons.md`.
 
