@@ -35,7 +35,7 @@ ni `<Solution>`): son las órdenes y lo que hay que mirar en su salida.
 
 - **Cuándo**: en los momentos en que algo nuevo ya se puede ejecutar. El primer `uv sync`, la primera
   vez que una orden de la CLI responde, al terminar los tests de una pieza (`uv run pytest -m unit -q
-  tests/unit/test_<pieza>.py`), antes de lanzar algo largo (el `--dry-run`, una configuración de
+tests/unit/test_<pieza>.py`), antes de lanzar algo largo (el `--dry-run`, una configuración de
   humo), al terminar un entrenamiento o una exportación (la evaluación, el fichero que tiene que
   existir), en la demo (`pnpm test`, `pnpm dev` con su query). No después de cada bloque de código:
   una lección de código típica tiene entre dos y cinco.

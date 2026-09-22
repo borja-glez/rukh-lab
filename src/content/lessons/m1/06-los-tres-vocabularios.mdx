@@ -468,6 +468,26 @@ El número de jugada se escribe solo delante de la jugada de las blancas
 todo formato hay que copiarlo exacto en el gemelo de TypeScript, porque un espacio de más son partidas
 un 8 % más largas y una tabla de estadísticas que no cuadra.
 
+<Callout kind="ejecuta" title="Dos tokenizadores que no necesitan datos">
+  `uci_vocab.py` y `san_chars.py` no dependen de nada más que de `python-chess`. Codifica una
+  apertura con los dos y pasa los tests del alfabeto; el último de ese fichero compara contra la
+  fixture de paridad, que todavía no existe, así que se deja fuera:
+
+```sh
+uv run python -c "from rukh.tokenize.uci_vocab import UciTokenizer; t = UciTokenizer(); ids = t.encode_game('e2e4 e7e5 g1f3', 1850, 1920, '1-0'); print(len(t), ids, t.decode(ids))"
+uv run python -c "from rukh.tokenize.san_chars import SanCharTokenizer, san_text, uci_to_san; s = uci_to_san('e2e4 e7e5 g1f3'); print(len(SanCharTokenizer()), repr(s))"
+uv run pytest -m unit -q tests/unit/test_san_chars.py -k "not fixture"
+```
+
+La primera imprime `2030` y `[1, 20, 48, 997, 1164, 1455, 5, 2]`: `<bos>`, `<w1800>`, `<b1900>`,
+las tres jugadas, `<1-0>` y `<eos>`, que es lo que devuelve el `decode`. La segunda, `35` y
+`'1.e4 e5 2.Nf3'`, con el número pegado a la jugada de las blancas. Copia
+[`tests/unit/test_san_chars.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_san_chars.py)
+—tamaños, un carácter de fuera que lanza, `decode` que salta los especiales, `uci_to_san` que numera
+solo las blancas y rechaza una ilegal— para la tercera: cuatro tests en verde y uno deseleccionado.
+
+</Callout>
+
 ## `bpe.py`: dejar que los datos decidan
 
 El <Term id="bpe">BPE</Term> es un taquígrafo que inventa abreviaturas: lo que más veces tiene que
@@ -722,6 +742,26 @@ longitud salen siempre en el mismo orden. Es el mismo principio que el cuarto t�
 `scoring.py`, y sirve para lo mismo: que el artefacto de estadísticas sea reproducible. El campo
 `moves` es `len(t) // 4`, una aproximación que subestima cuando hay promociones y que es
 suficiente para lo que se usa: decir "esta ficha se traga diez medias jugadas".
+
+<Callout kind="ejecuta" title="Un BPE pequeño, sobre tus partidas">
+  `bpe.py` importa `tokenizers`, la primera de las tres dependencias que M1 añade al
+  `pyproject.toml` (las tres se ven juntas en «Publicar el dataset»). Añádela y entrena un BPE de
+  prueba sobre las 20 000 primeras partidas de enero, en `.tmp/`, que está en el `.gitignore`:
+
+```sh
+uv add --no-sync "tokenizers>=0.22"
+uv sync --extra cu128 --group dev   # --extra cpu si no tienes GPU NVIDIA
+uv run python -c "from pathlib import Path; from rukh.tokenize.bpe import train_bpe_from_parquet, longest_tokens; tok = train_bpe_from_parquet(Path('data/uci/year=2025/month=01/games.parquet'), Path('.tmp/bpe-prueba.json'), 4096, 20000); print(tok.get_vocab_size()); print(longest_tokens(tok, 3))"
+```
+
+`--no-sync` y el `uv sync` explícito son para que la sincronización mantenga el extra de `torch`
+que elegiste en M0. El entrenamiento necesita `data/uci/` de la conversión y tarda unos
+segundos. Tiene que imprimir `4096` y tres tokens
+de cuarenta caracteres: aperturas enteras de diez medias jugadas (en la máquina de referencia, la
+primera es la Najdorf, `e2e4c7c5g1f3d7d6d2d4c5d4f3d4g8f6b1c3a7a6`). Los tests de `bpe.py` y de
+`uci_vocab.py` importan `fixture.py`, que llega en la lección siguiente: se pasan allí.
+
+</Callout>
 
 ## El fichero de tests que fija la enumeración
 
@@ -1004,11 +1044,6 @@ enroques por los dos flancos y de los dos bandos, y al menos una promoción a ca
 and len(m) == 5`). Una fixture de paridad que solo tuviera partidas normales no probaría nada de lo
 que se rompe.
 
-Las dos fixturas de datos de este módulo —[`tests/fixtures/games.pgn`](https://github.com/borja-glez/rukh/blob/p1/tests/fixtures/games.pgn),
-351 líneas de PGN, y `tests/fixtures/games.parquet`, un parquet de veinte partidas— **se enlazan y no
-se pegan**: son datos inertes, y lo que hay que saber de ellas es qué garantizan, que es exactamente
-lo que dicen las aserciones de arriba.
-
 El segundo comprueba que el `games.json` versionado coincide, campo a campo, con lo que produce el
 codificador de hoy. Ese fichero es el que las dos webs leen para comprobar su propia paridad, así que
 si se quedara viejo la comparación seguiría pasando contra una referencia equivocada.
@@ -1057,22 +1092,6 @@ divergieran las dos pasarían sus tests.
 
 </Solution>
 </Exercise>
-
-## Los tests que se quedan en un enlace
-
-<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
-
-| Fichero                                                                                                   | Líneas | Qué garantiza                                                                                                                                                                                         |
-| --------------------------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`tests/unit/test_san_chars.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_san_chars.py) | 56     | Que el alfabeto tiene 35 entradas, que `encode` lanza ante un carácter de fuera, que `decode` salta los especiales y que `uci_to_san` numera solo las jugadas de las blancas y rechaza una ilegal.    |
-| [`tests/unit/test_bpe.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_bpe.py)             | 164    | Que `bpe_text` y `split_moves` son inversos sobre partidas con promociones (incluida la ambigüedad de la `b`), que el entrenamiento respeta los ids especiales y que `decode` reconstruye la partida. |
-
-</div>
-
-`test_san_chars.py` se queda fuera porque repite, en menor escala, la estructura de
-`test_uci_vocab.py`: tamaños, bordes y un viaje de ida y vuelta. `test_bpe.py` se queda fuera por
-tamaño, y merece abrirlo si vas a tocar `split_moves`: la mitad del fichero son partidas con
-promociones a alfil desde la columna b, que es el caso que el callout describe.
 
 ## Qué has aprendido
 

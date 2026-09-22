@@ -34,9 +34,8 @@ tres procesos de trabajo por cada núcleo que te sobre y una conexión de <Term 
 para que no te llene el disco del sistema.
 
 Son tres ficheros y 382 líneas: `src/rukh/data/uci.py` (la conversión), `src/rukh/data/parallel.py`
-(el reparto entre procesos) y `src/rukh/data/db.py` (la conexión). Están aquí enteros, tal como
-están en el repositorio en el tag `p1`, con su enlace a GitHub y las líneas exactas debajo de
-cada bloque. Y después los dos ficheros de test que fijan el contrato: uno comprueba que el enroque
+(el reparto entre procesos) y `src/rukh/data/db.py` (la conexión). Y después los dos ficheros de
+test que fijan el contrato: uno comprueba que el enroque
 y la promoción salen bien, y el otro que el pool no se traga un mes entero en memoria antes de
 escribir la primera fila.
 
@@ -779,6 +778,20 @@ una ruta absoluta bajo `root()`, que es lo que `RUKH_HOME` mueve. Todas las ruta
 configuraciones del pipeline pasan por aquí, y por eso un test puede apuntar el proyecto entero a un
 directorio temporal con una variable de entorno.
 
+<Callout kind="ejecuta" title="La conexión, configurada">
+  Con `db.py` y el `resolve` de `paths.py` escritos, abre una conexión y pregúntale a DuckDB qué
+  ajustes tiene:
+
+```sh
+uv run python -c "from rukh.data.db import connect; con = connect(); print(con.execute(\"SELECT current_setting('temp_directory'), current_setting('memory_limit'), current_setting('threads')\").fetchone())"
+```
+
+El primer valor tiene que ser la ruta de `data/duckdb-tmp` dentro de tu repositorio (y el
+directorio aparece en disco), no el temporal del sistema. El límite de memoria sale en la unidad de
+DuckDB (unos 29,8 GiB para los 32 GB por defecto) y los hilos, tantos como núcleos.
+
+</Callout>
+
 ## Los tests: el contrato de la conversión
 
 `tests/unit/test_uci.py` es de los tests más útiles del repositorio porque las cinco partidas que
@@ -1132,6 +1145,40 @@ Y este lanza el pool de `spawn` de verdad con dos procesos y comprueba la misma 
 materialicen los doce— no se puede comprobar con un pool falso, porque con uno falso el orden es
 trivialmente correcto.
 
+<Callout kind="ejecuta" title="Los tests de la conversión y del pool">
+  Con los tres ficheros y sus dos tests escritos, pasa los dos ficheros. El último test de
+  `test_uci.py` invoca `rukh data uci`, una orden que depende del `pipeline.py` de la lección
+  siguiente y de las configuraciones de todos los pasos que ese fichero importa, así que de momento
+  se deja fuera:
+
+```sh
+uv run pytest -m unit -q tests/unit/test_uci.py tests/unit/test_parallel.py -k "not cli"
+```
+
+Once tests en verde y uno deseleccionado. Los dos que lanzan un pool de `spawn` de verdad son los
+que tardan un par de segundos; si alguno falla con `Can't pickle local object`, hay un punto de
+entrada que no está a nivel de módulo. Sin `-k`, `test_cli_data_uci` falla en su `exit_code == 0`
+hasta que `publish.py`, el último paso que importa `pipeline.py`, exista en «Publicar el dataset».
+
+</Callout>
+
+<Callout kind="ejecuta" title="La conversión de verdad, sobre los seis millones">
+  Con los tests en verde ya puedes convertir los dos meses que dejó M0. La orden `rukh data uci`
+  tardará unas lecciones en funcionar, pero no hace falta esperarla: el paso entero es la función
+  `run`, y su configuración por defecto es la misma que tendrá el `pipeline.yaml`.
+
+```sh
+uv run python -c "from rukh.data.uci import UciConfig, run; print(run(UciConfig()).counts)"
+```
+
+Tarda entre diez y veinte minutos con todos los núcleos ocupados y la memoria estable (es la
+contrapresión de `parallel.py` haciendo su trabajo). Al terminar tienen que existir
+`data/uci/year=2025/month=01/games.parquet`, su gemelo de febrero y `data/uci/manifest.json`; en la
+ejecución de referencia los conteos fueron 2 949 514 y 2 946 874, con cero ilegales en
+`filters.conversion` del manifiesto.
+
+</Callout>
+
 <Exercise n="01" title="Quítale el límite al pool y mira la memoria">
   En una copia del repositorio, cambia `run_batches` para que use `pool.imap(func, jobs)` de la
   biblioteca estándar en vez de `imap_bounded`, y ejecuta `uv run rukh data uci --workers 4` sobre
@@ -1154,20 +1201,6 @@ usa: un test verde sobre código muerto es exactamente lo que el segundo test ex
 </Solution>
 </Exercise>
 
-## Los tests que no están pegados aquí
-
-Dos ficheros de test de este paso se quedan en un enlace, y el motivo es en los dos casos el mismo:
-lo que comprueban depende de código que todavía no has visto.
-
-<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
-
-| Fichero                                                                                           | Líneas | Qué garantiza                                                                                                                                                                                                                                                                   |
-| ------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`tests/unit/test_db.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_db.py)       | 65     | Que cada conexión lleva el directorio de volcado, el límite de memoria y los hilos, y que la sección `duckdb:` del pipeline la heredan todos los pasos. Va entero en la lección siguiente, que es donde se explica el `pipeline.yaml` del que dependen dos de sus cuatro casos. |
-| [`tests/unit/test_elite.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_elite.py) | 170    | Que la descarga de la base Elite reutiliza este mismo `convert_rows`. Va en la lección siguiente, con el fichero que prueba.                                                                                                                                                    |
-
-</div>
-
 ## Qué has aprendido
 
 El primer paso del pipeline, entero: qué tiene dentro el `movetext` de Lichess y en qué orden hay que
@@ -1178,7 +1211,8 @@ pool de procesos no se trague un mes en memoria antes de escribir una fila.
 **Cómo se mide**: `uv run rukh data uci` deja `data/uci/year=2025/month=01/games.parquet` y su
 gemelo de febrero, con 2 949 514 y 2 946 874 partidas, y un `manifest.json` cuyos contadores suman
 las seis millones leídas con cero ilegales. `uv run pytest -m unit -q tests/unit/test_uci.py
-tests/unit/test_parallel.py` pasa los once casos en menos de diez segundos.
+tests/unit/test_parallel.py` pasa los doce casos en menos de diez segundos, el último en cuanto la CLI
+y el `pipeline.py` estén completos.
 
 Lo siguiente es el orquestador. Nueve pasos como este, cada uno con su configuración, comparten un
 único fichero YAML y una única sección de DuckDB, y la CLI gana ocho órdenes nuevas que se parecen

@@ -374,7 +374,7 @@ def _batch() -> tuple[torch.Tensor, torch.Tensor]:
 <Src file="tests/unit/test_hf_wrapper.py" tag="p4" lines="1-42" />
 
 Los dos `importorskip` **antes** del import de `rukh.models.hf` son lo que permite que este fichero
-exista en un repositorio cuya CI de CPU no instala `transformers`. El `# noqa: E402` del import de
+exista en un entorno que no tiene `transformers` instalado. El `# noqa: E402` del import de
 abajo está porque el linter, con razón en general, no quiere imports después de código; aquí el orden
 es el punto.
 
@@ -619,21 +619,22 @@ tiene un presupuesto de tres minutos y **nada de M0 a M3 importa ninguno**. Un p
 `transformers` en sus dependencias por usarlo en un módulo de seis paga la instalación en cada
 ejecución de cada rama.
 
-{/* prettier-ignore */}
-```yaml title=".github/workflows/ml.yml"
-      # `hf` as well as `cpu`: without it the Hugging Face tests skip, and one of them is the
-      # only check that the hand-written LoRA of `rukh.models.lora` is the same update rule as
-      # `peft`'s. A claim that is verified on one laptop is not verified.
-      - name: Sync (CPU torch, Hugging Face extra, dev group)
-        run: uv sync --extra cpu --extra hf --group dev
+<Callout kind="ejecuta" title="Instala el extra y pasa la prueba contra `peft`">
+  Hasta que el extra esté instalado, `test_hf_wrapper.py` se salta entero por sus dos
+  `importorskip`, y con él la única comprobación de que la LoRA escrita a mano es la misma regla de
+  actualización que la de `peft`. Instálalo y pásalo:
+
+```sh
+uv sync --extra cu128 --extra hf --group dev   # --extra cpu si no tienes GPU NVIDIA
+uv run pytest -m unit -q tests/unit/test_hf_wrapper.py
 ```
 
-<Src file=".github/workflows/ml.yml" tag="p4" lines="27-31" />
+Nueve tests en verde, en CPU y en segundos: los cinco de fidelidad de la envoltura, el de la config
+que no se confunde con un par encoder-decoder, el del recuento, el de las dos curvas y el de los
+pesos congelados. Si en vez de eso sale `1 skipped`, el extra no se instaló en el entorno que usa
+`uv run`.
 
-Y aun así la CI **sí** lo instala, con el motivo escrito encima: sin el extra, los tests de Hugging
-Face se saltan, y uno de ellos es la única comprobación de que la LoRA escrita a mano es la misma
-regla de actualización que la de `peft`. La frase que lo cierra vale fuera del proyecto: **una
-afirmación verificada en un solo portátil no está verificada**.
+</Callout>
 
 ## `qwen.py`: el afinado del modelo general
 
@@ -1497,6 +1498,18 @@ la política de rescate sin un modelo. Los tres tests que siguen son los tres co
 ocurre **y se cuenta**, no se vuelve a preguntar (`asked == 1` después de una respuesta fallida), y
 una posición terminada rescata a `None` en vez de reventar.
 
+<Callout kind="ejecuta" title="Las tres maneras de fallar, sin cargar un modelo">
+  El análisis de las respuestas y la política de rescate se prueban con un jugador de guion:
+
+```sh
+uv run pytest -m unit -q tests/unit/test_qwen_source.py
+```
+
+Catorce tests en verde: los cinco casos parametrizados de grafías legales, uno por modo de fallo,
+el de la contabilidad y los tres del rescate. No necesitan el extra `hf` ni la GPU.
+
+</Callout>
+
 ### La pieza que deja entrar a otro jugador en la escalera
 
 Para que Qwen juegue contra los mismos rivales que el decoder hizo falta partir `play_game` en dos.
@@ -1635,6 +1648,20 @@ def play_game_with(
 con dos sustituciones: `player.choose` en vez de las dos llamadas a `pick_move`, y `player.observe`
 en vez de añadir a mano el token a la historia. La condición del rescate cambia de `move is None` a
 `not was_legal`, que es la misma cosa dicha desde el lado del jugador.
+
+<Callout kind="ejecuta" title="Partir `play_game` no cambia ninguna partida">
+  El refactor tiene que dejar al decoder jugando exactamente igual. Los tests de M2 que juegan
+  partidas completas contra un rival aleatorio son los que lo dicen:
+
+```sh
+uv run pytest -m unit -q tests/unit/test_sampler.py
+```
+
+Todos en verde, incluidos el de la partida completa, el que cuenta propuestas ilegales sin máscara
+y el de que la misma semilla repite la misma partida. El de GPU y el que juega contra Stockfish
+llevan sus propias marcas y no entran en `-m unit`.
+
+</Callout>
 
 ## `qwen_suite.py`: la misma suite, otro jugador
 
@@ -2021,27 +2048,6 @@ suficiente como para esperar.
 `cache_db` apunta a una base propia: un ensayo no debe contaminar la caché de las mediciones de
 verdad, que se reutiliza entre ejecuciones.
 
-```bash title="Terminal"
-uv sync --extra cu128 --extra hf --group dev
-uv run rukh train qwen --config configs/train/qwen3-smoke.yaml
-uv run rukh eval qwen --adapter checkpoints/qwen3-smoke --config configs/eval/qwen-smoke.yaml --stage qwen3-smoke
-uv run rukh train qwen --config configs/train/qwen3-pgn.yaml
-uv run rukh eval qwen --adapter checkpoints/qwen3-pgn-qlora --config configs/eval/greedy.yaml --stage qwen3-pgn-qlora
-```
-
-Los dos primeros son un minuto entre los dos. El afinado real descarga Qwen3-0.6B del Hub la primera
-vez (1,5 GB) y corre 1 500 pasos; la evaluación por la misma escalera tarda unos 40 minutos, más que
-la del decoder, porque cada jugada es una generación de texto.
-
-<Callout kind="roto" title="Y lo que QLoRA no ahorró">
-  El nombre promete memoria y a esta escala no la da. Cuatro bits sobre Qwen3-0.6B ahorraron **341
-  MB de pesos** (un 29 %) y **7 MB del pico** (un 0,4 %), porque la tabla de embeddings —el 25,9 %
-  del modelo— no se cuantiza y el pico lo marcan las activaciones y el optimizador, no los pesos
-  congelados. La ventaja de QLoRA es real cuando el modelo no cabe; a 0,6 B en una tarjeta de 32 GB
-  no hay nada que no quepa. Se intentó, se midió y se dice, que es lo que permiten los dos campos de
-  memoria de `QwenReport`.
-</Callout>
-
 ## Las dos órdenes de la CLI
 
 ```python title="src/rukh/cli.py"
@@ -2165,6 +2171,43 @@ Y la de evaluación, cuyo docstring vuelve a decir cuál es la columna que este 
 decoder no. La línea de `failures:` imprime los cuatro modos de fallo por separado en la consola, que
 es donde se mira mientras corre: un solo número de legalidad haría falta abrir el informe para saber
 **cómo** falló.
+
+<Callout kind="ejecuta" title="El ensayo de Qwen, de punta a punta">
+  Con las dos órdenes escritas, ensaya el camino entero antes de la media hora de GPU. Hace falta la
+  GPU, red para descargar Qwen3-0.6B del Hub la primera vez (1,5 GB), `data/pgn-text/` de la lección
+  anterior y, para la evaluación, Stockfish y el mes de validación de `data/uci/`.
+
+```sh
+uv run rukh train qwen --config configs/train/qwen3-smoke.yaml
+uv run rukh eval qwen --adapter checkpoints/qwen3-smoke --config configs/eval/qwen-smoke.yaml --stage qwen3-smoke
+```
+
+Los dos son un minuto entre los dos, sin contar la descarga. El entrenamiento tiene que imprimir
+`precision: 4-bit NF4` —o `bf16` con una línea `fallback:` que diga por qué—, `samples: 100 over 2
+steps` y `adapter:` apuntando a `checkpoints/qwen3-smoke`, donde queda también el `run.json`. La
+evaluación imprime la línea `failures:` con los cuatro modos de fallo por separado y la ruta del
+informe; si falta `data/puzzles/puzzles.parquet`, el informe lo dice en sus notas en vez de fallar.
+
+</Callout>
+
+Después, las dos ejecuciones de verdad:
+
+```bash title="Terminal"
+uv run rukh train qwen --config configs/train/qwen3-pgn.yaml
+uv run rukh eval qwen --adapter checkpoints/qwen3-pgn-qlora --config configs/eval/greedy.yaml --stage qwen3-pgn-qlora
+```
+
+El afinado real corre 1 500 pasos; la evaluación por la misma escalera tarda unos 40 minutos, más
+que la del decoder, porque cada jugada es una generación de texto.
+
+<Callout kind="roto" title="Y lo que QLoRA no ahorró">
+  El nombre promete memoria y a esta escala no la da. Cuatro bits sobre Qwen3-0.6B ahorraron **341
+  MB de pesos** (un 29 %) y **7 MB del pico** (un 0,4 %), porque la tabla de embeddings —el 25,9 %
+  del modelo— no se cuantiza y el pico lo marcan las activaciones y el optimizador, no los pesos
+  congelados. La ventaja de QLoRA es real cuando el modelo no cabe; a 0,6 B en una tarjeta de 32 GB
+  no hay nada que no quepa. Se intentó, se midió y se dice, que es lo que permiten los dos campos de
+  memoria de `QwenReport`.
+</Callout>
 
 ## Qué has aprendido
 

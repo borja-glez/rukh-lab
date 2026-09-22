@@ -1199,6 +1199,20 @@ sin `meta.json`, `meta.json` sin la clave, fichero ausente) y un `.pt` cualquier
 checkpoint de Rukh. Ese último mensaje de error se lee más veces de las que parece, porque los pesos
 de Hugging Face también son un `.pt`.
 
+<Callout kind="ejecuta" title="El planificador y los checkpoints">
+  Con `schedule.py`, `loop.py`, `checkpoint.py` y el `__init__.py` del paquete escritos, los dos
+  ficheros de tests ya importan todo lo que necesitan:
+
+```sh
+uv run pytest -m unit -q tests/unit/test_schedule.py tests/unit/test_checkpoint.py
+```
+
+Nueve tests en verde (cinco del planificador, cuatro de los checkpoints), en CPU y sin datos: los
+checkpoints se escriben en el directorio temporal de pytest. Si falla la importación de
+`rukh.train`, el culpable suele ser un nombre de `__init__.py` que no coincide con el fichero.
+
+</Callout>
+
 ## `tracking.py`: que una ejecución reanudada sea una sola curva
 
 M0 dejó `start_run` escribiendo en la base SQLite local. M2 le añade una cosa, y es la que hace que
@@ -1398,6 +1412,24 @@ fichero, y `--max-steps` para las pruebas de trescientos pasos del ejercicio de 
 Fíjate en que `--preset` también pone `model: None`. Sin eso, una configuración con un `model`
 explícito ignoraría el preset que acabas de pedir por la línea de órdenes y entrenarías otra cosa.
 
+<Callout kind="ejecuta" title="Una ejecución de humo antes de la de verdad">
+  Antes de gastar minutos de GPU, comprueba que el bucle arranca, evalúa y guarda con una tirada de
+  300 pasos. Necesita los tokens empaquetados de M1 (`data/tokens/uci/train` y `val`); en CPU
+  funciona, pero despacio.
+
+```sh
+uv run rukh train --help
+uv run rukh train --config configs/train/tiny.yaml --max-steps 300
+```
+
+La segunda termina imprimiendo `preset: tiny`, `steps: 300` y la ruta de
+`checkpoints/tiny-<fecha>-<hora>/step-300.pt`; en esa carpeta tiene que haber también un `best.pt`.
+Por el camino verás dos líneas `step 250` y `step 300` con `val/loss` y `val/top1`. Si `torch.compile`
+no puede compilar (en Windows sin Triton, por ejemplo) aparece el aviso `training eagerly` y la
+ejecución sigue: es la caída de `maybe_compile`, no un error.
+
+</Callout>
+
 ### `tiny`, en tres minutos
 
 ```bash title="Terminal"
@@ -1492,6 +1524,21 @@ Si el proceso se corta —se reinicia la máquina, se cae el driver—, no se pi
 `--resume checkpoints/small/step-12000.pt` continúa exactamente donde estaba, con el optimizador,
 los generadores y la misma ejecución de MLflow. Esa es la diferencia entre guardar los pesos y guardar
 un checkpoint.
+
+<Callout kind="ejecuta" title="Qué dejó la tirada de `small`">
+  Al terminar, mira la carpeta de la ejecución y lo que lleva dentro el mejor checkpoint:
+
+```sh
+ls checkpoints/small-*/
+uv run python -c "import glob; from rukh.train import load_checkpoint; p = load_checkpoint(sorted(glob.glob('checkpoints/small-*/best.pt'))[-1]); print(p['step'], p['best_val'], p['vocab_hash'], p['git_sha'])"
+```
+
+Tiene que haber veinte `step-*.pt`, de `step-1000.pt` a `step-20000.pt`, más `best.pt`. La segunda
+orden imprime el paso del mejor checkpoint, su pérdida de validación y la procedencia; en la tirada
+de referencia el mejor fue el último: paso `20000` y una pérdida de 1,5197. Un `None` en `vocab_hash` significa que
+el paquete de tokens no tenía `meta.json`.
+
+</Callout>
 
 <Exercise n="01" title="Dos entrenamientos de 300 pasos que explican la receta">
   Con `--max-steps 300`, lanza `tiny` tres veces: (a) tal cual; (b) con `warmup: 0` en una copia de

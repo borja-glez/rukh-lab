@@ -183,6 +183,21 @@ De paso el histograma enseña otra cosa que no se buscaba: el corpus está domin
 con **5 969 302 partidas**, casi un tercio del total. Es la Elite Database, que entró entera en P2
 y arrastra la distribución hacia arriba. Un corpus no es plano porque nadie lo aplane.
 
+<Callout kind="ejecuta" title="El histograma, antes y después del arreglo">
+  Solo necesita un flujo empaquetado en disco: sin modelo, sin GPU y sin red.
+
+```sh
+uv run python labs/m4/header_histogram.py
+uv run python labs/m4/header_histogram.py --tokens data/tokens-elo/uci/train
+```
+
+La primera lee `data/tokens-v4/uci/train` (M2) y tiene que terminar en `headers below <w1800>: 0 of
+12 ever seen in this corpus`. La segunda lee el corpus plano de la lección 2: las barras empiezan en
+`<w1000>` y la línea final dice `8 of 12`, porque de `<w1000>` a `<w1700>` hay ocho cabeceras y las
+cuatro de más abajo siguen sin una sola partida.
+
+</Callout>
+
 - Comprueba también el manifiesto del conjunto balanceado de P1
   (`data/elo-bins/manifest.json`): su bin más bajo es `1800`, que es la misma frase dicha desde
   otro sitio.
@@ -265,7 +280,7 @@ minutos.
 
 **Objetivo:** un adaptador que sea LoRA de verdad, y las pruebas que lo demuestran.
 
-`src/rukh/models/lora.py` está entero en la lección 3, y sus ocho tests con él. Este lab es el
+`src/rukh/models/lora.py` está entero en la lección 3, y sus catorce tests con él. Este lab es el
 script que comprueba las cuatro afirmaciones del método sin necesitar ningún checkpoint: se
 construye su propio decoder de juguete.
 
@@ -919,129 +934,6 @@ carga `chorcat/rukh-medium-elo` desde el desplegable de etapa, que sí viene dec
 declara y lo que el registro de la demo sabe, y es la misma razón por la que el selector estuvo
 apagado desde P2.
 
-</Callout>
-
-### El README de los labs
-
-Los cuatro scripts vienen con su propio README, que es lo que un lector encuentra si llega al
-directorio sin pasar por el curso: qué necesita cada uno, qué imprime y qué significa lo que
-imprime.
-
-{/* prettier-ignore */}
-````md title="labs/m4/README.md"
-# M4 labs
-
-Scripts referenced by the M4 lesson (`rukh-lab`, `curso/m4/01-fine-tuning`). Run them from the
-repository root.
-
-| Script | Needs | Lesson lab |
-|---|---|---|
-| `header_histogram.py` | a packed token stream | 1 · mirar el corpus antes de culpar al modelo |
-| `lora_check.py` | nothing (check 4 needs the `hf` extra) | 4 y 5 · LoRA a mano y la prueba contra `peft` |
-| `games_needed.py` | a sweep's `results.json` | 6 · ¿faltan partidas o no hay diferencia? |
-| `lora_spectrum.py` | a checkpoint and a trained adapter | la figura de la sección de LoRA |
-
-Both are copies of the code the lesson shows, and both print the numbers the lesson quotes. If you
-edit one, edit the other.
-
-## `header_histogram.py`
-
-Counts how many times the model has seen each Elo header. The second token of every packed game
-*is* White's header, so the whole measurement is a `Counter` over `tokens[starts + 1]`.
-
-On `data/tokens-v4/uci/train` — the corpus every published model trained on — it prints:
-
-```
-data/tokens-v4/uci/train: 18,942,740 games, 1,681,069,636 tokens
-
-    <w1800>  1,570,327  #############
-    ...
-    <w2500>  5,969,302  ################################################
-    ...
-headers below <w1800>: 0 of 12 ever seen in this corpus
-```
-
-Zero of twelve. That is the whole of M4's first section: the headers below 1800 exist in the
-vocabulary, have a row in the embedding table, and never received a gradient. Run it again with
-`--tokens data/tokens-elo/uci/train` to see the corpus that fixed it.
-
-## `lora_check.py`
-
-Four claims about the hand-written LoRA, in order of how easy they are to get wrong, on a toy
-decoder it builds itself. The fourth is the one that makes the chapter honest: the same
-configuration trained with `apply_lora` and with `peft.get_peft_model`, on the same base weights
-and with the same `A` copied across, has to optimise the same number. It does, bit for bit:
-
-```
-4. step   ours          peft          |delta|
-      0   4.17093372    4.17093372    0.00e+00
-      ...
-      5   4.15640736    4.15640736    0.00e+00
-```
-
-The comparison runs on `attn.proj` and not on the query and value projections, and that is not a
-detail: `peft` cannot express what we do on a fused `qkv`. Asked for `target_modules=["qkv"]` it
-adapts all three projections with **one** `A`/`B` pair of 2304 rows, while `apply_lora` gives one
-pair per slice. Those are different parameterisations, and comparing them would measure the
-difference rather than the correctness of the code.
-````
-
-<Src file="labs/m4/README.md" tag="p4" lines="1-55" />
-
-{/* prettier-ignore */}
-````md title="labs/m4/README.md"
-## `games_needed.py`
-
-The question every overlapping interval raises, answered with arithmetic instead of machine time.
-The ladder scores a proportion, so its standard error is `sqrt(p (1 - p) / n)` and two 95 %
-intervals stop touching when the gap between the scores beats `1.96 (se1 + se2)` — about
-`n > 3.84 / (delta p)^2` games per condition for proportions near a half.
-
-On the sweep this milestone ran, with `--only 1500,2000,2400` (the conditions `GOAL.md` names):
-
-```
-  <w1500> -> <w2000>  0.466->0.453  -0.013   no              24,420
-  <w2000> -> <w2400>  0.453->0.569  +0.116   no                 284
-```
-
-Twenty-four thousand games is sixty hours of Stockfish to tighten an interval around a difference
-that is not there; two hundred and eighty-four is an hour. The two rows read the same on the
-report — "not separated" — and mean opposite things, which is the whole point of running this
-before deciding whether to re-run anything.
-
-## `lora_spectrum.py`
-
-"The correction has to pass through eight dimensions" is easy to write and easy to believe without
-checking. The check is one line of linear algebra: the singular values of `W` and of
-`delta W = (alpha / r) B A` for the same matrix.
-
-On the published `lora-e4`, over the query slice of `blocks.0.attn.qkv`:
-
-```
-  r = 8, alpha = 16, scale = 2.0
-  non-zero singular values: W 768, delta W 8
-  ||delta W||_F / ||W||_F = 0.0441
-  first singular values of delta W: [0.8338, 0.4277, 0.3592, 0.3211, 0.2811, 0.2302, 0.1991, 0.1774, 0.0, 0.0]
-```
-
-Eight, and the ninth is `0.0` rather than something small. It writes
-`artifacts/web/lora-spectrum.json`, which is what the lesson's `LoraSpectrum` figure draws.
-````
-
-<Src file="labs/m4/README.md" tag="p4" lines="57-92" />
-
-La tabla de arriba es la que hay que mirar antes de ejecutar nada: los dos labs que no necesitan
-nada (`lora_check.py` y, con cualquier flujo empaquetado, `header_histogram.py`) son los que más
-enseñan, y los dos que necesitan un checkpoint o un barrido se pueden leer sin ejecutarlos porque el
-README pega su salida real.
-
-<Callout kind="roto" title="Un README que se quedó a medias de una edición">
-  Fíjate en la frase que sigue a la tabla: «Both are copies of the code the lesson shows». Eran dos
-  scripts cuando se escribió y ahora son cuatro, y la frase se quedó en singular plural de dos. No
-  es un error que rompa nada y por eso está todavía ahí, que es exactamente cómo envejece la
-  documentación: lo que no tiene test se desincroniza y nadie lo nota. La regla no es «escribe menos
-  documentación», es «pon la que se pueda comprobar donde algo la compruebe» — y por eso los números
-  que este README cita salen de la salida real de los scripts y no de la memoria de quien lo editó.
 </Callout>
 
 ## Qué has aprendido, cómo se mide

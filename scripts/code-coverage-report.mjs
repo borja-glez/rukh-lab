@@ -33,7 +33,7 @@ const write = process.argv.includes('--write');
 const LINKED_ONLY = [
   /^uv\.lock$/,
   /^LICENSE$/,
-  /^README\.md$/,
+  /(^|\/)README\.md$/,
   /^\.github\//,
   /^tests\/fixtures\//,
   /^gold\//,
@@ -171,7 +171,7 @@ lines.push(`| **Total** | **${all.covered}** | **${all.total}** | **${pct(all)}*
 lines.push('');
 lines.push('Fuera de la cuenta, por política y no por olvido: `uv.lock` (generado), `LICENSE`,');
 lines.push(
-  '`README.md`, `.github/`, `tests/fixtures/`, `gold/` y `docs/`. No enseñan nada del proyecto.',
+  'los `README.md`, `.github/`, `tests/fixtures/`, `gold/` y `docs/`. No enseñan nada del proyecto.',
 );
 lines.push('');
 lines.push('## Por hito: lo que el lector tiene escrito al cerrar cada módulo');
