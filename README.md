@@ -31,20 +31,27 @@ Requirements: Node ≥ 24 and pnpm 10 (`corepack enable`).
 
 ## Scripts
 
-| Script                | What it does                                                                     |
-| --------------------- | -------------------------------------------------------------------------------- |
-| `pnpm dev`            | Dev server (CSP is only applied in `build`/`preview`).                           |
-| `pnpm build`          | Static build to `dist/`.                                                         |
-| `pnpm preview`        | Serves `dist/` (used by E2E).                                                    |
-| `pnpm check`          | `astro check` (types in `.astro` and `.ts`).                                     |
-| `pnpm lint`           | ESLint.                                                                          |
-| `pnpm format`         | Prettier (write); `pnpm format:check` verifies.                                  |
-| `pnpm test`           | Vitest: token hash, theme script hash, MDX registry, dictionary, progress.       |
-| `pnpm e2e`            | Playwright against `pnpm preview`: navigation, progress, axe, CSP.               |
-| `pnpm lighthouse`     | Lighthouse CI on `dist/` (desktop, 3 runs, all categories ≥ 0.95).               |
-| `pnpm sync:data`      | Copies `../rukh/artifacts/web/*.json` to `src/data/` (no-op if missing).         |
-| `pnpm sync:tokenizer` | Copies the TS tokenizer from `../rukh-web/src/lib/chess-lm/` (no-op if missing). |
-| `pnpm tokens:hash`    | Prints the sha256 of `tokens.css`; `--write` updates `docs/design-system.md`.    |
+| Script                | What it does                                                                      |
+| --------------------- | --------------------------------------------------------------------------------- |
+| `pnpm dev`            | Dev server (CSP is only applied in `build`/`preview`).                            |
+| `pnpm build`          | Static build to `dist/`.                                                          |
+| `pnpm preview`        | Serves `dist/` (used by E2E).                                                     |
+| `pnpm check`          | `astro check` (types in `.astro` and `.ts`).                                      |
+| `pnpm lint`           | ESLint.                                                                           |
+| `pnpm format`         | Prettier (write); `pnpm format:check` verifies.                                   |
+| `pnpm test`           | Vitest: token hash, theme script hash, MDX registry, dictionary, progress.        |
+| `pnpm verify:code`    | Every code block in a lesson is that file of `rukh`, verbatim, at the module tag. |
+| `pnpm fix:code`       | Rewrites each `<Src lines="…">` to the range where its block actually sits.       |
+| `pnpm coverage:code`  | How much of the engine the course has already shown, by group and by file.        |
+| `pnpm e2e`            | Playwright against `pnpm preview`: navigation, progress, axe, CSP.                |
+| `pnpm lighthouse`     | Lighthouse CI on `dist/` (desktop, 3 runs, all categories ≥ 0.95).                |
+| `pnpm sync:data`      | Copies `../rukh/artifacts/web/*.json` to `src/data/` (no-op if missing).          |
+| `pnpm sync:tokenizer` | Copies the TS tokenizer from `../rukh-web/src/lib/chess-lm/` (no-op if missing).  |
+| `pnpm tokens:hash`    | Prints the sha256 of `tokens.css`; `--write` updates `docs/design-system.md`.     |
+
+`verify:code`, `fix:code` and `coverage:code` need the sibling clones (`../rukh`, `../rukh-web`) and
+say so and exit 0 when they are missing, so a clone of this repo alone still builds. The rule they
+enforce, and why it exists, is in `docs/runbooks/codigo-en-lecciones.md`.
 
 CI (`.github/workflows/ci.yml`) runs format check, lint, check, test, build, `docker build`,
 Lighthouse and E2E on every push and pull request.
