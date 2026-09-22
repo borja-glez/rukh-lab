@@ -1,0 +1,760 @@
+---
+title: 'Puzles y pares de preferencia: dos conjuntos que ya estaban hechos'
+description:
+  'El banco de puzles con su partición determinista por tramo de dificultad, y los pares de
+  preferencia para DPO que salen de las líneas múltiples de las evaluaciones sin ejecutar Stockfish
+  ni una vez. Con el signo que hay que mirar dos veces.'
+module: m1
+order: 5
+duration: 105
+level: medio
+status: vigente
+updated: 2026-09-22
+keywords:
+  - puzles
+  - split
+  - DPO
+  - preferencias
+  - centipeones
+  - polars
+artifacts:
+  - kind: dataset
+    label: chorcat/rukh-puzzles
+    href: https://huggingface.co/datasets/chorcat/rukh-puzzles
+  - kind: dataset
+    label: chorcat/rukh-dpo-pairs
+    href: https://huggingface.co/datasets/chorcat/rukh-dpo-pairs
+---
+
+## Qué vas a construir
+
+Dos conjuntos de datos que el curso va a usar mucho y que no cuestan casi nada de construir, porque
+alguien ya hizo el trabajo caro.
+
+El primero es el **banco de puzles**: seis millones de posiciones tácticas de Lichess, filtradas por
+calidad, repartidas en tres tramos de dificultad y partidas en entrenamiento y test con una clave
+determinista. El conjunto de test que sale de aquí es el que sostiene la tabla única desde M2 hasta
+M6, y lo peor que le puede pasar a una tabla de resultados es que el conjunto sobre el que se mide
+cambie por el camino.
+
+El segundo son los **<Term id="par-de-preferencia">pares de preferencia</Term>** para el <Term id="dpo">DPO</Term>
+de M5. Son decenas de miles de tríos "posición, jugada buena, jugada mala",
+y salen enteros de la columna `pvs` de la lección anterior **sin ejecutar Stockfish ni una vez**. Lo
+único que hay que hacer bien es el signo, y ahí es donde se equivoca todo el mundo.
+
+Dos ficheros, 309 líneas.
+
+## `puzzles.py`: un banco de test que no se mueve
+
+```python title="src/rukh/data/puzzles.py"
+"""Puzzle splits by difficulty band from ``Lichess/chess-puzzles`` (deterministic by id)."""
+
+from __future__ import annotations
+
+import hashlib
+
+import polars as pl
+from pydantic import Field
+
+from rukh.config import BaseConfig
+from rukh.data.db import DuckDbConfig, connect
+from rukh.data.manifest import FileHash, Manifest
+from rukh.data.uci import sha256_file
+from rukh.paths import resolve
+
+PUZZLES_FILE = "puzzles.parquet"
+BANDS: list[tuple[str, int, int | None]] = [
+    ("1000-1500", 1000, 1500),
+    ("1500-2000", 1500, 2000),
+    ("2000+", 2000, None),
+]
+```
+
+<Src file="src/rukh/data/puzzles.py" tag="p1" lines="1-21" />
+
+Tres tramos con el corte en 1500 y en 2000, y nada por debajo de 1000. El tercero tiene `None` como
+límite superior, que es lo que lo convierte en "2000 o más": la alternativa —un número grande— habría
+que subirlo el día que aparezca un puzle de 3500.
+
+Que los tramos vivan en una constante del módulo y no en la configuración es deliberado. Son la
+definición del banco de test: si se pudieran cambiar desde un YAML, dos corridas del pipeline
+producirían dos conjuntos con la misma pinta y distinta composición, y las cifras de M2 y de M6
+dejarían de ser comparables sin que nada lo dijera.
+
+```python title="src/rukh/data/puzzles.py"
+class PuzzlesConfig(BaseConfig):
+    """Remote dataset, quality filters and split sizes."""
+
+    dataset: str = "Lichess/chess-puzzles"
+    remote_glob: str = "hf://datasets/{dataset}/**/*.parquet"
+    out_dir: str = "data/puzzles"
+    max_rating_deviation: int = Field(default=100, ge=0)
+    min_plays: int = Field(default=100, ge=0)
+    n_test: int = Field(default=2_000, ge=1)
+    n_train: int = Field(default=50_000, ge=1)
+    seed: int = 42
+    duckdb: DuckDbConfig = Field(default_factory=DuckDbConfig)
+
+
+def band(rating: int) -> str | None:
+    """Difficulty band for ``rating``; ``None`` below 1000."""
+    for name, lo, hi in BANDS:
+        if rating >= lo and (hi is None or rating < hi):
+            return name
+    return None
+```
+
+<Src file="src/rukh/data/puzzles.py" tag="p1" lines="24-43" />
+
+Los dos filtros de calidad son la parte que merece explicación, porque no son obvios.
+
+`RatingDeviation <= 100` es la incertidumbre del sistema de puntuación de Lichess sobre la dificultad
+de ese puzle: cuanto menos lo ha jugado la gente, más alta. Un puzle con desviación 300 tiene una
+dificultad declarada que es poco más que una suposición, y meterlo en un tramo es asignarle un nivel
+que no tiene. `NbPlays >= 100` es lo mismo por el otro lado: cien intentos es el mínimo para que la
+tasa de acierto signifique algo.
+
+Los dos juntos tiran una buena parte del catálogo, y esa es la intención. Lo que se quiere no es
+**más** puzles, es que el tramo "2000+" contenga puzles que de verdad son de 2000+.
+
+```python title="src/rukh/data/puzzles.py"
+def _source(cfg: PuzzlesConfig) -> str:
+    """Remote parquet glob (tests monkeypatch this to a local file)."""
+    return cfg.remote_glob.format(dataset=cfg.dataset)
+
+
+def load_filtered(cfg: PuzzlesConfig) -> pl.DataFrame:
+    """Read the puzzles that pass the quality filters with DuckDB (predicate pushdown)."""
+    con = connect(cfg.duckdb)
+    try:
+        table = con.execute(
+            f"""
+            SELECT PuzzleId AS puzzle_id, FEN AS fen, Moves AS moves, Rating AS rating,
+                   Themes AS themes
+            FROM read_parquet('{_source(cfg)}')
+            WHERE RatingDeviation <= {cfg.max_rating_deviation}
+              AND NbPlays >= {cfg.min_plays}
+              AND Rating >= 1000
+            """
+        ).arrow()
+    finally:
+        con.close()
+    return pl.from_arrow(table)  # type: ignore[return-value]
+```
+
+<Src file="src/rukh/data/puzzles.py" tag="p1" lines="46-67" />
+
+La consulta selecciona cinco columnas de las once que tiene el dataset y filtra en el `WHERE`. Otra
+vez el <Term id="predicate-pushdown">predicado empujado al origen</Term>: DuckDB lee `RatingDeviation`
+y `NbPlays` de las cabeceras de cada grupo de filas, descarta los que no pueden contener
+coincidencias y trae solo lo que queda.
+
+El `SELECT … AS` renombra de `PascalCase` a `snake_case` en el mismo sitio donde se lee. Es una línea
+de aburrimiento que ahorra una capa: el resto del fichero, los tests y el dataset publicado hablan en
+`snake_case` y nadie tiene que acordarse de que Lichess escribe `PuzzleId`.
+
+`.arrow()` y después `pl.from_arrow` en vez de `.pl()` directamente: el paso por Arrow es gratis
+—las dos librerías comparten el formato en memoria— y deja explícito que no hay copia.
+
+```python title="src/rukh/data/puzzles.py"
+def split_key(puzzle_id: str, seed: int) -> int:
+    """Stable 64-bit order key: ``blake2b(seed:puzzle_id)``."""
+    digest = hashlib.blake2b(f"{seed}:{puzzle_id}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "little", signed=False)
+
+
+def split_frame(frame: pl.DataFrame, cfg: PuzzlesConfig) -> pl.DataFrame:
+    """Assign ``band`` and ``split``: per band, first ``n_test`` by key then up to ``n_train``."""
+    keyed = frame.with_columns(
+        pl.col("rating").map_elements(band, return_dtype=pl.String).alias("band"),
+        pl.col("puzzle_id")
+        .map_elements(lambda p: split_key(p, cfg.seed), return_dtype=pl.UInt64)
+        .alias("key"),
+        pl.col("themes").cast(pl.List(pl.String)),
+    ).filter(pl.col("band").is_not_null())
+    keyed = keyed.sort(["band", "key"]).with_columns(
+        pl.int_range(pl.len()).over("band").alias("rank")
+    )
+    return (
+        keyed.with_columns(
+            pl.when(pl.col("rank") < cfg.n_test)
+            .then(pl.lit("test"))
+            .when(pl.col("rank") < cfg.n_test + cfg.n_train)
+            .then(pl.lit("train"))
+            .otherwise(None)
+            .alias("split")
+        )
+        .filter(pl.col("split").is_not_null())
+        .select("puzzle_id", "fen", "moves", "rating", "themes", "band", "split")
+    )
+```
+
+<Src file="src/rukh/data/puzzles.py" tag="p1" lines="70-99" />
+
+Aquí está la partición, y hay dos decisiones dentro.
+
+La primera es **por qué se parte por una clave y no al azar**. `split_key` es
+`blake2b(f"{seed}:{puzzle_id}")` truncado a ocho bytes, y de ahí salen tres propiedades que un
+`random.shuffle` no da: es reproducible sin guardar la lista de ids, es independiente del orden en
+que lleguen las filas, y **es estable cuando el dataset crece**. Esa tercera es la que importa: si
+Lichess publica cien mil puzles nuevos y vuelves a ejecutar el paso, los puzles que estaban en test
+siguen en test, porque su clave no depende de los demás. Con un barajado, cada corrida reparte de
+nuevo y el banco de test de M6 no es el de M2.
+
+<Callout kind="teoria" title="Por qué `seed:id` y no `id` a secas">
+  La semilla va **dentro** de lo que se cifra, no sumada al resultado. Eso hace dos cosas: permite
+  generar una partición alternativa entera cambiando un número (útil para comprobar que un resultado
+  no depende del reparto concreto) y evita el problema aritmético que tenía el muestreo por tramos
+  de Elo, donde sumar la semilla a un id de 64 bits desbordaba. Concatenar cadenas antes de cifrar
+  no desborda nunca.
+</Callout>
+
+La segunda decisión es el orden de las operaciones. Primero se calcula el tramo y se **descartan** los
+que no caen en ninguno (`band` devuelve `None` por debajo de 1000); después se ordena por
+`(band, key)` y se numera dentro de cada tramo con `pl.int_range(pl.len()).over("band")`; y solo
+entonces se reparte: los `n_test` primeros a test, los `n_train` siguientes a entrenamiento, y el
+resto **fuera**.
+
+Que el test sean los primeros por clave y no los últimos da igual; lo que no da igual es que los dos
+conjuntos salgan del mismo orden, porque eso es lo que garantiza que sean **disjuntos** sin
+comprobarlo. Y descartar el sobrante en vez de mandarlo todo a entrenamiento mantiene el tamaño del
+dataset publicado acotado y conocido: 2 000 de test y hasta 50 000 de entrenamiento por tramo,
+siempre.
+
+```python title="src/rukh/data/puzzles.py"
+def run(cfg: PuzzlesConfig) -> Manifest:
+    """Download, filter, split and write ``out_dir/puzzles.parquet`` plus the manifest."""
+    out_dir = resolve(cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frame = split_frame(load_filtered(cfg), cfg)
+    target = out_dir / PUZZLES_FILE
+    frame.write_parquet(target.as_posix(), compression="zstd")
+    counts = {
+        f"{b}/{s}": int(n)
+        for b, s, n in frame.group_by("band", "split").len().sort("band", "split").iter_rows()
+    }
+    manifest = Manifest(
+        dataset=cfg.dataset,
+        months=[],
+        filters={
+            "max_rating_deviation": cfg.max_rating_deviation,
+            "min_plays": cfg.min_plays,
+            "bands": [b for b, _, _ in BANDS],
+            "n_test": cfg.n_test,
+            "n_train": cfg.n_train,
+            "seed": cfg.seed,
+            "split_by": "blake2b(seed:PuzzleId)",
+        },
+        counts=counts,
+        files=[
+            FileHash(path=PUZZLES_FILE, sha256=sha256_file(target), bytes=target.stat().st_size)
+        ],
+    )
+    (out_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2) + "\n", "utf-8")
+    return manifest
+```
+
+<Src file="src/rukh/data/puzzles.py" tag="p1" lines="102-131" />
+
+Los conteos del manifiesto son por `tramo/split` (`"2000+/test": 2000`), que es la forma de verlo de
+un vistazo. Y `split_by` guarda la fórmula de la clave **como texto**, igual que el tramo de Elo y el
+criterio de mejor línea: el día que alguien cambie `blake2b` por otra cosa, los manifiestos viejos
+siguen diciendo cuál era la suya, y por lo tanto por qué sus cifras no son comparables.
+
+## `pairs.py`: preferencias gratis
+
+El DPO de M5 necesita tríos: una posición, una respuesta preferida y una rechazada. La forma cara de
+conseguirlos es ejecutar un motor sobre millones de posiciones. La forma barata es darse cuenta de que
+**la columna `pvs` de la lección anterior ya los tiene**: para cada posición hay varias líneas
+analizadas, ordenadas de mejor a peor, con su valor en centipeones. La primera jugada de la mejor es
+la elegida; la primera jugada de una suficientemente peor, la rechazada.
+
+```python title="src/rukh/data/pairs.py"
+"""DPO pairs from the multi-PV evaluations: best first move versus a clearly worse one.
+
+The lines are ranked with ``rukh.data.scoring``, the same ordering and mate convention the
+``evals`` consolidation uses, so ``chosen`` is always the consolidated ``best_move``. The
+margin is measured from the side to move (for Black a lower ``cp`` is better). Both moves are
+checked for legality with python-chess. One pair per FEN, balanced by phase.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import polars as pl
+import pyarrow.parquet as pq
+from pydantic import Field
+
+from rukh.config import BaseConfig
+from rukh.data.manifest import FileHash, Manifest
+from rukh.data.scoring import (
+    BEST_LINE_DOC,
+    MATE_SCORE,
+    line_rank_key,
+    score_mover,
+    score_white,
+)
+from rukh.data.uci import sha256_file
+from rukh.paths import resolve
+
+LOGGER = logging.getLogger(__name__)
+PAIRS_FILE = "pairs.parquet"
+PHASES = ("opening", "middlegame", "endgame")
+BATCH_ROWS = 50_000
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p1" lines="1-33" />
+
+El docstring enuncia las cuatro reglas del fichero, y las cuatro tienen su motivo.
+
+```python title="src/rukh/data/pairs.py"
+class PairsConfig(BaseConfig):
+    """Input evaluations, margin and the per-phase cap."""
+
+    positions_eval: str = "data/evals/positions-eval.parquet"
+    out_dir: str = "data/pairs"
+    min_delta_cp: int = Field(default=100, ge=1)
+    max_per_phase: int = Field(default=200_000, ge=1)
+    seed: int = 42
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p1" lines="36-43" />
+
+`min_delta_cp: 100` es la decisión D-018: un peón entero de diferencia. Un margen más pequeño
+produciría muchos más pares y peores, porque dos líneas separadas por veinte centipeones a
+profundidad 20 no están realmente separadas: es ruido del motor, y enseñarle al modelo a preferir una
+sobre otra es enseñarle ruido.
+
+```python title="src/rukh/data/pairs.py"
+def rank_lines(fen: str, pvs: list[dict[str, object]]) -> list[tuple[str, int, int]]:
+    """``(move, score_white, score_mover)`` for every scored line, best line first."""
+    turn = fen.split()[1]
+    scored: list[tuple[tuple[bool, int, int, str], str, int, int]] = []
+    for pv in pvs:
+        move = pv.get("move")
+        cp, mate, depth = pv.get("cp"), pv.get("mate"), pv.get("depth")
+        white = score_white(cp, mate)  # type: ignore[arg-type]
+        if not move or white is None:
+            continue
+        key = line_rank_key(cp, mate, depth, str(move), turn)  # type: ignore[arg-type]
+        scored.append((key, str(move), white, score_mover(cp, mate, turn)))  # type: ignore[arg-type]
+    scored.sort(key=lambda item: item[0])
+    return [(move, white, mover) for _, move, white, mover in scored]
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p1" lines="46-59" />
+
+`rank_lines` ordena las líneas con `line_rank_key`, **la misma función** que reproduce el SQL de la
+consolidación. Esa es la propiedad que hace que la jugada elegida de un par sea siempre igual al
+`best_move` que el paso anterior escribió en su columna; si las dos ordenaciones se separaran, el
+dataset de pares diría una cosa y el de evaluaciones otra sobre la misma posición.
+
+Devuelve la tripleta `(jugada, valor desde las blancas, valor desde el que mueve)`. Llevar **los dos**
+valores es lo que permite guardar en el parquet un `cp` con el convenio de Lichess (desde las
+blancas, comparable con el de cualquier otra fuente) y a la vez medir el margen desde el bando que
+mueve, que es lo único que tiene sentido para decidir qué jugada es peor.
+
+```python title="src/rukh/data/pairs.py"
+def make_pair(
+    fen: str, pvs: list[dict[str, object]], min_delta_cp: int
+) -> dict[str, object] | None:
+    """``chosen``/``rejected`` for one FEN or ``None`` when no line is bad enough or illegal."""
+    import chess
+
+    scored = rank_lines(fen, pvs)
+    if len(scored) < 2:
+        return None
+    chosen, cp_chosen, best_mover = scored[0]
+    rejected: tuple[str, int, int] | None = None
+    for move, white, mover in scored[1:]:
+        if move != chosen and best_mover - mover >= min_delta_cp:
+            rejected = (move, white, mover)
+            break
+    if rejected is None:
+        return None
+    try:
+        board = chess.Board(f"{fen} 0 1")
+    except ValueError:
+        return None
+    legal = {m.uci() for m in board.legal_moves}
+    if chosen not in legal or rejected[0] not in legal:
+        return None
+    return {
+        "fen": fen,
+        "chosen": chosen,
+        "rejected": rejected[0],
+        "cp_chosen": cp_chosen,
+        "cp_rejected": rejected[1],
+    }
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p1" lines="62-92" />
+
+Treinta líneas, y las tres decisiones que llevan dentro son las que hay que entender.
+
+**El margen se mide desde el que mueve.** `best_mover - mover >= min_delta_cp`, con `mover` el valor
+visto desde el bando al que le toca. Para las blancas coincide con el convenio de Lichess; para las
+negras está negado.
+
+<Callout kind="roto" title="El signo que construye un dataset perfectamente al revés">
+  Si el margen se midiera con los valores desde las blancas —`cp_chosen - cp_rejected >= 100`— el
+  dataset saldría correcto en las posiciones de las blancas y **exactamente invertido en las de las
+  negras**: para las negras, un `cp` más bajo es mejor, así que la línea "peor" según esa cuenta es
+  la buena.
+
+Lo grave no es el error, es que no da ningún síntoma. El fichero tiene el mismo número de filas, las
+jugadas son legales, el margen medio es el esperado y la mitad de los pares son correctos. La pérdida
+de DPO lo aprende tan contenta: el modelo mejora en las posiciones de las blancas y empeora en las de
+las negras, y lo que se ve al final es un modelo que no mejora, tres módulos después, sin que nada
+apunte a este `>=`.
+
+La comprobación que lo atrapa en un minuto: coge diez pares con `split_part(fen, ' ', 2) = 'b'` y
+mira si `cp_chosen < cp_rejected`. Para las negras, tiene que serlo.
+
+</Callout>
+
+**Las dos jugadas se verifican legales**, aunque vengan del análisis de un motor. Cuesta
+microsegundos y su modo de fallo es entrenar sobre jugadas imposibles. El `chess.Board(f"{fen} 0 1")`
+añade los dos contadores que `fen4` quitó, porque python-chess quiere un FEN de seis campos para
+construir un tablero; los valores concretos no importan, solo el parseo. Y el `try/except
+ValueError` cubre el caso de un FEN corrupto en el origen: una fila mala devuelve `None` y no tumba
+el paso.
+
+**Una sola pareja por posición**, la primera que cumple el margen recorriendo de mejor a peor. Es
+decir, la jugada rechazada es la **menos mala** de las que están suficientemente mal. Coger la peor de
+todas daría pares más fáciles —distinguir la mejor jugada de una catástrofe no enseña mucho— y coger
+todas las que pasan el filtro daría varios pares de la misma posición, que en DPO es una forma de
+ponderarla sin querer.
+
+```python title="src/rukh/data/pairs.py"
+def build_pairs(evals: Path, min_delta_cp: int) -> pl.DataFrame:
+    """One pair per FEN, reading the evaluations parquet batch by batch."""
+    reader = pq.ParquetFile(evals)
+    rows: list[dict[str, object]] = []
+    for batch in reader.iter_batches(batch_size=BATCH_ROWS, columns=["fen", "phase", "pvs"]):
+        records = zip(
+            batch.column("fen").to_pylist(),
+            batch.column("phase").to_pylist(),
+            batch.column("pvs").to_pylist(),
+            strict=True,
+        )
+        for fen, ph, pvs in records:
+            pair = make_pair(fen, pvs, min_delta_cp)
+            if pair is not None:
+                pair["phase"] = ph
+                rows.append(pair)
+    schema = {
+        "fen": pl.String,
+        "chosen": pl.String,
+        "rejected": pl.String,
+        "cp_chosen": pl.Int32,
+        "cp_rejected": pl.Int32,
+        "phase": pl.String,
+    }
+    return pl.DataFrame(rows, schema=schema)
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p1" lines="95-119" />
+
+`build_pairs` lee por lotes de 50 000 filas y **solo tres columnas** (`fen`, `phase`, `pvs`), que es
+lo mismo que hacían `iter_games` y `iter_batches`: el fichero de evaluaciones tiene doce columnas y
+las otras nueve no hacen falta.
+
+El `schema` explícito del `pl.DataFrame` final es necesario, no cosmético: si la lista de filas sale
+vacía —y sale vacía cuando la cobertura del join del paso anterior fue mala— polars no tiene de dónde
+inferir los tipos, y un dataframe vacío sin esquema rompe el `group_by` de más abajo con un error que
+habla de columnas inexistentes en vez de decir que no hay pares.
+
+```python title="src/rukh/data/pairs.py"
+def phase_counts(frame: pl.DataFrame) -> dict[str, int]:
+    """Rows per phase, always with the three keys."""
+    return {ph: int(frame.filter(pl.col("phase") == ph).height) for ph in PHASES}
+
+
+def balance(frame: pl.DataFrame, max_per_phase: int, seed: int) -> pl.DataFrame:
+    """Same number of pairs per phase: the smallest phase count, capped at ``max_per_phase``."""
+    counts = phase_counts(frame)
+    n = min(min(counts.values()), max_per_phase)
+    if n == 0:
+        return frame.clear()
+    parts = [
+        frame.filter(pl.col("phase") == ph).sample(n=n, seed=seed, shuffle=True) for ph in PHASES
+    ]
+    return pl.concat(parts)
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p1" lines="122-136" />
+
+`phase_counts` **siempre devuelve las tres claves**, incluso con cero. Es la misma idea que el
+esquema explícito: un diccionario que a veces tiene tres claves y a veces dos obliga a poner `.get()`
+en todos los sitios que lo consumen, y tarde o temprano alguien se olvida.
+
+`balance` iguala las tres fases al tamaño de la más pequeña. Los finales son la fase escasa —las
+partidas de 1800 a ritmo rápido se deciden antes— así que ese número manda. La alternativa, no
+equilibrar, daría un conjunto que es sobre todo aperturas, y un modelo alineado con él preferiría
+buenas jugadas de apertura y no habría visto un final.
+
+El `sample(n=n, seed=seed, shuffle=True)` en vez de coger las `n` primeras: las filas vienen
+ordenadas por `game_id, ply` del paso anterior, así que las primeras de cada fase serían las de las
+primeras partidas. Muestrear con semilla es aleatorio y reproducible a la vez.
+
+```python title="src/rukh/data/pairs.py"
+def run(cfg: PairsConfig) -> Manifest:
+    """Build, balance and write ``out_dir/pairs.parquet`` plus the manifest."""
+    evals = resolve(cfg.positions_eval)
+    out_dir = resolve(cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw = build_pairs(evals, cfg.min_delta_cp)
+    candidates = phase_counts(raw)
+    empty = [ph for ph, n in candidates.items() if n == 0]
+    if empty:
+        LOGGER.warning(
+            "no DPO candidates for %s: the balanced output is empty (candidates %s). "
+            "Check the coverage of %s.",
+            ", ".join(empty),
+            candidates,
+            evals,
+        )
+    balanced = balance(raw, cfg.max_per_phase, cfg.seed)
+    target = out_dir / PAIRS_FILE
+    balanced.write_parquet(target.as_posix(), compression="zstd")
+    counts = phase_counts(balanced)
+    counts["candidates"] = int(raw.height)
+    manifest = Manifest(
+        dataset="Lichess/chess-position-evaluations",
+        months=[],
+        filters={
+            "min_delta_cp": cfg.min_delta_cp,
+            "max_per_phase": cfg.max_per_phase,
+            "seed": cfg.seed,
+            "mate_score": MATE_SCORE,
+            "cp_point_of_view": "white",
+            "best_line": BEST_LINE_DOC,
+            "legality": "python-chess",
+            "candidates_by_phase": candidates,
+            "empty_phases": empty,
+        },
+        counts=counts,
+        files=[FileHash(path=PAIRS_FILE, sha256=sha256_file(target), bytes=target.stat().st_size)],
+    )
+    (out_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2) + "\n", "utf-8")
+    return manifest
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p1" lines="139-178" />
+
+El `LOGGER.warning` de las fases vacías es la única traza del pipeline, y está donde tiene que estar.
+Si una fase se queda a cero, el `balance` devuelve un dataframe **vacío** —el mínimo de los tres es
+cero— y el paso terminaría en verde escribiendo un parquet sin filas. El aviso dice qué fase faltó,
+cuántos candidatos había en cada una y qué fichero mirar; y por si el aviso se pierde en la salida,
+`empty_phases` y `candidates_by_phase` quedan escritos en el manifiesto.
+
+Los `counts` del manifiesto llevan las tres fases del fichero final **más** `candidates`, el total
+antes de equilibrar. Esas cuatro cifras juntas dicen cuánto se tiró y por qué: si `candidates` es
+69 246 y las tres fases quedan en 4 629, es que los finales eran 4 629.
+
+<Callout kind="mundo-real" title="El dataset que sale de los residuos de otro">
+  La columna `pvs` se guardó porque no costaba nada: las líneas peores ya estaban descargadas. De
+  ahí sale un conjunto de preferencias que, generado a mano, habría costado millones de llamadas a
+  un motor. El patrón se repite en todas partes: **los datos de preferencia más baratos son los que
+  ya produjo un sistema que tenía que ordenar algo**. Los clics sobre una lista de resultados, la
+  opción que un revisor humano eligió entre varias propuestas, la respuesta que un usuario copió de
+  entre tres. Antes de montar una campaña de anotación, merece la pena preguntar qué está tirando a
+  la basura el sistema que ya tienes.
+</Callout>
+
+<Callout kind="hoy" title="Lo que este paso todavía no produce">
+  Un par de preferencia está definido por un FEN, y un modelo que lee secuencias de jugadas no sabe
+  leer un FEN. El puente —reconstruir el prefijo de jugadas que llevó a cada posición y guardarlo
+  como `dpo-prompts.parquet`— llega en M5, que es donde se necesita. En M1 el fichero de pares es lo
+  que ves aquí: FEN, elegida, rechazada, los dos `cp` y la fase.
+</Callout>
+
+## Los tests de los puzles
+
+```python title="tests/unit/test_puzzles.py"
+"""Tests for rukh.data.puzzles: filters, bands and the deterministic disjoint split."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import polars as pl
+import pytest
+
+from rukh.data import puzzles as puzzles_module
+from rukh.data.puzzles import PuzzlesConfig, band, run, split_frame, split_key
+
+pytestmark = pytest.mark.unit
+
+
+def test_band_edges() -> None:
+    assert band(999) is None
+    assert band(1000) == "1000-1500"
+    assert band(1499) == "1000-1500"
+    assert band(1500) == "1500-2000"
+    assert band(2000) == "2000+"
+    assert band(3100) == "2000+"
+
+
+def test_split_key_is_stable() -> None:
+    assert split_key("abc12", 42) == split_key("abc12", 42)
+    assert split_key("abc12", 42) != split_key("abc12", 43)
+    assert split_key("abc12", 42) != split_key("abc13", 42)
+```
+
+<Src file="tests/unit/test_puzzles.py" tag="p1" lines="1-28" />
+
+`test_band_edges` prueba los tramos por sus bordes y por los dos lados (999/1000, 1499/1500,
+2000, 3100). Un test de tramos que solo prueba valores del medio no prueba nada: los errores de este
+tipo de función están siempre en el `>=` contra el `>`.
+
+`test_split_key_is_stable` fija las tres propiedades de la clave en tres líneas: misma entrada,
+misma salida; semilla distinta, clave distinta; id distinto, clave distinta.
+
+```python title="tests/unit/test_puzzles.py"
+def _remote(path: Path) -> None:
+    rows = []
+    for i in range(60):
+        rows.append(
+            {
+                "PuzzleId": f"p{i:05d}",
+                "GameId": f"g{i}",
+                "FEN": "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
+                "Moves": "f1b5 a7a6",
+                "Rating": 900 + i * 40,
+                "RatingDeviation": 150 if i % 10 == 0 else 80,
+                "Popularity": 90,
+                "NbPlays": 50 if i % 7 == 0 else 500,
+                "Themes": ["fork", "short"],
+                "OpeningTags": ["Ruy_Lopez"],
+            }
+        )
+    pl.DataFrame(rows).write_parquet(path.as_posix())
+
+
+def test_run_filters_bands_and_splits(rukh_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    remote = rukh_home / "remote.parquet"
+    _remote(remote)
+    monkeypatch.setattr(puzzles_module, "_source", lambda cfg: remote.as_posix())
+    cfg = PuzzlesConfig(n_test=3, n_train=5)
+    manifest = run(cfg)
+    frame = pl.read_parquet((rukh_home / "data" / "puzzles" / "puzzles.parquet").as_posix())
+    assert frame.columns == ["puzzle_id", "fen", "moves", "rating", "themes", "band", "split"]
+    assert frame["rating"].min() >= 1000
+    assert frame["puzzle_id"].n_unique() == frame.height
+    for b in ("1000-1500", "1500-2000", "2000+"):
+        test = frame.filter((pl.col("band") == b) & (pl.col("split") == "test"))
+        train = frame.filter((pl.col("band") == b) & (pl.col("split") == "train"))
+        assert test.height == 3 and 0 < train.height <= 5
+        assert not set(test["puzzle_id"]) & set(train["puzzle_id"])
+    assert manifest.counts["2000+/test"] == 3
+    # Rows dropped by quality filters never appear.
+    ids = set(frame["puzzle_id"].to_list())
+    assert "p00000" not in ids and "p00007" not in ids and "p00010" not in ids
+```
+
+<Src file="tests/unit/test_puzzles.py" tag="p1" lines="31-69" />
+
+`_remote` fabrica sesenta puzles con ratings de 900 a 3260 y —esto es lo bueno— **mete a propósito
+los que hay que tirar**: uno de cada diez con `RatingDeviation` 150 y uno de cada siete con
+`NbPlays` 50. Las dos últimas líneas del test comprueban por id que `p00000` (desviación alta y
+pocas partidas), `p00007` (pocas partidas) y `p00010` (desviación alta) no están.
+
+El resto del test recorre los tres tramos y comprueba, en cada uno, que el test tiene exactamente
+`n_test` filas, que el entrenamiento no pasa de `n_train`, y que **los dos conjuntos no comparten ni
+un id** (`not set(test) & set(train)`). Esa última aserción es la que vale por todo el fichero: es la
+promesa de que no hay fuga entre las dos mitades, comprobada y no supuesta.
+
+```python title="tests/unit/test_puzzles.py"
+def test_split_is_deterministic_and_seed_sensitive(rukh_home: Path) -> None:
+    remote = rukh_home / "remote.parquet"
+    _remote(remote)
+    frame = (
+        pl.read_parquet(remote.as_posix())
+        .rename(
+            {
+                "PuzzleId": "puzzle_id",
+                "FEN": "fen",
+                "Moves": "moves",
+                "Rating": "rating",
+                "Themes": "themes",
+            }
+        )
+        .select("puzzle_id", "fen", "moves", "rating", "themes")
+    )
+    cfg = PuzzlesConfig(n_test=4, n_train=6, seed=42)
+    a = split_frame(frame, cfg)
+    b = split_frame(frame, cfg)
+    assert a.equals(b)
+    c = split_frame(frame, cfg.model_copy(update={"seed": 7}))
+    assert set(a.filter(pl.col("split") == "test")["puzzle_id"]) != set(
+        c.filter(pl.col("split") == "test")["puzzle_id"]
+    )
+```
+
+<Src file="tests/unit/test_puzzles.py" tag="p1" lines="72-95" />
+
+Y este comprueba las dos caras del determinismo: dos particiones con la misma semilla son idénticas
+(`a.equals(b)`), y con otra semilla el conjunto de test **cambia**. La segunda mitad es la que no se
+suele escribir, y es la que detectaría una `split_key` que ignorase la semilla —que pasaría la
+primera mitad sin despeinarse.
+
+<Exercise n="01" title="Comprueba el signo de los pares de las negras">
+  Con `data/pairs/pairs.parquet` generado, escribe una consulta que se quede con los pares en los que
+  le toca mover a las negras y compruebe la relación entre `cp_chosen` y `cp_rejected`. ¿Cuál tiene
+  que ser? Después escribe la misma consulta para las blancas. ¿Qué consulta única comprobaría las
+  dos a la vez?
+
+<Solution>
+  El turno está en el segundo campo del FEN: `split_part(fen, ' ', 2) = 'b'`. Para las negras,
+  `cp_chosen < cp_rejected` en todos los pares, porque los `cp` están desde el punto de vista de las
+  blancas y para las negras menos es mejor. Para las blancas, `cp_chosen > cp_rejected`.
+
+La consulta única usa el signo del que mueve, que es exactamente lo que hace `mover_sign`:
+
+```sql
+SELECT count(*) AS mal
+FROM read_parquet('data/pairs/pairs.parquet')
+WHERE (CASE WHEN split_part(fen, ' ', 2) = 'w' THEN 1 ELSE -1 END)
+      * (cp_chosen - cp_rejected) < 100
+```
+
+Tiene que dar cero: el margen, medido desde el que mueve, es siempre de al menos cien centipeones.
+Guárdate la consulta: es la que ejecutarías el día que el DPO de M5 no mejore nada.
+
+</Solution>
+</Exercise>
+
+## Los tests que se quedan en un enlace
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Fichero                                                                                           | Líneas | Qué garantiza                                                                                                                                                                                                    |
+| ------------------------------------------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`tests/unit/test_pairs.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_pairs.py) | 180    | El signo del margen para las negras, el mate que gana a cualquier ventaja material, que una jugada ilegal descarta el par, que hay un par por FEN como máximo, y que el equilibrado deja las tres fases iguales. |
+
+</div>
+
+Se queda fuera por espacio: son 180 líneas construidas alrededor de listas de `pvs` fabricadas a mano,
+posición a posición, y su contenido es el catálogo de casos que el callout del signo describe. Si
+algún día tocas `make_pair`, ese fichero es lo primero que hay que leer; el caso de las negras está
+escrito dos veces, con un mate y con centipeones, precisamente porque es el que se rompe.
+
+## Qué has aprendido
+
+Cómo se construye un banco de test que sigue siendo el mismo cuando el catálogo de origen crece, y
+cómo se saca un conjunto de preferencias de lo que otro paso iba a tirar. Y el detalle que decide si
+el segundo vale o no vale: desde qué lado se mide la diferencia.
+
+**Cómo se mide**: `uv run rukh data puzzles` deja `data/puzzles/puzzles.parquet` con 2 000 puzles de
+test por tramo y hasta 50 000 de entrenamiento, y un manifiesto con el conteo por `tramo/split`.
+`uv run rukh data pairs` deja `data/pairs/pairs.parquet` con las tres fases igualadas y `candidates`
+diciendo de cuántos se partió. `uv run pytest -m unit -q tests/unit/test_puzzles.py
+tests/unit/test_pairs.py` pasa en verde.
+
+Con esto el pipeline de datos está completo. Lo que viene ahora es la otra mitad del módulo y la
+primera decisión de modelado del curso: convertir esas partidas en números. Tres vocabularios, tres
+formas de decir lo mismo, y una tabla medida que zanja cuál se usa.

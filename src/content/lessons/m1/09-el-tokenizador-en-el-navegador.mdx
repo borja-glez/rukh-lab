@@ -1,0 +1,935 @@
+---
+title: 'El tokenizador en el navegador'
+description:
+  'La segunda implementación de los tres tokenizadores, en TypeScript, sin compartir una línea con
+  la de Python. Por qué hay dos, qué las mantiene iguales y qué subconjunto del BPE de Hugging Face
+  hace falta reproducir para que los ids coincidan.'
+module: m1
+order: 9
+duration: 125
+level: medio
+status: vigente
+updated: 2026-09-22
+keywords:
+  - TypeScript
+  - paridad
+  - BPE
+  - navegador
+  - fixture
+  - tokenizador
+artifacts:
+  - kind: demo
+    label: rukh.borjaglez.com
+    href: https://rukh.borjaglez.com
+  - kind: tokenizer
+    label: chorcat/rukh-tokenizer
+    href: https://huggingface.co/chorcat/rukh-tokenizer
+---
+
+import TokenizerPlayground from '../../../islands/TokenizerPlayground.tsx';
+
+## Qué vas a construir
+
+Los mismos tres tokenizadores, otra vez, en TypeScript. Corren en el navegador de quien juega contra
+el modelo, no comparten una sola línea con los de Python, y tienen que producir **exactamente los
+mismos ids**.
+
+Es la parte del módulo que más incomoda al escribirla, porque duplicar código está mal en cualquier
+otra situación. Aquí no hay alternativa, y merece la pena entender por qué antes de mirar el código:
+es la misma situación en la que acaba cualquiera que sirva un modelo en un sitio distinto de donde lo
+entrenó.
+
+Cuatro ficheros en `rukh-web`, 414 líneas, más el test que las ata a la fixture de Python.
+
+<Callout kind="teoria" title="Por qué no se comparte el código">
+  Las tres opciones que no funcionan:
+
+**Llamar a Python desde el navegador.** Un tokenizador se ejecuta antes de cada jugada; una llamada a
+un servidor por jugada convierte una demo que funciona sin conexión en una que depende de un
+servidor, y le suma la latencia de ida y vuelta a algo que tarda microsegundos.
+
+**Llevar Python al navegador.** Pyodide existe y funciona; son varios megabytes de descarga para
+ejecutar 400 líneas que en TypeScript son 400 líneas.
+
+**Generar el TypeScript desde el Python.** Un transpilador para un subconjunto de un lenguaje es más
+código que el que ahorra, y falla en el sitio peor: en las diferencias de semántica (la división
+entera, el orden de un `sort`, el `%` con negativos) que son justamente las que producen ids
+distintos.
+
+Lo que queda es escribirlo dos veces y **hacer que la divergencia sea imposible de pasar por alto**.
+Eso es lo que hace la fixture.
+
+</Callout>
+
+## La estrategia: una fixture y dos suites
+
+El vocabulario UCI se puede reimplementar porque no depende de los datos: es una enumeración. Basta
+con copiar el orden. El BPE **sí** depende de los datos, así que no se reimplementa el entrenamiento;
+se reimplementa el **codificador**, que lee el `bpe.json` que Python entrenó.
+
+Y para comprobar que las dos mitades dicen lo mismo hay un solo artefacto: `fixtures/games.json`, las
+veinte partidas que Python codificó con los tres esquemas en la lección del empaquetado. La
+implementación de TypeScript las codifica por su cuenta y compara.
+
+Cuatro ficheros de `rukh-web` **no se pegan aquí y sí se enlazan**, porque son artefactos generados y
+leerlos no enseña nada:
+[`vocab.json`](https://github.com/borja-glez/rukh-web/blob/9be992c/src/lib/chess-lm/vocab.json) (los
+2 030 tokens en orden),
+[`bpe.json`](https://github.com/borja-glez/rukh-web/blob/9be992c/src/lib/chess-lm/bpe.json) (el modelo
+BPE que escribió `tokenizers`),
+[`fixtures/games.json`](https://github.com/borja-glez/rukh-web/blob/9be992c/src/lib/chess-lm/fixtures/games.json)
+(las veinte partidas con sus ids) y
+[`scripts/sync-tokenizer.mjs`](https://github.com/borja-glez/rukh-web/blob/9be992c/scripts/sync-tokenizer.mjs)
+(las cien líneas que copian los tres desde `rukh/artifacts/tokenizer/`). Los tres JSON salen de
+`rukh data tokenize --export-fixture`, que es código que ya has leído entero.
+
+## `tokenizer.ts`: la enumeración, otra vez
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/tokenizer.ts"
+// Fixed-vocabulary UCI tokenizer. The vocabulary is a deterministic enumeration (it does not
+// depend on any data) implemented identically in Python (`rukh/src/rukh/tokenize/uci_vocab.py`)
+// and here; `tests/parity.test.ts` checks both against the fixture exported from Python.
+
+const FILES = 'abcdefgh';
+const RANKS = '12345678';
+
+/** The 64 squares in file-major order: a1, a2, ..., a8, b1, ..., h8 (index `file * 8 + rank`). */
+export const SQUARES: readonly string[] = Array.from({ length: 64 }, (_, i) => {
+  const file = FILES[Math.floor(i / 8)];
+  const rank = RANKS[i % 8];
+  return `${file}${rank}`;
+});
+
+/** Special tokens, in id order (0-7). Elo bins follow (8-61) and moves start at id 62. */
+export const SPECIALS: readonly string[] = [
+  '<pad>',
+  '<bos>',
+  '<eos>',
+  '<mask>',
+  '<unk>',
+  '<1-0>',
+  '<0-1>',
+  '<1/2>',
+];
+
+export const PAD_ID = 0;
+export const BOS_ID = 1;
+export const EOS_ID = 2;
+export const MASK_ID = 3;
+export const UNK_ID = 4;
+
+export const ELO_MIN = 600;
+/** Upper clamp before binning, so 3200+ lands in `<w3200>`; it is not the highest bin (3200). */
+export const ELO_CLAMP_MAX = 3299;
+export const ELO_BIN_WIDTH = 100;
+/** Number of Elo bins per side: 600, 700, ..., 3200. */
+export const ELO_BIN_COUNT = 27;
+
+const PROMOTION_PIECES = ['q', 'r', 'b', 'n'] as const;
+
+/** Result strings accepted by `encodeGame`, mapped to their special token. */
+const RESULT_TOKENS: Record<string, string> = {
+  '1-0': '<1-0>',
+  '0-1': '<0-1>',
+  '1/2-1/2': '<1/2>',
+};
+```
+
+<Src file="src/lib/chess-lm/tokenizer.ts" repo="rukh-web" tag="9be992c" lines="1-47" />
+
+El comentario de cabecera dice las tres cosas que hay que saber: que la enumeración no depende de
+datos, dónde está su gemela y quién comprueba que coinciden.
+
+`SQUARES` construye las 64 casillas con un `Array.from` indexado, y el comentario repite la fórmula
+del orden (`file * 8 + rank`) igual que el test de Python. Las dos implementaciones llegan a la misma
+lista por caminos distintos —un doble bucle allí, un índice aquí— y eso es sano: si las dos usaran el
+mismo truco, un error de razonamiento se cometería dos veces.
+
+Fíjate en `ELO_CLAMP_MAX = 3299` y en su comentario. En Python ese número no existe como constante:
+está escrito como `ELO_MAX + ELO_STEP - 1` dentro de `elo_bin`. Aquí está sacado a una constante con
+nombre **y con la advertencia de que no es el tramo más alto**, que es 3200. La distinción importa
+porque el recorte se aplica **antes** del suelo a centenas: 3299 recortado y después redondeado hacia
+abajo da 3200, que es el último tramo que existe. Poner ahí 3300 sí rompería la paridad —un 3300 caería
+en un `<w3300>` que no está en la tabla— y por eso la constante lleva su comentario encima.
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/tokenizer.ts"
+function coords(square: string): [number, number] {
+  return [FILES.indexOf(square[0] ?? ''), RANKS.indexOf(square[1] ?? '')];
+}
+
+/** True if `to` is reachable from `from` by a queen (same file, rank or diagonal) or a knight. */
+function reachable(from: string, to: string): boolean {
+  if (from === to) return false;
+  const [ff, fr] = coords(from);
+  const [tf, tr] = coords(to);
+  const df = Math.abs(tf - ff);
+  const dr = Math.abs(tr - fr);
+  const queen = df === 0 || dr === 0 || df === dr;
+  const knight = (df === 1 && dr === 2) || (df === 2 && dr === 1);
+  return queen || knight;
+}
+
+/** Maps an Elo to its bin token: `clamp(elo, 600, 3299)` floored to hundreds, four digits. */
+export function eloBin(elo: number, side: 'w' | 'b'): string {
+  const clamped = Math.min(Math.max(elo, ELO_MIN), ELO_CLAMP_MAX);
+  const bin = Math.floor(clamped / ELO_BIN_WIDTH) * ELO_BIN_WIDTH;
+  return `<${side}${String(bin).padStart(4, '0')}>`;
+}
+
+function eloBinTokens(side: 'w' | 'b'): string[] {
+  return Array.from({ length: ELO_BIN_COUNT }, (_, i) => eloBin(ELO_MIN + i * ELO_BIN_WIDTH, side));
+}
+```
+
+<Src file="src/lib/chess-lm/tokenizer.ts" repo="rukh-web" tag="9be992c" lines="49-74" />
+
+`reachable` recibe cadenas y no desplazamientos, al revés que el `_reachable` de Python. Es una
+diferencia de forma y no de significado: las tres condiciones —misma columna, misma fila, misma
+diagonal, o salto de caballo— son las mismas.
+
+`eloBin` hace `Math.min(Math.max(elo, 600), 3299)` y después `Math.floor(x / 100) * 100`. En Python la
+misma línea usa `//`, la división entera. **Aquí no se puede usar `Math.trunc`**: para números
+positivos coinciden, pero `Math.floor` es lo que corresponde a `//` de Python, que redondea hacia
+abajo. Con Elos siempre positivos da igual, y escribirlo con `floor` es lo correcto de todas formas:
+es la clase de equivalencia que hay que resolver mirando, no probando.
+
+El `padStart(4, '0')` reproduce el `{elo:04d}` de Python. Sin él, `<w600>` en vez de `<w0600>`, y los
+54 tokens de Elo dejarían de coincidir.
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/tokenizer.ts"
+/** Enumerates the 1968 pseudo-legal UCI move strings: 1792 plain moves then 176 promotions. */
+export function buildMoves(): string[] {
+  const moves: string[] = [];
+  for (const from of SQUARES) {
+    for (const to of SQUARES) {
+      if (reachable(from, to)) moves.push(`${from}${to}`);
+    }
+  }
+  for (const [fromRank, toRank] of [
+    ['7', '8'],
+    ['2', '1'],
+  ]) {
+    for (const from of SQUARES) {
+      if (from[1] !== fromRank) continue;
+      for (const to of SQUARES) {
+        if (to[1] !== toRank) continue;
+        if (Math.abs(coords(to)[0] - coords(from)[0]) > 1) continue;
+        for (const piece of PROMOTION_PIECES) moves.push(`${from}${to}${piece}`);
+      }
+    }
+  }
+  return moves;
+}
+
+/** The full 2030-token vocabulary: specials, white Elo bins, black Elo bins, moves. */
+export function buildVocab(): string[] {
+  return [...SPECIALS, ...eloBinTokens('w'), ...eloBinTokens('b'), ...buildMoves()];
+}
+```
+
+<Src file="src/lib/chess-lm/tokenizer.ts" repo="rukh-web" tag="9be992c" lines="76-103" />
+
+`buildMoves` hace en una función lo que en Python son dos (`build_moves` y `build_promotions`), y el
+orden resultante es el mismo: primero las 1 792 jugadas normales, después las 176 promociones. El
+`continue` sobre `from[1] !== fromRank` recorre las 64 casillas filtrando por fila, donde Python
+itera solo sobre las columnas; el resultado es idéntico porque `SQUARES` está en orden por columnas.
+
+`buildVocab` devuelve la misma lista de 2 030 que `build_vocab`, con el mismo orden de las cuatro
+partes. Esa función y la de Python son la definición del contrato.
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/tokenizer.ts"
+export class UciTokenizer {
+  readonly tokens: readonly string[];
+  private readonly ids: Map<string, number>;
+
+  constructor(tokens: readonly string[] = buildVocab()) {
+    this.tokens = tokens;
+    this.ids = new Map(tokens.map((token, id) => [token, id]));
+  }
+
+  get size(): number {
+    return this.tokens.length;
+  }
+
+  /** Id of a token, or `<unk>` (4) if it is not in the vocabulary. */
+  tokenId(token: string): number {
+    return this.ids.get(token) ?? UNK_ID;
+  }
+
+  /** Encodes a whitespace-separated UCI move string; unknown moves map to `<unk>`. */
+  encodeMoves(uci: string): number[] {
+    return uci
+      .trim()
+      .split(/\s+/)
+      .filter((move) => move.length > 0)
+      .map((move) => this.tokenId(move));
+  }
+```
+
+<Src file="src/lib/chess-lm/tokenizer.ts" repo="rukh-web" tag="9be992c" lines="105-130" />
+
+El constructor acepta una lista de tokens **opcional**, con `buildVocab()` por defecto. Es lo que
+permite construir el tokenizador desde el `vocab.json` descargado en vez de desde la enumeración, y
+es útil en un caso concreto: si el navegador carga los pesos de un modelo publicado, puede cargar
+también el vocabulario con el que se entrenó y no depender de que el código local siga coincidiendo.
+
+`tokenId` devuelve `UNK_ID` cuando no encuentra el token, igual que el `.get(move, self.unk_id)` de
+Python.
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/tokenizer.ts"
+  /**
+   * `[<bos>, <wXXXX>, <bXXXX>, ...moves, <result>, <eos>]`. When the whole game fits in `maxLen`
+   * the sequence ends with `<eos>`; otherwise it is cut to the first `maxLen` ids (no result, no
+   * `<eos>`), exactly as `UciTokenizer.encode_game` does in Python.
+   */
+  encodeGame(
+    uci: string,
+    whiteElo: number,
+    blackElo: number,
+    result: string,
+    maxLen = 200,
+  ): number[] {
+    const resultToken = RESULT_TOKENS[result.trim()];
+    if (resultToken === undefined) throw new Error(`unknown result: ${result}`);
+    const ids = [
+      BOS_ID,
+      this.tokenId(eloBin(whiteElo, 'w')),
+      this.tokenId(eloBin(blackElo, 'b')),
+      ...this.encodeMoves(uci),
+      this.tokenId(resultToken),
+      EOS_ID,
+    ];
+    return ids.length <= maxLen ? ids : ids.slice(0, maxLen);
+  }
+
+  /** Token strings for a sequence of ids; out-of-range ids decode to `<unk>`. */
+  decode(ids: readonly number[]): string[] {
+    return ids.map((id) => this.tokens[id] ?? '<unk>');
+  }
+}
+```
+
+<Src file="src/lib/chess-lm/tokenizer.ts" repo="rukh-web" tag="9be992c" lines="132-161" />
+
+`encodeGame` reproduce el corte con `ids.length <= maxLen ? ids : ids.slice(0, maxLen)`, y el
+comentario dice explícitamente que hace lo mismo que Python, **incluido no añadir `<eos>` cuando se
+corta**. Esa frase en el comentario vale por un test: es el detalle que alguien arreglaría al
+portarlo.
+
+La diferencia de estilo con Python es que aquí el resultado desconocido **lanza** un `Error`, igual
+que allí lanza `ValueError`. Las dos implementaciones fallan en los mismos sitios, que es tan parte
+de la paridad como los ids.
+
+## `san-chars.ts`: cuarenta y dos líneas
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/san-chars.ts"
+// Character-level tokenizer for numbered SAN text plus the result (`1.e4 e5 2.Nf3 ... 1-0`).
+// Mirrors `rukh/src/rukh/tokenize/san_chars.py`: `<pad>`, `<bos>`, `<eos>` first, then the fixed
+// 32-symbol alphabet in this exact order; `encode` wraps the text in `<bos>` ... `<eos>`.
+
+export const SAN_ALPHABET = ' #+-.0123456789=BKNOQRabcdefghx/';
+export const SAN_SPECIALS: readonly string[] = ['<pad>', '<bos>', '<eos>'];
+export const SAN_PAD_ID = 0;
+export const SAN_BOS_ID = 1;
+export const SAN_EOS_ID = 2;
+
+export class SanCharTokenizer {
+  readonly tokens: readonly string[];
+  private readonly ids: Map<string, number>;
+
+  constructor(alphabet: string = SAN_ALPHABET, specials: readonly string[] = SAN_SPECIALS) {
+    this.tokens = [...specials, ...alphabet];
+    this.ids = new Map(this.tokens.map((token, id) => [token, id]));
+  }
+```
+
+<Src file="src/lib/chess-lm/san-chars.ts" repo="rukh-web" tag="9be992c" lines="1-18" />
+
+El alfabeto es la misma cadena de 32 caracteres, copiada literalmente, **en el mismo orden**. No hay
+nada más que copiar: el orden de esa cadena es el vocabulario.
+
+El constructor acepta alfabeto y especiales como parámetros, otra vez para poder construirlo desde un
+fichero.
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/san-chars.ts"
+  get size(): number {
+    return this.tokens.length;
+  }
+
+  /** `[<bos>, one id per character, <eos>]`; characters outside the alphabet throw. */
+  encode(text: string): number[] {
+    const ids = Array.from(text, (char) => {
+      const id = this.ids.get(char);
+      if (id === undefined)
+        throw new Error(`character not in SAN alphabet: ${JSON.stringify(char)}`);
+      return id;
+    });
+    return [SAN_BOS_ID, ...ids, SAN_EOS_ID];
+  }
+
+  /** Joins the characters back into text; special tokens are dropped. */
+  decode(ids: readonly number[]): string {
+    return ids
+      .map((id) => this.tokens[id] ?? '')
+      .filter((token) => !SAN_SPECIALS.includes(token))
+      .join('');
+  }
+}
+```
+
+<Src file="src/lib/chess-lm/san-chars.ts" repo="rukh-web" tag="9be992c" lines="20-42" />
+
+`Array.from(text, ...)` y no `text.split('')`: el primero itera por **puntos de código**, el segundo
+por unidades UTF-16. Con el alfabeto SAN, que es todo ASCII, da lo mismo; con cualquier otro texto,
+`split('')` partiría un emoji por la mitad. Es el valor por defecto correcto.
+
+Y `encode` lanza ante un carácter fuera del alfabeto, igual que en Python, por el mismo motivo: un
+carácter de fuera significa que el SAN está mal reconstruido, no que haya un dato raro.
+
+## `bpe.ts`: reproducir el codificador, no el entrenamiento
+
+Este es el fichero difícil, y su comentario de cabecera explica por qué.
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/bpe.ts"
+// Applies a BPE model trained with Hugging Face `tokenizers` (`models.BPE` with a
+// `WhitespaceSplit` pre-tokenizer, no continuing-subword prefix and no end-of-word suffix) to
+// UCI text. It reads the `tokenizer.json` that `Tokenizer.save()` writes and reproduces the
+// encoder: split on whitespace, start from single characters and merge the adjacent pair with
+// the lowest merge rank (leftmost on ties) until nothing merges, then map symbols to ids.
+// Only that subset is implemented: a file with dropout, `fuse_unk`, `byte_fallback`, an affix or
+// another pre-tokenizer is rejected by the constructor instead of being encoded incorrectly.
+
+export interface BpeAddedToken {
+  id: number;
+  content: string;
+  special?: boolean;
+}
+
+export interface BpeFile {
+  model: {
+    type?: string;
+    unk_token?: string | null;
+    ignore_merges?: boolean;
+    dropout?: number | null;
+    continuing_subword_prefix?: string | null;
+    end_of_word_suffix?: string | null;
+    fuse_unk?: boolean;
+    byte_fallback?: boolean;
+    vocab: Record<string, number>;
+    merges: string[] | [string, string][];
+  };
+  pre_tokenizer?: { type?: string } | null;
+  added_tokens?: BpeAddedToken[];
+}
+
+export const DEFAULT_UNK_TOKEN = '<unk>';
+
+/** Pre-tokenizers this loader reproduces; anything else splits words differently. */
+const SUPPORTED_PRE_TOKENIZERS = ['WhitespaceSplit'];
+```
+
+<Src file="src/lib/chess-lm/bpe.ts" repo="rukh-web" tag="9be992c" lines="1-35" />
+
+El formato que escribe `Tokenizer.save()` de Hugging Face es un JSON con muchas opciones, y la
+mayoría cambian cómo se codifica. Un cargador que las ignore produce ids distintos **sin avisar**, que
+es exactamente el modo de fallo que este módulo entero intenta evitar.
+
+La decisión del fichero es no implementar las que no se usan y **rechazar** un fichero que las
+declare. Las interfaces de arriba son el subconjunto soportado, escrito como tipos.
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/bpe.ts"
+/**
+ * Rejects a `tokenizer.json` whose options this loader does not implement, instead of encoding
+ * it as if they held their default value. The supported subset is listed in the README.
+ */
+function assertSupported(file: BpeFile): void {
+  const { model } = file;
+  const unsupported = (option: string, value: unknown, expected: string): Error =>
+    new Error(
+      `unsupported BPE model: ${option} is ${JSON.stringify(value) ?? 'undefined'}, ` +
+        `this loader only supports ${expected}`,
+    );
+
+  if (model.type !== undefined && model.type !== 'BPE') {
+    throw unsupported('model.type', model.type, '"BPE"');
+  }
+  if (model.dropout !== undefined && model.dropout !== null) {
+    throw unsupported('model.dropout', model.dropout, 'null');
+  }
+  for (const option of ['continuing_subword_prefix', 'end_of_word_suffix'] as const) {
+    const value = model[option];
+    if (value !== undefined && value !== null && value !== '') {
+      throw unsupported(`model.${option}`, value, 'null or ""');
+    }
+  }
+  for (const option of ['fuse_unk', 'byte_fallback'] as const) {
+    if (model[option] === true) throw unsupported(`model.${option}`, true, 'false');
+  }
+  const preTokenizer = file.pre_tokenizer;
+  if (preTokenizer != null && !SUPPORTED_PRE_TOKENIZERS.includes(preTokenizer.type ?? '')) {
+    throw unsupported(
+      'pre_tokenizer.type',
+      preTokenizer.type,
+      SUPPORTED_PRE_TOKENIZERS.map((type) => `"${type}"`).join(', '),
+    );
+  }
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+```
+
+<Src file="src/lib/chess-lm/bpe.ts" repo="rukh-web" tag="9be992c" lines="37-76" />
+
+`assertSupported` es la puerta. Recorre las seis opciones que este cargador no implementa y lanza un
+error que dice cuál es, qué valor tiene y qué valores acepta.
+
+Merece la pena entender qué haría cada una si se ignorase:
+
+- `dropout` hace que el codificador **salte fusiones al azar**, para regularizar durante el
+  entrenamiento. Un fichero con dropout codificado como si no lo tuviera da ids distintos cada vez
+  en el lado que lo aplica.
+- `continuing_subword_prefix` (el `##` de BERT) y `end_of_word_suffix` (el `</w>` del BPE clásico)
+  cambian los tokens mismos: con prefijo, `e4` en medio de una palabra es `##e4`, un token distinto.
+- `fuse_unk` junta varios desconocidos seguidos en uno.
+- `byte_fallback` descompone lo desconocido en bytes en vez de en `<unk>`.
+- Otro `pre_tokenizer` parte el texto en otros sitios, y con eso cambia todo.
+
+<Transfer concept="Rechazar lo que no implementas" where="Cualquier lector de un formato ajeno: un parser de configuración, un cliente de una API con campos opcionales, un cargador de checkpoints.">
+  La tentación al implementar un subconjunto es ignorar lo que no entiendes, porque "no lo usamos".
+  El resultado es un lector que acepta cualquier fichero y produce resultados silenciosamente
+  incorrectos para los que usan lo que no implementaste.
+
+La alternativa cuesta lo que ves arriba: una función que enumera lo no soportado y lanza. El
+beneficio es que el fallo ocurre **al cargar**, con un mensaje que nombra la opción, en vez de tres
+capas más allá en forma de resultado raro. Es `extra="forbid"` otra vez, aplicado a un formato que no
+controlas.
+
+</Transfer>
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/bpe.ts"
+export class BpeTokenizer {
+  readonly vocab: ReadonlyMap<string, number>;
+  readonly tokens: readonly string[];
+  readonly unkId: number;
+  /** Merge rank by `a\u0000b` key (the pair separator cannot appear in a token). */
+  private readonly ranks: Map<string, number>;
+  private readonly addedTokens: Map<string, number>;
+  private readonly addedPattern: RegExp | null;
+  private readonly ignoreMerges: boolean;
+
+  constructor(file: BpeFile) {
+    assertSupported(file);
+    const { model } = file;
+    this.vocab = new Map(Object.entries(model.vocab));
+    const size = Math.max(-1, ...this.vocab.values()) + 1;
+    const tokens: string[] = new Array<string>(size).fill('');
+    for (const [token, id] of this.vocab) tokens[id] = token;
+    this.tokens = tokens;
+
+    const unkToken = model.unk_token ?? DEFAULT_UNK_TOKEN;
+    const unkId = this.vocab.get(unkToken);
+    if (unkId === undefined) throw new Error(`BPE vocabulary has no ${unkToken} token`);
+    this.unkId = unkId;
+    this.ignoreMerges = model.ignore_merges ?? false;
+
+    this.ranks = new Map();
+    model.merges.forEach((merge, rank) => {
+      const [a, b] = typeof merge === 'string' ? splitMerge(merge) : merge;
+      if (!this.vocab.has(a) || !this.vocab.has(b) || !this.vocab.has(a + b)) return;
+      this.ranks.set(pairKey(a, b), rank);
+    });
+
+    this.addedTokens = new Map();
+    for (const added of file.added_tokens ?? []) this.addedTokens.set(added.content, added.id);
+    const contents = [...this.addedTokens.keys()].sort((x, y) => y.length - x.length);
+    this.addedPattern =
+      contents.length > 0 ? new RegExp(`(${contents.map(escapeRegExp).join('|')})`) : null;
+  }
+```
+
+<Src file="src/lib/chess-lm/bpe.ts" repo="rukh-web" tag="9be992c" lines="78-115" />
+
+El constructor hace cuatro cosas, y dos merecen mirarse.
+
+La tabla de rangos (`ranks`) mapea cada par fusionable a **su posición en la lista de fusiones**. La
+clave es `a\u0000b`, con un carácter nulo de separador, y el comentario dice por qué: el separador no
+puede aparecer dentro de un token. Con un espacio como separador, un par cuyo primer elemento
+terminara en espacio colisionaría con otro.
+
+La línea que filtra —`if (!this.vocab.has(a) || !this.vocab.has(b) || !this.vocab.has(a + b)) return;`—
+descarta las fusiones cuyo resultado no está en el vocabulario. Eso pasa de verdad: el entrenador
+recorta el vocabulario al tamaño pedido y puede dejar fusiones huérfanas en la lista. Aplicarlas
+produciría símbolos sin id.
+
+Y el `model.merges.forEach((merge, rank) => ...)` con las dos formas (`string[]` o
+`[string, string][]`) es compatibilidad con dos versiones del formato: `tokenizers` escribía las
+fusiones como `"a b"` y ahora las escribe como pares.
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/bpe.ts"
+  get size(): number {
+    return this.tokens.length;
+  }
+
+  /** Ids of the tokens of `text`, applying added tokens first and BPE to the rest. */
+  encode(text: string): number[] {
+    return this.tokenize(text).map(
+      (token) => this.addedTokens.get(token) ?? this.vocab.get(token) ?? this.unkId,
+    );
+  }
+
+  /** Token strings of `text` (unknown characters stay as themselves). */
+  tokenize(text: string): string[] {
+    if (this.addedPattern === null) return this.tokenizeSpan(text);
+    const out: string[] = [];
+    for (const span of text.split(this.addedPattern)) {
+      if (span.length === 0) continue;
+      if (this.addedTokens.has(span)) out.push(span);
+      else out.push(...this.tokenizeSpan(span));
+    }
+    return out;
+  }
+
+  /** Token strings for a sequence of ids; out-of-range ids decode to the unknown token. */
+  decode(ids: readonly number[]): string[] {
+    return ids.map((id) => this.tokens[id] || this.tokens[this.unkId] || DEFAULT_UNK_TOKEN);
+  }
+```
+
+<Src file="src/lib/chess-lm/bpe.ts" repo="rukh-web" tag="9be992c" lines="117-143" />
+
+`tokenize` trata los **tokens añadidos** primero. Son los especiales (`<pad>`, `<bos>`, …), que no se
+pueden dejar pasar por BPE: si `<bos>` se fusionase carácter a carácter saldría un puñado de ids en
+vez de uno. La expresión regular se construye con los contenidos ordenados de más largo a más corto,
+que es lo que evita que un token añadido que sea prefijo de otro gane la partida.
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/bpe.ts"
+  private tokenizeSpan(text: string): string[] {
+    const out: string[] = [];
+    for (const word of text.split(/\s+/)) {
+      if (word.length > 0) out.push(...this.mergeWord(word));
+    }
+    return out;
+  }
+
+  private mergeWord(word: string): string[] {
+    if (this.ignoreMerges && this.vocab.has(word)) return [word];
+    const symbols = Array.from(word);
+    for (;;) {
+      let best = -1;
+      let bestRank = Number.POSITIVE_INFINITY;
+      for (let i = 0; i + 1 < symbols.length; i++) {
+        const rank = this.ranks.get(pairKey(symbols[i]!, symbols[i + 1]!));
+        if (rank !== undefined && rank < bestRank) {
+          bestRank = rank;
+          best = i;
+        }
+      }
+      if (best < 0) return symbols;
+      symbols.splice(best, 2, symbols[best]! + symbols[best + 1]!);
+    }
+  }
+}
+```
+
+<Src file="src/lib/chess-lm/bpe.ts" repo="rukh-web" tag="9be992c" lines="145-170" />
+
+Y aquí está el algoritmo, en quince líneas. Se parte de los caracteres sueltos y, en cada vuelta, se
+busca **el par adyacente con el rango más bajo** —la fusión más temprana— y se aplica. Cuando no
+queda ninguno, se devuelven los símbolos.
+
+Ese `rank < bestRank` estricto es la línea que decide la corrección de todo el fichero: con empate,
+gana el primero encontrado, es decir, **el de más a la izquierda**. Es lo que hace `tokenizers`, y
+cambiarlo a `<=` daría otra segmentación en los casos de empate.
+
+<Callout kind="roto" title="Aplicar las fusiones como si fueran un conjunto">
+  La implementación ingenua es "recorre la palabra y une cualquier par que esté en la tabla". Da una
+  segmentación distinta y peor, porque deja correr una fusión tardía antes que la temprana sobre la
+  que se construyó.
+
+Con `e2e4e7e5`: si `e2e4` se aprendió en la fusión 900 y `e4e7` en la 300, aplicar de izquierda a
+derecha produciría `e2e4` primero y dejaría `e7e5` detrás; aplicar por rango produce `e4e7` primero y
+la segmentación entera cambia. **El orden es el modelo**, y por eso el bucle busca el mínimo global
+en cada vuelta en vez de recorrer una sola vez.
+
+El síntoma, si se hace mal, es que las veinte partidas de la fixture dan ids distintos en unas cuantas
+posiciones. Sin la fixture, el síntoma sería un modelo que juega peor en el navegador que en las
+pruebas, y nadie miraría el tokenizador.
+
+</Callout>
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/bpe.ts"
+function pairKey(a: string, b: string): string {
+  return `${a}\u0000${b}`;
+}
+
+function splitMerge(merge: string): [string, string] {
+  const space = merge.indexOf(' ');
+  if (space < 0) throw new Error(`malformed BPE merge: ${JSON.stringify(merge)}`);
+  return [merge.slice(0, space), merge.slice(space + 1)];
+}
+
+export function loadBpe(json: BpeFile): BpeTokenizer {
+  return new BpeTokenizer(json);
+}
+```
+
+<Src file="src/lib/chess-lm/bpe.ts" repo="rukh-web" tag="9be992c" lines="172-184" />
+
+{/* prettier-ignore */}
+```ts title="src/lib/chess-lm/index.ts"
+export {
+  BOS_ID,
+  ELO_BIN_COUNT,
+  ELO_BIN_WIDTH,
+  ELO_CLAMP_MAX,
+  ELO_MIN,
+  EOS_ID,
+  MASK_ID,
+  PAD_ID,
+  SPECIALS,
+  SQUARES,
+  UNK_ID,
+  UciTokenizer,
+  buildMoves,
+  buildVocab,
+  eloBin,
+} from './tokenizer';
+export {
+  SAN_ALPHABET,
+  SAN_BOS_ID,
+  SAN_EOS_ID,
+  SAN_PAD_ID,
+  SAN_SPECIALS,
+  SanCharTokenizer,
+} from './san-chars';
+export { BpeTokenizer, DEFAULT_UNK_TOKEN, loadBpe } from './bpe';
+export type { BpeAddedToken, BpeFile } from './bpe';
+```
+
+<Src file="src/lib/chess-lm/index.ts" repo="rukh-web" tag="9be992c" lines="1-27" />
+
+El `index.ts` es la superficie pública del módulo: lo que el resto de la demo puede importar. Que
+esté escrito a mano y no sea un `export *` es deliberado —lo que no está en esta lista es interno— y
+es lo que permite cambiar `mergeWord` sin preguntarse quién lo usa.
+
+## El test de paridad
+
+{/* prettier-ignore */}
+```ts title="tests/parity.test.ts"
+// Parity with the Python tokenizers (`rukh/src/rukh/tokenize/`). The JSON files under
+// src/lib/chess-lm/ are synced from ../rukh/artifacts/tokenizer with `pnpm sync:tokenizer`; these
+// tests fail (never skip) when they are missing.
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { buildVocab, UciTokenizer } from '../src/lib/chess-lm/tokenizer';
+import { SanCharTokenizer } from '../src/lib/chess-lm/san-chars';
+import { loadBpe, type BpeFile } from '../src/lib/chess-lm/bpe';
+
+const dir = resolve(import.meta.dirname, '../src/lib/chess-lm');
+
+interface VocabFile {
+  version: number;
+  specials: string[];
+  tokens: string[];
+}
+
+interface FixtureGame {
+  uci: string;
+  san: string;
+  white_elo: number;
+  black_elo: number;
+  result: string;
+  uci_ids: number[];
+  san_ids: number[];
+  bpe_ids: number[];
+}
+
+interface FixtureFile {
+  games: FixtureGame[];
+}
+
+function readJson<T>(name: string): T {
+  const path = resolve(dir, name);
+  if (!existsSync(path)) {
+    throw new Error(`fixture missing: ${path} (run \`pnpm sync:tokenizer\`)`);
+  }
+  return JSON.parse(readFileSync(path, 'utf8')) as T;
+}
+
+function readGames(): FixtureGame[] {
+  const fixture = readJson<FixtureFile | FixtureGame[]>('fixtures/games.json');
+  const games = Array.isArray(fixture) ? fixture : fixture.games;
+  if (!Array.isArray(games) || games.length === 0) {
+    throw new Error('fixture missing: fixtures/games.json has no games');
+  }
+  return games;
+}
+```
+
+<Src file="tests/parity.test.ts" repo="rukh-web" tag="9be992c" lines="1-49" />
+
+Lo primero del fichero es una decisión que parece menor y no lo es: si los JSON no están, el test
+**falla**, no se salta. Un test que se salta cuando falta su fixture es un test que desaparece el día
+que alguien rompe el `sync`, y la suite se queda verde sin comprobar nada. El mensaje dice qué orden
+lo arregla.
+
+`readGames` acepta las dos formas del fichero —una lista o un objeto con `games`— porque las dos han
+existido. Python escribe una lista.
+
+{/* prettier-ignore */}
+```ts title="tests/parity.test.ts"
+describe('parity with Python', () => {
+  it('vocab.json matches buildVocab() one to one', () => {
+    const vocab = readJson<VocabFile>('vocab.json');
+    expect(vocab.tokens).toEqual(buildVocab());
+    expect(vocab.tokens.slice(0, vocab.specials.length)).toEqual(vocab.specials);
+  });
+
+  it('fixtures/games.json has 20 games', () => {
+    expect(readGames()).toHaveLength(20);
+  });
+
+  it('UciTokenizer.encodeGame reproduces uci_ids', () => {
+    const tokenizer = new UciTokenizer();
+    for (const [i, game] of readGames().entries()) {
+      expect(
+        tokenizer.encodeGame(game.uci, game.white_elo, game.black_elo, game.result),
+        `game ${i}`,
+      ).toEqual(game.uci_ids);
+    }
+  });
+
+  it('SanCharTokenizer.encode reproduces san_ids', () => {
+    const tokenizer = new SanCharTokenizer();
+    for (const [i, game] of readGames().entries()) {
+      expect(tokenizer.encode(`${game.san} ${game.result}`), `game ${i}`).toEqual(game.san_ids);
+    }
+  });
+
+  // Python encodes the moves concatenated without spaces (`bpe_text` in
+  // artifacts/tokenizer/README.md), so a whole game is a single BPE "word".
+  it('loadBpe(bpe.json).encode reproduces bpe_ids', () => {
+    const bpe = loadBpe(readJson<BpeFile>('bpe.json'));
+    for (const [i, game] of readGames().entries()) {
+      expect(bpe.encode(game.uci.replaceAll(' ', '')), `game ${i}`).toEqual(game.bpe_ids);
+    }
+  });
+});
+```
+
+<Src file="tests/parity.test.ts" repo="rukh-web" tag="9be992c" lines="51-87" />
+
+Cuatro comprobaciones, y entre las cuatro cierran el contrato.
+
+La primera es la más fuerte: `expect(vocab.tokens).toEqual(buildVocab())`. Los 2 030 tokens del
+fichero que Python exportó, contra los 2 030 que la enumeración de TypeScript construye, **en orden**.
+Un solo token desplazado y el test dice cuál.
+
+Las tres siguientes recorren las veinte partidas y comparan los ids de cada esquema, con el índice de
+la partida en el mensaje del `expect` (`game ${i}`) para que el fallo diga cuál. La del BPE lleva un
+comentario recordando por qué se quitan los espacios: es la decisión de `bpe_text`, y sin ella una
+partida sería veinte "palabras" y no una.
+
+Fíjate en lo que este test **no** hace: no entrena nada, no descarga nada y no compara con Python en
+tiempo real. Compara con un fichero que Python escribió y que está versionado en los dos repositorios.
+Ese es el truco entero: la paridad se comprueba contra un artefacto, no contra un proceso.
+
+<Callout kind="mundo-real" title="Tres copias del mismo fichero">
+  Los artefactos del tokenizador viven en `rukh/artifacts/tokenizer/`, y `rukh-web` y `rukh-lab`
+  tienen cada uno su copia, sincronizada con su propio script. Tres copias del mismo JSON es
+  exactamente lo que no debería hacerse, y es lo que permite que la demo funcione sin red y que el
+  curso se construya sin clonar el repositorio de ML.
+
+La defensa es doble: cada web tiene su propio test de paridad contra su copia, y además hay un test
+de hash que compara las copias entre sí. Los dos hacen falta: el hash detecta que dos copias
+divergieron, pero no que las dos divergieron a la vez del original; la paridad detecta eso.
+
+Cuando tengas que duplicar un artefacto, duplica también la comprobación. Una copia sin test es una
+bomba de relojería con la mecha del tamaño de tu memoria.
+
+</Callout>
+
+## La visualización
+
+Lo de abajo corre en tu navegador, sin red y sin modelo: es el tokenizador UCI de TypeScript que
+acabas de leer, el de caracteres y el BPE cargado desde el `bpe.json`. `chess.js` convierte el PGN a
+UCI y a SAN; cada esquema tokeniza lo suyo y muestra las fichas con su id. Las fichas de control van
+en un color, las de Elo en otro y las jugadas en el de siempre; en la fila de BPE, las fichas que
+abarcan más de una jugada van resaltadas.
+
+<TokenizerPlayground client:visible />
+
+Cuatro PGN que conviene probar:
+
+1. **El de ejemplo**, el mate de Légal (siete jugadas). Cuenta las fichas: 13 medias jugadas más
+   cinco de control en UCI, y compáralo con los caracteres de SAN. Cambia el Elo de blancas a 2450 y
+   mira qué ficha cambia y cuál no.
+2. **El mate del pastor**, `1. e4 e5 2. Bc4 Nc6 3. Qh5 Nf6 4. Qxf7#`. Fíjate en cómo el `#` y la `x`
+   ocupan un carácter cada uno en SAN y ninguno en UCI: la captura y el jaque mate están implícitos
+   en `h5f7`.
+3. **Una partida larga.** El botón "Partida larga" genera una partida legal de más de cien jugadas
+   con `chess.js`; también puedes pegar cualquier PGN exportado desde la demo o desde Lichess. El
+   aviso de "más de 200 tokens" aparece en los esquemas que truncarían, y con SAN por carácter
+   aparece con casi cualquier partida real.
+4. **Una siciliana Najdorf**, `1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. Nxd4 Nf6 5. Nc3 a6`. Mira la fila de
+   BPE: verás una sola ficha resaltada tragándose varias jugadas de golpe, con el número de jugadas
+   que abarca en su título. Es el `mergeWord` de arriba, hecho visible.
+
+Y un PGN inválido (borra una jugada a la mitad, o escribe `Nf9`) muestra el error en vez de tokens:
+es exactamente lo que hace `san_to_uci` en Python al devolver `None`.
+
+<Exercise n="01" title="Rompe la paridad de dos formas distintas">
+  En una copia de `rukh-web`, quita el `padStart(4, '0')` de `eloBin` (deja `String(bin)`) y ejecuta
+  `pnpm test`. ¿Qué tests fallan? Después déjalo como estaba y cambia el orden de
+  `PROMOTION_PIECES` a `['q', 'b', 'r', 'n']`. ¿Qué falla ahora, y cuál de los dos fallos habrías
+  detectado con una fixture de veinte partidas normales?
+
+<Solution>
+  Sin el `padStart`, los tokens de Elo pasan a ser `<w600>` en vez de `<w0600>`: fallan
+  `vocab.json matches buildVocab() one to one` —los 54 tokens de Elo, del id 8 al 61, no coinciden— y
+  `UciTokenizer.encodeGame reproduces uci_ids` en **las veinte partidas**, porque todas llevan dos
+  tokens de Elo. Es un fallo ruidoso.
+
+Con el orden de las promociones cambiado falla el primer test con un diff de los 176 últimos tokens,
+y `encodeGame` solo falla en las partidas de la fixture que **tienen una promoción**. Si la fixture
+fuesen veinte partidas normales, ese segundo test pasaría y el único que lo detectaría sería el
+primero.
+
+La moraleja de los dos juntos: **una fixture solo cubre lo que contiene**, y por eso el primer test
+compara las dos enumeraciones enteras en vez de conformarse con veinte partidas. Y por eso el test de
+Python exige que el PGN de la fixture tenga enroques por los dos flancos y al menos una promoción a
+caballo.
+
+</Solution>
+</Exercise>
+
+## Qué has aprendido
+
+Por qué un modelo servido en un sitio distinto de donde se entrenó acaba con dos tokenizadores, y qué
+hay que montar para que esa duplicación no se convierta en una divergencia silenciosa: una
+enumeración que no depende de datos, un artefacto exportado desde el lado autoritativo, y un test en
+cada copia que lo reproduce token a token.
+
+**Cómo se mide**: `pnpm test` en `rukh-web` pasa las cuatro comprobaciones de paridad sobre las veinte
+partidas; `buildVocab().length === 2030` y `vocab.tokens` coincide uno a uno con la enumeración. En
+`rukh-lab` corre el mismo test contra su propia copia, y un test de hash comprueba que las dos copias
+son byte a byte la misma.
+
+Lo siguiente cierra el módulo: los tres labs, con las salidas reales de la ejecución de referencia y
+los números que zanjan la decisión del tokenizador.

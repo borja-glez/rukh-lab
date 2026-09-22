@@ -48,7 +48,7 @@ export const routeHelp: Record<Route, string> = {
 };
 
 export const labRoutes: Record<string, LabRoute[]> = {
-  'm1/02-labs-del-pipeline': [
+  'm1/10-labs-del-pipeline': [
     {
       lab: 'Lab 1',
       what: 'Explorar el parquet con DuckDB',

@@ -1,0 +1,1140 @@
+---
+title: 'Empaquetar y servir lotes'
+description:
+  'El empaquetador que escribe seis millones de partidas en un array uint16 sin que nada pase por
+  memoria, el dataset de ventanas alineadas a <bos>, el orquestador de `rukh data tokenize` y la
+  fixture de paridad que el navegador va a reproducir.'
+module: m1
+order: 7
+duration: 150
+level: medio
+status: vigente
+updated: 2026-09-22
+keywords:
+  - memmap
+  - dataloader
+  - padding
+  - uint16
+  - empaquetado
+  - paridad
+artifacts:
+  - kind: tokenizer
+    label: chorcat/rukh-tokenizer
+    href: https://huggingface.co/chorcat/rukh-tokenizer
+---
+
+## Qué vas a construir
+
+El puente entre los vocabularios de la lección anterior y la GPU de M2. Tres piezas:
+
+Un **empaquetador** que codifica seis millones de partidas y las escribe seguidas en un único array
+de `uint16` de 480 MB, con un índice aparte que dice dónde empieza cada una. Ni las partidas ni el
+flujo completo pasan nunca por memoria a la vez.
+
+Un **dataset** que sirve ventanas de 200 tokens desde ese array con <Term id="memmap">memmap</Term>,
+siempre alineadas al `<bos>` de una partida, con el objetivo `y` desplazado una posición. Es el
+contrato exacto que el decoder de M2 consume.
+
+Y un **orquestador**, el que está detrás de `rukh data tokenize`, con la fixture de paridad que el
+tokenizador del navegador tendrá que reproducir id a id.
+
+Cuatro ficheros, 575 líneas.
+
+## `pack.py`: tres codificadores con la misma forma
+
+```python title="src/rukh/tokenize/pack.py"
+"""Pack encoded games into one ``uint16`` stream (``tokens.npy``) plus a game index.
+
+The stream is the concatenation of every encoded game (``<bos> ... <eos>``), untruncated;
+``starts.npy`` holds the offset of each ``<bos>`` so a loader can cut ``block``-sized windows
+aligned to game starts (D-019). ``meta.json`` records counts, the scheme and a hash of the
+vocabulary so a stale pack is never mixed with a different tokenizer.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
+
+import numpy as np
+import pyarrow.parquet as pq
+from pydantic import BaseModel, ConfigDict
+
+from rukh.data.pipeline import TokenizeConfig
+from rukh.paths import resolve
+from rukh.tokenize.san_chars import SanCharTokenizer, san_text, uci_to_san
+from rukh.tokenize.uci_vocab import RESULT_TOKENS, UciTokenizer
+
+if TYPE_CHECKING:
+    from tokenizers import Tokenizer
+
+TOKENS_FILE = "tokens.npy"
+STARTS_FILE = "starts.npy"
+META_FILE = "meta.json"
+CHUNK_GAMES = 20_000
+COPY_TOKENS = (64 << 20) // 2  # 64 MiB of uint16 per copy into the memmap
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p1" lines="1-32" />
+
+`COPY_TOKENS = (64 << 20) // 2` son 64 MiB expresados en número de `uint16`, con el comentario al
+lado explicando la división por dos. Es el tamaño del trozo con el que el fichero crudo se copia al
+memmap, y aparece al final del fichero.
+
+El flujo se guarda en `uint16`: dos bytes por token, suficiente para 65 536 ids y por tanto para los
+tres vocabularios (2 030, 35 y 4 096). Con `int32` el fichero pesaría el doble para no guardar nada
+más.
+
+```python title="src/rukh/tokenize/pack.py"
+class GameEncoder(Protocol):
+    """What ``pack_month`` needs from a tokenizer."""
+
+    scheme: str
+    pad_id: int
+    bos_id: int
+    eos_id: int
+
+    def vocab_size(self) -> int: ...
+
+    def vocab_hash(self) -> str: ...
+
+    def encode_game(
+        self, uci: str, white_elo: int, black_elo: int, result: str, max_len: int
+    ) -> list[int]: ...
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p1" lines="35-49" />
+
+`GameEncoder` es un `Protocol`, no una clase base: los tres codificadores de abajo no heredan de nada
+y aun así encajan, porque tienen los métodos y los atributos. Es tipado estructural, y aquí sirve
+para algo concreto: `pack_month` no importa ninguno de los tres, así que empaquetar con UCI no
+arrastra la librería `tokenizers` que necesita el BPE.
+
+```python title="src/rukh/tokenize/pack.py"
+class UciGameEncoder:
+    """The fixed UCI vocabulary as a ``GameEncoder``."""
+
+    scheme = "uci"
+
+    def __init__(self, tokenizer: UciTokenizer | None = None) -> None:
+        self.tokenizer = tokenizer or UciTokenizer()
+        self.pad_id = self.tokenizer.pad_id
+        self.bos_id = self.tokenizer.bos_id
+        self.eos_id = self.tokenizer.eos_id
+
+    def vocab_size(self) -> int:
+        return len(self.tokenizer)
+
+    def vocab_hash(self) -> str:
+        return _sha256_text(json.dumps(self.tokenizer.ids))
+
+    def encode_game(
+        self, uci: str, white_elo: int, black_elo: int, result: str, max_len: int
+    ) -> list[int]:
+        return self.tokenizer.encode_game(uci, white_elo, black_elo, result, max_len=max_len)
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p1" lines="52-72" />
+
+```python title="src/rukh/tokenize/pack.py"
+class SanGameEncoder:
+    """Char-level SAN: ``[<bos>, chars of '1.e4 e5 ... 1-0', <eos>]`` (no Elo tokens)."""
+
+    scheme = "san"
+
+    def __init__(self, tokenizer: SanCharTokenizer | None = None) -> None:
+        self.tokenizer = tokenizer or SanCharTokenizer()
+        self.pad_id = self.tokenizer.pad_id
+        self.bos_id = self.tokenizer.bos_id
+        self.eos_id = self.tokenizer.eos_id
+
+    def vocab_size(self) -> int:
+        return len(self.tokenizer)
+
+    def vocab_hash(self) -> str:
+        return _sha256_text(json.dumps(self.tokenizer.ids))
+
+    def encode_game(
+        self, uci: str, white_elo: int, black_elo: int, result: str, max_len: int
+    ) -> list[int]:
+        return self.tokenizer.encode(san_text(uci_to_san(uci), result))[:max_len]
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p1" lines="75-95" />
+
+Los dos primeros son envoltorios finos, y la diferencia interesante está en `SanGameEncoder`: su
+`encode_game` **ignora los dos Elo**. No es un descuido, es la consecuencia de que el alfabeto de 32
+símbolos no tenga tokens de Elo, y el docstring lo dice. Este esquema no se puede condicionar, y esa
+limitación aparece aquí, en la firma que sí los recibe y no los usa.
+
+También se ve el orden real de la conversión: `uci_to_san(uci)` reconstruye el SAN desde el UCI
+guardado, `san_text(...)` le pega el resultado, y el tokenizador codifica esa cadena. Tres pasos por
+partida, con un tablero de `python-chess` en medio, y por eso el esquema SAN tarda hora y media en
+empaquetarse mientras los otros dos tardan minutos.
+
+```python title="src/rukh/tokenize/pack.py"
+class BpeGameEncoder:
+    """BPE over spaceless UCI: ``[<bos>, bpe ids..., <result>, <eos>]`` (no Elo tokens)."""
+
+    scheme = "bpe"
+
+    def __init__(self, bpe: Tokenizer) -> None:
+        self.bpe = bpe
+        self.pad_id = UciTokenizer.pad_id
+        self.bos_id = UciTokenizer.bos_id
+        self.eos_id = UciTokenizer.eos_id
+        for token in UciTokenizer.specials:
+            if bpe.token_to_id(token) != UciTokenizer().vocab[token]:
+                raise ValueError(f"BPE special token {token} does not share the UCI id")
+
+    def vocab_size(self) -> int:
+        return self.bpe.get_vocab_size()
+
+    def vocab_hash(self) -> str:
+        return _sha256_text(self.bpe.to_str())
+
+    def encode_game(
+        self, uci: str, white_elo: int, black_elo: int, result: str, max_len: int
+    ) -> list[int]:
+        from rukh.tokenize.bpe import bpe_text
+
+        if result not in RESULT_TOKENS:
+            raise ValueError(f"unknown result {result!r}")
+        ids = [self.bos_id, *self.bpe.encode(bpe_text(uci)).ids]
+        ids.append(self.bpe.token_to_id(RESULT_TOKENS[result]))
+        ids.append(self.eos_id)
+        return ids[:max_len]
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p1" lines="98-128" />
+
+El `BpeGameEncoder` tiene la comprobación más útil de los tres, en su constructor: recorre los ocho
+tokens especiales y exige que el BPE les haya dado **los mismos ids que el vocabulario UCI**. Si
+alguien entrenase un BPE sin pasarle `special_tokens`, `<pad>` no sería el 0, el relleno del loader
+metería un token cualquiera en cada hueco y la pérdida con `ignore_index=0` estaría ignorando la
+jugada que ocupe ese id. Con la comprobación, el pack falla al construirse.
+
+Y la forma de la secuencia BPE es `[<bos>, ids del texto pegado, <resultado>, <eos>]`: tres tokens de
+encuadre en vez de los cinco del UCI, porque tampoco hay tokens de Elo. Ese `+3` reaparece en las
+estadísticas.
+
+```python title="src/rukh/tokenize/pack.py"
+class PackInfo(BaseModel):
+    """Contents of ``meta.json``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    n_games: int
+    n_tokens: int
+    scheme: str
+    vocab_size: int
+    vocab_hash: str
+    source: str
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def make_encoder(scheme: str, bpe: Tokenizer | None = None) -> GameEncoder:
+    if scheme == "uci":
+        return UciGameEncoder()
+    if scheme == "san":
+        return SanGameEncoder()
+    if scheme == "bpe":
+        if bpe is None:
+            raise ValueError("scheme 'bpe' needs a trained tokenizer")
+        return BpeGameEncoder(bpe)
+    raise ValueError(f"unknown scheme {scheme!r}")
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p1" lines="131-157" />
+
+`PackInfo` es el contenido de `meta.json`, y el campo que importa es `vocab_hash`. No es
+documentación: es lo que permite que el bucle de entrenamiento de M2 **rechace** un pack cuyo
+vocabulario no es el del modelo. Sin él, entrenar con un `data/tokens/uci/` regenerado después de
+tocar la enumeración funcionaría perfectamente, sobre ids que significan otra cosa, y la pérdida
+bajaría igual.
+
+`make_encoder` es un despachador de tres ramas con un `raise` al final. La rama del BPE exige el
+tokenizador entrenado, porque a diferencia de los otros dos este esquema **no se puede construir
+solo**.
+
+```python title="src/rukh/tokenize/pack.py"
+def pack_month(games: Path, encoder: GameEncoder, out: Path) -> PackInfo:
+    """Encode every game of ``games`` (a UCI parquet) into ``out/tokens.npy`` + ``starts.npy``.
+
+    The parquet is read row group by row group and the token stream is appended to a raw file;
+    once its length is known the raw file is copied into the ``.npy`` memmap in 64 MiB chunks,
+    so neither the games nor the whole stream are ever held in memory at once.
+    """
+    if encoder.vocab_size() > np.iinfo(np.uint16).max + 1:
+        raise ValueError("vocabulary does not fit in uint16")
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    raw_path = out / "tokens.bin"
+    starts: list[int] = []
+    n_tokens = 0
+    reader = pq.ParquetFile(Path(games))
+    with raw_path.open("wb") as raw:
+        for batch in reader.iter_batches(
+            batch_size=CHUNK_GAMES, columns=["uci", "white_elo", "black_elo", "result"]
+        ):
+            buffer: list[int] = []
+            rows = zip(
+                batch.column("uci").to_pylist(),
+                batch.column("white_elo").to_pylist(),
+                batch.column("black_elo").to_pylist(),
+                batch.column("result").to_pylist(),
+                strict=True,
+            )
+            for uci, w_elo, b_elo, result in rows:
+                ids = encoder.encode_game(uci, int(w_elo), int(b_elo), result, max_len=1 << 30)
+                starts.append(n_tokens)
+                n_tokens += len(ids)
+                buffer.extend(ids)
+            raw.write(np.asarray(buffer, dtype=np.uint16).tobytes())
+    tokens = np.lib.format.open_memmap(
+        out / TOKENS_FILE, mode="w+", dtype=np.uint16, shape=(n_tokens,)
+    )
+    _copy_raw(raw_path, tokens, n_tokens)
+    tokens.flush()
+    del tokens
+    raw_path.unlink()
+    np.save(out / STARTS_FILE, np.asarray(starts, dtype=np.int64))
+    info = PackInfo(
+        n_games=len(starts),
+        n_tokens=n_tokens,
+        scheme=encoder.scheme,
+        vocab_size=encoder.vocab_size(),
+        vocab_hash=encoder.vocab_hash(),
+        source=Path(games).name,
+    )
+    (out / META_FILE).write_text(info.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    return info
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p1" lines="160-210" />
+
+Cincuenta líneas, y son la lección del fichero. Léelas por la memoria.
+
+La primera guarda es la comprobación del `uint16`: un vocabulario de más de 65 536 entradas no cabe,
+y hay que saberlo antes de escribir 480 MB, no después.
+
+Después vienen **dos pasadas y un fichero temporal**, que es la parte que hay que entender. El
+problema es que `np.lib.format.open_memmap` necesita saber la **forma final** del array para crearlo,
+y la longitud total del flujo no se conoce hasta haber codificado la última partida. Las opciones
+eran tres: acumular todo en memoria (varios gigas), recorrer el parquet dos veces (codificar seis
+millones de partidas dos veces) o **escribir los ids a un fichero crudo mientras se cuentan**, que es
+lo que hace. Cuando el bucle acaba, `n_tokens` es exacto, se crea el memmap y se copia.
+
+El `max_len=1 << 30` —mil millones— es la segunda decisión: **el pack guarda las partidas enteras**.
+El corte a 200 tokens lo hace el loader, no el empaquetador. Así, cambiar la ventana de contexto en
+M2 no obliga a volver a tokenizar seis millones de partidas, y el mismo pack sirve para probar 200,
+512 y 1 024.
+
+`starts` se acumula en una lista de Python y se escribe al final con `np.save`. Es el único objeto que
+crece en memoria: un entero de 64 bits por partida, 24 MB para tres millones. Sus desplazamientos son
+absolutos sobre el flujo entero, así que no se pueden saber hasta que el flujo está completo.
+
+<Callout kind="teoria" title="Por qué `del tokens` antes del `unlink`">
+  `tokens.flush()` vuelca las páginas sucias al disco y `del tokens` suelta la referencia al memmap,
+  que es lo que hace que el fichero se cierre. En Windows, un fichero mapeado no se puede borrar ni
+  renombrar mientras alguien lo tenga abierto, y `raw_path.unlink()` está justo después. Es una de
+  esas líneas que en Linux sobran y que sin ella el paso falla en la máquina de referencia con un
+  `PermissionError` que no menciona los memmaps.
+</Callout>
+
+```python title="src/rukh/tokenize/pack.py"
+def _copy_raw(raw_path: Path, tokens: np.ndarray, n_tokens: int) -> None:
+    """Copy the raw token file into the memmap in ``COPY_TOKENS``-sized chunks."""
+    offset = 0
+    with raw_path.open("rb") as raw:
+        while offset < n_tokens:
+            chunk = np.fromfile(raw, dtype=np.uint16, count=min(COPY_TOKENS, n_tokens - offset))
+            if not len(chunk):
+                raise OSError(f"{raw_path}: expected {n_tokens} tokens, got {offset}")
+            tokens[offset : offset + len(chunk)] = chunk
+            offset += len(chunk)
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p1" lines="213-222" />
+
+La copia va en trozos de 64 MiB con `np.fromfile(raw, count=...)`, que lee **desde la posición actual
+del fichero**: el bucle avanza solo. El `if not len(chunk)` es la guarda contra un fichero crudo más
+corto de lo que dice el contador, que solo puede pasar si algo se escribió mal; y lanza un `OSError`
+con las dos cifras en el mensaje, que es lo que hace falta para diagnosticarlo.
+
+```python title="src/rukh/tokenize/pack.py"
+def read_pack_info(directory: Path) -> PackInfo:
+    return PackInfo.model_validate_json((Path(directory) / META_FILE).read_text("utf-8"))
+
+
+def month_parquet(uci_dir: Path, month: str) -> Path:
+    year, mm = month.split("-")
+    return Path(uci_dir) / f"year={year}" / f"month={mm}" / "games.parquet"
+
+
+def pack_scheme(cfg: TokenizeConfig, scheme: str, bpe: Tokenizer | None = None) -> list[Path]:
+    """Pack ``train_month`` and ``val_month`` under ``out_dir/<scheme>/{train,val}``."""
+    encoder = make_encoder(scheme, bpe)
+    uci_dir = resolve(cfg.uci_dir)
+    written: list[Path] = []
+    for split, month in (("train", cfg.train_month), ("val", cfg.val_month)):
+        out = resolve(cfg.out_dir) / scheme / split
+        pack_month(month_parquet(uci_dir, month), encoder, out)
+        written.append(out / META_FILE)
+    return written
+```
+
+<Src file="src/rukh/tokenize/pack.py" tag="p1" lines="225-243" />
+
+`pack_scheme` empaqueta los dos meses en `data/tokens/<esquema>/train/` y `.../val/`. Enero entrena,
+febrero valida; es la partición temporal de la primera lección del módulo, aquí convertida en dos
+directorios.
+
+## `loader.py`: el contrato con el decoder
+
+```python title="src/rukh/tokenize/loader.py"
+"""``PackedDataset`` and ``make_loader``: ``<bos>``-aligned windows over a packed token stream."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+from rukh.tokenize.pack import STARTS_FILE, TOKENS_FILE, PackInfo, read_pack_info
+
+IGNORE_INDEX = 0  # ``<pad>`` in every scheme; the loss must use ``ignore_index=0``.
+```
+
+<Src file="src/rukh/tokenize/loader.py" tag="p1" lines="1-13" />
+
+`IGNORE_INDEX = 0` con su comentario. Vale porque `<pad>` es el id 0 **en los tres esquemas**, y eso
+no es casualidad: es lo que la comprobación del `BpeGameEncoder` garantiza. La pérdida del decoder de
+M2 se construye con `ignore_index=0` y esta constante es de dónde sale el número.
+
+```python title="src/rukh/tokenize/loader.py"
+class PackedDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
+    """Windows of ``block`` tokens over ``tokens.npy``.
+
+    With ``start_at_game`` every item starts at a ``<bos>`` (item ``i`` is game ``i``);
+    otherwise the stream is cut into consecutive blocks. A window that runs past the end of
+    the stream is padded with ``<pad>`` (0). Each item is ``(x, y)`` with ``y = x[1:] + [<pad>]``.
+    """
+
+    def __init__(self, directory: Path, block: int = 200, start_at_game: bool = True) -> None:
+        if block < 2:
+            raise ValueError("block must be at least 2")
+        self.directory = Path(directory)
+        self.block = block
+        self.start_at_game = start_at_game
+        self.info: PackInfo = read_pack_info(self.directory)
+        self.tokens = np.load(self.directory / TOKENS_FILE, mmap_mode="r")
+        self.starts = np.load(self.directory / STARTS_FILE)
+        self.pad_id = 0
+
+    def __len__(self) -> int:
+        if self.start_at_game:
+            return int(len(self.starts))
+        return max(1, int(len(self.tokens)) // self.block) if len(self.tokens) else 0
+
+    def window(self, index: int) -> np.ndarray:
+        """``block + 1`` tokens from the window origin, padded with ``<pad>`` past the end."""
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        origin = int(self.starts[index]) if self.start_at_game else index * self.block
+        chunk = np.asarray(self.tokens[origin : origin + self.block + 1], dtype=np.int64)
+        if len(chunk) < self.block + 1:
+            chunk = np.concatenate(
+                [chunk, np.full(self.block + 1 - len(chunk), self.pad_id, dtype=np.int64)]
+            )
+        return chunk
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        chunk = self.window(index)
+        x = torch.from_numpy(chunk[: self.block].copy())
+        y = torch.from_numpy(chunk[1 : self.block + 1].copy())
+        y[-1] = self.pad_id
+        return x, y
+```
+
+<Src file="src/rukh/tokenize/loader.py" tag="p1" lines="16-57" />
+
+Cuarenta líneas que son el contrato entre los datos y el modelo. Cada una tiene su motivo.
+
+`mmap_mode="r"` en `tokens.npy`: `np.load` **no lee el fichero**. Lo mapea en el espacio de
+direcciones del proceso y el sistema operativo trae las páginas cuando se tocan. Un fichero de 480 MB
+—o de 2,5 GB, el del esquema SAN— no ocupa memoria del proceso, y varios lectores comparten las
+mismas páginas físicas. Es el libro de consulta de la biblioteca: nadie se lo lleva fotocopiado
+entero, cada lector abre la página que necesita.
+
+`__len__` devuelve el número de **partidas**, no de tokens: un ejemplo por partida y época. Barajar es
+barajar índices de partida. Con `start_at_game=False` el mismo dataset corta el flujo en bloques
+consecutivos sin alinear —la alternativa descartada en D-019, la de nanoGPT— y está ahí para poder
+medirla en M2 en vez de argumentar sobre ella.
+
+`window` pide `block + 1` tokens porque el objetivo es la entrada desplazada: `y[t]` es el token que
+viene después de `x[t]`. De ahí sale `y[:-1] == x[1:]`, que es una de las aserciones del test. El
+relleno con `<pad>` solo ocurre **en la última partida del flujo**, cuando no quedan 201 tokens por
+delante; en todo lo demás la ventana está llena de jugadas reales.
+
+`y[-1] = self.pad_id` pone la última posición a relleno a propósito: su objetivo de verdad estaría
+fuera de la ventana, y es más honesto no entrenarla que inventarla.
+
+El `dtype=np.int64` de la ventana y el `.copy()` de `__getitem__` son dos detalles con causa. Se
+guarda en `uint16` para que el fichero sea pequeño y se convierte a `int64` al salir porque es lo que
+`nn.Embedding` y la entropía cruzada esperan como índices. Y el `.copy()` es obligatorio: un trozo de
+memmap es de solo lectura, y `torch.from_numpy` quiere memoria escribible.
+
+<Callout kind="roto" title="Lo que este dataset todavía no sabe hacer (y que M4 tuvo que arreglar)">
+  Fíjate en una asimetría: `tokens.npy` se carga con `mmap_mode="r"` y `starts.npy` **no**. El índice
+  de partidas es un array normal en memoria: un `int64` por partida.
+
+Con esta versión, funciona. Con 12,5 millones de partidas son 95 MB, y en Windows los workers del
+`DataLoader` arrancan con `spawn`, así que el objeto del dataset se serializa entero **una vez por
+worker**: 95 MB por worker, y pasa. Con 18,9 millones de partidas son 145 MB y la tubería se corta
+antes del primer paso con un `UnpicklingError: pickle data was truncated` que no menciona los datos
+por ningún lado.
+
+El arreglo llega en M4 y son tres métodos (`_open`, `__getstate__`, `__setstate__`): el estado que
+viaja al worker no lleva los arrays, y cada worker los vuelve a mapear desde los mismos ficheros. 145
+MB por worker pasan a medio kilobyte.
+
+Lo transferible no es el arreglo, es el modo de fallo: **lo que optimizaste no es lo que creció**.
+Memmapear el array grande dio el problema por resuelto mientras la estructura pequeña de al lado
+escalaba igual de linealmente. Pasa idéntico con un índice vectorial memmapeado y un diccionario de
+identificadores por worker, o con un agente cuyo esquema de herramientas es minúsculo y cuyo historial
+de resultados se reserializa en cada paso.
+
+</Callout>
+
+```python title="src/rukh/tokenize/loader.py"
+def make_loader(
+    dataset: PackedDataset,
+    batch_size: int,
+    seed: int = 0,
+    workers: int = 0,
+    shuffle: bool = True,
+    drop_last: bool = True,
+) -> DataLoader[tuple[torch.Tensor, torch.Tensor]]:
+    """A ``DataLoader`` whose shuffling is fully determined by ``seed``."""
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        num_workers=workers,
+        generator=generator,
+        persistent_workers=workers > 0,
+    )
+```
+
+<Src file="src/rukh/tokenize/loader.py" tag="p1" lines="60-79" />
+
+`drop_last=True` descarta el último lote incompleto, y lo que gana no son las pocas ventanas que
+tira: gana que **todos los lotes tengan la misma forma**. Un lote corto cambia el tamaño efectivo de
+ese paso y, con `torch.compile`, dispara una recompilación para una forma que aparece una vez por
+época.
+
+El `torch.Generator` sembrado con `seed` es lo **único** que decide el orden. Dos loaders con la
+misma semilla devuelven los mismos lotes en el mismo orden, y eso es una afirmación de
+reproducibilidad del proyecto, comprobada por un test y no una esperanza.
+
+`persistent_workers=workers > 0` evita que los procesos de trabajo se creen y se destruyan en cada
+época. Con `spawn`, arrancar cuatro intérpretes cuesta segundos, y multiplicado por las épocas de un
+entrenamiento es tiempo de GPU parada.
+
+## `run.py`: lo que hace `rukh data tokenize`
+
+```python title="src/rukh/tokenize/run.py"
+"""Orchestration behind ``rukh data tokenize``: artifacts, parity fixture, statistics, packing."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import numpy as np
+from pydantic import BaseModel, ConfigDict
+
+from rukh.data.pipeline import TokenizeConfig
+from rukh.paths import resolve
+from rukh.tokenize.fixture import build_fixture, write_fixture
+from rukh.tokenize.san_chars import SanCharTokenizer, san_text, uci_to_san
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+if TYPE_CHECKING:
+    from tokenizers import Tokenizer
+
+SCHEMES = ("uci", "san", "bpe")
+
+
+class TokenizeReport(BaseModel):
+    """What ``run`` wrote, as absolute POSIX paths."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scheme: str
+    vocab_size: int
+    written: list[str]
+```
+
+<Src file="src/rukh/tokenize/run.py" tag="p1" lines="1-31" />
+
+```python title="src/rukh/tokenize/run.py"
+def _bpe_path(cfg: TokenizeConfig) -> Path:
+    return resolve(cfg.artifacts_dir) / "bpe.json"
+
+
+def _ensure_bpe(cfg: TokenizeConfig, games: Path, retrain: bool) -> Tokenizer:
+    """Load ``bpe.json``; train it from ``games`` when missing or ``retrain``."""
+    from rukh.tokenize.bpe import load_bpe, train_bpe_from_parquet
+
+    path = _bpe_path(cfg)
+    if retrain or not path.is_file():
+        return train_bpe_from_parquet(games, path, cfg.bpe_vocab_size, cfg.bpe_train_games)
+    return load_bpe(path)
+
+
+def export_artifacts(cfg: TokenizeConfig, bpe: Tokenizer | None) -> list[Path]:
+    """Write ``vocab.json`` and ``fixtures/games.json`` (with ``bpe_ids`` when ``bpe`` given)."""
+    artifacts = resolve(cfg.artifacts_dir)
+    tokenizer = UciTokenizer()
+    vocab_path = artifacts / "vocab.json"
+    tokenizer.export(vocab_path)
+    entries = build_fixture(
+        resolve(cfg.fixture_pgn), tokenizer, SanCharTokenizer(), bpe, max_len=cfg.max_len
+    )
+    fixture_path = artifacts / "fixtures" / "games.json"
+    write_fixture(entries, fixture_path)
+    return [vocab_path, fixture_path]
+```
+
+<Src file="src/rukh/tokenize/run.py" tag="p1" lines="34-59" />
+
+`_ensure_bpe` tiene la política del BPE en dos líneas: si se pide el esquema `bpe` se **reentrena**;
+si solo hace falta uno (para las estadísticas o para añadir `bpe_ids` a la fixture) se carga el que
+haya, y se entrena solo si no existe. De ahí sale el orden en que se lanzan los comandos, que no es
+arbitrario: primero `--scheme bpe`, para que `bpe.json` exista, y al final el `uci` con
+`--export-fixture`, para que la fixture pueda incluir los ids BPE.
+
+`export_artifacts` escribe los dos ficheros que salen del repositorio: `vocab.json` y
+`fixtures/games.json`. Son los que `rukh-lab` y `rukh-web` copian.
+
+```python title="src/rukh/tokenize/run.py"
+def _summary(lengths: list[int], max_len: int) -> dict[str, float]:
+    arr = np.asarray(lengths, dtype=np.int64)
+    return {
+        "mean": round(float(arr.mean()), 2),
+        "p50": round(float(np.percentile(arr, 50)), 2),
+        "p95": round(float(np.percentile(arr, 95)), 2),
+        "pct_le_max_len": round(float((arr <= max_len).mean() * 100), 2),
+    }
+
+
+def compute_stats(cfg: TokenizeConfig, games: Path, bpe: Tokenizer) -> dict[str, object]:
+    """Tokens per game for the three schemes over the first ``stats_n_games`` of ``games``.
+
+    Every count is what the scheme's encoder really emits (``rukh.tokenize.pack``): the UCI
+    scheme frames a game with five tokens (``<bos>``, two Elo tokens, result, ``<eos>``), BPE
+    with three (``<bos>``, result, ``<eos>``) and char-level SAN with two, because there the
+    result is part of the text.
+    """
+    import polars as pl
+
+    from rukh.tokenize.bpe import bpe_text, longest_tokens
+
+    frame = (
+        pl.scan_parquet(Path(games).as_posix())
+        .select("uci", "white_elo", "black_elo", "result")
+        .head(cfg.stats_n_games)
+        .collect()
+    )
+    uci_tok = UciTokenizer()
+    san_tok = SanCharTokenizer()
+    uci_len: list[int] = []
+    san_len: list[int] = []
+    bpe_len: list[int] = []
+    for uci, w_elo, b_elo, result in frame.iter_rows():
+        uci_len.append(len(uci_tok.encode_game(uci, w_elo, b_elo, result, max_len=1 << 30)))
+        san_len.append(len(san_tok.encode(san_text(uci_to_san(uci), result))))
+        bpe_len.append(len(bpe.encode(bpe_text(uci)).ids) + 3)
+    return {
+        "source": {"games": Path(games).name, "n_games": frame.height, "max_len": cfg.max_len},
+        "schemes": {
+            "uci": {"vocab_size": len(uci_tok), **_summary(uci_len, cfg.max_len)},
+            "san": {"vocab_size": len(san_tok), **_summary(san_len, cfg.max_len)},
+            "bpe": {"vocab_size": bpe.get_vocab_size(), **_summary(bpe_len, cfg.max_len)},
+        },
+        "bpe_longest_tokens": longest_tokens(bpe, 10),
+    }
+```
+
+<Src file="src/rukh/tokenize/run.py" tag="p1" lines="62-107" />
+
+Aquí está la tabla de estadísticas del módulo, y el docstring explica lo único que podría falsearla:
+**cada esquema cuenta los tokens que su codificador emite de verdad**, incluidos los de encuadre, que
+son cinco en UCI, tres en BPE y dos en SAN. El `+ 3` de la línea del BPE es eso, escrito.
+
+Si cada esquema contara solo las jugadas, la comparación seguiría saliendo parecida; contando el
+encuadre, la comparación es la que el entrenamiento va a pagar. Es la diferencia entre medir el
+tokenizador y medir el coste.
+
+`_summary` devuelve media, mediana, p95 y el porcentaje que cabe en `max_len`. Las cuatro juntas
+dicen cosas distintas: la media es el coste de una época, el p95 es la ventana de contexto que
+necesitas para no truncar casi nada, y el porcentaje es la cobertura del bloque que usa el loader.
+
+Lo que salió medido sobre las primeras 20 000 partidas de enero:
+
+<TokenizerStats />
+
+**UCI fijo**: media 80,64 tokens por partida, p50 76, p95 139 y **99,8 %** por debajo de 200.
+**SAN por carácter**: media 422,44, p50 393, p95 754 y solo el **7,77 %** cabe en 200.
+**BPE de 4 096**: media 68,05, p50 62, p95 129 y **99,84 %** por debajo de 200.
+
+Ese 5,2× entre UCI y SAN es el mismo factor que aparece sobre el corpus entero (240 068 954 tokens
+contra 1 258 749 609 para las mismas 2 949 514 partidas de enero), y no se paga en disco sino en
+tiempo de GPU: con el presupuesto fijo de M2 —20 000 pasos × 51 200 tokens— el esquema UCI hace algo
+más de cuatro épocas sobre enero y el SAN no llega a completar una. Y como el coste de la atención
+crece con el cuadrado de la longitud, igualar las épocas no costaría 5,2 veces más sino unas 27.
+
+<Callout kind="teoria" title="Lo que la tabla no puede decir">
+  Ninguna estadística del tokenizador dice cuál tokenización **juega** mejor. Solo dice cuánto
+  cuesta cada una y qué tiene que aprender el modelo por su cuenta. La respuesta a "cuál es mejor"
+  la da la tabla única en M2, entrenando el mismo decoder sobre las tres con el mismo presupuesto.
+  Lo que sí sabes ya es que, si dos tokenizaciones jugaran igual, la de secuencias más cortas es la
+  que querrías: entrena más rápido y cabe en el navegador con menos memoria.
+</Callout>
+
+```python title="src/rukh/tokenize/run.py"
+def write_stats(cfg: TokenizeConfig, games: Path, bpe: Tokenizer) -> Path:
+    path = resolve(cfg.web_artifacts_dir) / "tokenizer-stats.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stats = compute_stats(cfg, games, bpe)
+    path.write_text(json.dumps(stats, indent=2) + "\n", encoding="utf-8", newline="\n")
+    return path
+```
+
+<Src file="src/rukh/tokenize/run.py" tag="p1" lines="110-115" />
+
+Otra vez `newline="\n"` y un `indent` fijo: este JSON lo copia `pnpm sync:data` al sitio del curso, y
+un fichero que cambia de saltos de línea según el sistema produce un diff en cada máquina.
+
+```python title="src/rukh/tokenize/run.py"
+def run(
+    cfg: TokenizeConfig,
+    scheme: str = "uci",
+    export_fixture: bool = False,
+    stats: bool = False,
+    games: Path | None = None,
+    pack: bool = False,
+) -> TokenizeReport:
+    """Run the requested tokenizer step(s) for ``scheme``.
+
+    ``--scheme bpe`` (re)trains ``bpe.json`` from ``games``; ``--stats`` needs a BPE, so it
+    trains one from ``games`` when none exists. ``--export-fixture`` adds ``bpe_ids`` to the
+    fixture whenever ``bpe.json`` is available. ``--pack`` writes ``train_month`` and
+    ``val_month`` as memmap token streams under ``out_dir/<scheme>/``.
+    """
+    if scheme not in SCHEMES:
+        raise ValueError(f"scheme must be one of {SCHEMES}, got {scheme!r}")
+    games_path = games or resolve(cfg.stats_games)
+    written: list[Path] = []
+    bpe: Tokenizer | None = None
+
+    if scheme == "bpe" or stats:
+        bpe = _ensure_bpe(cfg, games_path, retrain=scheme == "bpe")
+        if scheme == "bpe":
+            written.append(_bpe_path(cfg))
+    elif (export_fixture or pack) and _bpe_path(cfg).is_file():
+        from rukh.tokenize.bpe import load_bpe
+
+        bpe = load_bpe(_bpe_path(cfg))
+
+    if stats and bpe is not None:
+        written.append(write_stats(cfg, games_path, bpe))
+    if pack:
+        from rukh.tokenize.pack import pack_scheme
+
+        written.extend(pack_scheme(cfg, scheme, bpe))
+    if export_fixture:
+        written.extend(export_artifacts(cfg, bpe))
+
+    vocab_size = len(UciTokenizer())
+    if scheme == "san":
+        vocab_size = len(SanCharTokenizer())
+    elif scheme == "bpe" and bpe is not None:
+        vocab_size = bpe.get_vocab_size()
+    return TokenizeReport(
+        scheme=scheme, vocab_size=vocab_size, written=[p.as_posix() for p in written]
+    )
+```
+
+<Src file="src/rukh/tokenize/run.py" tag="p1" lines="118-164" />
+
+El `run` es un árbol de decisiones sobre cuatro banderas, y conviene leerlo como una tabla. La
+primera mitad decide si hace falta un BPE y de dónde sale; la segunda ejecuta lo pedido en el orden
+correcto —estadísticas, empaquetado, fixture— y va acumulando rutas en `written`. El `vocab_size` que
+devuelve depende del esquema, porque es lo que la CLI imprime.
+
+Fíjate en el `elif (export_fixture or pack) and _bpe_path(cfg).is_file()`: si se pide la fixture o un
+pack de otro esquema **y hay un BPE por ahí**, se carga. Es lo que hace que la fixture lleve
+`bpe_ids` sin tener que pedirlo, y lo que hace que el orden de los tres comandos importe.
+
+```python title="src/rukh/cli.py"
+@data_app.command("tokenize")
+def data_tokenize(
+    config: PipelineOption = None,
+    scheme: Annotated[
+        str, typer.Option("--scheme", help="Tokenization scheme: uci, san or bpe.")
+    ] = "uci",
+    export_fixture: Annotated[
+        bool,
+        typer.Option(
+            "--export-fixture",
+            help="Write artifacts/tokenizer/vocab.json and fixtures/games.json.",
+        ),
+    ] = False,
+    stats: Annotated[
+        bool,
+        typer.Option("--stats", help="Write artifacts/web/tokenizer-stats.json for all schemes."),
+    ] = False,
+    games: Annotated[
+        Path | None,
+        typer.Option(
+            "--games",
+            exists=True,
+            dir_okay=False,
+            help="UCI games parquet for BPE training and statistics (default from config).",
+        ),
+    ] = None,
+    pack: Annotated[
+        bool,
+        typer.Option("--pack", help="Pack train/val months into data/tokens/<scheme>/."),
+    ] = False,
+) -> None:
+    """Build tokenizer artifacts, the parity fixture, statistics and packed token streams."""
+    from rukh.data.pipeline import load_pipeline
+    from rukh.tokenize.run import SCHEMES, run
+
+    if scheme not in SCHEMES:
+        typer.echo(f"error: --scheme must be one of {', '.join(SCHEMES)}", err=True)
+        raise typer.Exit(code=2)
+    cfg = load_pipeline(config).tokenize
+    report = run(
+        cfg, scheme=scheme, export_fixture=export_fixture, stats=stats, games=games, pack=pack
+    )
+    typer.echo(f"scheme:     {report.scheme}")
+    typer.echo(f"vocab_size: {report.vocab_size}")
+    _echo_written(report.written)
+```
+
+<Src file="src/rukh/cli.py" tag="p1" lines="141-185" />
+
+La orden es la más cargada de la CLI —cinco opciones— y es la única del grupo `data` que no imprime
+un manifiesto. Su comprobación del esquema se hace **antes** de cargar la configuración y sale con
+código 2, el de "mal uso" de typer, en vez de dejar que el `ValueError` de `run` produzca una traza.
+
+## `fixture.py`: veinte partidas que el navegador tendrá que reproducir
+
+```python title="src/rukh/tokenize/fixture.py"
+"""Parity fixture: 20 PGN games encoded with every scheme, consumed by the TypeScript twin."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import chess.pgn
+
+from rukh.tokenize.bpe import bpe_text
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+if TYPE_CHECKING:
+    from tokenizers import Tokenizer
+
+    from rukh.tokenize.san_chars import SanCharTokenizer
+```
+
+<Src file="src/rukh/tokenize/fixture.py" tag="p1" lines="1-17" />
+
+```python title="src/rukh/tokenize/fixture.py"
+def read_pgn_games(path: Path) -> list[dict[str, object]]:
+    """Read every game of a PGN file as ``{id, white_elo, black_elo, result, uci, san}``.
+
+    ``san`` is the numbered movetext without comments or result (``1.e4 e5 2.Nf3 ...``) and
+    ``uci`` the space-separated UCI moves. Every move is replayed with python-chess, so an
+    illegal game raises instead of producing a corrupt fixture.
+    """
+    games: list[dict[str, object]] = []
+    with Path(path).open(encoding="utf-8") as fh:
+        while True:
+            game = chess.pgn.read_game(fh)
+            if game is None:
+                break
+            if game.errors:
+                raise ValueError(f"{path}: {game.headers.get('Site')}: {game.errors[0]}")
+            board = game.board()
+            uci: list[str] = []
+            san: list[str] = []
+            for move in game.mainline_moves():
+                if move not in board.legal_moves:
+                    raise ValueError(f"{path}: illegal move {move.uci()} in {board.fen()}")
+                if board.turn == chess.WHITE:
+                    san.append(f"{board.fullmove_number}.{board.san(move)}")
+                else:
+                    san.append(board.san(move))
+                uci.append(move.uci())
+                board.push(move)
+            games.append(
+                {
+                    "id": game.headers.get("Site", f"game-{len(games) + 1}"),
+                    "white_elo": int(game.headers["WhiteElo"]),
+                    "black_elo": int(game.headers["BlackElo"]),
+                    "result": game.headers["Result"],
+                    "uci": " ".join(uci),
+                    "san": " ".join(san),
+                }
+            )
+    return games
+```
+
+<Src file="src/rukh/tokenize/fixture.py" tag="p1" lines="20-57" />
+
+`read_pgn_games` **lanza** en dos sitios: si `python-chess` registró un error al parsear (`game.errors`)
+y si alguna jugada no es legal. Es lo contrario del `return None` de `san_to_uci`, y la asimetría
+tiene sentido: allí se procesaban seis millones de partidas de origen desconocido y una mala no podía
+tumbar el lote; aquí son veinte partidas versionadas en el repositorio, y una mala significa que la
+fixture está corrupta. Una fixture de paridad corrupta es peor que no tener fixture, porque las dos
+implementaciones coincidirían en reproducir la corrupción.
+
+El `id` sale de la cabecera `Site` con un respaldo `game-N`. Es la clave con la que el test de
+TypeScript empareja sus resultados con los de Python.
+
+```python title="src/rukh/tokenize/fixture.py"
+def build_fixture(
+    pgn_path: Path,
+    uci_tokenizer: UciTokenizer,
+    san_tokenizer: SanCharTokenizer | None = None,
+    bpe: Tokenizer | None = None,
+    max_len: int = 200,
+) -> list[dict[str, object]]:
+    """Encode the PGN games with the fixed vocabulary and, when given, char-level SAN and BPE."""
+    entries = read_pgn_games(pgn_path)
+    for entry in entries:
+        entry["uci_ids"] = uci_tokenizer.encode_game(
+            str(entry["uci"]),
+            int(entry["white_elo"]),  # type: ignore[arg-type]
+            int(entry["black_elo"]),  # type: ignore[arg-type]
+            str(entry["result"]),
+            max_len=max_len,
+        )
+        if san_tokenizer is not None:
+            entry["san_ids"] = san_tokenizer.encode(f"{entry['san']} {entry['result']}")
+        if bpe is not None:
+            entry["bpe_ids"] = bpe.encode(bpe_text(str(entry["uci"]))).ids
+    return entries
+
+
+def write_fixture(entries: list[dict[str, object]], path: Path) -> None:
+    """Write the fixture deterministically (``indent=0``, ASCII, trailing newline)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(entries, indent=0, ensure_ascii=True) + "\n"
+    path.write_text(text, encoding="utf-8", newline="\n")
+```
+
+<Src file="src/rukh/tokenize/fixture.py" tag="p1" lines="60-89" />
+
+`build_fixture` codifica cada partida con los tres esquemas, y los dos últimos son **opcionales**:
+`san_ids` solo si se le pasa el tokenizador de caracteres, `bpe_ids` solo si hay BPE. Así la fixture
+se puede generar en una máquina sin `tokenizers` instalado, con menos campos, y el consumidor
+comprueba los que haya.
+
+`write_fixture` repite las tres garantías de determinismo de `UciTokenizer.export`: `indent=0`,
+`ensure_ascii=True` y `newline="\n"`. Ese fichero se compara byte a byte entre tres repositorios.
+
+## Los tests del loader
+
+```python title="tests/unit/test_loader.py"
+"""Tests for rukh.tokenize.loader: <bos>-aligned windows, padding, determinism."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+from rukh.tokenize.loader import IGNORE_INDEX, PackedDataset, make_loader
+from rukh.tokenize.pack import UciGameEncoder, pack_month
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(scope="module")
+def pack_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = Path(__file__).resolve().parents[2]
+    out = tmp_path_factory.mktemp("pack")
+    pack_month(root / "tests" / "fixtures" / "games.parquet", UciGameEncoder(), out)
+    return out
+```
+
+<Src file="tests/unit/test_loader.py" tag="p1" lines="1-23" />
+
+La fixture del módulo empaqueta las veinte partidas del `games.parquet` de test una sola vez para los
+cinco casos. Y empaqueta de verdad, con `pack_month` y `UciGameEncoder`: los tests del loader corren
+sobre un pack real, no sobre arrays fabricados, así que prueban las dos piezas juntas.
+
+```python title="tests/unit/test_loader.py"
+def test_items_are_bos_aligned_windows(pack_dir: Path) -> None:
+    ds = PackedDataset(pack_dir, block=200)
+    assert len(ds) == 20
+    for i in range(len(ds)):
+        x, y = ds[i]
+        assert x.shape == (200,) and y.shape == (200,)
+        assert x.dtype == torch.int64
+        assert x[0] == UciTokenizer.bos_id
+        assert torch.equal(y[:-1], x[1:])
+        assert y[-1] == IGNORE_INDEX
+
+
+def test_last_window_is_padded(pack_dir: Path) -> None:
+    ds = PackedDataset(pack_dir, block=400)
+    x, y = ds[len(ds) - 1]
+    tokens = np.load(pack_dir / "tokens.npy")
+    tail = len(tokens) - int(ds.starts[-1])
+    assert tail < 400
+    assert x[tail - 1] == UciTokenizer.eos_id
+    assert torch.all(x[tail:] == IGNORE_INDEX)
+    assert torch.all(y[tail - 1 :] == IGNORE_INDEX)
+
+
+def test_contiguous_blocks(pack_dir: Path) -> None:
+    ds = PackedDataset(pack_dir, block=64, start_at_game=False)
+    tokens = np.load(pack_dir / "tokens.npy")
+    assert len(ds) == len(tokens) // 64
+    x, _ = ds[1]
+    assert torch.equal(x, torch.from_numpy(tokens[64:128].astype(np.int64)))
+    with pytest.raises(IndexError):
+        ds[len(ds)]
+```
+
+<Src file="tests/unit/test_loader.py" tag="p1" lines="26-56" />
+
+`test_items_are_bos_aligned_windows` recorre las veinte partidas y comprueba, en cada una, las cinco
+promesas del contrato: la forma, el tipo, que **empieza en `<bos>`**, que `y[:-1] == x[1:]` y que la
+última posición de `y` es relleno. Esas cinco aserciones son literalmente lo que el bucle de
+entrenamiento de M2 da por hecho.
+
+`test_last_window_is_padded` es el caso del final del flujo, y está montado con cuidado: usa un bloque
+de 400 —más grande que lo que queda— calcula cuántos tokens hay de verdad desde el último `<bos>`
+(`tail`), y comprueba que la posición `tail - 1` es el `<eos>` de la última partida y que **todo lo
+que viene después es relleno**. Es la única forma de probar el `np.concatenate` sin escribir el
+número a mano.
+
+`test_contiguous_blocks` prueba la otra rama, la de los bloques sin alinear, comparando el segundo
+bloque con `tokens[64:128]` leído directamente del fichero. Y comprueba que pedir un índice de más
+lanza `IndexError` en vez de devolver basura.
+
+```python title="tests/unit/test_loader.py"
+def test_same_seed_same_batches(pack_dir: Path) -> None:
+    ds = PackedDataset(pack_dir, block=200)
+    a = make_loader(ds, batch_size=4, seed=7)
+    b = make_loader(ds, batch_size=4, seed=7)
+    c = make_loader(ds, batch_size=4, seed=8)
+    batches_a = [x for x, _ in a]
+    batches_b = [x for x, _ in b]
+    batches_c = [x for x, _ in c]
+    assert len(batches_a) == 5
+    assert all(torch.equal(p, q) for p, q in zip(batches_a, batches_b, strict=True))
+    assert any(not torch.equal(p, q) for p, q in zip(batches_a, batches_c, strict=True))
+    assert batches_a[0].shape == (4, 200)
+
+
+def test_thousand_samples_in_range(pack_dir: Path) -> None:
+    ds = PackedDataset(pack_dir, block=200)
+    rng = np.random.default_rng(0)
+    for i in rng.integers(0, len(ds), size=1000):
+        x, y = ds[int(i)]
+        assert int(x.max()) < 2030 and int(y.max()) < 2030
+        assert int(x.min()) >= 0 and int(y.min()) >= 0
+```
+
+<Src file="tests/unit/test_loader.py" tag="p1" lines="59-79" />
+
+`test_same_seed_same_batches` es la afirmación de reproducibilidad, y está escrita con las dos
+mitades: misma semilla, mismos lotes; semilla distinta, **algún** lote distinto. La segunda mitad es
+la que detectaría un `make_loader` que ignorase el generador.
+
+Y `test_thousand_samples_in_range` es un test de propiedad: mil ventanas al azar, y todas con ids
+dentro de `[0, 2030)`. No prueba ningún caso concreto; prueba que no hay ninguno malo. Es el test que
+atraparía un desbordamiento del `uint16` o un desplazamiento de índice en el `window`.
+
+<Exercise n="01" title="Mide el precio del padding">
+  Escribe una variante `PaddedDataset` que devuelva una partida por ejemplo, rellenada con `<pad>`
+  hasta 200 y truncada si es más larga. Con un lote de 64, calcula la fracción de objetivos que son
+  `<pad>` y compárala con la de `PackedDataset`. ¿Cuántos tokens "útiles" por lote sirve cada uno?
+
+<Solution>
+  Con la media medida arriba (80,64 tokens por partida, encuadre incluido; la mediana es 76), una
+  partida por fila deja unos 119 `<pad>` por ejemplo: **el 60 % del lote es relleno**. `ignore_index`
+  lo descarta de la pérdida, pero la atención ya lo ha calculado.
+
+`PackedDataset` mide 0,005 —medio por ciento— en un lote de 64 × 200 sobre el pack de enero, porque
+el relleno solo aparece en la última ventana del flujo. Son unas 2,5 veces más posiciones
+contribuyendo a la pérdida con el mismo presupuesto de GPU.
+
+Para medirlo tú: `(yb == 0).float().mean().item()` sobre el primer lote de cada uno.
+
+</Solution>
+</Exercise>
+
+## Los tests que se quedan en un enlace
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Fichero                                                                                         | Líneas | Qué garantiza                                                                                                                                                                                                                                                 |
+| ----------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`tests/unit/test_pack.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_pack.py) | 123    | Que los tres codificadores producen la forma que dice su docstring, que `pack_month` deja `tokens.npy`/`starts.npy`/`meta.json` coherentes entre sí, que el `vocab_hash` cambia al cambiar el vocabulario y que un BPE con especiales distintos es rechazado. |
+
+</div>
+
+Se queda fuera porque lo que prueba ya está probado dos veces desde otros ángulos: la fixture de
+`test_loader.py` ejecuta `pack_month` de verdad en cada corrida, y `test_uci_vocab.py` cubre los
+codificadores. Lo que tiene de propio son las aserciones sobre `meta.json` —`n_tokens == len(tokens)`
+y `n_games == len(starts)`—, que es lo primero que hay que mirar si un pack sale raro.
+
+## Qué has aprendido
+
+Cómo se escriben seis millones de partidas en un fichero que cabe en 480 MB sin que nada pase por
+memoria, y cómo se sirven desde él lotes `(x, y)` que la GPU puede consumir sin gastar la mitad del
+cálculo en relleno. Y el detalle que hace que todo esto sea comprobable: un hash del vocabulario en
+el `meta.json`, para que un pack viejo no se mezcle nunca con un tokenizador nuevo.
+
+**Cómo se mide**: los tres comandos, **en este orden**, dejan los tres packs y los artefactos:
+
+```bash title="Terminal"
+uv run rukh data tokenize --scheme bpe --pack
+uv run rukh data tokenize --scheme san --pack
+uv run rukh data tokenize --scheme uci --stats --export-fixture --pack
+```
+
+El último imprime `vocab_size: 2030` y la lista de lo escrito. El pack de enero con el esquema UCI
+tiene 2 949 514 partidas y 240 068 954 tokens; el de febrero, 2 946 874 y 238 657 571.
+`uv run pytest -m unit -q tests/unit/test_pack.py tests/unit/test_loader.py` pasa en verde.
+
+Lo siguiente es sacar todo esto del disco duro: las cards, los manifiestos y las órdenes que suben
+seis datasets y un tokenizador a Hugging Face.

@@ -1,0 +1,1132 @@
+---
+title: 'El pipeline: un YAML, nueve pasos, ocho órdenes'
+description:
+  'El orquestador del módulo: la configuración única con su sección de DuckDB compartida, las ocho
+  órdenes nuevas de la CLI, la base Elite que se descarga en zip y se convierte con el mismo código,
+  y el muestreo por tramos de Elo que M4 necesita.'
+module: m1
+order: 3
+duration: 150
+level: base
+status: vigente
+updated: 2026-09-22
+keywords:
+  - pipeline
+  - pydantic
+  - typer
+  - DuckDB
+  - Elo
+  - PGN
+artifacts:
+  - kind: dataset
+    label: chorcat/rukh-elo-bins
+    href: https://huggingface.co/datasets/chorcat/rukh-elo-bins
+---
+
+## Qué vas a construir
+
+Nueve pasos de datos, cada uno con su configuración, sus rutas, sus contadores y su manifiesto. Si
+cada uno llevara su propio fichero YAML y su propia opción `--config`, tendrías nueve ficheros que
+repiten `data/uci` y nueve sitios donde cambiar el límite de memoria de <Term id="duckdb">DuckDB</Term>.
+Esta lección es el pegamento: **un solo `pipeline.yaml`**, un modelo pydantic que lo valida entero, y
+ocho órdenes de la CLI que se parecen tanto entre sí que conviene ver por qué.
+
+Y con el pegamento vienen dos pasos completos, los dos que solo dependen de lo que ya sabes: `elite`,
+que descarga la base Elite de Lichess en zip y la convierte con el mismo `convert_rows` de la lección
+anterior, y `elo-bins`, que muestrea hasta 50 000 partidas por tramo de 100 puntos de <Term id="elo">Elo</Term> para
+que M4 tenga con qué entrenar los tokens de cabecera.
+
+## Un modelo para todo el pipeline
+
+```python title="src/rukh/data/pipeline.py"
+"""``PipelineConfig``: every data step's config under one YAML (``configs/data/pipeline.yaml``)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from pydantic import Field, model_validator
+
+from rukh import paths
+from rukh.config import BaseConfig, load_yaml
+from rukh.data.db import DuckDbConfig
+from rukh.data.elite import EliteConfig
+from rukh.data.elo_bins import EloBinsConfig
+from rukh.data.evals import EvalsConfig
+from rukh.data.pairs import PairsConfig
+from rukh.data.positions import PositionsConfig
+from rukh.data.publish import PublishConfig
+from rukh.data.puzzles import PuzzlesConfig
+from rukh.data.uci import UciConfig
+```
+
+<Src file="src/rukh/data/pipeline.py" tag="p1" lines="1-19" />
+
+Diez importaciones de configuración, una por paso. Es el único fichero del paquete que conoce a
+todos, y eso es deliberado: los pasos no se conocen entre sí. `uci.py` no sabe que existe
+`elo_bins.py`; solo `pipeline.py` sabe que los dos están en el mismo YAML. Si mañana un paso
+desaparece, se borra una línea aquí y una sección del YAML.
+
+```python title="src/rukh/data/pipeline.py"
+class TokenizeConfig(BaseConfig):
+    """Where games come from, where packed tokens and tokenizer artifacts go."""
+
+    uci_dir: str = "data/uci"
+    out_dir: str = "data/tokens"
+    artifacts_dir: str = "artifacts/tokenizer"
+    web_artifacts_dir: str = "artifacts/web"
+    fixture_pgn: str = "tests/fixtures/games.pgn"
+    train_month: str = "2025-01"
+    val_month: str = "2025-02"
+    stats_games: str = "data/uci/year=2025/month=01/games.parquet"
+    bpe_vocab_size: int = Field(default=4096, ge=100)
+    bpe_train_games: int = Field(default=200_000, ge=1)
+    stats_n_games: int = Field(default=20_000, ge=1)
+    max_len: int = Field(default=200, ge=8)
+```
+
+<Src file="src/rukh/data/pipeline.py" tag="p1" lines="22-36" />
+
+`TokenizeConfig` vive aquí y no en `src/rukh/tokenize/` por una razón práctica: es la única
+configuración del pipeline cuyo paso está en otro paquete, y ponerla en `tokenize/` crearía una
+importación circular en cuanto `pipeline.py` la importase junto al resto. Sus campos son los de la
+lección de los vocabularios y los de la de empaquetado; aquí solo interesa que los valores por
+defecto **son los que se usaron de verdad**: mes de entrenamiento `2025-01`, mes de validación
+`2025-02`, BPE de 4 096 entrenado sobre 200 000 partidas, estadísticas sobre 20 000 y bloques de 200
+tokens.
+
+```python title="src/rukh/data/pipeline.py"
+DUCKDB_STEPS = ("positions", "evals", "puzzles", "elo_bins")
+
+
+class PipelineConfig(BaseConfig):
+    """All step configs; each step reads only its own section.
+
+    ``duckdb:`` is shared: the top-level settings are copied into every step that opens a
+    DuckDB connection unless that step declares its own.
+    """
+
+    duckdb: DuckDbConfig = Field(default_factory=DuckDbConfig)
+    uci: UciConfig = Field(default_factory=UciConfig)
+    tokenize: TokenizeConfig = Field(default_factory=TokenizeConfig)
+    positions: PositionsConfig = Field(default_factory=PositionsConfig)
+    evals: EvalsConfig = Field(default_factory=EvalsConfig)
+    puzzles: PuzzlesConfig = Field(default_factory=PuzzlesConfig)
+    pairs: PairsConfig = Field(default_factory=PairsConfig)
+    elite: EliteConfig = Field(default_factory=EliteConfig)
+    elo_bins: EloBinsConfig = Field(default_factory=EloBinsConfig)
+    publish: PublishConfig = Field(default_factory=PublishConfig)
+
+    @model_validator(mode="after")
+    def _share_duckdb(self) -> PipelineConfig:
+        default = DuckDbConfig()
+        for name in DUCKDB_STEPS:
+            step = getattr(self, name)
+            if step.duckdb == default:
+                setattr(self, name, step.model_copy(update={"duckdb": self.duckdb}))
+        return self
+```
+
+<Src file="src/rukh/data/pipeline.py" tag="p1" lines="39-67" />
+
+Aquí está la única pieza con lógica del fichero, y es la que hace que la sección `duckdb:` del YAML
+signifique algo.
+
+El problema: cuatro pasos abren una conexión de DuckDB (`positions`, `evals`, `puzzles` y
+`elo_bins`) y cada uno tiene su propio campo `duckdb` en su configuración. Sin el validador,
+subir el límite de memoria a 48 GB obligaría a escribirlo cuatro veces, y olvidarse de una dejaría
+un paso con 32 GB sin que nada lo dijera.
+
+La solución es un `model_validator(mode="after")`, es decir, una función que corre **después** de
+que pydantic haya validado todos los campos. Compara el `duckdb` de cada paso con uno recién
+construido: si son iguales, ese paso no lo declaró en el YAML y hereda el de arriba; si difieren, es
+que alguien lo puso a propósito y se respeta.
+
+<Callout
+  kind="teoria"
+  title="Ausente y «igual al valor por defecto» son lo mismo aquí, y está bien"
+>
+  El truco tiene un límite honesto: si escribes en el YAML el valor por defecto exacto
+  (`memory_limit: 32GB`) dentro de un paso, el validador no puede distinguirlo de no haberlo escrito
+  y lo sobrescribe con el global. La alternativa —preguntarle a pydantic qué campos venían de verdad
+  en el documento, con `model_fields_set`— existe, y se descartó porque el caso que arregla no
+  existe: nadie escribe explícitamente el valor por defecto para que sea distinto del global. Cuando
+  una comprobación es más complicada que el fallo que evita, la comprobación es el fallo.
+</Callout>
+
+`setattr(self, name, step.model_copy(update=...))` y no `step.duckdb = self.duckdb` porque los
+modelos del proyecto se tratan como inmutables: `model_copy` devuelve uno nuevo con el campo
+cambiado. Cuesta una copia de un objeto de dos campos y evita que dos configuraciones compartan por
+accidente el mismo `DuckDbConfig` mutable.
+
+```python title="src/rukh/data/pipeline.py"
+def default_config_path() -> Path:
+    return paths.package_root() / "configs" / "data" / "pipeline.yaml"
+
+
+def load_pipeline(path: Path | None = None) -> PipelineConfig:
+    """Load ``pipeline.yaml`` (the shipped one when ``path`` is ``None``)."""
+    return load_yaml(path or default_config_path(), PipelineConfig)
+```
+
+<Src file="src/rukh/data/pipeline.py" tag="p1" lines="70-76" />
+
+`default_config_path()` usa `package_root()` y no `root()`, y esa distinción viene de M0. El
+`pipeline.yaml` es **código**: está versionado, vive en el árbol de fuentes y no se mueve cuando
+`RUKH_HOME` apunta los datos a otro disco. Si usara `root()`, un `RUKH_HOME=D:\rukh` haría que
+`rukh data uci` buscara la configuración en `D:\rukh\configs\` y fallara con un fichero no
+encontrado que no menciona la variable de entorno.
+
+## El fichero que lo configura todo
+
+{/* prettier-ignore */}
+```yaml title="configs/data/pipeline.yaml"
+# Every step of `rukh data ...` after `fetch`. Paths are relative to the repo root (RUKH_HOME).
+duckdb:               # applied to every DuckDB connection of the pipeline
+  memory_limit: 32GB
+  threads: 0          # 0 = cpu_count()
+uci:
+  raw_dir: data/raw
+  out_dir: data/uci
+  min_plies: 20
+  max_plies: 300
+  workers: 0          # 0 = cpu_count() - 1
+tokenize:
+  uci_dir: data/uci
+  out_dir: data/tokens
+  artifacts_dir: artifacts/tokenizer
+  web_artifacts_dir: artifacts/web
+  fixture_pgn: tests/fixtures/games.pgn
+  train_month: "2025-01"
+  val_month: "2025-02"
+  stats_games: data/uci/year=2025/month=01/games.parquet
+  bpe_vocab_size: 4096
+  bpe_train_games: 200000
+  stats_n_games: 20000
+  max_len: 200
+positions:
+  uci_dir: data/uci
+  month: "2025-01"
+  out_dir: data/positions
+  n_games: 300000
+  max_positions: 5000000
+  workers: 0
+evals:
+  dataset: Lichess/chess-position-evaluations
+  remote_pattern: "hf://datasets/{dataset}/data/data_{index:04d}.parquet"
+```
+
+<Src file="configs/data/pipeline.yaml" tag="p1" lines="1-33" />
+
+{/* prettier-ignore */}
+```yaml title="configs/data/pipeline.yaml"
+  n_files: 20
+  positions: data/positions/positions.parquet
+  out_dir: data/evals
+puzzles:
+  dataset: Lichess/chess-puzzles
+  remote_glob: "hf://datasets/{dataset}/**/*.parquet"
+  out_dir: data/puzzles
+  max_rating_deviation: 100
+  min_plays: 100
+  n_test: 2000
+  n_train: 50000
+  seed: 42
+pairs:
+  positions_eval: data/evals/positions-eval.parquet
+  out_dir: data/pairs
+  min_delta_cp: 100
+  max_per_phase: 200000
+  seed: 42
+elite:
+  base_url: https://database.nikonoel.fr
+  months: ["2025-01", "2025-02"]
+  out_dir: data/elite
+  min_plies: 20
+  max_plies: 300
+  workers: 0
+elo_bins:
+  uci_dir: data/uci
+  out_dir: data/elo-bins
+  n_per_bin: 50000
+  seed: 42
+publish:
+  owner: chorcat
+  publish_dir: data/publish
+```
+
+<Src file="configs/data/pipeline.yaml" tag="p1" lines="34-66" />
+
+Sesenta y seis líneas y cada clave es una decisión que aparece en alguna lección de este módulo o en
+un módulo posterior. Las que conviene fijar ahora:
+
+- `duckdb.memory_limit: 32GB` de los 64 de la máquina de referencia; la otra mitad es para los
+  procesos de trabajo del pool.
+- `uci.max_plies: 300` es el tope de longitud, y `positions.n_games: 300000` es cuántas partidas se
+  recorren para extraer posiciones: no hacen falta los seis millones para tener cinco millones de
+  posiciones distintas.
+- `puzzles.seed: 42`, `pairs.seed: 42` y `elo_bins.seed: 42`. La misma semilla en tres sitios no es
+  pereza: es lo que hace que los tres conjuntos se puedan regenerar idénticos, y el conjunto de test
+  de los puzles es el que sostiene la tabla única de M2 a M6.
+- `evals.n_files: 20` son los veinte ficheros parquet en los que Lichess publica sus 395 millones de
+  posiciones evaluadas.
+- `elite.base_url` apunta a `database.nikonoel.fr`, que no es Lichess: la base Elite es una
+  recopilación mantenida por un tercero a partir del volcado público.
+
+Este YAML **no** contiene la descarga de M0, que sigue teniendo su propio fichero porque tiene su
+propia orden (`rukh data fetch`) y su propia forma: una configuración por recorte, no por paso. De
+ese fichero M1 cambia una línea:
+
+{/* prettier-ignore */}
+```yaml title="configs/data/lichess-2025-01-02.yaml"
+# Two recent months of rated standard games, filtered remotely (see docs/spec/01-datos.md).
+dataset: Lichess/standard-chess-games
+months: ["2025-01", "2025-02"]
+min_elo: 1800
+min_base_seconds: 180
+terminations: ["Normal", "Time forfeit"]
+min_plies: 20
+exclude_variants: true
+out_dir: data/raw
+limit: 3000000
+```
+
+<Src file="configs/data/lichess-2025-01-02.yaml" tag="p1" lines="1-10" />
+
+`limit: 3000000` donde M0 tenía `limit: null`. Es la decisión D-017 del registro de ejecución, y sale
+de una cuenta: los filtros de M0 dejan pasar el 18 % de las partidas, un mes de Lichess son unos cien
+millones, así que sin tope quedarían unos dieciocho millones por mes. Con el tope, y como los
+ficheros del mes están en orden cronológico, se cogen los primeros doce ficheros —unos cinco días de
+enero y otros cinco de febrero— y salen seis millones en total. El manifiesto lo registra como
+recorte temporal, que es lo honesto: no es una muestra aleatoria del mes, son los primeros días.
+
+## Ocho órdenes que se parecen
+
+```python title="src/rukh/cli.py"
+PipelineOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--config",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="Pipeline YAML (default: configs/data/pipeline.yaml).",
+    ),
+]
+
+
+def _echo_written(written: list[str]) -> None:
+    typer.echo("written:")
+    for path in written:
+        typer.echo(f"  {path}")
+```
+
+<Src file="src/rukh/cli.py" tag="p1" lines="96-111" />
+
+`PipelineOption` es un alias de tipo, y existe porque la opción `--config` se repite en ocho órdenes
+con sus cuatro comprobaciones (`exists`, `dir_okay=False`, `readable`, la ayuda). Escrita una vez y
+reutilizada ocho, cambiar el texto de ayuda es cambiar una línea. `Path | None` con `= None` como
+valor por defecto es lo que permite que la orden funcione sin `--config`: `load_pipeline(None)` carga
+el fichero que viene con el paquete.
+
+```python title="src/rukh/cli.py"
+@data_app.command("uci")
+def data_uci(
+    config: PipelineOption = None,
+    workers: Annotated[
+        int | None, typer.Option("--workers", help="Override the pool size from the config.")
+    ] = None,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the manifest as JSON only.")
+    ] = False,
+) -> None:
+    """Convert fetched SAN movetext to legal UCI games, one parquet per month."""
+    from rukh.data.pipeline import load_pipeline
+    from rukh.data.uci import run
+
+    cfg = load_pipeline(config).uci
+    if workers is not None:
+        cfg = cfg.model_copy(update={"workers": workers})
+    manifest = run(cfg)
+    if as_json:
+        typer.echo(manifest.model_dump_json(indent=2))
+        return
+    typer.echo(f"months:   {', '.join(manifest.months)}")
+    for month, count in manifest.counts.items():
+        typer.echo(f"  {month}: {count} games kept")
+    typer.echo(f"manifest: {cfg.out_dir}/manifest.json")
+```
+
+<Src file="src/rukh/cli.py" tag="p1" lines="114-138" />
+
+`rukh data uci` es la orden de la lección anterior, y es la más larga de las ocho porque tiene una
+opción propia. `--workers` sobrescribe el valor del YAML con un `model_copy`, sin tocar el fichero:
+es la opción que se usa para depurar (`--workers 1` hace la conversión en serie, en el proceso
+principal, donde un `breakpoint()` funciona).
+
+Fíjate en los dos `import` dentro de la función, la regla de M0: `cli.py` solo importa `typer` al
+nivel del módulo. Aquí importa de verdad, porque `rukh.data.pipeline` arrastra los diez módulos de
+configuración y con ellos pyarrow, polars y duckdb. Con las importaciones arriba, `rukh --help`
+tardaría segundos.
+
+```python title="src/rukh/cli.py"
+def _echo_manifest(manifest: object, as_json: bool, out_dir: str) -> None:
+    from rukh.data.manifest import Manifest
+
+    assert isinstance(manifest, Manifest)
+    if as_json:
+        typer.echo(manifest.model_dump_json(indent=2))
+        return
+    typer.echo(f"dataset:  {manifest.dataset}")
+    if manifest.months:
+        typer.echo(f"months:   {', '.join(manifest.months)}")
+    typer.echo("counts:")
+    for key, value in manifest.counts.items():
+        typer.echo(f"  {key}: {value}")
+    typer.echo("files:")
+    for file in manifest.files:
+        typer.echo(f"  {file.path} ({file.bytes} bytes)")
+    typer.echo(f"manifest: {out_dir}/manifest.json")
+
+
+JsonOption = Annotated[bool, typer.Option("--json", help="Print the manifest as JSON.")]
+
+
+@data_app.command("positions")
+def data_positions(config: PipelineOption = None, as_json: JsonOption = False) -> None:
+    """Walk sampled games into deduplicated 4-field FENs with phase labels."""
+    from rukh.data.pipeline import load_pipeline
+    from rukh.data.positions import run
+
+    cfg = load_pipeline(config).positions
+    _echo_manifest(run(cfg), as_json, cfg.out_dir)
+```
+
+<Src file="src/rukh/cli.py" tag="p1" lines="188-217" />
+
+`_echo_manifest` es la salida legible de un manifiesto, y existe una sola vez para las seis órdenes
+que devuelven uno. El `assert isinstance(manifest, Manifest)` con el parámetro tipado como `object`
+es un rodeo deliberado: tipar el parámetro como `Manifest` obligaría a importar `Manifest` al nivel
+del módulo, que es justo lo que la regla de arranque prohíbe. El `assert` le dice al comprobador de
+tipos lo que el `import` local ya sabe.
+
+```python title="src/rukh/cli.py"
+@data_app.command("evals")
+def data_evals(
+    config: PipelineOption = None,
+    files: Annotated[
+        str | None,
+        typer.Option("--files", help="Remote file indices, e.g. 0-19, 3 or 0,2,5-7 (default all)."),
+    ] = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Semi-join the positions with the remote Stockfish evaluations (resumable per file)."""
+    from rukh.data.evals import run
+    from rukh.data.pipeline import load_pipeline
+
+    cfg = load_pipeline(config).evals
+    _echo_manifest(run(cfg, files=files), as_json, cfg.out_dir)
+
+
+@data_app.command("puzzles")
+def data_puzzles(config: PipelineOption = None, as_json: JsonOption = False) -> None:
+    """Filter Lichess puzzles and split them by difficulty band with a fixed seed."""
+    from rukh.data.pipeline import load_pipeline
+    from rukh.data.puzzles import run
+
+    cfg = load_pipeline(config).puzzles
+    _echo_manifest(run(cfg), as_json, cfg.out_dir)
+
+
+@data_app.command("pairs")
+def data_pairs(config: PipelineOption = None, as_json: JsonOption = False) -> None:
+    """Build phase-balanced DPO pairs from the multi-PV evaluations."""
+    from rukh.data.pairs import run
+    from rukh.data.pipeline import load_pipeline
+
+    cfg = load_pipeline(config).pairs
+    _echo_manifest(run(cfg), as_json, cfg.out_dir)
+
+
+@data_app.command("elite")
+def data_elite(config: PipelineOption = None, as_json: JsonOption = False) -> None:
+    """Download the Lichess Elite Database months and convert them to UCI."""
+    from rukh.data.elite import run
+    from rukh.data.pipeline import load_pipeline
+
+    cfg = load_pipeline(config).elite
+    _echo_manifest(run(cfg), as_json, cfg.out_dir)
+
+
+@data_app.command("elo-bins")
+def data_elo_bins(config: PipelineOption = None, as_json: JsonOption = False) -> None:
+    """Sample up to n_per_bin games per 100-Elo bin of the average rating."""
+    from rukh.data.elo_bins import run
+    from rukh.data.pipeline import load_pipeline
+
+    cfg = load_pipeline(config).elo_bins
+    _echo_manifest(run(cfg), as_json, cfg.out_dir)
+```
+
+<Src file="src/rukh/cli.py" tag="p1" lines="220-274" />
+
+Seis órdenes, cinco de ellas de cuatro líneas: cargar la sección, ejecutar, imprimir. Esa uniformidad
+es el objetivo. Cada paso del pipeline es una función `run(cfg) -> Manifest` y nada más, así que la
+CLI no tiene lógica que se pueda romper; la única con un argumento extra es `evals`, y su `--files`
+existe porque ese paso tarda horas y hay que poder pedirle un trozo.
+
+<Callout kind="mundo-real" title="La orden aburrida es la orden correcta">
+  Una CLI donde cada orden hace algo distinto con su salida es una CLI donde cada orden tiene su
+  propio error. Aquí la forma es siempre la misma —sección del YAML, `run`, manifiesto— y eso
+  significa que un paso nuevo son cuatro líneas y que `--json` funciona igual en todas sin que nadie
+  lo piense. El precio es un `_echo_manifest` genérico que imprime "counts" en vez de algo bonito
+  para cada paso, y se paga con gusto.
+</Callout>
+
+## `elite.py`: descargar un zip y convertirlo con el código de ayer
+
+La base Elite de Lichess es una recopilación de partidas de jugadores de 2500+ contra 2300+, sin
+bullet, empaquetada en un zip por mes. M4 la usa para el afinado "como los maestros", y lo
+interesante de este fichero es lo poco que tiene: **convierte con el mismo `convert_batch` de
+`uci.py`**, así que los dos corpus salen con el mismo esquema y un mismo modelo puede leer los dos.
+
+```python title="src/rukh/data/elite.py"
+"""Lichess Elite Database (2500+ vs 2300+, no bullet): download, extract, convert to UCI."""
+
+from __future__ import annotations
+
+import re
+import zipfile
+from collections.abc import Iterator
+from pathlib import Path
+
+import pyarrow.parquet as pq
+from pydantic import Field
+
+from rukh.config import BaseConfig
+from rukh.data.manifest import FileHash, Manifest
+from rukh.data.parallel import run_batches
+from rukh.data.uci import (
+    OUT_SCHEMA,
+    RAW_COLUMNS,
+    convert_batch,
+    resolve_workers,
+    sha256_file,
+    write_results,
+)
+from rukh.paths import resolve
+
+GAMES_FILE = "games.parquet"
+BATCH_GAMES = 20_000
+_HEADER_RE = re.compile(r'^\[(\w+)\s+"(.*)"\]\s*$')
+
+
+class EliteConfig(BaseConfig):
+    """Which monthly zips to fetch and the ply bounds of the conversion."""
+
+    base_url: str = "https://database.nikonoel.fr"
+    months: list[str] = Field(default=["2025-01", "2025-02"], min_length=1)
+    out_dir: str = "data/elite"
+    min_plies: int = Field(default=20, ge=0)
+    max_plies: int = Field(default=300, ge=1)
+    workers: int = Field(default=0, ge=0)
+```
+
+<Src file="src/rukh/data/elite.py" tag="p1" lines="1-39" />
+
+Siete nombres importados de `uci.py`, incluido `OUT_SCHEMA`. Si este fichero declarase su propio
+esquema, las dos mitades podrían divergir sin que nadie lo notase hasta que el tokenizador leyera una
+columna que en un corpus es `int16` y en el otro `int32`.
+
+```python title="src/rukh/data/elite.py"
+def zip_name(month: str) -> str:
+    return f"lichess_elite_{month}.zip"
+
+
+def zip_url(cfg: EliteConfig, month: str) -> str:
+    return f"{cfg.base_url.rstrip('/')}/{zip_name(month)}"
+
+
+def _download(url: str, dest: Path) -> None:
+    """Stream ``url`` to ``dest`` (tests monkeypatch this)."""
+    import requests
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with requests.get(url, stream=True, timeout=120) as response:
+        response.raise_for_status()
+        with tmp.open("wb") as fh:
+            for chunk in response.iter_content(chunk_size=1 << 20):
+                fh.write(chunk)
+    tmp.replace(dest)
+
+
+def extract_pgn(zip_path: Path, dest_dir: Path) -> Path:
+    """Extract the (single) ``.pgn`` member of the zip; returns its path."""
+    with zipfile.ZipFile(zip_path) as archive:
+        members = [m for m in archive.namelist() if m.lower().endswith(".pgn")]
+        if len(members) != 1:
+            raise ValueError(f"{zip_path.name}: expected one .pgn member, found {members}")
+        archive.extract(members[0], dest_dir)
+    return dest_dir / members[0]
+```
+
+<Src file="src/rukh/data/elite.py" tag="p1" lines="42-71" />
+
+`_download` escribe a un `.part` y lo renombra al final. Es el mismo patrón que verás en `evals.py` y
+la razón es la misma: un zip de ochenta megas interrumpido a la mitad tiene que ser distinguible de
+uno completo, y la forma barata de conseguirlo es que el nombre definitivo solo exista cuando la
+descarga terminó. Con `stream=True` y trozos de 1 MiB el fichero no pasa por memoria.
+
+El docstring dice "tests monkeypatch this", y esa frase es la que hace testables los 197 líneas: la
+única función que toca la red está aislada, tiene una línea de lógica y se sustituye desde el test
+por una que copia un zip de mentira.
+
+`extract_pgn` **falla si el zip no tiene exactamente un `.pgn`**. Podría coger el primero, y sería
+peor: el día que la recopilación cambie de formato y meta dos ficheros, coger el primero produce un
+dataset a medias y coger ninguno produce un error que se lee.
+
+```python title="src/rukh/data/elite.py"
+def iter_pgn_rows(pgn_path: Path, month: str) -> Iterator[dict[str, object]]:
+    """Yield raw rows (``RAW_COLUMNS``) from a PGN file with a light line parser.
+
+    A new game starts when a header follows movetext or repeats a tag of the current block, so
+    a game with headers but no moves is dropped instead of polluting the next one. Without a
+    ``Site`` tag the game id falls back to ``month:index`` (every game still gets its own id);
+    a missing or unparsable Elo is recorded as ``None``, never as 0.
+    """
+    headers: dict[str, str] = {}
+    movetext: list[str] = []
+    in_moves = False
+    index = 0
+
+    def flush(index: int) -> dict[str, object] | None:
+        if not headers or not movetext:
+            return None
+        return {
+            "Site": headers.get("Site") or f"{month}:{index}",
+            "movetext": " ".join(movetext),
+            "WhiteElo": _int(headers.get("WhiteElo")),
+            "BlackElo": _int(headers.get("BlackElo")),
+            "Result": headers.get("Result", "*"),
+            "TimeControl": headers.get("TimeControl"),
+            "UTCDate": headers.get("UTCDate", headers.get("Date")),
+            "ECO": headers.get("ECO"),
+            "month": month,
+        }
+
+    with pgn_path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith("["):
+                match = _HEADER_RE.match(line)
+                if match is None:
+                    continue
+                if in_moves or match.group(1) in headers:
+                    row = flush(index)
+                    if row is not None:
+                        yield row
+                    index += 1
+                    headers, movetext, in_moves = {}, [], False
+                headers[match.group(1)] = match.group(2)
+            elif line:
+                in_moves = True
+                movetext.append(line)
+    row = flush(index)
+    if row is not None:
+        yield row
+```
+
+<Src file="src/rukh/data/elite.py" tag="p1" lines="74-121" />
+
+Este es el trozo con miga. El PGN no es un formato tabular: es una sucesión de bloques de cabeceras
+entre corchetes seguidos de líneas de jugadas, separados por líneas en blanco. La tentación es
+partir por líneas en blanco, y es un error: un PGN exportado de algunos programas mete líneas en
+blanco dentro del movetext.
+
+La regla que usa el parser es otra y está en el docstring: **una partida nueva empieza cuando una
+cabecera aparece después de jugadas, o cuando repite una etiqueta del bloque actual**. La primera
+condición cubre el caso normal; la segunda cubre el de una partida con cabeceras pero sin jugadas,
+que existe (una partida abandonada antes de la primera jugada) y que sin esa comprobación se
+fusionaría con la siguiente, llevándose su `Result` y su Elo.
+
+`flush` devuelve `None` cuando no hay cabeceras o no hay jugadas, y el `index` avanza igual. Eso es
+lo que garantiza que el identificador de respaldo (`month:index`, cuando no hay etiqueta `Site`) sea
+único aunque haya bloques descartados por el camino.
+
+```python title="src/rukh/data/elite.py"
+def _int(value: str | None) -> int | None:
+    """``None`` when the header is missing or not a number (never a fabricated 0)."""
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
+
+
+def _batches(rows: Iterator[dict[str, object]]) -> Iterator[list[dict[str, object]]]:
+    batch: list[dict[str, object]] = []
+    for row in rows:
+        for name in RAW_COLUMNS:
+            row.setdefault(name, None)
+        batch.append(row)
+        if len(batch) >= BATCH_GAMES:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+```
+
+<Src file="src/rukh/data/elite.py" tag="p1" lines="124-142" />
+
+`_int` devuelve `None` y nunca un 0. Es la misma decisión que `_parse_elo` de `uci.py` y por el mismo
+motivo: un 0 sería un Elo y contaminaría el muestreo por tramos. Que aparezcan las dos funciones por
+separado, casi idénticas, es la única duplicación real del par de ficheros, y está porque una recibe
+un `str | None` de una cabecera PGN y la otra un `object` de una columna de parquet.
+
+`_batches` reagrupa el flujo de filas en lotes de 20 000, que es lo que espera `convert_batch`. Y
+`row.setdefault(name, None)` rellena las columnas que el PGN no traiga, igual que hacía
+`iter_batches` en `uci.py`.
+
+```python title="src/rukh/data/elite.py"
+def convert_pgns(pgns: list[tuple[str, Path]], dst: Path, cfg: EliteConfig) -> dict[str, int]:
+    """Convert every ``(month, pgn)`` into one UCI parquet with the ``uci.py`` schema."""
+    totals = {"rows": 0, "kept": 0, "illegal": 0, "short": 0, "long": 0}
+    workers = resolve_workers(cfg.workers)
+
+    def jobs() -> Iterator[tuple[list[dict[str, object]], int, int]]:
+        for month, pgn in pgns:
+            for batch in _batches(iter_pgn_rows(pgn, month)):
+                yield batch, cfg.min_plies, cfg.max_plies
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with pq.ParquetWriter(dst, OUT_SCHEMA, compression="zstd") as writer:
+        write_results(writer, run_batches(convert_batch, jobs(), workers), totals)
+    return totals
+```
+
+<Src file="src/rukh/data/elite.py" tag="p1" lines="145-158" />
+
+Catorce líneas, y son el motivo de la lección: `convert_pgns` monta un generador de trabajos y se lo
+pasa al **mismo** `run_batches` con el **mismo** `convert_batch`, y lo escribe con el **mismo**
+`write_results` y el **mismo** `OUT_SCHEMA`. Todo el trabajo de la lección anterior —la limpieza del
+movetext, la reproducción sobre el tablero, los cinco contadores, la contrapresión del pool— se
+reutiliza sin una línea nueva.
+
+Fíjate en que `jobs` es una función anidada, no una función de módulo, y eso está bien: **lo que
+viaja al proceso hijo es `convert_batch`**, que sí es de módulo. El generador se queda en el proceso
+padre.
+
+```python title="src/rukh/data/elite.py"
+def run(cfg: EliteConfig) -> Manifest:
+    """Download each month's zip (once), extract, convert and write the manifest."""
+    out_dir = resolve(cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files: list[FileHash] = []
+    sources: dict[str, str] = {}
+    pgns: list[tuple[str, Path]] = []
+    for month in cfg.months:
+        zip_path = out_dir / zip_name(month)
+        url = zip_url(cfg, month)
+        if not zip_path.is_file():
+            _download(url, zip_path)
+        sources[month] = url
+        files.append(
+            FileHash(
+                path=zip_path.name, sha256=sha256_file(zip_path), bytes=zip_path.stat().st_size
+            )
+        )
+        pgns.append((month, extract_pgn(zip_path, out_dir)))
+    target = out_dir / GAMES_FILE
+    totals = convert_pgns(pgns, target, cfg)
+    files.append(FileHash(path=GAMES_FILE, sha256=sha256_file(target), bytes=target.stat().st_size))
+    manifest = Manifest(
+        dataset="Lichess Elite Database (database.nikonoel.fr)",
+        months=list(cfg.months),
+        filters={
+            "source_urls": sources,
+            "min_plies": cfg.min_plies,
+            "max_plies": cfg.max_plies,
+            "legal_only": True,
+            "conversion": totals,
+        },
+        counts={"games": totals["kept"]},
+        files=files,
+    )
+    (out_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2) + "\n", "utf-8")
+    return manifest
+```
+
+<Src file="src/rukh/data/elite.py" tag="p1" lines="161-197" />
+
+El `if not zip_path.is_file()` hace que la orden sea idempotente: volver a lanzarla con el zip ya
+descargado extrae y convierte otra vez, sin pedir ochenta megas. Y el manifiesto registra las URL de
+origen en `filters.source_urls`, que es lo que hace que la card de este dataset pueda decir de dónde
+salió sin que nadie lo recuerde.
+
+## `elo_bins.py`: noventa líneas y una consulta
+
+El problema que resuelve está medido en el primer lab del módulo: de las 2 949 514 partidas de enero,
+el 53,2 % son de un 1800 o un 1900 y solo el 1,5 % de 2500 para arriba. Entrenar sobre esa
+distribución significa que el token `<w2400>` recibe una fracción minúscula de los gradientes.
+
+```python title="src/rukh/data/elo_bins.py"
+"""Elo-balanced sample: up to ``n_per_bin`` games per 100-Elo bin of the average rating."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from pydantic import Field
+
+from rukh.config import BaseConfig
+from rukh.data.db import DuckDbConfig, connect
+from rukh.data.manifest import FileHash, Manifest
+from rukh.data.uci import month_dirs, sha256_file
+from rukh.paths import resolve
+
+GAMES_FILE = "games.parquet"
+
+
+class EloBinsConfig(BaseConfig):
+    """Source months, per-bin cap and seed."""
+
+    uci_dir: str = "data/uci"
+    out_dir: str = "data/elo-bins"
+    n_per_bin: int = Field(default=50_000, ge=1)
+    seed: int = 42
+    duckdb: DuckDbConfig = Field(default_factory=DuckDbConfig)
+```
+
+<Src file="src/rukh/data/elo_bins.py" tag="p1" lines="1-25" />
+
+```python title="src/rukh/data/elo_bins.py"
+def sample_bins(
+    sources: list[Path],
+    target: Path,
+    n_per_bin: int,
+    seed: int,
+    duckdb_cfg: DuckDbConfig | None = None,
+) -> dict[str, int]:
+    """DuckDB: ``bin = avg(white_elo, black_elo) // 100 * 100``; keep ``n_per_bin`` by hash.
+
+    The seed shifts the hash, not the id: ``hash(game_id + seed)`` overflowed BIGINT for ids
+    near the top of the range.
+    """
+    files = ", ".join(f"'{p.as_posix()}'" for p in sources)
+    con = connect(duckdb_cfg)
+    try:
+        con.execute(
+            f"""
+            COPY (
+              SELECT * EXCLUDE (rk)
+              FROM (
+                SELECT *,
+                       row_number() OVER (PARTITION BY bin ORDER BY hash(game_id) + {seed}) AS rk
+                FROM (
+                  SELECT *, ((white_elo + black_elo) // 2) // 100 * 100 AS bin
+                  FROM read_parquet([{files}], hive_partitioning = false)
+                )
+              )
+              WHERE rk <= {int(n_per_bin)}
+              ORDER BY bin, rk
+            ) TO '{target.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+        rows = con.execute(
+            f"SELECT bin, count(*) FROM read_parquet('{target.as_posix()}') "
+            "GROUP BY bin ORDER BY bin"
+        ).fetchall()
+    finally:
+        con.close()
+    return {str(int(b)): int(n) for b, n in rows}
+```
+
+<Src file="src/rukh/data/elo_bins.py" tag="p1" lines="28-66" />
+
+La consulta tiene tres niveles y se lee de dentro afuera.
+
+El más interno calcula el tramo: `((white_elo + black_elo) // 2) // 100 * 100`. La media de los dos
+Elo, truncada a la centena. Un 1899 y un 1901 dan media 1900 y caen en el tramo 1900; un 1850 contra
+un 1950 también. Que el tramo sea de la **media** y no del Elo de las blancas es una decisión: lo que
+determina cómo se juega una partida es el nivel de la mesa, no el de un bando.
+
+El de en medio numera las filas dentro de cada tramo con `row_number() OVER (PARTITION BY bin ORDER
+BY hash(game_id) + {seed})`. Ordenar por un hash del id es un muestreo determinista: no es aleatorio
+de verdad, pero es impredecible respecto a cualquier propiedad de la partida y **da lo mismo cada
+vez que se ejecuta**. El de fuera se queda con las primeras `n_per_bin` de cada tramo.
+
+<Callout kind="roto" title="`hash(game_id + seed)` desbordaba, `hash(game_id) + seed` no">
+  El docstring lo dice en dos líneas y merece desarrollarlo, porque es un fallo que solo aparece con
+  datos reales. `game_id` es un entero con signo de 64 bits que ocupa todo el rango, y en el
+  `BIGINT` de DuckDB sumarle 42 a un id cercano a 2⁶³−1 **desborda**: la consulta muere con un error
+  de conversión a mitad de un fichero de tres millones de filas.
+
+Sumar la semilla **después** del hash no arregla el desbordamiento por magia: lo que cambia es que
+`hash()` de DuckDB devuelve un `UBIGINT` cuya aritmética envuelve en vez de abortar. El efecto de la
+semilla es el mismo —desplazar el orden— y el error desaparece.
+
+La lección transferible no es sobre DuckDB. Es que **un identificador que usa todo el rango de su
+tipo no admite aritmética**, y que los ids con forma de hash son exactamente eso. Si tienes que
+combinarlos con algo, hazlo dentro de una función que envuelva, o convierte a texto y concatena.
+Hay un test específico para este caso, más abajo, con ids en los cuatro extremos del `int64`.
+
+</Callout>
+
+```python title="src/rukh/data/elo_bins.py"
+def run(cfg: EloBinsConfig) -> Manifest:
+    """Sample every month under ``uci_dir`` and write ``out_dir/games.parquet`` + manifest."""
+    months = month_dirs(resolve(cfg.uci_dir))
+    if not months:
+        raise FileNotFoundError(f"no games under {resolve(cfg.uci_dir)}")
+    out_dir = resolve(cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / GAMES_FILE
+    counts = sample_bins([p for _, p in months], target, cfg.n_per_bin, cfg.seed, cfg.duckdb)
+    manifest = Manifest(
+        dataset="Lichess/standard-chess-games",
+        months=[m for m, _ in months],
+        filters={
+            "bin": "((white_elo + black_elo) // 2) // 100 * 100",
+            "n_per_bin": cfg.n_per_bin,
+            "seed": cfg.seed,
+        },
+        counts=counts,
+        files=[FileHash(path=GAMES_FILE, sha256=sha256_file(target), bytes=target.stat().st_size)],
+    )
+    (out_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2) + "\n", "utf-8")
+    return manifest
+```
+
+<Src file="src/rukh/data/elo_bins.py" tag="p1" lines="69-90" />
+
+Los conteos del manifiesto son **por tramo**, no un total, y eso es lo que convierte al manifiesto en
+la prueba de que el balanceo funcionó: `{"1800": 50000, "1900": 50000, …, "3000": 1517}`. Los tramos
+que no llegan al tope quedan como están, con su número real, y esa es la información que M4 necesita
+para saber qué cabeceras de Elo tienen datos detrás y cuáles no.
+
+La fórmula del tramo se guarda **como texto** en `filters.bin`. Es documentación ejecutable al revés:
+el día que alguien cambie la fórmula, los manifiestos viejos siguen diciendo cuál era la suya.
+
+## Los tests
+
+```python title="tests/unit/test_elo_bins.py"
+"""Tests for rukh.data.elo_bins: bin formula, per-bin cap and determinism."""
+
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+
+import polars as pl
+import pytest
+
+from rukh.data.elo_bins import EloBinsConfig, run
+
+pytestmark = pytest.mark.unit
+
+
+def _stage(rukh_home: Path, repo_root: Path) -> None:
+    src = repo_root / "tests" / "fixtures" / "games.parquet"
+    for month in ("01", "02"):
+        target = rukh_home / "data" / "uci" / "year=2025" / f"month={month}" / "games.parquet"
+        target.parent.mkdir(parents=True)
+        shutil.copy(src, target)
+
+
+def test_run_caps_each_bin(rukh_home: Path, repo_root: Path) -> None:
+    _stage(rukh_home, repo_root)
+    manifest = run(EloBinsConfig(n_per_bin=2, seed=1))
+    frame = pl.read_parquet((rukh_home / "data" / "elo-bins" / "games.parquet").as_posix())
+    assert "bin" in frame.columns
+    per_bin = frame.group_by("bin").len()
+    assert per_bin["len"].max() <= 2
+    expected = ((pl.col("white_elo") + pl.col("black_elo")) // 2) // 100 * 100
+    assert frame.filter(pl.col("bin") != expected).height == 0
+    assert manifest.months == ["2025-01", "2025-02"]
+    assert all(v <= 2 for v in manifest.counts.values())
+    assert manifest.filters["n_per_bin"] == 2
+```
+
+<Src file="tests/unit/test_elo_bins.py" tag="p1" lines="1-35" />
+
+El primero comprueba las tres promesas de golpe: que ningún tramo pasa del tope, que la columna `bin`
+es exactamente la fórmula (recalculándola con polars y exigiendo cero filas discrepantes) y que el
+manifiesto lo refleja. Recalcular la fórmula en otra herramienta en vez de copiar el número esperado
+es lo que hace que el test siga valiendo si cambian los datos de la fixture.
+
+```python title="tests/unit/test_elo_bins.py"
+def test_run_handles_ids_at_the_edge_of_int64(rukh_home: Path, repo_root: Path) -> None:
+    """``game_id`` is a signed 64-bit hash: adding the seed to it would overflow."""
+    src = pl.read_parquet((repo_root / "tests" / "fixtures" / "games.parquet").as_posix())
+    edges = [2**63 - 1, -(2**63), 2**63 - 2, -(2**63) + 1]
+    ids = (edges * ((src.height // len(edges)) + 1))[: src.height]
+    target = rukh_home / "data" / "uci" / "year=2025" / "month=01" / "games.parquet"
+    target.parent.mkdir(parents=True)
+    src.with_columns(pl.Series("game_id", ids, dtype=pl.Int64)).write_parquet(target.as_posix())
+    manifest = run(EloBinsConfig(n_per_bin=1, seed=42))
+    assert sum(manifest.counts.values()) > 0
+
+
+def test_run_is_deterministic(rukh_home: Path, repo_root: Path) -> None:
+    _stage(rukh_home, repo_root)
+    run(EloBinsConfig(n_per_bin=1, seed=3))
+    first = pl.read_parquet((rukh_home / "data" / "elo-bins" / "games.parquet").as_posix())
+    run(EloBinsConfig(n_per_bin=1, seed=3))
+    second = pl.read_parquet((rukh_home / "data" / "elo-bins" / "games.parquet").as_posix())
+    assert first.equals(second)
+    assert first.height == first["bin"].n_unique()
+```
+
+<Src file="tests/unit/test_elo_bins.py" tag="p1" lines="38-57" />
+
+Y aquí está el test del desbordamiento, con su docstring diciendo qué vigila. Fabrica una columna
+`game_id` con los cuatro valores extremos del `int64` repetidos, y lo único que comprueba es que la
+consulta **termina**: `sum(manifest.counts.values()) > 0`. Un test que solo comprueba que algo no
+revienta parece pobre, y es exactamente lo que hace falta aquí, porque el fallo era una excepción.
+
+El último comprueba el determinismo de la forma correcta: ejecutar dos veces con la misma semilla y
+exigir que los dos parquets sean iguales. No "parecidos", ni "del mismo tamaño": `first.equals(second)`.
+
+## El test de la conexión compartida
+
+Ahora que el `pipeline.yaml` está explicado, el test de `db.py` de la lección anterior se puede leer
+entero.
+
+```python title="tests/unit/test_db.py"
+"""Tests for rukh.data.db: every connection gets the spill directory, memory limit and threads."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+from rukh.data.db import TMP_DIRNAME, DuckDbConfig, connect, temp_directory
+from rukh.data.pipeline import DUCKDB_STEPS, PipelineConfig
+
+pytestmark = pytest.mark.unit
+
+
+def _settings(con: object) -> dict[str, object]:
+    row = con.execute(  # type: ignore[attr-defined]
+        "SELECT current_setting('temp_directory'), current_setting('memory_limit'), "
+        "current_setting('threads')"
+    ).fetchone()
+    return {"temp_directory": row[0], "memory_limit": row[1], "threads": row[2]}
+
+
+def test_connect_applies_the_settings(rukh_home: Path) -> None:
+    con = connect(DuckDbConfig(memory_limit="2GB", threads=3))
+    try:
+        settings = _settings(con)
+    finally:
+        con.close()
+    assert settings["temp_directory"] == (rukh_home / "data" / TMP_DIRNAME).as_posix()
+    assert settings["memory_limit"] == "1.8 GiB"  # DuckDB reports GiB
+    assert settings["threads"] == 3
+    assert (rukh_home / "data" / TMP_DIRNAME).is_dir()
+
+
+def test_connect_defaults_to_32gb_and_every_core(rukh_home: Path) -> None:
+    con = connect()
+    try:
+        settings = _settings(con)
+    finally:
+        con.close()
+    assert settings["memory_limit"] == "29.8 GiB"  # 32 GB
+    assert settings["threads"] == (os.cpu_count() or 4)
+    assert temp_directory() == rukh_home / "data" / TMP_DIRNAME
+```
+
+<Src file="tests/unit/test_db.py" tag="p1" lines="1-44" />
+
+Los dos primeros comprueban que los tres ajustes llegan a la conexión, preguntándole a la propia
+DuckDB con `current_setting` en vez de fiarse de que el `SET` se ejecutó. Los comentarios de los
+`assert` son necesarios: DuckDB **reporta el límite en GiB**, así que `2GB` vuelve como `1.8 GiB` y
+`32GB` como `29.8 GiB`. Un test que esperara `"2GB"` fallaría por un motivo que no tiene nada que ver
+con lo que quiere probar.
+
+```python title="tests/unit/test_db.py"
+def test_pipeline_shares_the_duckdb_section() -> None:
+    cfg = PipelineConfig.model_validate({"duckdb": {"memory_limit": "8GB", "threads": 2}})
+    for name in DUCKDB_STEPS:
+        step = getattr(cfg, name)
+        assert step.duckdb.memory_limit == "8GB" and step.duckdb.threads == 2
+    # A step may still override it.
+    cfg = PipelineConfig.model_validate(
+        {"duckdb": {"memory_limit": "8GB"}, "evals": {"duckdb": {"memory_limit": "1GB"}}}
+    )
+    assert cfg.evals.duckdb.memory_limit == "1GB"
+    assert cfg.positions.duckdb.memory_limit == "8GB"
+
+
+def test_shipped_pipeline_yaml_declares_duckdb() -> None:
+    from rukh.data.pipeline import load_pipeline
+
+    cfg = load_pipeline()
+    assert cfg.duckdb.memory_limit == "32GB"
+    assert cfg.puzzles.duckdb == cfg.duckdb
+```
+
+<Src file="tests/unit/test_db.py" tag="p1" lines="47-65" />
+
+Estos dos son los del validador de arriba. El primero recorre `DUCKDB_STEPS` —la tupla, no una lista
+escrita a mano en el test— y comprueba que los cuatro pasos heredaron la sección global, y después
+que un paso que declara la suya la conserva mientras los demás siguen heredando. El segundo carga el
+`pipeline.yaml` **de verdad**, el que viaja en el repositorio, y comprueba que declara su sección
+`duckdb` y que los pasos la heredan. Es un test sobre un fichero de configuración, de los que el
+`test_lock_guard.py` de M0 inauguró: si una propiedad vive en un YAML y romperla no falla nada,
+escribe el test que la lee.
+
+<Exercise n="01" title="Añade un paso al pipeline">
+  Sin escribir el paso de verdad, añade al `PipelineConfig` una sección `openings` con un
+  `OpeningsConfig` de tres campos (un `uci_dir`, un `out_dir` y un `min_games: int`), y añádelo a
+  `DUCKDB_STEPS`. Ejecuta `uv run pytest -m unit -q tests/unit/test_db.py`. ¿Qué falla y por qué?
+  Después arréglalo de la forma mínima.
+
+<Solution>
+  Falla `test_pipeline_shares_the_duckdb_section` con un `AttributeError`, porque el bucle recorre
+  `DUCKDB_STEPS` y `OpeningsConfig` no tiene campo `duckdb`. El arreglo mínimo es darle el campo:
+  `duckdb: DuckDbConfig = Field(default_factory=DuckDbConfig)`, igual que los otros cuatro.
+
+Lo interesante es el orden en que te enteras: el test falla en cuanto añades el nombre a la tupla,
+antes de que exista una línea del paso nuevo. Esa tupla es el contrato —"estos pasos abren
+conexiones"— y tenerla escrita en un sitio convierte un olvido en un error. La alternativa, descubrir
+por qué tu paso nuevo vuelca al disco C: en mitad de una consulta de dos horas, cuesta más.
+
+</Solution>
+</Exercise>
+
+## Los tests que se quedan en un enlace
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Fichero                                                                                           | Líneas | Qué garantiza                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`tests/unit/test_elite.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_elite.py) | 170    | Que el parser de PGN corta las partidas donde debe (bloques sin jugadas, cabeceras repetidas, movetext con líneas en blanco), que un Elo ausente es `None`, y que la descarga es idempotente. |
+
+</div>
+
+Se queda fuera por espacio, no por interés: son 170 líneas que repiten, caso a caso, la misma
+estructura que ya has leído en `test_uci.py` —una constante de PGN por rareza, un `monkeypatch` de
+`_download` y una aserción sobre los contadores—, y lo que tienen de nuevo es el catálogo de formas
+raras de escribir un PGN. Si vas a escribir un parser de PGN alguna vez, ese fichero es la lista de
+lo que te va a pasar.
+
+## Qué has aprendido
+
+El esqueleto del pipeline: una configuración única que un modelo pydantic valida entera y que
+reparte su sección de DuckDB a los pasos que abren conexiones; una CLI donde añadir un paso son
+cuatro líneas porque todos los pasos tienen la misma forma; y dos pasos completos que muestran las
+dos formas de reutilizar lo de ayer, importando el código (`elite`) o empujando el trabajo al motor
+(`elo-bins`).
+
+**Cómo se mide**: `uv run rukh data elite` deja `data/elite/games.parquet` con el esquema de
+`uci.py`, y `uv run rukh data elo-bins` deja `data/elo-bins/games.parquet` cuyo manifiesto tiene un
+conteo por tramo de cien puntos. `uv run pytest -m unit -q tests/unit/test_db.py
+tests/unit/test_elo_bins.py tests/unit/test_elite.py` pasa en verde.
+
+Lo siguiente son las posiciones. Hasta aquí todo han sido partidas enteras; el paso siguiente las
+abre jugada a jugada, se queda con las posiciones y las cruza con cuarenta y dos gigabytes de
+evaluaciones de Stockfish que no vamos a descargar.

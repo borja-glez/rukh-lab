@@ -1,0 +1,1089 @@
+---
+title: 'Los tres vocabularios'
+description:
+  'El vocabulario UCI enumerado sin mirar un dato, el alfabeto de 32 símbolos sobre SAN y el BPE
+  aprendido de 200 000 partidas. Con el fichero de tests que fija la enumeración token a token y
+  la hace reproducible en otro lenguaje.'
+module: m1
+order: 6
+duration: 140
+level: base
+status: vigente
+updated: 2026-09-22
+keywords:
+  - tokenización
+  - vocabulario
+  - BPE
+  - SAN
+  - UCI
+  - paridad
+artifacts:
+  - kind: tokenizer
+    label: chorcat/rukh-tokenizer
+    href: https://huggingface.co/chorcat/rukh-tokenizer
+---
+
+## Qué vas a construir
+
+Las tres respuestas a la pregunta de la primera lección del módulo —qué es un <Term id="token">token</Term>— escritas
+en código. Un <Term id="vocabulario">vocabulario</Term> de
+2 030 entradas que se enumera sin mirar un solo dato; un alfabeto de 32 símbolos que no sabe nada de
+ajedrez; y un <Term id="bpe">BPE</Term> de 4 096 entradas que aprende de doscientas mil partidas qué
+trozos merecen ser unidad.
+
+Los tres tienen la misma interfaz —`encode`, `decode`, un `vocab`— y por eso el empaquetador de la
+lección siguiente los usa sin saber cuál tiene delante. Y el primero tiene una propiedad que los
+otros dos no: **no depende de los datos**, así que una segunda implementación escrita en otro
+lenguaje, sin compartir una línea de código, produce exactamente la misma tabla. Esa es la propiedad
+que hace posible el tokenizador del navegador y la que un fichero de tests vigila token a token.
+
+Cuatro ficheros, 393 líneas.
+
+```python title="src/rukh/tokenize/__init__.py"
+"""Tokenization schemes for chess games: fixed UCI vocabulary, char-level SAN and BPE."""
+```
+
+<Src file="src/rukh/tokenize/__init__.py" tag="p1" lines="1-1" />
+
+El `__init__.py` del paquete es una línea de docstring y ningún reexporte. Es deliberado: importar
+`rukh.tokenize` no debe arrastrar `tokenizers` ni `polars`, y un `from .bpe import train_bpe` aquí lo
+haría.
+
+## `uci_vocab.py`: una tabla que se calcula, no se guarda
+
+```python title="src/rukh/tokenize/uci_vocab.py"
+"""Fixed UCI vocabulary: a deterministic enumeration shared with the TypeScript twin.
+
+The vocabulary does not depend on data. It is built by enumerating squares in file-major order
+(``a1, a2, ..., a8, b1, ..., h8``), every ``from``/``to`` pair reachable by a queen or a knight
+(1 792 moves), every promotion (176) and a fixed block of special tokens in front. Any change to
+this enumeration breaks parity with ``rukh-web/src/lib/chess-lm/tokenizer.ts`` and with
+``artifacts/tokenizer/fixtures/games.json``.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+FILES = "abcdefgh"
+PROMOTION_PIECES = "qrbn"
+RESULT_TOKENS: dict[str, str] = {"1-0": "<1-0>", "0-1": "<0-1>", "1/2-1/2": "<1/2>"}
+ELO_MIN = 600
+ELO_MAX = 3200
+ELO_STEP = 100
+
+SPECIALS: list[str] = ["<pad>", "<bos>", "<eos>", "<mask>", "<unk>", "<1-0>", "<0-1>", "<1/2>"]
+PAD_ID = 0
+BOS_ID = 1
+EOS_ID = 2
+MASK_ID = 3
+UNK_ID = 4
+```
+
+<Src file="src/rukh/tokenize/uci_vocab.py" tag="p1" lines="1-27" />
+
+El docstring es la advertencia más importante del módulo: **cualquier cambio en esta enumeración
+rompe la paridad** con el gemelo de TypeScript y con la fixture. No es que sea difícil de cambiar; es
+que cambiarlo significa cambiar tres cosas a la vez y volver a entrenar todo lo entrenado, porque los
+pesos de un modelo están indexados por estos ids.
+
+Los cinco ids especiales son constantes del módulo y no propiedades calculadas. `PAD_ID = 0` en
+particular se usa en sitios que ni siquiera importan este fichero: la pérdida del decoder de M2 lleva
+`ignore_index=0`, y el empaquetador rellena con ceros. Escribirlo como constante deja el número a la
+vista en vez de escondido en un `vocab["<pad>"]`.
+
+```python title="src/rukh/tokenize/uci_vocab.py"
+def squares() -> list[str]:
+    """The 64 squares in file-major order (index ``file * 8 + rank``)."""
+    return [f"{FILES[f]}{r + 1}" for f in range(8) for r in range(8)]
+
+
+def _reachable(df: int, dr: int) -> bool:
+    """Whether a queen (line or diagonal) or a knight can go from one square to another."""
+    if df == 0 and dr == 0:
+        return False
+    if df == 0 or dr == 0 or abs(df) == abs(dr):
+        return True
+    return {abs(df), abs(dr)} == {1, 2}
+```
+
+<Src file="src/rukh/tokenize/uci_vocab.py" tag="p1" lines="30-41" />
+
+`squares()` enumera **por columnas**: `a1, a2, …, a8, b1, …`. El orden concreto da igual mientras sea
+el mismo en los dos lados; lo que importa es que esté escrito y probado, porque el orden por filas
+(`a1, b1, c1…`) es igual de natural y produce una tabla completamente distinta con los mismos tokens.
+
+`_reachable` es la única regla de ajedrez de todo el fichero, y es más lista de lo que parece. Un par
+de casillas entra en el vocabulario si **una dama o un caballo** podrían cubrir ese desplazamiento en
+un tablero vacío: línea (`df == 0 or dr == 0`), diagonal (`abs(df) == abs(dr)`) o salto de caballo
+(`{abs(df), abs(dr)} == {1, 2}`).
+
+Con eso basta para todas las piezas. La torre y el alfil se mueven como una dama recortada; el rey
+también; el peón avanza en línea y captura en diagonal. Lo que descarta son pares como `a1b4` o
+`a1c4`, que **ninguna pieza puede hacer**: ni línea, ni diagonal, ni salto. De los 4 096 pares
+posibles quedan 1 792.
+
+<Callout kind="teoria" title="Por qué no enumerar los 4 096 y quedarse tranquilo">
+  Sería más sencillo y añadiría 2 304 entradas que nunca reciben un gradiente: 2 304 vectores de la
+  dimensión del modelo entrenándose a cero, y 2 304 columnas más en la capa de salida que hay que
+  calcular y normalizar en cada paso de generación. Con un modelo pequeño, la capa de embeddings y
+  la de salida son una fracción grande del total, así que la cuenta importa. Y hay un beneficio más
+  útil: un vocabulario donde toda entrada es una jugada bien formada significa que el modelo **nunca
+  puede emitir una cadena que no sea una jugada**. Puede emitir jugadas ilegales en la posición, que
+  es otra cosa y se resuelve con una máscara; no puede emitir `a1b4`.
+</Callout>
+
+```python title="src/rukh/tokenize/uci_vocab.py"
+def build_moves() -> list[str]:
+    """1 792 ``fromto`` strings, ``from`` outer and ``to`` inner, both in file-major order."""
+    moves: list[str] = []
+    for ff in range(8):
+        for fr in range(8):
+            for tf in range(8):
+                for tr in range(8):
+                    if _reachable(tf - ff, tr - fr):
+                        moves.append(f"{FILES[ff]}{fr + 1}{FILES[tf]}{tr + 1}")
+    return moves
+
+
+def build_promotions() -> list[str]:
+    """176 ``fromto+piece`` strings: rank 7 to 8 (White) then rank 2 to 1 (Black)."""
+    promotions: list[str] = []
+    for from_rank, to_rank in ((7, 8), (2, 1)):
+        for ff in range(8):
+            for tf in range(8):
+                if abs(tf - ff) <= 1:
+                    for piece in PROMOTION_PIECES:
+                        promotions.append(f"{FILES[ff]}{from_rank}{FILES[tf]}{to_rank}{piece}")
+    return promotions
+```
+
+<Src file="src/rukh/tokenize/uci_vocab.py" tag="p1" lines="44-65" />
+
+Los dos bucles cuádruples son literales a propósito: origen fuera, destino dentro, los dos por
+columnas. Escrito con `itertools.product` sería más corto y más difícil de reproducir exactamente en
+otro lenguaje, que es lo único que se le pide a este código.
+
+`build_promotions` enumera 176: los pares de la fila 7 a la 8 (blancas) y de la 2 a la 1 (negras),
+con desplazamiento de columna de como mucho uno —un peón promociona avanzando recto o capturando en
+diagonal— por las cuatro piezas. El orden de las piezas (`"qrbn"`) es otra convención que hay que
+copiar en el otro lado tal cual.
+
+Fíjate en que **las promociones van al final**, después de las jugadas normales. Eso significa que
+todas las jugadas de cuatro caracteres tienen ids consecutivos, y no es casualidad: mantiene los ids
+de las jugadas comunes en un bloque contiguo y deja las 176 raras aparte.
+
+```python title="src/rukh/tokenize/uci_vocab.py"
+def elo_tokens(side: str) -> list[str]:
+    """``<w0600>`` ... ``<w3200>`` (or ``b``): 27 bins of 100 Elo."""
+    return [f"<{side}{elo:04d}>" for elo in range(ELO_MIN, ELO_MAX + 1, ELO_STEP)]
+
+
+def build_vocab() -> list[str]:
+    """The full token list in id order: specials, Elo bins, moves, promotions (2 030 tokens)."""
+    return SPECIALS + elo_tokens("w") + elo_tokens("b") + build_moves() + build_promotions()
+
+
+def elo_bin(elo: int) -> int:
+    """Lower edge of the 100-Elo bin, clamped to ``[600, 3200]``."""
+    return min(max(int(elo), ELO_MIN), ELO_MAX + ELO_STEP - 1) // ELO_STEP * ELO_STEP
+
+
+def elo_token(elo: int, side: str) -> str:
+    """``<w1800>``-style token for ``elo`` and side ``w`` or ``b``."""
+    if side not in ("w", "b"):
+        raise ValueError(f"side must be 'w' or 'b', got {side!r}")
+    return f"<{side}{elo_bin(elo):04d}>"
+```
+
+<Src file="src/rukh/tokenize/uci_vocab.py" tag="p1" lines="68-87" />
+
+Veintisiete tramos por bando, de 600 a 3200 de cien en cien. `elo_bin` **recorta** antes de truncar,
+y el límite superior es `ELO_MAX + ELO_STEP - 1` = 3299: un jugador de 3250 cae en `<w3200>`, y uno
+de 9999 también. Sin ese recorte, un Elo por encima del rango produciría un token que no existe y un
+`KeyError` en medio del empaquetado de seis millones de partidas.
+
+`elo_token` valida el bando y lanza si no es `w` ni `b`. Es una función que solo llama código del
+propio repositorio, así que validar puede parecer excesivo; lo que evita es que un error de
+tipografía produzca un token `<x1800>` que no está en la tabla y falle tres llamadas más allá con un
+mensaje sobre un diccionario.
+
+El orden del vocabulario completo —especiales, Elo de blancas, Elo de negras, jugadas, promociones—
+tiene una consecuencia que no se ve hasta M3: **los tokens que no son jugadas forman un prefijo**. Los
+62 primeros ids son control, y del 62 en adelante todo son jugadas. Por eso el enmascarado del
+encoder puede sortear una jugada aleatoria con un `randint(62, vocab_size)` en vez de sortear y
+rechazar hasta acertar.
+
+```python title="src/rukh/tokenize/uci_vocab.py"
+class UciTokenizer:
+    """Encode/decode games as ``[<bos>, <wXXXX>, <bXXXX>, moves..., <result>, <eos>]``."""
+
+    specials: list[str] = SPECIALS
+    pad_id = PAD_ID
+    bos_id = BOS_ID
+    eos_id = EOS_ID
+    mask_id = MASK_ID
+    unk_id = UNK_ID
+
+    def __init__(self) -> None:
+        self.ids: list[str] = build_vocab()
+        self.vocab: dict[str, int] = {token: i for i, token in enumerate(self.ids)}
+        if len(self.vocab) != len(self.ids):
+            raise RuntimeError("duplicate tokens in the UCI vocabulary")
+
+    def __len__(self) -> int:
+        return len(self.ids)
+```
+
+<Src file="src/rukh/tokenize/uci_vocab.py" tag="p1" lines="90-107" />
+
+La comprobación de duplicados del `__init__` es barata y paranoica, y vale la pena: la enumeración
+podría, tras una edición descuidada, generar el mismo token dos veces (por ejemplo si
+`build_promotions` dejara de exigir `abs(tf - ff) <= 1`), y el diccionario se quedaría con el último.
+El resultado sería un vocabulario de 2 030 entradas nominales y menos ids reales, con un
+desplazamiento silencioso de todo lo que viene detrás.
+
+```python title="src/rukh/tokenize/uci_vocab.py"
+    def encode_game(
+        self,
+        uci: str,
+        white_elo: int,
+        black_elo: int,
+        result: str,
+        max_len: int = 200,
+    ) -> list[int]:
+        """Encode one game; unknown moves map to ``<unk>``; the sequence is cut at ``max_len``.
+
+        When the whole game fits in ``max_len`` the sequence ends with ``<eos>``; otherwise it
+        is truncated to the first ``max_len`` ids (no result, no ``<eos>``).
+        """
+        if result not in RESULT_TOKENS:
+            raise ValueError(f"unknown result {result!r}; expected one of {list(RESULT_TOKENS)}")
+        ids = [
+            self.bos_id,
+            self.vocab[elo_token(white_elo, "w")],
+            self.vocab[elo_token(black_elo, "b")],
+        ]
+        ids.extend(self.vocab.get(move, self.unk_id) for move in uci.split())
+        ids.append(self.vocab[RESULT_TOKENS[result]])
+        ids.append(self.eos_id)
+        return ids[:max_len]
+```
+
+<Src file="src/rukh/tokenize/uci_vocab.py" tag="p1" lines="109-132" />
+
+La forma de la secuencia es la decisión de la primera lección, aquí escrita:
+`<bos>`, Elo de blancas, Elo de negras, las jugadas, el resultado, `<eos>`.
+
+`self.vocab.get(move, self.unk_id)` es la red de seguridad. Todas las jugadas legales del ajedrez
+están en la tabla, así que un `<unk>` solo puede venir de texto corrupto; el `get` con valor por
+defecto evita que una fila mala tumbe el empaquetado de un mes entero.
+
+Y el corte es un `ids[:max_len]` a secas, que es la decisión que más discusión genera y la que el
+docstring deja escrita: cuando la partida no cabe, **la secuencia se queda sin resultado y sin
+`<eos>`**.
+
+<Callout kind="roto" title="Añadir `<eos>` después del corte sería peor">
+  El impulso natural es rematar la secuencia truncada con un `<eos>` para que "esté bien formada". Es
+  justo lo que no hay que hacer. El modelo aprendería un final **falso**: una partida que termina en
+  una posición de medio juego que se seguía jugando, y encima sin token de resultado, así que
+  aprendería que a veces `<eos>` viene sin `<1-0>` delante.
+
+Una secuencia que no acaba no enseña nada sobre cómo se acaban las partidas. Una que acaba mal
+enseña algo equivocado. El precio de la opción elegida es que cada partida truncada gasta 200
+posiciones de contexto sin aportar un final, y por eso la cifra que decide `max_len` es el porcentaje
+de partidas que caben: con 200 tokens, el 99,8 %.
+
+</Callout>
+
+```python title="src/rukh/tokenize/uci_vocab.py"
+    def decode(self, ids: list[int]) -> list[str]:
+        """Map ids back to their token strings (raises ``IndexError`` on unknown ids)."""
+        return [self.ids[i] for i in ids]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "version": 1,
+            "size": len(self.ids),
+            "specials": list(self.specials),
+            "elo_bins": {"min": ELO_MIN, "max": ELO_MAX, "step": ELO_STEP},
+            "tokens": list(self.ids),
+        }
+
+    def export(self, path: Path) -> None:
+        """Write ``vocab.json`` deterministically (``indent=0``, ASCII, trailing newline)."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(self.to_dict(), indent=0, ensure_ascii=True) + "\n"
+        path.write_text(text, encoding="utf-8", newline="\n")
+
+    @classmethod
+    def from_file(cls, path: Path) -> UciTokenizer:
+        """Load a ``vocab.json`` and check it matches the built-in enumeration."""
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        tokenizer = cls()
+        if data.get("tokens") != tokenizer.ids:
+            raise ValueError(f"{path} does not match the built-in UCI vocabulary")
+        return tokenizer
+```
+
+<Src file="src/rukh/tokenize/uci_vocab.py" tag="p1" lines="134-161" />
+
+`export` escribe el JSON con `indent=0`, `ensure_ascii=True` y `newline="\n"`, y las tres cosas son
+por el mismo motivo: **el fichero tiene que salir byte a byte igual en cualquier máquina**. Sin el
+`newline` explícito, Python en Windows escribiría `\r\n` y el sha256 del fichero cambiaría entre
+sistemas; sin `ensure_ascii`, un carácter no ASCII (no los hay, pero) se escribiría distinto. Hay un
+test que comprueba ese hash exacto, y solo tiene sentido si la escritura es determinista.
+
+`from_file` no confía en el fichero: lo carga y **comprueba que coincide con la enumeración
+compilada**. Es decir, el `vocab.json` no es la fuente de la verdad, es una copia exportada para que
+otros la lean. Si alguien edita el JSON a mano, cargarlo falla.
+
+<Transfer concept="Artefacto derivado, no fuente de verdad" where="Cualquier fichero generado que otros sistemas consumen: un esquema OpenAPI, un `.d.ts`, una tabla de features, un índice de embeddings.">
+  La regla que aplica este fichero es que **el artefacto se regenera y se compara, nunca se edita**.
+  El código que lo produce es la fuente; el fichero es una foto. Y la comprobación va en el cargador,
+  no en un script aparte que alguien tiene que acordarse de ejecutar.
+
+El modo de fallo que evita es aburrido y universal: alguien arregla algo editando el fichero
+generado, funciona, y la siguiente regeneración lo deshace sin que nadie relacione las dos cosas.
+
+</Transfer>
+
+## `san_chars.py`: el que menos sabe
+
+```python title="src/rukh/tokenize/san_chars.py"
+"""Char-level SAN tokenizer: a fixed 32-symbol alphabet plus ``<pad>``, ``<bos>``, ``<eos>``.
+
+The text is the numbered SAN movetext without comments followed by the result:
+``1.e4 e5 2.Nf3 Nc6 ... 1-0``. Every character must belong to the alphabet.
+"""
+
+from __future__ import annotations
+
+ALPHABET = " #+-.0123456789=BKNOQRabcdefghx/"
+SPECIALS: list[str] = ["<pad>", "<bos>", "<eos>"]
+PAD_ID = 0
+BOS_ID = 1
+EOS_ID = 2
+```
+
+<Src file="src/rukh/tokenize/san_chars.py" tag="p1" lines="1-13" />
+
+Treinta y dos símbolos: espacio, `#`, `+`, `-`, `.`, los dígitos, las letras de las piezas
+(`B K N O Q R`), las columnas (`a`-`h`), `x`, `=` y `/`. Con los tres especiales, **35 tokens**. Es
+el vocabulario más pequeño posible y el que menos hipótesis hace sobre los datos.
+
+Fíjate en lo que **no** está: no hay tokens de Elo. No caben en un alfabeto de caracteres, y eso es
+una consecuencia de la elección de tokenizador que no se ve hasta tres módulos después: este esquema
+**no se puede condicionar** como M4 condiciona el UCI. No es un olvido, es parte de lo que se está
+comparando.
+
+Y sí está el `/`, que solo aparece en el resultado `1/2-1/2`. El texto que codifica este esquema son
+las jugadas **más el resultado**, así que el alfabeto tiene que cubrirlo.
+
+```python title="src/rukh/tokenize/san_chars.py"
+class SanCharTokenizer:
+    """Encode text as ``[<bos>, char..., <eos>]`` and decode ids back to text."""
+
+    specials: list[str] = SPECIALS
+    pad_id = PAD_ID
+    bos_id = BOS_ID
+    eos_id = EOS_ID
+
+    def __init__(self) -> None:
+        self.ids: list[str] = SPECIALS + list(ALPHABET)
+        self.vocab: dict[str, int] = {token: i for i, token in enumerate(self.ids)}
+        if len(self.vocab) != len(self.ids):
+            raise RuntimeError("duplicate symbols in the SAN alphabet")
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def encode(self, text: str) -> list[int]:
+        """Encode ``text``; raises ``ValueError`` on a character outside the alphabet."""
+        ids = [self.bos_id]
+        for ch in text:
+            try:
+                ids.append(self.vocab[ch])
+            except KeyError:
+                raise ValueError(f"character {ch!r} is not in the SAN alphabet") from None
+        ids.append(self.eos_id)
+        return ids
+
+    def decode(self, ids: list[int]) -> str:
+        """Join the characters of ``ids``, skipping special tokens."""
+        return "".join(self.ids[i] for i in ids if i >= len(SPECIALS))
+```
+
+<Src file="src/rukh/tokenize/san_chars.py" tag="p1" lines="16-46" />
+
+`encode` **lanza** ante un carácter desconocido en vez de convertirlo en `<unk>`, y aquí no hay
+ningún `<unk>` en el vocabulario. Es lo contrario de lo que hace el tokenizador UCI, y la asimetría
+tiene su razón: el alfabeto SAN es cerrado por construcción, así que un carácter fuera de él no
+significa "dato raro", significa **"la reconstrucción del SAN está rota"**. Un `<unk>` silencioso
+escondería eso detrás de una pérdida un poco peor y nadie lo encontraría.
+
+El `raise … from None` corta la cadena de excepciones: el `KeyError` interno no aporta nada sobre el
+`ValueError` con el carácter dentro, y arrastrarlo llenaría la traza de ruido.
+
+`decode` salta los especiales con `if i >= len(SPECIALS)`, que funciona porque los tres especiales son
+los tres primeros ids. Es el mismo truco del prefijo de control del vocabulario UCI, a escala
+pequeña.
+
+```python title="src/rukh/tokenize/san_chars.py"
+def san_text(san_movetext: str, result: str) -> str:
+    """The exact text this scheme encodes: numbered SAN plus a space and the result."""
+    return f"{san_movetext} {result}"
+
+
+def uci_to_san(uci: str) -> str:
+    """Numbered SAN movetext (``1.e4 e5 2.Nf3 ...``) for a space-separated UCI game.
+
+    Raises ``ValueError`` on an illegal move, like the rest of the pipeline.
+    """
+    import chess
+
+    board = chess.Board()
+    out: list[str] = []
+    for token in uci.split():
+        move = chess.Move.from_uci(token)
+        if move not in board.legal_moves:
+            raise ValueError(f"illegal move {token} in {board.fen()}")
+        san = board.san(move)
+        out.append(f"{board.fullmove_number}.{san}" if board.turn == chess.WHITE else san)
+        board.push(move)
+    return " ".join(out)
+```
+
+<Src file="src/rukh/tokenize/san_chars.py" tag="p1" lines="49-70" />
+
+`uci_to_san` es el camino de vuelta del primer paso del pipeline, y hace falta porque este esquema
+codifica SAN mientras el corpus está guardado en UCI. Reproduce la partida **sobre un tablero real**,
+exactamente por el mismo motivo que `san_to_uci` lo hacía en el otro sentido: la misma jugada es
+`Nf3` o `Ngf3` según dónde esté el otro caballo, y eso solo lo sabe la posición de ese instante.
+
+El número de jugada se escribe solo delante de la jugada de las blancas
+(`if board.turn == chess.WHITE`), y **pegado**, sin espacio: `1.e4 e5 2.Nf3`. Es un formato, y como
+todo formato hay que copiarlo exacto en el gemelo de TypeScript, porque un espacio de más son partidas
+un 8 % más largas y una tabla de estadísticas que no cuadra.
+
+## `bpe.py`: dejar que los datos decidan
+
+El <Term id="bpe">BPE</Term> es un taquígrafo que inventa abreviaturas: lo que más veces tiene que
+escribir se gana un signo propio, y lo raro lo sigue escribiendo letra a letra. Se parte de los
+caracteres como tokens iniciales, se cuenta qué par de tokens adyacentes aparece más veces en el
+corpus, ese par se fusiona en un token nuevo, y se repite hasta llegar al tamaño de vocabulario
+pedido. La lista de fusiones, **en orden**, es el modelo.
+
+El algoritmo no está escrito en `rukh`: lo pone la librería `tokenizers` de Hugging Face, que es la
+misma que usan los LLM de texto. Lo que sí es nuestro, y es lo que hay que entender, son las cinco
+decisiones de cómo se le da de comer.
+
+```python title="src/rukh/tokenize/bpe.py"
+"""BPE over UCI text with Hugging Face ``tokenizers``.
+
+The text of one game is its UCI moves concatenated without spaces (``e2e4e7e5g1f3...``), so
+that BPE can merge whole openings into one token. ``WhitespaceSplit`` keeps games apart when
+several are fed as one text. The model has no normalizer, no continuing-subword prefix and no
+end-of-word suffix: the TypeScript twin re-applies ``model.merges`` by rank over each
+whitespace-split word and must reproduce ``Tokenizer.encode(text).ids`` exactly.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+if TYPE_CHECKING:
+    import chess
+
+PROMOTION_LETTERS = frozenset("qrbn")
+
+
+def bpe_text(uci: str) -> str:
+    """The text BPE sees for one game: moves joined without spaces."""
+    return uci.replace(" ", "")
+```
+
+<Src file="src/rukh/tokenize/bpe.py" tag="p1" lines="1-28" />
+
+Ahí están todas, en el docstring y en dos líneas de código.
+
+**El texto de una partida son sus jugadas pegadas, sin espacios.** `bpe_text` es un `replace(" ",
+"")` y es la decisión que hace interesante todo el esquema: con espacios, el pre-tokenizador cortaría
+por jugada y BPE nunca podría fusionar a través de las fronteras. Sin ellos, puede aprender que
+`e2e4c7c5g1f3` van juntos, y de ahí salen los tokens de apertura entera.
+
+**`WhitespaceSplit` como pre-tokenizador y nada más.** Sin normalizador, sin prefijo de subpalabra
+continuada, sin sufijo de fin de palabra. Cada una de esas opciones sería algo que el gemelo del
+navegador tendría que reproducir exactamente, así que la decisión es no tener ninguna. El
+`WhitespaceSplit` sigue haciendo falta para que, cuando se le pasen varias partidas en un texto, no
+se fusionen entre sí.
+
+```python title="src/rukh/tokenize/bpe.py"
+def split_moves(text: str) -> list[str]:
+    """Split a spaceless UCI string back into moves.
+
+    A move is four characters plus a promotion letter, and ``b`` is both a file and a
+    promotion piece, so the split replays the game: the letter belongs to the move only when
+    the piece that moves is a pawn reaching the last rank (or, when the position is corrupt
+    and no piece sits on the origin square, when the ranks are 7 to 8 or 2 to 1).
+    """
+    import chess
+
+    board = chess.Board()
+    moves: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        move = text[i : i + 4]
+        i += 4
+        if i < n and text[i] in PROMOTION_LETTERS and _is_promotion(board, move):
+            move += text[i]
+            i += 1
+        moves.append(move)
+        try:
+            parsed = chess.Move.from_uci(move)
+        except ValueError:
+            break
+        if parsed in board.legal_moves:
+            board.push(parsed)
+        else:
+            break
+    if i < n:
+        moves.extend(_split_blind(text[i:]))
+    return moves
+```
+
+<Src file="src/rukh/tokenize/bpe.py" tag="p1" lines="31-62" />
+
+`split_moves` es el camino de vuelta, y es sorprendentemente delicado. El texto que sale del BPE son
+jugadas pegadas y hay que volver a partirlas. Una jugada son cuatro caracteres… **salvo las
+promociones, que son cinco**, y ahí está el problema: la letra de promoción puede ser `q`, `r`, `b` o
+`n`, y **`b` también es una columna**.
+
+Dada la cadena `a7a8b1c3`, ¿es `a7a8b` (promoción a alfil) seguido de `1c3…`, o es `a7a8` seguido de
+`b1c3` (caballo a c3)? Las dos lecturas son sintácticamente válidas y solo una es la partida.
+
+La solución es reproducir la partida: se lleva un tablero, y la letra pertenece a la jugada **solo si
+la pieza que se mueve es un peón que llega a la última fila**. Con el tablero delante no hay
+ambigüedad.
+
+<Callout kind="roto" title="La ambigüedad de un carácter que se cuela tres módulos después">
+  Un partidor de cuatro en cuatro que se trague la letra siempre que la vea produce partidas
+  perfectamente legales la mayor parte del tiempo y se descarrila justo después de una jugada de
+  alfil que empieza en la columna b. El síntoma no aparece en el tokenizador: aparece en la demo, al
+  decodificar lo que el modelo generó, en forma de jugada ilegal esporádica que no se reproduce.
+
+Los tres `break` del bucle son la otra mitad de la defensa. Si una jugada no se puede parsear o no es
+legal, el tablero deja de ser fiable, se sale del bucle y el resto se parte con `_split_blind`, que
+usa la regla de las filas (`78` o `21`, desplazamiento de columna ≤ 1) sin consultar nada. Es peor y
+es lo único que se puede hacer sin tablero; lo importante es que el código **sabe** que a partir de
+ahí está adivinando.
+
+</Callout>
+
+```python title="src/rukh/tokenize/bpe.py"
+def _is_promotion(board: chess.Board, move: str) -> bool:
+    import chess
+
+    if len(move) != 4:
+        return False
+    try:
+        from_sq = chess.parse_square(move[:2])
+        to_sq = chess.parse_square(move[2:])
+    except ValueError:
+        return False
+    piece = board.piece_at(from_sq)
+    if piece is None:
+        return move[1] + move[3] in ("78", "21") and abs(ord(move[0]) - ord(move[2])) <= 1
+    return piece.piece_type == chess.PAWN and chess.square_rank(to_sq) in (0, 7)
+
+
+def _split_blind(text: str) -> list[str]:
+    """Rank-based split for text after an illegal move (no board to consult)."""
+    moves: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        move = text[i : i + 4]
+        i += 4
+        if (
+            i < n
+            and text[i] in PROMOTION_LETTERS
+            and len(move) == 4
+            and move[1] + move[3] in ("78", "21")
+            and abs(ord(move[0]) - ord(move[2])) <= 1
+        ):
+            move += text[i]
+            i += 1
+        moves.append(move)
+    return moves
+```
+
+<Src file="src/rukh/tokenize/bpe.py" tag="p1" lines="65-99" />
+
+`_is_promotion` tiene una rama para el caso en que no hay pieza en la casilla de origen —el tablero
+ya no cuadra con el texto— y cae en la misma regla de filas que `_split_blind`. Las dos funciones
+comparten criterio a propósito: es la degradación ordenada del mismo juicio.
+
+```python title="src/rukh/tokenize/bpe.py"
+def train_bpe(
+    texts: Iterable[str],
+    vocab_size: int = 4096,
+    specials: list[str] | None = None,
+) -> Tokenizer:
+    """Train a BPE model on ``texts`` (one game per text, already spaceless)."""
+    tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
+    tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    trainer = trainers.BpeTrainer(
+        vocab_size=vocab_size,
+        special_tokens=list(UciTokenizer.specials if specials is None else specials),
+        show_progress=False,
+    )
+    tokenizer.train_from_iterator(texts, trainer)
+    return tokenizer
+
+
+def save(tokenizer: Tokenizer, path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tokenizer.save(str(path), pretty=True)
+
+
+def load_bpe(path: Path) -> Tokenizer:
+    return Tokenizer.from_file(str(path))
+```
+
+<Src file="src/rukh/tokenize/bpe.py" tag="p1" lines="102-126" />
+
+**Los tokens especiales son los del UCI, con sus mismos ids.** `special_tokens=list(UciTokenizer.
+specials)` los mete en el entrenador primero, así que en el vocabulario BPE `<pad>` vuelve a ser 0,
+`<bos>` 1 y `<eos>` 2. Eso es lo que permite que un pack de BPE use el mismo `ignore_index=0` y el
+mismo empaquetador que uno de UCI, sin una rama por esquema.
+
+`save(..., pretty=True)` escribe el JSON indentado. Pesa más y se puede leer en un editor, que es
+exactamente lo que hace el lab de las fusiones.
+
+```python title="src/rukh/tokenize/bpe.py"
+def encode(tokenizer: Tokenizer, text: str) -> list[int]:
+    return tokenizer.encode(text).ids
+
+
+def decode(tokenizer: Tokenizer, ids: list[int]) -> str:
+    """Concatenate the tokens (skipping specials) and re-split into space-separated moves."""
+    specials = set(UciTokenizer.specials)
+    tokens = [tokenizer.id_to_token(i) for i in ids]
+    text = "".join(t for t in tokens if t is not None and t not in specials)
+    return " ".join(split_moves(text))
+
+
+def iter_parquet_texts(games: Path, n_games: int) -> Iterator[str]:
+    """Yield ``bpe_text`` for the first ``n_games`` rows of a UCI games parquet."""
+    import polars as pl
+
+    frame = pl.scan_parquet(Path(games).as_posix()).select("uci").head(n_games).collect()
+    for uci in frame["uci"]:
+        yield bpe_text(uci)
+
+
+def train_bpe_from_parquet(games: Path, out: Path, vocab_size: int, n_games: int) -> Tokenizer:
+    tokenizer = train_bpe(iter_parquet_texts(games, n_games), vocab_size=vocab_size)
+    save(tokenizer, out)
+    return tokenizer
+
+
+def longest_tokens(tokenizer: Tokenizer, n: int = 10) -> list[dict[str, object]]:
+    """The ``n`` longest learned tokens, with how many whole moves each spans."""
+    specials = set(UciTokenizer.specials)
+    vocab = tokenizer.get_vocab()
+    tokens = sorted((t for t in vocab if t not in specials), key=lambda t: (-len(t), vocab[t]))[:n]
+    return [{"token": t, "id": vocab[t], "length": len(t), "moves": len(t) // 4} for t in tokens]
+```
+
+<Src file="src/rukh/tokenize/bpe.py" tag="p1" lines="129-161" />
+
+`decode` concatena los tokens, quita los especiales y vuelve a partir en jugadas con `split_moves`.
+Es la demostración de que esas 30 líneas de la función de partir no son un adorno: sin ellas, el BPE
+puede codificar pero no se puede leer lo que produce.
+
+`iter_parquet_texts` usa `pl.scan_parquet(...).select("uci").head(n).collect()`: el `scan` es
+perezoso, así que el `select` y el `head` se empujan al lector y solo se materializan las 200 000
+filas de una columna. Y devuelve un generador, que es lo que `train_from_iterator` espera.
+
+`longest_tokens` ordena por `(-len(t), vocab[t])`, con el id como desempate: dos tokens de la misma
+longitud salen siempre en el mismo orden. Es el mismo principio que el cuarto término de la clave de
+`scoring.py`, y sirve para lo mismo: que el artefacto de estadísticas sea reproducible. El campo
+`moves` es `len(t) // 4`, una aproximación que subestima cuando hay promociones y que es
+suficiente para lo que se usa: decir "esta ficha se traga diez medias jugadas".
+
+## El fichero de tests que fija la enumeración
+
+`tests/unit/test_uci_vocab.py` es el test más importante de M1, porque lo que vigila es un contrato
+entre tres implementaciones y dos repositorios.
+
+```python title="tests/unit/test_uci_vocab.py"
+"""Tests for rukh.tokenize.uci_vocab: enumeration, encode/decode, export and the fixture."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from rukh.cli import app
+from rukh.tokenize.fixture import build_fixture, read_pgn_games
+from rukh.tokenize.uci_vocab import (
+    SPECIALS,
+    UciTokenizer,
+    build_moves,
+    build_promotions,
+    build_vocab,
+    elo_bin,
+    elo_token,
+    squares,
+)
+
+pytestmark = pytest.mark.unit
+
+VOCAB_SHA256 = "f6aa692bbd581c124dda4db0a088111580df4d311974bb5d4ec29b4d761142f1"
+
+
+@pytest.fixture(scope="module")
+def tok() -> UciTokenizer:
+    return UciTokenizer()
+```
+
+<Src file="tests/unit/test_uci_vocab.py" tag="p1" lines="1-32" />
+
+`VOCAB_SHA256` es el hash del `vocab.json` exportado. Un valor literal en un test suele ser mala
+señal; aquí es exactamente lo correcto, porque lo que se está afirmando es "la tabla es **esta**", y
+no hay forma más compacta de decirlo. Cualquier cambio en la enumeración lo mueve.
+
+La fixture es de ámbito `module`: construir el tokenizador enumera 2 030 tokens, y hacerlo una vez
+por test en un fichero de quince es tiempo tirado.
+
+```python title="tests/unit/test_uci_vocab.py"
+def test_squares_are_file_major() -> None:
+    sq = squares()
+    assert sq[:9] == ["a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "b1"]
+    assert sq[-1] == "h8"
+    assert sq.index("c5") == 2 * 8 + 4
+
+
+def test_enumeration_sizes(tok: UciTokenizer) -> None:
+    assert len(build_moves()) == 1792
+    assert len(build_promotions()) == 176
+    assert len(build_vocab()) == 2030
+    assert len(tok) == 2030
+    assert len(tok.vocab) == 2030
+
+
+def test_special_and_elo_ids(tok: UciTokenizer) -> None:
+    assert tok.ids[:8] == SPECIALS
+    assert tok.vocab["<pad>"] == 0 and tok.vocab["<bos>"] == 1 and tok.vocab["<eos>"] == 2
+    assert tok.vocab["<mask>"] == 3 and tok.vocab["<unk>"] == 4
+    assert tok.vocab["<1-0>"] == 5 and tok.vocab["<0-1>"] == 6 and tok.vocab["<1/2>"] == 7
+    assert tok.vocab["<w0600>"] == 8 and tok.vocab["<w3200>"] == 34
+    assert tok.vocab["<b0600>"] == 35 and tok.vocab["<b3200>"] == 61
+    assert tok.ids[62] == "a1a2"
+    assert tok.ids[-1] == "h2h1n"
+
+
+def test_moves_and_promotions_present(tok: UciTokenizer) -> None:
+    for move in ("e2e4", "e7e8q", "g1f3", "a1a8", "a1h8", "e1g1", "e1c1", "a1b3"):
+        assert move in tok.vocab, move
+    # Neither a queen nor a knight reaches these.
+    for move in ("a1b4", "a1c4", "e2e2", "e7e8k", "e6e7q", "a7c8q"):
+        assert move not in tok.vocab, move
+
+
+def test_promotion_order(tok: UciTokenizer) -> None:
+    promos = build_promotions()
+    assert promos[:8] == ["a7a8q", "a7a8r", "a7a8b", "a7a8n", "a7b8q", "a7b8r", "a7b8b", "a7b8n"]
+    assert promos[88] == "a2a1q"
+    assert tok.vocab["a7a8q"] == 62 + 1792
+```
+
+<Src file="tests/unit/test_uci_vocab.py" tag="p1" lines="35-73" />
+
+Estos cinco tests son la enumeración entera, escrita en aserciones.
+
+`test_squares_are_file_major` fija el orden con tres comprobaciones: los nueve primeros, el último y
+el índice de una casilla del medio calculado con la fórmula (`sq.index("c5") == 2 * 8 + 4`). Escribir
+la fórmula en vez del número 20 es lo que hace que el test documente la convención.
+
+`test_enumeration_sizes` es donde viven los tres números del módulo: 1 792, 176 y 2 030. Y comprueba
+`len(tok.vocab) == 2030` además de `len(tok) == 2030`, que no es redundante: son la lista y el
+diccionario, y si hubiera un duplicado el segundo sería menor.
+
+`test_special_and_elo_ids` fija **los ids concretos**: `<w0600>` es el 8, `<w3200>` el 34, `<b0600>`
+el 35, el 62 es `a1a2` y el último es `h2h1n`. Esos números son los que la implementación de
+TypeScript tiene que reproducir, y tenerlos escritos aquí es lo que convierte una divergencia en un
+fallo con nombre.
+
+`test_moves_and_promotions_present` es la prueba de `_reachable`, y la mitad interesante es la
+segunda lista: `a1b4` y `a1c4` no están porque ninguna pieza los hace; `e2e2` no está porque el
+desplazamiento nulo se excluye; `e7e8k` no está porque no se promociona a rey; `e6e7q` no está porque
+la promoción es de la 7 a la 8; y `a7c8q` no está porque el desplazamiento de columna es de dos.
+
+`test_promotion_order` fija el orden de las cuatro piezas y comprueba la aritmética del bloque:
+`a7a8q` es el id `62 + 1792`, es decir, justo después de las 1 792 jugadas.
+
+```python title="tests/unit/test_uci_vocab.py"
+@pytest.mark.parametrize(
+    ("elo", "expected"),
+    [
+        (0, 600),
+        (599, 600),
+        (600, 600),
+        (1850, 1800),
+        (1899, 1800),
+        (3199, 3100),
+        (3200, 3200),
+        (3299, 3200),
+        (3300, 3200),
+        (9999, 3200),
+    ],
+)
+def test_elo_bin_clamps(elo: int, expected: int) -> None:
+    assert elo_bin(elo) == expected
+
+
+def test_elo_token_format() -> None:
+    assert elo_token(650, "w") == "<w0600>"
+    assert elo_token(2412, "b") == "<b2400>"
+    with pytest.raises(ValueError):
+        elo_token(1800, "x")
+```
+
+<Src file="tests/unit/test_uci_vocab.py" tag="p1" lines="76-99" />
+
+Diez casos parametrizados para `elo_bin`, y están los que importan: por debajo del mínimo (0, 599),
+el borde inferior, el caso normal (1850, 1899 → 1800), y los cuatro de arriba, donde 3199 baja a 3100
+y 3200, 3299 y 9999 se quedan en 3200. Ese grupo es el que prueba el `ELO_MAX + ELO_STEP - 1` del
+recorte.
+
+```python title="tests/unit/test_uci_vocab.py"
+def test_encode_game_layout(tok: UciTokenizer) -> None:
+    ids = tok.encode_game("e2e4 e7e5", 1850, 1920, "1-0")
+    assert ids == [
+        1,
+        tok.vocab["<w1800>"],
+        tok.vocab["<b1900>"],
+        tok.vocab["e2e4"],
+        tok.vocab["e7e5"],
+        5,
+        2,
+    ]
+    assert tok.encode_game("", 1000, 1000, "1/2-1/2")[-2:] == [7, 2]
+    assert tok.encode_game("", 1000, 1000, "0-1")[-2:] == [6, 2]
+
+
+def test_encode_game_truncates(tok: UciTokenizer) -> None:
+    moves = " ".join(["g1f3", "g8f6", "f3g1", "f6g8"] * 60)
+    ids = tok.encode_game(moves, 1800, 1800, "1/2-1/2", max_len=200)
+    assert len(ids) == 200
+    assert ids[-1] != tok.eos_id
+    full = tok.encode_game(moves, 1800, 1800, "1/2-1/2", max_len=10_000)
+    assert len(full) == 3 + 240 + 2 and full[-1] == tok.eos_id
+
+
+def test_encode_game_unknown_move_and_result(tok: UciTokenizer) -> None:
+    assert tok.encode_game("zz99", 1800, 1800, "1-0")[3] == tok.unk_id
+    with pytest.raises(ValueError):
+        tok.encode_game("e2e4", 1800, 1800, "*")
+```
+
+<Src file="tests/unit/test_uci_vocab.py" tag="p1" lines="102-129" />
+
+`test_encode_game_layout` escribe la forma de la secuencia como una lista literal, con los ids de
+control a la vista (`1` al principio, `5` y `2` al final) y los de las jugadas por nombre. Que el
+`<bos>` sea 1 y el `<eos>` 2 se escribe como número porque son constantes del formato; que `e2e4` sea
+el id 997 no se escribe, porque es una consecuencia de la enumeración y escribirlo obligaría a tocar
+el test cada vez que se mirase.
+
+`test_encode_game_truncates` prueba las dos ramas del corte con la misma partida: 240 plies de
+caballos yendo y viniendo. Con `max_len=200` salen 200 ids y **el último no es `<eos>`**; con
+`max_len=10000` salen `3 + 240 + 2` y el último sí lo es. La suma escrita a mano dice de dónde sale
+cada término.
+
+```python title="tests/unit/test_uci_vocab.py"
+def test_decode_roundtrip(tok: UciTokenizer) -> None:
+    ids = tok.encode_game("e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5c6 d7c6", 2100, 2050, "0-1")
+    tokens = tok.decode(ids)
+    assert tokens == [
+        "<bos>",
+        "<w2100>",
+        "<b2000>",
+        "e2e4",
+        "e7e5",
+        "g1f3",
+        "b8c6",
+        "f1b5",
+        "a7a6",
+        "b5c6",
+        "d7c6",
+        "<0-1>",
+        "<eos>",
+    ]
+    assert [tok.vocab[t] for t in tokens] == ids
+
+
+def test_export_is_stable(tmp_path: Path, tok: UciTokenizer) -> None:
+    path = tmp_path / "vocab.json"
+    tok.export(path)
+    data = path.read_bytes()
+    assert hashlib.sha256(data).hexdigest() == VOCAB_SHA256
+    payload = json.loads(data)
+    assert payload["version"] == 1
+    assert payload["size"] == 2030
+    assert payload["specials"] == SPECIALS
+    assert payload["elo_bins"] == {"min": 600, "max": 3200, "step": 100}
+    assert payload["tokens"] == tok.ids
+    assert UciTokenizer.from_file(path).ids == tok.ids
+
+
+def test_committed_vocab_matches(repo_root: Path) -> None:
+    path = repo_root / "artifacts" / "tokenizer" / "vocab.json"
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == VOCAB_SHA256
+```
+
+<Src file="tests/unit/test_uci_vocab.py" tag="p1" lines="132-169" />
+
+`test_decode_roundtrip` escribe la partida decodificada entera, token a token, y después comprueba
+que volver a codificar los nombres da los mismos ids. Leer ese bloque es la mejor forma de entender
+qué es una secuencia de este modelo.
+
+`test_export_is_stable` comprueba el hash del fichero recién exportado, y `test_committed_vocab_matches`
+comprueba que el `artifacts/tokenizer/vocab.json` **versionado en el repositorio** tiene ese mismo
+hash. Los dos juntos son la garantía de que el fichero que se publica en Hugging Face y el que copian
+las dos webs es el que produce este código, y no una versión de hace tres commits que alguien olvidó
+regenerar.
+
+```python title="tests/unit/test_uci_vocab.py"
+def test_fixture_pgn_has_20_legal_varied_games(repo_root: Path) -> None:
+    games = read_pgn_games(repo_root / "tests" / "fixtures" / "games.pgn")
+    assert len(games) == 20
+    results = {g["result"] for g in games}
+    assert results == {"1-0", "0-1", "1/2-1/2"}
+    plies = [len(str(g["uci"]).split()) for g in games]
+    assert min(plies) < 10 and max(plies) > 200
+    all_uci = " ".join(str(g["uci"]) for g in games).split()
+    assert "e1g1" in all_uci and "e1c1" in all_uci and "e8g8" in all_uci
+    assert any(m.endswith("n") and len(m) == 5 for m in all_uci)
+
+
+def test_committed_fixture_matches_encoder(repo_root: Path, tok: UciTokenizer) -> None:
+    fixture = json.loads(
+        (repo_root / "artifacts" / "tokenizer" / "fixtures" / "games.json").read_text("utf-8")
+    )
+    entries = build_fixture(repo_root / "tests" / "fixtures" / "games.pgn", tok)
+    assert len(fixture) == 20
+    for got, want in zip(fixture, entries, strict=True):
+        for key in ("id", "white_elo", "black_elo", "result", "uci", "san", "uci_ids"):
+            assert got[key] == want[key], (got["id"], key)
+        assert len(got["uci_ids"]) <= 200
+        assert got["uci_ids"][0] == 1
+```
+
+<Src file="tests/unit/test_uci_vocab.py" tag="p1" lines="172-194" />
+
+Los dos tests de la fixture. El primero comprueba que el PGN de veinte partidas **sigue siendo
+variado**: los tres resultados presentes, una partida de menos de 10 plies y otra de más de 200,
+enroques por los dos flancos y de los dos bandos, y al menos una promoción a caballo (`m.endswith("n")
+and len(m) == 5`). Una fixture de paridad que solo tuviera partidas normales no probaría nada de lo
+que se rompe.
+
+Las dos fixturas de datos de este módulo —[`tests/fixtures/games.pgn`](https://github.com/borja-glez/rukh/blob/p1/tests/fixtures/games.pgn),
+351 líneas de PGN, y `tests/fixtures/games.parquet`, un parquet de veinte partidas— **se enlazan y no
+se pegan**: son datos inertes, y lo que hay que saber de ellas es qué garantizan, que es exactamente
+lo que dicen las aserciones de arriba.
+
+El segundo comprueba que el `games.json` versionado coincide, campo a campo, con lo que produce el
+codificador de hoy. Ese fichero es el que las dos webs leen para comprobar su propia paridad, así que
+si se quedara viejo la comparación seguiría pasando contra una referencia equivocada.
+
+```python title="tests/unit/test_uci_vocab.py"
+def test_cli_tokenize_exports_fixture(rukh_home: Path, repo_root: Path) -> None:
+    cfg = rukh_home / "pipeline.yaml"
+    pgn = (repo_root / "tests" / "fixtures" / "games.pgn").as_posix()
+    cfg.write_text(f"tokenize:\n  fixture_pgn: {pgn}\n", encoding="utf-8")
+    result = CliRunner().invoke(
+        app, ["data", "tokenize", "--config", str(cfg), "--scheme", "uci", "--export-fixture"]
+    )
+    assert result.exit_code == 0, result.output
+    assert (rukh_home / "artifacts" / "tokenizer" / "vocab.json").is_file()
+    assert (rukh_home / "artifacts" / "tokenizer" / "fixtures" / "games.json").is_file()
+    assert "vocab_size: 2030" in result.output
+
+
+def test_cli_tokenize_rejects_bad_scheme() -> None:
+    result = CliRunner().invoke(app, ["data", "tokenize", "--scheme", "nope"])
+    assert result.exit_code == 2
+```
+
+<Src file="tests/unit/test_uci_vocab.py" tag="p1" lines="197-212" />
+
+Y los dos de la CLI: que `--export-fixture` escribe los dos ficheros y anuncia `vocab_size: 2030`, y
+que un esquema inexistente sale con código 2 —el código de "mal uso" de typer— en vez de reventar.
+
+<Exercise n="01" title="Cambia el orden de las casillas y cuenta los daños">
+  En una copia del repositorio, cambia `squares()` a orden por filas (`[f"{FILES[f]}{r + 1}" for r in
+  range(8) for f in range(8)]`) y ejecuta `uv run pytest -m unit -q tests/unit/test_uci_vocab.py`.
+  ¿Cuántos tests fallan? ¿Cuáles **no** fallan, y por qué es eso lo preocupante?
+
+<Solution>
+  Falla `test_squares_are_file_major` y, si además se cambia `build_moves` para usar la nueva
+  función, fallan `test_special_and_elo_ids` (el id 62 ya no es `a1a2`), `test_promotion_order`,
+  `test_export_is_stable`, `test_committed_vocab_matches` y `test_committed_fixture_matches_encoder`.
+
+Lo interesante es lo que **no** falla: `test_enumeration_sizes` sigue en verde —siguen siendo 1 792
+jugadas y 2 030 tokens—, `test_encode_game_layout` sigue en verde porque escribe los ids de las
+jugadas por nombre, y `test_decode_roundtrip` también, porque codifica y decodifica con la misma
+tabla. Es decir: **una enumeración distinta es internamente coherente**. Lo único que detecta el
+cambio es lo que compara contra algo de fuera —el hash del fichero, la fixture— y por eso esos tres
+tests existen. Si solo hubiera tests de coherencia interna, el día que dos implementaciones
+divergieran las dos pasarían sus tests.
+
+</Solution>
+</Exercise>
+
+## Los tests que se quedan en un enlace
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Fichero                                                                                                   | Líneas | Qué garantiza                                                                                                                                                                                         |
+| --------------------------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`tests/unit/test_san_chars.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_san_chars.py) | 56     | Que el alfabeto tiene 35 entradas, que `encode` lanza ante un carácter de fuera, que `decode` salta los especiales y que `uci_to_san` numera solo las jugadas de las blancas y rechaza una ilegal.    |
+| [`tests/unit/test_bpe.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_bpe.py)             | 164    | Que `bpe_text` y `split_moves` son inversos sobre partidas con promociones (incluida la ambigüedad de la `b`), que el entrenamiento respeta los ids especiales y que `decode` reconstruye la partida. |
+
+</div>
+
+`test_san_chars.py` se queda fuera porque repite, en menor escala, la estructura de
+`test_uci_vocab.py`: tamaños, bordes y un viaje de ida y vuelta. `test_bpe.py` se queda fuera por
+tamaño, y merece abrirlo si vas a tocar `split_moves`: la mitad del fichero son partidas con
+promociones a alfil desde la columna b, que es el caso que el callout describe.
+
+## Qué has aprendido
+
+Tres formas de convertir una partida en números, escritas enteras. Una enumeración determinista que
+no mira los datos y que por eso se puede reproducir en otro lenguaje; un alfabeto cerrado que prefiere
+lanzar antes que inventar un `<unk>`; y un BPE cuyas cinco decisiones están todas en cómo se le da de
+comer, no en el algoritmo.
+
+**Cómo se mide**: `uv run pytest -m unit -q tests/unit/test_uci_vocab.py tests/unit/test_san_chars.py
+tests/unit/test_bpe.py` pasa en verde, y el `vocab.json` exportado tiene el sha256 que el test fija.
+Los números del vocabulario son 2 030, 35 y 4 096.
+
+Lo siguiente es convertir eso en tensores: el empaquetador que escribe seis millones de partidas en
+un array de `uint16` sin que nada pase por memoria, y el dataloader que sirve lotes desde él.

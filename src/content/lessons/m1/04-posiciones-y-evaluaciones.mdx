@@ -1,0 +1,1042 @@
+---
+title: 'Posiciones y evaluaciones: el join que no descarga 42 GB'
+description: 'De partidas a posiciones: el FEN de cuatro campos que sirve de clave, las fases, la
+  deduplicación con conteo, y el semi join resumible contra los 395 millones de posiciones
+  evaluadas que Lichess publica. Con el módulo de puntuación que ordena las líneas.'
+module: m1
+order: 4
+duration: 135
+level: medio
+status: vigente
+updated: 2026-09-22
+keywords:
+  - FEN
+  - Stockfish
+  - DuckDB
+  - semi join
+  - multi-PV
+  - centipeones
+artifacts:
+  - kind: dataset
+    label: chorcat/rukh-positions-eval
+    href: https://huggingface.co/datasets/chorcat/rukh-positions-eval
+---
+
+## Qué vas a construir
+
+Hasta aquí el pipeline ha tratado las partidas como cadenas. Este paso las abre: recorre 300 000
+partidas jugada a jugada sobre un tablero, se queda con cada **posición**, las deduplica contando
+cuántas veces se ha visto cada una, y después cruza el resultado con las 395 millones de posiciones
+que Lichess publica ya evaluadas por <Term id="stockfish">Stockfish</Term>.
+
+Ese cruce es contra 42 GB de parquet remoto, y no vamos a descargarlos. La técnica —empujar el
+filtro al origen y traer solo las filas que coinciden— es una de las más rentables que hay, y aquí
+está escrita en veinte líneas de SQL con dos detalles que la hacen resumible entre sesiones.
+
+Lo que sale es el dataset del que salen otras dos cosas del curso: las etiquetas del encoder de M3 y,
+gratis, los pares de preferencia para el DPO de M5. Tres ficheros, 437 líneas.
+
+## `positions.py`: de partidas a posiciones
+
+```python title="src/rukh/data/positions.py"
+"""Positions from the UCI games: normalized 4-field FEN, phase, deduplicated with a count.
+
+``fen4`` is ``pieces turn castling en-passant`` (the key of
+``Lichess/chess-position-evaluations``); move counters are dropped so the same position from
+different games collapses into one row with ``n_seen`` occurrences. The first occurrence wins
+the ``game_id``/``ply``/``last_move``/``result`` columns.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+from pydantic import Field
+
+from rukh.config import BaseConfig
+from rukh.data.db import DuckDbConfig
+from rukh.data.db import connect as db_connect
+from rukh.data.manifest import FileHash, Manifest
+from rukh.data.parallel import run_batches
+from rukh.data.uci import resolve_workers, sha256_file
+from rukh.paths import resolve
+
+OPENING_MAX_PLY = 10
+MIDDLEGAME_MIN_PIECES = 14
+BATCH_GAMES = 5_000
+POSITIONS_FILE = "positions.parquet"
+PARTS_DIR = "parts"
+POSITION_SCHEMA = pa.schema(
+    [
+        ("seq", pa.int64()),
+        ("fen4", pa.string()),
+        ("game_id", pa.int64()),
+        ("ply", pa.int16()),
+        ("last_move", pa.string()),
+        ("result", pa.string()),
+        ("phase", pa.string()),
+    ]
+)
+```
+
+<Src file="src/rukh/data/positions.py" tag="p1" lines="1-41" />
+
+El docstring de arriba define **`fen4`**, que es el concepto de toda la lección. Un <Term id="fen">FEN</Term> completo
+tiene seis campos: las piezas, el turno, los enroques, la casilla
+al paso, el contador de la regla de las cincuenta jugadas y el número de jugada. Los dos últimos son
+**contadores**, no posición: la misma configuración de piezas alcanzada en la jugada 20 de una
+partida y en la 24 de otra tiene el mismo tablero y distinto FEN completo.
+
+Quitarlos hace dos cosas a la vez. La primera es que dos partidas que llegan a la misma posición
+colapsan en una fila, con `n_seen` diciendo cuántas veces se vio: de las ~23 millones de posiciones
+que salen de 300 000 partidas quedan bastantes menos distintas, y el ahorro es todo el coste del
+paso siguiente. La segunda es que `fen4` **es la clave con la que Lichess publica sus evaluaciones**,
+así que sin esta normalización el join del paso siguiente no existiría.
+
+Las dos constantes de fase (`OPENING_MAX_PLY = 10`, `MIDDLEGAME_MIN_PIECES = 14`) son convenciones
+del proyecto, no verdades del ajedrez, y por eso acaban escritas en el manifiesto. Lo único que se
+les pide es que sean las mismas en todo el curso: el equilibrado por fase de los pares de preferencia
+y las tablas por fase de M3 y M5 dependen de que "final" signifique lo mismo en los tres sitios.
+
+```python title="src/rukh/data/positions.py"
+class PositionsConfig(BaseConfig):
+    """Which games to walk and how many distinct positions to keep."""
+
+    uci_dir: str = "data/uci"
+    month: str = "2025-01"
+    out_dir: str = "data/positions"
+    n_games: int = Field(default=300_000, ge=1)
+    max_positions: int = Field(default=5_000_000, ge=1)
+    workers: int = Field(default=0, ge=0)
+    duckdb: DuckDbConfig = Field(default_factory=DuckDbConfig)
+```
+
+<Src file="src/rukh/data/positions.py" tag="p1" lines="44-53" />
+
+`n_games: 300000` de los casi tres millones que tiene enero. No hacen falta más: las posiciones de
+apertura se repiten muchísimo, así que multiplicar las partidas por diez no multiplica por diez las
+posiciones distintas, y lo que interesa del dataset es la cobertura del catálogo de Lichess, no el
+tamaño.
+
+```python title="src/rukh/data/positions.py"
+def fen4(board: object) -> str:
+    """First four FEN fields, built without the move counters python-chess would format.
+
+    The en-passant square is written only when the capture is legal, which is the convention
+    of ``Lichess/chess-position-evaluations``.
+    """
+    import chess
+
+    ep = chess.SQUARE_NAMES[board.ep_square] if board.has_legal_en_passant() else "-"  # type: ignore[attr-defined]
+    turn = "w" if board.turn else "b"  # type: ignore[attr-defined]
+    return f"{board.board_fen()} {turn} {board.castling_xfen()} {ep}"  # type: ignore[attr-defined]
+
+
+def phase(ply: int, n_pieces: int) -> str:
+    """``opening`` up to ply 10, ``middlegame`` with 14+ pieces afterwards, else ``endgame``."""
+    if ply <= OPENING_MAX_PLY:
+        return "opening"
+    return "middlegame" if n_pieces >= MIDDLEGAME_MIN_PIECES else "endgame"
+```
+
+<Src file="src/rukh/data/positions.py" tag="p1" lines="56-73" />
+
+Dieciocho líneas, y la tercera es la que hay que leer dos veces.
+
+`board.has_legal_en_passant()` en vez de `board.ep_square`. La diferencia: `ep_square` está puesto
+siempre que el último movimiento fue un peón dos casillas, aunque **ninguna captura al paso sea
+legal** (porque no hay peón enemigo al lado, o porque capturar dejaría al rey en jaque).
+`has_legal_en_passant()` solo es cierto cuando la captura se puede hacer de verdad.
+
+<Callout kind="roto" title="La cobertura que baja unos puntos y nadie sabe por qué">
+  La convención de las evaluaciones publicadas por Lichess es la segunda: la casilla al paso se
+  escribe solo cuando la captura es legal. Un `fen4` construido de la forma obvia coincide con el de
+  Lichess **en casi todas las posiciones** y discrepa exactamente en las que tienen un peón recién
+  avanzado dos casillas sin nadie que lo pueda capturar, que son muchas más de las que uno diría: le
+  pasa a `e2e4` en la primera jugada de cada partida.
+
+El síntoma es que el `SEMI JOIN` del paso siguiente se las salta en silencio y la cobertura sale unos
+puntos más baja, sin ningún error, sin ninguna traza, sin nada que apunte a la causa. Es el modo de
+fallo más caro que hay en un pipeline de datos: **una clave que casi casa**. Cuando cruces por una
+clave construida, la comprobación barata es coger veinte filas del origen ajeno y verificar que tu
+clave coincide con la suya carácter a carácter; hay un test de esta lección que hace exactamente eso.
+
+</Callout>
+
+`board.castling_xfen()` y no `castling_shredder_fen()`: el primero es la notación estándar (`KQkq`),
+el segundo la de Chess960. Y la función construye la cadena a mano en vez de cortar
+`board.fen().split()[:4]`, que daría lo mismo: formatear el FEN completo para tirar dos campos son
+dos concatenaciones por posición, y esto corre veintitrés millones de veces.
+
+`phase` es un `if` de tres ramas. `chess.popcount(board.occupied)` cuenta las piezas del tablero con
+una operación sobre el bitboard, que es la forma barata: `len(board.piece_map())` construiría un
+diccionario de hasta 32 entradas por posición.
+
+```python title="src/rukh/data/positions.py"
+def walk_game(game_id: int, uci: str, result: str) -> Iterator[tuple[str, int, int, str, str, str]]:
+    """Yield ``(fen4, game_id, ply, last_move, result, phase)`` after every move."""
+    import chess
+
+    board = chess.Board()
+    for ply, token in enumerate(uci.split(), start=1):
+        move = chess.Move.from_uci(token)
+        board.push(move)
+        yield fen4(board), game_id, ply, token, result, phase(ply, chess.popcount(board.occupied))
+
+
+def walk_rows(rows: list[tuple[int, str, str]]) -> dict[str, list[object]]:
+    """Walk a batch of ``(game_id, uci, result)``; module-level for the spawn pool."""
+    out: dict[str, list[object]] = {name: [] for name in POSITION_SCHEMA.names if name != "seq"}
+    for game_id, uci, result in rows:
+        for fen, gid, ply, last_move, res, ph in walk_game(game_id, uci, result):
+            out["fen4"].append(fen)
+            out["game_id"].append(gid)
+            out["ply"].append(ply)
+            out["last_move"].append(last_move)
+            out["result"].append(res)
+            out["phase"].append(ph)
+    return out
+```
+
+<Src file="src/rukh/data/positions.py" tag="p1" lines="76-98" />
+
+`walk_game` es un generador y no una lista, así que una partida de 300 plies nunca está entera en
+memoria. Y `walk_rows` es, otra vez, una función **a nivel de módulo**: es el punto de entrada del
+pool de `spawn` de la lección 2, con la misma restricción.
+
+Fíjate en que `walk_rows` construye un diccionario de columnas y no una lista de filas. Es lo que
+espera pyarrow: un `pa.table({"fen4": [...], "ply": [...]})` con una lista por columna es
+directamente la representación en memoria de Arrow, mientras que una lista de diccionarios habría que
+transponerla.
+
+La columna `seq` se excluye aquí (`if name != "seq"`) y se añade al escribir. No puede calcularla el
+worker: `seq` es la posición global dentro de la concatenación de todos los lotes, y un worker no
+sabe cuántos lotes le precedieron.
+
+```python title="src/rukh/data/positions.py"
+def iter_games(games: Path, n_games: int) -> Iterator[list[tuple[int, str, str]]]:
+    """Batches of ``(game_id, uci, result)``, read from the parquet in row groups."""
+    reader = pq.ParquetFile(games)
+    remaining = n_games
+    for batch in reader.iter_batches(batch_size=BATCH_GAMES, columns=["game_id", "uci", "result"]):
+        if remaining <= 0:
+            return
+        rows = list(
+            zip(
+                batch.column("game_id").to_pylist(),
+                batch.column("uci").to_pylist(),
+                batch.column("result").to_pylist(),
+                strict=True,
+            )
+        )[:remaining]
+        remaining -= len(rows)
+        yield rows
+```
+
+<Src file="src/rukh/data/positions.py" tag="p1" lines="101-117" />
+
+`iter_games` lee solo tres columnas de las diez del parquet. Eso no es cosmética: el parquet es
+columnar, así que pedir tres columnas lee tres columnas del disco y no toca las otras siete. El
+`movetext` no está en esta tabla, pero `uci` sí, y es la columna gorda.
+
+El `remaining` implementa el `n_games` sin leer de más: en cuanto se llega al tope, `return` corta el
+generador y los grupos de filas siguientes no se leen. El `[:remaining]` del último lote lo deja
+exacto.
+
+```python title="src/rukh/data/positions.py"
+def write_parts(games: Path, parts_dir: Path, cfg: PositionsConfig) -> int:
+    """Walk the games into ``parts_dir/part-NNNN.parquet`` (all positions, not deduplicated)."""
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    for old in parts_dir.glob("part-*.parquet"):
+        old.unlink()
+    workers = resolve_workers(cfg.workers)
+    batches = iter_games(games, cfg.n_games)
+    return _write_parts(parts_dir, run_batches(walk_rows, batches, workers), 0)
+
+
+def _write_parts(parts_dir: Path, results: Iterator[dict[str, list[object]]], seq: int) -> int:
+    for index, columns in enumerate(results):
+        n = len(columns["fen4"])
+        table = pa.table({"seq": list(range(seq, seq + n)), **columns}, schema=POSITION_SCHEMA)
+        pq.write_table(table, parts_dir / f"part-{index:04d}.parquet", compression="zstd")
+        seq += n
+    return seq
+```
+
+<Src file="src/rukh/data/positions.py" tag="p1" lines="120-136" />
+
+`write_parts` borra los `part-*.parquet` viejos antes de empezar. Es la línea que hace que volver a
+ejecutar el paso con otro `n_games` no mezcle resultados de dos corridas: sin ella, una corrida corta
+después de una larga dejaría los trozos sobrantes de la larga y la deduplicación los leería.
+
+Escribir en trozos y deduplicar después, en vez de deduplicar sobre la marcha, es la decisión
+central. Un diccionario en memoria con veintitrés millones de FEN de sesenta caracteres son varios
+gigas en el proceso padre, y además serializa todo el paso en un solo hilo. Escribir a disco y dejar
+que DuckDB agrupe es gratis en memoria y usa todos los núcleos.
+
+```python title="src/rukh/data/positions.py"
+def dedupe(
+    parts_dir: Path, out: Path, max_positions: int, duckdb_cfg: DuckDbConfig | None = None
+) -> int:
+    """Group the parts by ``fen4`` (first occurrence wins, ``n_seen`` counted) with DuckDB."""
+    glob = (parts_dir / "part-*.parquet").as_posix()
+    con = db_connect(duckdb_cfg)
+    try:
+        con.execute(
+            f"""
+            COPY (
+              SELECT fen4,
+                     arg_min(game_id, seq) AS game_id,
+                     arg_min(ply, seq) AS ply,
+                     arg_min(last_move, seq) AS last_move,
+                     arg_min(result, seq) AS result,
+                     arg_min(phase, seq) AS phase,
+                     count(*) AS n_seen
+              FROM read_parquet('{glob}')
+              GROUP BY fen4
+              ORDER BY min(seq)
+              LIMIT {int(max_positions)}
+            ) TO '{out.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+        row = con.execute(f"SELECT count(*) FROM read_parquet('{out.as_posix()}')").fetchone()
+    finally:
+        con.close()
+    return int(row[0]) if row else 0
+```
+
+<Src file="src/rukh/data/positions.py" tag="p1" lines="139-166" />
+
+`arg_min(game_id, seq)` es la función que hace legible esta consulta: "el `game_id` de la fila con el
+`seq` más pequeño del grupo". Sin ella habría que hacer una subconsulta con `row_number()` y quedarse
+con la primera, que es el mismo SQL en cuatro veces más líneas.
+
+La promesa es **"la primera aparición gana"**: la posición después de `1.e4` la vieron cien mil
+partidas, y las columnas `game_id`, `ply`, `last_move` y `result` que se guardan son las de la
+primera que pasó por allí. Es arbitrario y es honesto: lo que importa de esa fila es el FEN, y el
+`n_seen` dice cuántas eran.
+
+`ORDER BY min(seq)` antes del `LIMIT` es lo que hace que el tope de `max_positions` sea
+**determinista**: se quedan las primeras posiciones vistas, no las que el motor tenga a mano. Sin el
+`ORDER BY`, dos ejecuciones con el mismo tope darían dos conjuntos distintos.
+
+```python title="src/rukh/data/positions.py"
+def month_parquet(uci_dir: Path, month: str) -> Path:
+    year, mm = month.split("-")
+    return uci_dir / f"year={year}" / f"month={mm}" / "games.parquet"
+
+
+def run(cfg: PositionsConfig) -> Manifest:
+    """Walk up to ``n_games`` of ``month`` and write ``out_dir/positions.parquet`` + manifest."""
+    games = month_parquet(resolve(cfg.uci_dir), cfg.month)
+    out_dir = resolve(cfg.out_dir)
+    parts_dir = out_dir / PARTS_DIR
+    n_positions = write_parts(games, parts_dir, cfg)
+    out = out_dir / POSITIONS_FILE
+    n_distinct = dedupe(parts_dir, out, cfg.max_positions, cfg.duckdb)
+    manifest = Manifest(
+        dataset="Lichess/standard-chess-games",
+        months=[cfg.month],
+        filters={
+            "n_games": cfg.n_games,
+            "max_positions": cfg.max_positions,
+            "phase": {
+                "opening_max_ply": OPENING_MAX_PLY,
+                "middlegame_min_pieces": MIDDLEGAME_MIN_PIECES,
+            },
+        },
+        counts={"positions": n_positions, "distinct": n_distinct},
+        files=[FileHash(path=POSITIONS_FILE, sha256=sha256_file(out), bytes=out.stat().st_size)],
+    )
+    (out_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2) + "\n", "utf-8")
+    return manifest
+```
+
+<Src file="src/rukh/data/positions.py" tag="p1" lines="169-197" />
+
+Los dos contadores del manifiesto son `positions` (todas, con repeticiones) y `distinct` (las filas
+del fichero). Su cociente es la tasa de repetición del corpus, que es exactamente el dato que
+justifica que este paso exista.
+
+## `scoring.py`: una sola convención para ordenar líneas
+
+Antes del join hace falta un módulo pequeño y fácil de subestimar. Las evaluaciones de Lichess vienen
+en formato <Term id="multi-pv">multi-PV</Term>: para una misma posición hay **varias filas**, una por
+línea analizada, y hay que decidir cuál es la mejor. Esa decisión la toman dos consumidores distintos
+—la consolidación de `evals.py`, en SQL, y la construcción de pares de la lección siguiente, en
+Python— y tienen que tomarla igual.
+
+```python title="src/rukh/data/scoring.py"
+"""One scoring convention for every multi-PV consumer (consolidation and DPO pairs).
+
+``cp`` and ``mate`` in ``Lichess/chess-position-evaluations`` are from White's point of view.
+A mate is worth ``MATE_SCORE - mate`` (so a mate in 1 beats a mate in 5) and a line is judged
+from the side to move, which negates the score for Black.
+
+Lines are ranked best first by: a mate *for the side to move*, then depth, then the score for
+the side to move, then the move string as a tie-break. ``evals`` consolidates with the SQL
+expressions below and ``pairs`` ranks with ``line_rank_key``; both orderings must stay
+identical, which is why they live in one module.
+"""
+
+from __future__ import annotations
+
+MATE_SCORE = 10_000
+BEST_LINE_DOC = "deepest; mate for the mover first; then best cp for the side to move"
+
+# SQL counterparts used by ``rukh.data.evals`` (``sign`` is ``mover_sign`` of the FEN turn).
+SCORE_WHITE_SQL = f"""
+CASE WHEN mate IS NOT NULL
+     THEN CASE WHEN mate > 0 THEN {MATE_SCORE} - mate ELSE -{MATE_SCORE} - mate END
+     ELSE cp END
+"""
+RANK_ORDER_SQL = (
+    "(mate IS NOT NULL AND sign * mate > 0) DESC, depth DESC, sign * score_white DESC, move"
+)
+```
+
+<Src file="src/rukh/data/scoring.py" tag="p1" lines="1-26" />
+
+El docstring dice las dos convenciones. `cp` y `mate` vienen **desde el punto de vista de las
+blancas**, siempre, juegue quien juegue: un `cp: -300` significa que las negras van tres peones por
+delante, esté en su turno o en el del rival. Y un mate en `n` se convierte en un número comparable con
+`MATE_SCORE - mate`, de modo que un mate en 1 (9 999) vale más que un mate en 5 (9 995), y ambos más
+que cualquier ventaja material.
+
+Que la constante sea 10 000 y no `float('inf')` tiene un motivo: la columna es entera, y un infinito
+obligaría a flotantes en todo el dataset por un caso que se resuelve con un número grande. Diez mil
+centipeones son cien peones; ninguna evaluación legítima llega ahí.
+
+`SCORE_WHITE_SQL` y `RANK_ORDER_SQL` son **cadenas de SQL que viven en el mismo fichero que las
+funciones de Python equivalentes**, y eso es lo único raro del módulo. La alternativa —el `CASE` en
+`evals.py` y el `sorted(key=...)` en `pairs.py`— es la que había y es la que se descartó: son dos
+implementaciones de la misma regla en dos lenguajes, a ciento cincuenta líneas de distancia, y nada
+que avise cuando una cambie. Juntas, al menos se leen a la vez.
+
+```python title="src/rukh/data/scoring.py"
+def mover_sign(turn: str) -> int:
+    """``+1`` when White is to move, ``-1`` for Black."""
+    return 1 if turn == "w" else -1
+
+
+def score_white(cp: int | None, mate: int | None) -> int | None:
+    """Centipawns from White's point of view; a mate in ``n`` is ``+/-(10000 - n)``."""
+    if mate is not None:
+        return MATE_SCORE - mate if mate > 0 else -MATE_SCORE - mate
+    return None if cp is None else int(cp)
+
+
+def score_mover(cp: int | None, mate: int | None, turn: str) -> int | None:
+    """``score_white`` seen from the side to move: unchanged for White, negated for Black."""
+    white = score_white(cp, mate)
+    return None if white is None else mover_sign(turn) * white
+
+
+def line_rank_key(
+    cp: int | None, mate: int | None, depth: int | None, move: str, turn: str
+) -> tuple[bool, int, int, str]:
+    """Sort key (ascending) reproducing ``RANK_ORDER_SQL``: the best line sorts first."""
+    sign = mover_sign(turn)
+    white = score_white(cp, mate)
+    if white is None:
+        raise ValueError("a line without cp and without mate cannot be ranked")
+    mates_for_mover = mate is not None and sign * mate > 0
+    # DuckDB orders NULL depths last, so an unknown depth ranks below any known one.
+    return (not mates_for_mover, -(depth if depth is not None else -1), -sign * white, move)
+```
+
+<Src file="src/rukh/data/scoring.py" tag="p1" lines="29-57" />
+
+`line_rank_key` reproduce `RANK_ORDER_SQL` término a término, y las dos listas hay que leerlas en
+paralelo:
+
+1. **Mate a favor del que mueve**, primero. `sign * mate > 0` es "el mate es para el bando que le
+   toca": para las blancas (`sign = +1`) un `mate` positivo; para las negras (`sign = -1`) uno
+   negativo. En la clave de Python va como `not mates_for_mover` porque el orden es ascendente y
+   `False < True`.
+2. **Profundidad**, de mayor a menor. Una línea analizada a profundidad 40 es más fiable que una a 12,
+   **aunque prometa menos**. El comentario del código explica el `-1`: DuckDB pone los `NULL` al
+   final en un orden descendente, así que una profundidad desconocida tiene que quedar por debajo de
+   cualquier conocida, y `-(-1) = 1` la manda al final de la clave ascendente.
+3. **La puntuación desde el que mueve**, de mayor a menor.
+4. **La cadena de la jugada**, como desempate.
+
+Ese cuarto término no es decoración, y es la clase de detalle que se descubre tarde. Sin un orden
+**total**, dos líneas que empaten en las tres primeras claves quedan en el orden que el motor tenga a
+bien, y dos ejecuciones del mismo fichero pueden elegir "mejor línea" distinta. El dataset deja de ser
+reproducible y nadie se entera hasta que dos números no cuadran.
+
+<Transfer concept="Una regla de negocio, una implementación" where="Cualquier sistema donde la misma decisión se toma en dos sitios: la puntuación de un reranker en SQL y en el servicio, el filtro de un dashboard y el del informe nocturno, la validación del cliente y la del servidor.">
+  La versión ideal es una sola implementación. Cuando no se puede —porque una mitad corre en el motor
+  de datos y la otra en el lenguaje de aplicación— la versión realista es **ponerlas en el mismo
+  fichero, una debajo de otra, con un test que las compare sobre los mismos casos**.
+
+Lo que no vale es lo que parece más limpio: la regla en SQL donde se usa el SQL y en Python donde se
+usa Python. Se separan en la primera modificación urgente, y el síntoma no es un error sino dos
+conjuntos que discrepan en el 0,3 % de las filas.
+
+</Transfer>
+
+## `evals.py`: el join viaja a los datos
+
+```python title="src/rukh/data/evals.py"
+"""Join the sampled positions with ``Lichess/chess-position-evaluations`` (streaming, resumable).
+
+Each remote file ``data_00NN.parquet`` is semi-joined with the local positions by ``fen`` and
+written as ``data/evals/part-NN.parquet``; an existing part is skipped, so an interrupted run
+resumes where it stopped. ``consolidate`` then keeps one row per FEN with the best line and
+every line as ``pvs``; the ordering and the mate convention come from ``rukh.data.scoring``,
+shared with ``rukh.data.pairs``.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from pydantic import Field
+
+from rukh.config import BaseConfig
+from rukh.data.db import DuckDbConfig, connect
+from rukh.data.manifest import FileHash, Manifest
+from rukh.data.scoring import BEST_LINE_DOC, MATE_SCORE, RANK_ORDER_SQL, SCORE_WHITE_SQL
+from rukh.data.uci import sha256_file
+from rukh.paths import resolve
+
+EVAL_FILE = "positions-eval.parquet"
+
+__all__ = ["MATE_SCORE", "EvalsConfig", "consolidate", "fetch_part", "parse_files", "run"]
+
+
+class EvalsConfig(BaseConfig):
+    """Remote dataset, local positions and the output directory."""
+
+    dataset: str = "Lichess/chess-position-evaluations"
+    remote_pattern: str = "hf://datasets/{dataset}/data/data_{index:04d}.parquet"
+    n_files: int = Field(default=20, ge=1)
+    positions: str = "data/positions/positions.parquet"
+    out_dir: str = "data/evals"
+    duckdb: DuckDbConfig = Field(default_factory=DuckDbConfig)
+```
+
+<Src file="src/rukh/data/evals.py" tag="p1" lines="1-36" />
+
+`n_files: 20` son los veinte ficheros en los que Lichess reparte las 395 millones de posiciones
+evaluadas, unos 42 GB en total. `remote_pattern` es una plantilla con `hf://`, el esquema de sistema
+de ficheros de Hugging Face que DuckDB entiende: una URL que se lee como si fuera un fichero local y
+que soporta lecturas parciales.
+
+```python title="src/rukh/data/evals.py"
+def parse_files(spec: str, n_files: int) -> list[int]:
+    """``"0-19"``, ``"3"`` or ``"0,2,5-7"`` into a sorted list of file indices."""
+    indices: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            indices.update(range(int(lo), int(hi) + 1))
+        else:
+            indices.add(int(part))
+    bad = [i for i in indices if i < 0 or i >= n_files]
+    if bad:
+        raise ValueError(f"file index out of range 0-{n_files - 1}: {bad}")
+    return sorted(indices)
+
+
+def _source(cfg: EvalsConfig, index: int) -> str:
+    """Remote parquet for file ``index`` (tests monkeypatch this to a local file)."""
+    return cfg.remote_pattern.format(dataset=cfg.dataset, index=index)
+
+
+def part_path(out_dir: Path, index: int) -> Path:
+    return out_dir / f"part-{index:02d}.parquet"
+```
+
+<Src file="src/rukh/data/evals.py" tag="p1" lines="39-63" />
+
+`parse_files` existe para la opción `--files` de la CLI, y su valor está en la última comprobación:
+un índice fuera de rango es un `ValueError` **antes** de lanzar nada, no una URL que devuelve 404 a
+los diez minutos. El `set` intermedio absorbe los solapes (`0-5,3` son seis ficheros, no siete) y el
+`sorted` final los deja en orden para que el progreso sea legible.
+
+`_source` está aislada en una función de una línea por el mismo motivo que `_download` en `elite.py`:
+es lo único que toca la red, y un test la sustituye por una que devuelve una ruta local.
+
+```python title="src/rukh/data/evals.py"
+def fetch_part(cfg: EvalsConfig, index: int, positions: Path, out_dir: Path) -> tuple[Path, bool]:
+    """Semi-join one remote file with the positions; ``(path, fetched)`` (False = existed)."""
+    target = part_path(out_dir, index)
+    if target.is_file():
+        return target, False
+    tmp = target.with_suffix(".parquet.tmp")
+    con = connect(cfg.duckdb)
+    try:
+        con.execute(
+            f"""
+            COPY (
+              SELECT e.fen, e.line, e.depth, e.knodes, e.cp, e.mate
+              FROM read_parquet('{_source(cfg, index)}') e
+              SEMI JOIN read_parquet('{positions.as_posix()}') p ON e.fen = p.fen4
+            ) TO '{tmp.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+    finally:
+        con.close()
+    tmp.replace(target)
+    return target, True
+```
+
+<Src file="src/rukh/data/evals.py" tag="p1" lines="66-86" />
+
+Estas veinte líneas son la lección. Léela de dentro afuera.
+
+`SEMI JOIN` es el corazón. No es un `JOIN` normal: un semi join devuelve las filas de la izquierda
+**que tienen alguna coincidencia a la derecha**, sin traer ninguna columna de la derecha y sin
+duplicar filas cuando hay varias coincidencias. Aquí eso significa "de este fichero remoto, dame las
+evaluaciones cuyo FEN tenemos".
+
+Y lo que lo hace barato es lo que el motor hace con eso. Un parquet está partido en grupos de filas,
+y cada grupo lleva en su cabecera el mínimo y el máximo de cada columna. DuckDB lee primero **solo la
+columna `fen`** de cada grupo —proyección—, descarta los grupos que no pueden contener ninguna
+coincidencia —<Term id="predicate-pushdown">predicado empujado al origen</Term>— y solo entonces
+descarga las filas que quedan. De 42 GB viajan por la red unos pocos cientos de megas.
+
+Las dos líneas de la resumibilidad son igual de importantes y más fáciles de pasar por alto:
+
+- `if target.is_file(): return target, False`. Una parte ya escrita no se vuelve a pedir. Veinte
+  ficheros a varios minutos cada uno es algo que se deja corriendo entre sesiones, y reanudar tiene
+  que costar cero.
+- `tmp = target.with_suffix(".parquet.tmp")` … `tmp.replace(target)`. Se escribe a un temporal y se
+  renombra al terminar. El renombrado es atómico en el mismo sistema de ficheros, así que **el
+  nombre definitivo solo existe si la parte está completa**. Sin esto, cortar la ejecución con
+  Ctrl-C a mitad de la parte 7 dejaría un parquet truncado con el nombre bueno, y la corrida
+  siguiente lo daría por hecho.
+
+<Callout kind="hoy" title="Así se hace hoy: el predicado va al origen, no los datos a ti">
+  Hace unos años, cruzar tus claves con 42 GB de datos ajenos significaba descargar los 42 GB. Hoy
+  el patrón es el contrario: formato columnar con estadísticas por bloque, un motor que empuja el
+  predicado y la proyección al fichero, y materializar solo lo que sobrevive. Funciona igual contra
+  un bucket de S3, un lago en Delta o los parquet de Hugging Face, y saber usarlo es una de las
+  habilidades más rentables de un ingeniero de datos o de ML. La regla corta: **si tu primer impulso
+  es descargar el dataset, pregúntate qué fracción vas a mirar.**
+</Callout>
+
+```python title="src/rukh/data/evals.py"
+def consolidate(
+    out_dir: Path, positions: Path, duckdb_cfg: DuckDbConfig | None = None
+) -> dict[str, int]:
+    """Best line per FEN plus ``pvs``, joined back with the positions' metadata."""
+    parts = (out_dir / "part-*.parquet").as_posix()
+    target = out_dir / EVAL_FILE
+    con = connect(duckdb_cfg)
+    try:
+        con.execute(
+            f"""
+            CREATE TEMP TABLE lines AS
+            SELECT fen,
+                   split_part(line, ' ', 1) AS move,
+                   depth, knodes, cp, mate,
+                   CASE WHEN split_part(fen, ' ', 2) = 'w' THEN 1 ELSE -1 END AS sign,
+                   {SCORE_WHITE_SQL} AS score_white
+            FROM read_parquet('{parts}')
+            WHERE line IS NOT NULL AND line <> ''
+            """
+        )
+        con.execute(
+            f"""
+            CREATE TEMP TABLE ranked AS
+            SELECT *, sign * score_white AS score_mover,
+                   row_number() OVER (PARTITION BY fen ORDER BY {RANK_ORDER_SQL}) AS rk
+            FROM lines
+            """
+        )
+        con.execute(
+            f"""
+            COPY (
+              SELECT p.fen4 AS fen, p.game_id, p.ply, p.last_move, p.result, p.phase, p.n_seen,
+                     b.move AS best_move, b.cp, b.mate, b.depth, b.knodes,
+                     pv.pvs
+              FROM read_parquet('{positions.as_posix()}') p
+              JOIN ranked b ON b.fen = p.fen4 AND b.rk = 1
+              JOIN (
+                SELECT fen,
+                       list(struct_pack(move := move, cp := cp, mate := mate, depth := depth)
+                            ORDER BY rk) AS pvs
+                FROM ranked GROUP BY fen
+              ) pv ON pv.fen = p.fen4
+              ORDER BY p.game_id, p.ply
+            ) TO '{target.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+        total = con.execute(
+            f"SELECT count(*) FROM read_parquet('{positions.as_posix()}')"
+        ).fetchone()
+        covered = con.execute(
+            f"SELECT count(*) FROM read_parquet('{target.as_posix()}')"
+        ).fetchone()
+        n_lines = con.execute("SELECT count(*) FROM lines").fetchone()
+    finally:
+        con.close()
+    return {
+        "positions": int(total[0]) if total else 0,
+        "evaluated": int(covered[0]) if covered else 0,
+        "lines": int(n_lines[0]) if n_lines else 0,
+    }
+```
+
+<Src file="src/rukh/data/evals.py" tag="p1" lines="89-148" />
+
+La consolidación son tres sentencias y merece leerlas por separado.
+
+La primera crea `lines`: una fila por línea analizada, con la jugada extraída del campo `line`
+(`split_part(line, ' ', 1)`: la línea es una secuencia de jugadas y nos quedamos con la primera), el
+`sign` del bando que mueve leído **del propio FEN** (`split_part(fen, ' ', 2) = 'w'`) y la puntuación
+desde las blancas calculada con la expresión de `scoring.py`. El `WHERE line IS NOT NULL AND line <>
+''` descarta las filas sin línea, que existen.
+
+La segunda crea `ranked`: la misma tabla con un `row_number()` por FEN en el orden de `scoring.py`.
+Después de esto, `rk = 1` es la mejor línea de cada posición.
+
+La tercera escribe el fichero, y hace **dos** cosas con `ranked`. Por un lado se queda con la mejor
+línea (`JOIN ranked b ON … b.rk = 1`) y la despliega en columnas (`best_move`, `cp`, `mate`, `depth`,
+`knodes`). Por otro agrupa todas las líneas de cada FEN en una columna `pvs` con
+`list(struct_pack(...) ORDER BY rk)`: una lista de estructuras, en orden de mejor a peor.
+
+Esa columna `pvs` es el motivo de que exista la lección siguiente. Guardar las líneas peores no cuesta
+casi nada —ya están descargadas— y contiene un dataset entero de preferencias que si no habría que
+generar ejecutando Stockfish millones de veces.
+
+Y fíjate en el `JOIN` con las posiciones locales: el fichero final no es solo la evaluación, lleva
+también `game_id`, `ply`, `last_move`, `result`, `phase` y `n_seen` de nuestro parquet. Es lo que
+permite que M3 etiquete posiciones con su fase y que la lección siguiente reconstruya el prefijo de
+jugadas que llevó a cada par.
+
+Los tres conteos del final (`positions`, `evaluated`, `lines`) son los que producen la
+`coverage` del manifiesto: qué fracción de nuestras posiciones tiene evaluación. Es el número que hay
+que mirar después de la primera corrida, y el que se hunde si el `fen4` no casa.
+
+```python title="src/rukh/data/evals.py"
+def run(cfg: EvalsConfig, files: str | None = None) -> Manifest:
+    """Fetch the requested parts (skipping existing ones), consolidate and write the manifest."""
+    positions = resolve(cfg.positions)
+    out_dir = resolve(cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    indices = parse_files(files or f"0-{cfg.n_files - 1}", cfg.n_files)
+    fetched: list[int] = []
+    for index in indices:
+        _, was_fetched = fetch_part(cfg, index, positions, out_dir)
+        if was_fetched:
+            fetched.append(index)
+    counts = consolidate(out_dir, positions, cfg.duckdb)
+    present = sorted(int(p.stem.split("-")[1]) for p in out_dir.glob("part-*.parquet"))
+    target = out_dir / EVAL_FILE
+    manifest = Manifest(
+        dataset=cfg.dataset,
+        months=[],
+        filters={
+            "positions": Path(cfg.positions).as_posix(),
+            "files_present": present,
+            "files_fetched_now": fetched,
+            "n_files": cfg.n_files,
+            "coverage": round(counts["evaluated"] / counts["positions"], 4)
+            if counts["positions"]
+            else 0.0,
+            "best_line": BEST_LINE_DOC,
+            "mate_score": MATE_SCORE,
+        },
+        counts=counts,
+        files=[FileHash(path=EVAL_FILE, sha256=sha256_file(target), bytes=target.stat().st_size)],
+    )
+    (out_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2) + "\n", "utf-8")
+    return manifest
+```
+
+<Src file="src/rukh/data/evals.py" tag="p1" lines="151-183" />
+
+`files_present` y `files_fetched_now` se registran por separado a propósito: el primero dice con qué
+partes se construyó el fichero, el segundo cuáles se descargaron en esta corrida. En un paso
+resumible que se ejecuta en cuatro sesiones, solo el primero describe el resultado.
+
+`best_line` guarda en el manifiesto la **frase** que describe el criterio de ordenación
+(`BEST_LINE_DOC`), y `mate_score` la constante. Igual que la fórmula del tramo de Elo: el día que la
+convención cambie, los manifiestos viejos siguen diciendo cuál era la suya.
+
+## Los tests
+
+```python title="tests/unit/test_positions.py"
+"""Tests for rukh.data.positions: fen4 normalization, phase labels and deduplication."""
+
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+
+import chess
+import polars as pl
+import pytest
+from typer.testing import CliRunner
+
+from rukh.cli import app
+from rukh.data.positions import PositionsConfig, fen4, phase, run, walk_game
+
+pytestmark = pytest.mark.unit
+
+
+def test_fen4_drops_counters_and_keeps_castling_and_ep() -> None:
+    board = chess.Board()
+    for move in ("e2e4", "a7a6", "e4e5", "d7d5"):
+        board.push_uci(move)
+    assert board.fen().split()[4:] == ["0", "3"]
+    assert fen4(board) == "rnbqkbnr/1pp1pppp/p7/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6"
+    board.push_uci("e5d6")
+    assert fen4(board).endswith(" b KQkq -")
+
+
+def test_fen4_matches_the_first_four_fen_fields() -> None:
+    board = chess.Board()
+    moves = "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 a7a6 f1e2 e7e5 d4b3 f8e7 e1g1 e8g8"
+    for move in moves.split():
+        board.push_uci(move)
+        assert fen4(board) == " ".join(board.fen().split()[:4])
+    endgame = chess.Board("8/5k2/8/8/3pP3/8/5K2/8 b - e3 0 40")
+    assert fen4(endgame) == " ".join(endgame.fen().split()[:4])
+
+
+def test_phase_thresholds() -> None:
+    assert phase(1, 32) == "opening"
+    assert phase(10, 32) == "opening"
+    assert phase(11, 32) == "middlegame"
+    assert phase(11, 14) == "middlegame"
+    assert phase(11, 13) == "endgame"
+    assert phase(80, 5) == "endgame"
+
+
+def test_walk_game_rows() -> None:
+    rows = list(walk_game(7, "e2e4 e7e5 g1f3", "1-0"))
+    assert len(rows) == 3
+    fen, game_id, ply, last_move, result, ph = rows[0]
+    assert fen == "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -"
+    assert (game_id, ply, last_move, result, ph) == (7, 1, "e2e4", "1-0", "opening")
+    assert rows[2][2] == 3 and rows[2][3] == "g1f3"
+```
+
+<Src file="tests/unit/test_positions.py" tag="p1" lines="1-54" />
+
+El primer test es el del callout de arriba, escrito. Juega `e2e4 a7a6 e4e5 d7d5` —con lo que las
+negras acaban de avanzar el peón de d dos casillas y **la captura al paso es legal**— y comprueba
+que el `fen4` termina en `d6`. Después juega la captura y comprueba que el campo vuelve a `-`. Y la
+línea `assert board.fen().split()[4:] == ["0", "3"]` no prueba nada del código: está para dejar
+escrito **qué** son los dos campos que se tiran.
+
+El segundo es la comprobación barata de la que hablaba el callout, hecha del revés: recorre una
+siciliana entera y exige que `fen4(board)` sea idéntico a los cuatro primeros campos del FEN que
+formatea python-chess, **posición a posición**. Si las dos construcciones discrepan en algún caso —el
+enroque, el al paso, una promoción—, el test lo dice con la posición exacta. El `endgame` del final
+es una posición con al paso legal y sin enroques, el caso que más se parece al que rompía.
+
+`test_phase_thresholds` comprueba los dos umbrales por sus dos lados (10/11, 14/13), que es la única
+forma de probar un umbral.
+
+```python title="tests/unit/test_positions.py"
+def _stage_uci(rukh_home: Path, repo_root: Path) -> None:
+    target = rukh_home / "data" / "uci" / "year=2025" / "month=01" / "games.parquet"
+    target.parent.mkdir(parents=True)
+    shutil.copy(repo_root / "tests" / "fixtures" / "games.parquet", target)
+
+
+def test_run_dedupes_with_counts(rukh_home: Path, repo_root: Path) -> None:
+    _stage_uci(rukh_home, repo_root)
+    manifest = run(PositionsConfig(workers=1))
+    out = rukh_home / "data" / "positions" / "positions.parquet"
+    frame = pl.read_parquet(out.as_posix())
+    assert frame.columns == ["fen4", "game_id", "ply", "last_move", "result", "phase", "n_seen"]
+    total = int(
+        pl.read_parquet((repo_root / "tests" / "fixtures" / "games.parquet").as_posix())[
+            "n_plies"
+        ].sum()
+    )
+    assert manifest.counts["positions"] == total
+    assert manifest.counts["distinct"] == frame.height < total
+    assert frame["fen4"].n_unique() == frame.height
+    after_e4 = frame.filter(
+        pl.col("fen4") == "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -"
+    )
+    assert after_e4.height == 1 and int(after_e4["n_seen"][0]) > 1
+    assert after_e4["ply"][0] == 1 and after_e4["last_move"][0] == "e2e4"
+    assert set(frame["phase"].unique().to_list()) == {"opening", "middlegame", "endgame"}
+    assert manifest.files[0].path == "positions.parquet"
+
+
+def test_run_with_two_workers(rukh_home: Path, repo_root: Path) -> None:
+    """The spawn pool path, exercised end to end on the fixture month."""
+    _stage_uci(rukh_home, repo_root)
+    manifest = run(PositionsConfig(workers=2, n_games=4))
+    frame = pl.read_parquet((rukh_home / "data" / "positions" / "positions.parquet").as_posix())
+    assert manifest.counts["distinct"] == frame.height > 0
+    assert frame["fen4"].n_unique() == frame.height
+
+
+def test_run_respects_caps(rukh_home: Path, repo_root: Path) -> None:
+    _stage_uci(rukh_home, repo_root)
+    manifest = run(PositionsConfig(workers=1, n_games=2, max_positions=30))
+    assert manifest.counts["distinct"] == 30
+    assert manifest.counts["positions"] == 33 + 7
+```
+
+<Src file="tests/unit/test_positions.py" tag="p1" lines="57-99" />
+
+`test_run_dedupes_with_counts` es el test del contrato. Tres cosas dentro merecen mirarse. La primera:
+el total esperado no está escrito a mano, se calcula sumando la columna `n_plies` de la fixture, lo
+cual es una afirmación fuerte —**una posición por ply, ni una más ni una menos**— que sobrevive a que
+la fixture cambie. La segunda: `manifest.counts["distinct"] == frame.height < total` encadena dos
+comparaciones en una, y dice a la vez que el manifiesto no miente y que la deduplicación hizo algo.
+La tercera: busca la posición después de `1.e4` y exige que aparezca **una sola vez** con `n_seen >
+1` y con el `ply` y la jugada de la primera aparición, que es la promesa de los `arg_min`.
+
+`test_run_respects_caps` tiene el `assert manifest.counts["positions"] == 33 + 7`, escrito como suma
+a propósito: son dos partidas de la fixture con 33 y 7 plies. Un `40` pelado no diría de dónde sale.
+
+```python title="tests/unit/test_positions.py"
+def test_cli_positions(rukh_home: Path, repo_root: Path) -> None:
+    _stage_uci(rukh_home, repo_root)
+    cfg = rukh_home / "pipeline.yaml"
+    cfg.write_text("positions:\n  workers: 1\n  n_games: 3\n", encoding="utf-8")
+    result = CliRunner().invoke(app, ["data", "positions", "--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "distinct:" in result.output
+```
+
+<Src file="tests/unit/test_positions.py" tag="p1" lines="102-108" />
+
+```python title="tests/unit/test_scoring.py"
+"""Tests for rukh.data.scoring: the mate convention and the shared line ordering."""
+
+from __future__ import annotations
+
+import pytest
+
+from rukh.data.scoring import MATE_SCORE, line_rank_key, mover_sign, score_mover, score_white
+
+pytestmark = pytest.mark.unit
+
+
+def test_score_white_prefers_the_shorter_mate() -> None:
+    assert score_white(120, None) == 120
+    assert score_white(None, 1) == MATE_SCORE - 1
+    assert score_white(None, 5) == MATE_SCORE - 5
+    assert score_white(None, -1) == -MATE_SCORE + 1
+    assert score_white(None, -5) == -MATE_SCORE + 5
+    assert score_white(999, 2) == MATE_SCORE - 2  # mate wins over cp
+    assert score_white(None, None) is None
+
+
+def test_score_mover_flips_for_black() -> None:
+    assert mover_sign("w") == 1 and mover_sign("b") == -1
+    assert score_mover(150, None, "w") == 150
+    assert score_mover(150, None, "b") == -150
+    assert score_mover(None, 2, "w") == MATE_SCORE - 2
+    assert score_mover(None, -2, "b") == MATE_SCORE - 2
+    assert score_mover(None, None, "b") is None
+```
+
+<Src file="tests/unit/test_scoring.py" tag="p1" lines="1-28" />
+
+Los dos primeros de `test_scoring` fijan la convención con todos sus casos: `cp` a secas, mate a favor
+y en contra, mate corto contra mate largo, el mate ganando a una ventaja enorme de material
+(`score_white(999, 2)`), y el `None` cuando no hay ni una cosa ni otra. El de `score_mover` comprueba
+la línea que más veces se escribe mal en todo el proyecto: `score_mover(None, -2, "b") == MATE_SCORE
+
+- 2`, es decir, **un mate en 2 para las negras, visto desde las negras, es una ventaja**.
+
+```python title="tests/unit/test_scoring.py"
+def test_line_rank_key_orders_mate_then_depth_then_cp() -> None:
+    lines = [
+        ("deep_cp", dict(cp=400, mate=None, depth=40)),
+        ("shallow_mate", dict(cp=None, mate=4, depth=12)),
+        ("shallow_cp", dict(cp=900, mate=None, depth=12)),
+        ("faster_mate", dict(cp=None, mate=2, depth=12)),
+        ("getting_mated", dict(cp=None, mate=-3, depth=40)),
+    ]
+    order = [
+        name
+        for name, kw in sorted(
+            lines, key=lambda item: line_rank_key(move=item[0], turn="w", **item[1])
+        )
+    ]
+    assert order[:2] == ["faster_mate", "shallow_mate"]
+    # Depth outranks the score, so the two depth-40 lines come before the depth-12 one.
+    assert order[2:] == ["deep_cp", "getting_mated", "shallow_cp"]
+    # For Black the signs flip: a mate for Black comes first.
+    black = sorted(lines, key=lambda item: line_rank_key(move=item[0], turn="b", **item[1]))
+    assert black[0][0] == "getting_mated"
+
+
+def test_line_rank_key_rejects_an_unscored_line() -> None:
+    with pytest.raises(ValueError):
+        line_rank_key(None, None, 30, "e2e4", "w")
+```
+
+<Src file="tests/unit/test_scoring.py" tag="p1" lines="31-55" />
+
+Y este es el test del orden, montado como toca: cinco líneas con nombre, ordenadas con la clave de
+verdad, y aserciones sobre la **lista de nombres** resultante. Se lee como una frase: primero el mate
+más rápido, luego el mate más lento; después la profundidad manda sobre la puntuación, así que las
+dos líneas de profundidad 40 van antes que la de 12 aunque la de 12 prometa +900. Y el último bloque
+cambia el turno a negras y comprueba que `getting_mated` —un mate en −3, es decir, mate **para las
+negras**— pasa a ser la mejor línea.
+
+<Exercise n="01" title="Mide la cobertura del join y rompe la clave">
+  Después de ejecutar `rukh data positions` y `rukh data evals --files 0`, abre
+  `data/evals/manifest.json` y mira `filters.coverage`. Después, en una copia del repositorio,
+  cambia `fen4` para que use `board.ep_square` directamente en vez de `has_legal_en_passant()`,
+  borra `data/positions/` y `data/evals/part-00.parquet`, y repite. ¿Cuánto baja la cobertura, y
+  qué error salta?
+
+<Solution>
+  No salta ningún error, y ese es el punto del ejercicio. La cobertura baja varios puntos y el
+  pipeline termina en verde. Las posiciones que se pierden son todas las que siguen a un avance de
+  peón de dos casillas sin captura al paso posible, que empieza por casi todas las primeras jugadas
+  de casi todas las partidas.
+
+Para verlo, lo que hay que hacer es lo que hace el segundo test: comparar tu clave con la del otro
+lado en unos cuantos casos. `SELECT fen FROM read_parquet('hf://...data_0000.parquet') LIMIT 20`
+y buscar esos veinte FEN en tu `positions.parquet` es una consulta de dos minutos que atrapa el fallo
+antes de la corrida de tres horas.
+
+</Solution>
+</Exercise>
+
+## Los tests que se quedan en un enlace
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Fichero                                                                                           | Líneas | Qué garantiza                                                                                                                                                                                                            |
+| ------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`tests/unit/test_evals.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_evals.py) | 155    | Que `parse_files` acepta las tres formas y rechaza los índices fuera de rango; que una parte ya escrita no se vuelve a pedir; y que la consolidación elige la misma mejor línea que `line_rank_key`, con `pvs` ordenada. |
+
+</div>
+
+Se queda fuera porque su mitad interesante —el `monkeypatch` de `_source` a un parquet local
+fabricado con polars— ocupa sesenta líneas de andamiaje para probar una consulta que ya has leído
+entera. Lo que sí conviene saber es que **existe** y que prueba la equivalencia entre el SQL y el
+Python de `scoring.py`: es el test que hace legítimo tener la regla escrita dos veces.
+
+## Qué has aprendido
+
+Cómo se convierte un corpus de partidas en un catálogo de posiciones con una clave que casa con la de
+un tercero, y cómo se cruza ese catálogo con cuarenta y dos gigabytes que nunca se descargan. Y una
+regla de ordenación escrita una sola vez, en dos lenguajes, en el mismo fichero.
+
+**Cómo se mide**: `uv run rukh data positions` deja `data/positions/positions.parquet` con un
+manifiesto que dice cuántas posiciones se recorrieron y cuántas distintas quedaron;
+`uv run rukh data evals` deja `data/evals/positions-eval.parquet` con una `coverage` en su manifiesto
+que es el número a vigilar. `uv run pytest -m unit -q tests/unit/test_positions.py
+tests/unit/test_scoring.py tests/unit/test_evals.py` pasa en verde.
+
+Lo siguiente sale casi gratis de lo que acabas de construir: la columna `pvs` tiene, para cada
+posición, la jugada buena y la mala con su diferencia en <Term id="centipeon">centipeones</Term>. Eso
+es un par de preferencia, y hay decenas de miles.

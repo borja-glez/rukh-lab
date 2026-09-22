@@ -1,0 +1,890 @@
+---
+title: 'Publicar el dataset'
+description:
+  'El registro de los siete artefactos publicables, la card de Jinja que se rellena con el
+  manifiesto, la subida en un commit con reanudación para los ficheros grandes, y el `--dry-run` que
+  te deja verlo todo sin tocar la red.'
+module: m1
+order: 8
+duration: 125
+level: medio
+status: vigente
+updated: 2026-09-22
+keywords:
+  - Hugging Face
+  - dataset card
+  - Jinja
+  - licencia
+  - procedencia
+  - CC0
+artifacts:
+  - kind: dataset
+    label: chorcat/rukh-games-1800
+    href: https://huggingface.co/datasets/chorcat/rukh-games-1800
+  - kind: tokenizer
+    label: chorcat/rukh-tokenizer
+    href: https://huggingface.co/chorcat/rukh-tokenizer
+---
+
+## Qué vas a construir
+
+El último paso del pipeline y el único que sale del disco duro. `rukh data publish` coge uno de los
+siete artefactos que este módulo produce, **genera su card a partir del manifiesto** y lo sube a
+Hugging Face bajo `chorcat`.
+
+Lo interesante no es la subida, que son tres llamadas a una librería. Es la card. Todo lo que este
+módulo ha ido registrando —filtros, conteos, hashes de fichero, la versión de `rukh` que lo generó—
+se vuelca literalmente en el README del dataset, así que la página que alguien encuentra en el Hub
+dice exactamente con qué filtros se construyó lo que se está descargando. Es la <Term id="manifiesto">procedencia</Term>
+de las siete lecciones anteriores, convertida en documentación que no se escribe a mano y por tanto no se queda vieja.
+
+Un fichero de 403 líneas, una plantilla de 68 y la orden que los junta.
+
+## Tres dependencias nuevas
+
+```toml title="pyproject.toml"
+dependencies = [
+  "typer>=0.27",
+  "pydantic>=2.13",
+  "pyyaml>=6",
+  "mlflow>=3.16",
+  "python-chess>=1.999",
+  "duckdb>=1.5",
+  "polars>=1.44",
+  "pyarrow>=25",
+  "zstandard>=0.25",
+  "numpy>=2",
+  "huggingface_hub>=1.32",
+  "datasets>=5",
+  "tokenizers>=0.22",
+  "jinja2>=3.1",
+  "requests>=2.32",
+]
+```
+
+<Src file="pyproject.toml" tag="p1" lines="9-25" />
+
+Las tres últimas son de M1. `tokenizers` es el BPE de la lección de los vocabularios; `jinja2`, la
+plantilla de esta; y `requests`, la descarga de los zips de la base Elite. Nada de las tres entra en
+el camino caliente del entrenamiento, y las tres son dependencias normales y no extras porque el
+pipeline de datos no es opcional: sin él no hay nada que entrenar.
+
+Las tres arrastran 33 líneas nuevas al `uv.lock`, que **se enlaza y no se pega**, igual que en M0: son
+2 226 líneas generadas por `uv sync` con la versión exacta y el hash de cada paquete, se versionan
+porque son lo que hace reproducible el entorno, y no se editan a mano nunca. Lo que hay que saber de
+ese fichero es lo que comprueba `tests/unit/test_lock_guard.py`, que está entero en M0.
+
+## `publish.py`: el registro
+
+```python title="src/rukh/data/publish.py"
+"""Publish the derived datasets and the tokenizer to the Hugging Face Hub under ``chorcat``.
+
+``DATASETS`` is the registry: repo name, local directory, files, description, columns and
+license. ``publish`` renders the card (Jinja, English, HF YAML metadata), creates the repo and
+uploads the matching files in one commit with ``upload_folder`` (``upload_large_folder`` for
+the two multi-gigabyte datasets, which resumes and uploads in parallel), then the card. With
+``dry_run`` nothing touches the network: the card is written under
+``data/publish/<name>/README.md`` and the files are listed. All ``HfApi`` calls go through
+``_api`` so tests can replace it.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Literal
+
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
+from pydantic import BaseModel, ConfigDict
+
+from rukh.config import BaseConfig
+from rukh.data.manifest import Manifest
+from rukh.paths import resolve
+
+CARDS_DIR = Path(__file__).resolve().parent / "cards"
+LICHESS_CC0 = (
+    "CC0 1.0. The games, puzzles and evaluations come from the Lichess open database "
+    "(https://database.lichess.org, https://huggingface.co/Lichess), published under CC0; "
+    "the derived files keep that license. Please credit Lichess when you use them."
+)
+ELITE_LICENSE = (
+    "CC0 1.0 de facto. The games come from Lichess (CC0) through the Lichess Elite Database "
+    "curated by nikonoel (https://database.nikonoel.fr), which publishes no explicit license; "
+    "credit both Lichess and the Elite Database."
+)
+UCI_COLUMNS: list[tuple[str, str]] = [
+    ("game_id", "signed 64-bit hash of the Lichess `Site` URL (first 8 bytes of SHA-256)"),
+    ("uci", "space-separated UCI moves of the whole game, verified legal with python-chess"),
+    ("n_plies", "number of half-moves"),
+    ("white_elo", "White's Glicko-2 rating at game time"),
+    ("black_elo", "Black's Glicko-2 rating at game time"),
+    ("result", "`1-0`, `0-1` or `1/2-1/2`"),
+    ("time_control", "Lichess `base+increment` in seconds"),
+    ("utc_date", "date the game was played (UTC)"),
+    ("eco", "ECO opening code"),
+    ("month", "`YYYY-MM` partition the game came from"),
+]
+```
+
+<Src file="src/rukh/data/publish.py" tag="p1" lines="1-47" />
+
+El docstring describe la orden entera, y hay dos cosas que conviene fijar antes de seguir.
+
+La primera son **las dos licencias**, escritas como constantes de texto. `LICHESS_CC0` para todo lo
+que deriva del volcado público de Lichess, y `ELITE_LICENSE` para la base Elite, que es distinta: la
+recopilación de `database.nikonoel.fr` **no publica una licencia explícita**, aunque su contenido
+venga de Lichess y sea CC0. Decir "CC0 de facto" y pedir que se cite a los dos es lo honesto; poner
+"CC0" a secas sería afirmar algo que el tercero no ha dicho.
+
+La segunda es `UCI_COLUMNS`: la documentación de las diez columnas del parquet de partidas, escrita
+una vez y reutilizada por los tres datasets que comparten ese esquema. Es la misma idea que
+`OUT_SCHEMA` en `uci.py`, un nivel más arriba.
+
+```python title="src/rukh/data/publish.py"
+class DatasetSpec(BaseModel):
+    """One publishable artifact."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    repo_type: Literal["dataset", "model"]
+    local_dir: str
+    patterns: list[str]
+    command: str
+    pretty_name: str
+    description: str
+    columns: list[tuple[str, str]]
+    license: str = "cc0-1.0"
+    license_text: str = LICHESS_CC0
+    source: str
+    source_datasets: list[str]
+    task_categories: list[str]
+    tags: list[str] = []
+    exclude_counts: list[str] = []
+    large: bool = False
+    """Multi-gigabyte: upload with ``upload_large_folder`` when the Hub client has it."""
+```
+
+<Src file="src/rukh/data/publish.py" tag="p1" lines="50-71" />
+
+`DatasetSpec` es la ficha de un artefacto publicable, y el campo que más se nota es `command`: la
+orden con la que se regenera. Aparece en la card, así que cualquiera que descargue el dataset tiene
+delante la línea que lo reproduce.
+
+`exclude_counts` existe porque los manifiestos de dos pasos tienen contadores que **no son filas**.
+El de las evaluaciones lleva `lines` (las líneas analizadas) y `positions` (las de entrada); el de
+los pares lleva `candidates` (antes de equilibrar). Sumarlos todos para declarar el tamaño del
+dataset daría una cifra inflada, y la categoría de tamaño del Hub saldría mal.
+
+`large` marca los dos datasets de varios gigabytes, y su docstring dice para qué: elegir el método de
+subida.
+
+```python title="src/rukh/data/publish.py"
+DATASETS: dict[str, DatasetSpec] = {
+    spec.name: spec
+    for spec in [
+        DatasetSpec(
+            name="rukh-games-1800",
+            repo_type="dataset",
+            large=True,
+            local_dir="data/uci",
+            patterns=["year=*/month=*/games.parquet", "manifest.json"],
+            command="fetch` and `rukh data uci",
+            pretty_name="Rukh games 1800+",
+            description=(
+                "Rated standard Lichess games with both players at 1800+ Elo, base time of "
+                "at least 180 seconds, normal or time-forfeit terminations, 20 to 300 plies, "
+                "converted from SAN to legal UCI. Partitioned by month: train on 2025-01, "
+                "validate on 2025-02."
+            ),
+            columns=UCI_COLUMNS,
+            source="`Lichess/standard-chess-games` on the Hugging Face Hub",
+            source_datasets=["original"],
+            task_categories=["text-generation"],
+            tags=["games", "uci"],
+        ),
+```
+
+<Src file="src/rukh/data/publish.py" tag="p1" lines="74-96" />
+
+El registro es un diccionario construido por comprensión a partir de una lista, con `spec.name` como
+clave. Escribir la lista y derivar el diccionario evita el error clásico de un mapa escrito a mano:
+la clave y el `name` que se contradicen.
+
+Fíjate en `command="fetch` and `rukh data uci"`. Es feo y es correcto: este dataset necesita **dos**
+órdenes para regenerarse, y la plantilla lo inserta dentro de un `rukh data {{ command }}` entre
+acentos graves, así que la cadena se cierra y se vuelve a abrir. Es la clase de truco que hay que
+mirar dos veces antes de decidir que está mal.
+
+```python title="src/rukh/data/publish.py"
+        DatasetSpec(
+            name="rukh-games-elite",
+            repo_type="dataset",
+            local_dir="data/elite",
+            patterns=["games.parquet", "manifest.json"],
+            command="elite",
+            pretty_name="Rukh Elite games",
+            description=(
+                "Games from the Lichess Elite Database (2500+ against 2300+, no bullet), "
+                "converted to legal UCI with the same schema as `rukh-games-1800`. Used for "
+                "supervised fine-tuning on strong play."
+            ),
+            columns=UCI_COLUMNS,
+            license_text=ELITE_LICENSE,
+            source="Lichess Elite Database monthly zips (database.nikonoel.fr)",
+            source_datasets=["original"],
+            task_categories=["text-generation"],
+            tags=["games", "uci", "elite"],
+        ),
+        DatasetSpec(
+            name="rukh-elo-bins",
+            repo_type="dataset",
+            large=True,
+            local_dir="data/elo-bins",
+            patterns=["games.parquet", "manifest.json"],
+            command="elo-bins",
+            pretty_name="Rukh Elo-balanced games",
+            description=(
+                "A balanced sample of `rukh-games-1800`: up to `n_per_bin` games per 100-Elo "
+                "bin of the average rating of both players, for Elo conditioning experiments."
+            ),
+            columns=UCI_COLUMNS + [("bin", "lower edge of the 100-Elo bin of the average rating")],
+            source="`rukh-games-1800` (from `Lichess/standard-chess-games`)",
+            source_datasets=["original"],
+            task_categories=["text-generation"],
+            tags=["games", "uci", "elo"],
+        ),
+```
+
+<Src file="src/rukh/data/publish.py" tag="p1" lines="97-133" />
+
+`rukh-games-elite` comparte `columns=UCI_COLUMNS` con el anterior, que es la propiedad que la lección
+del pipeline prometía: los dos corpus tienen el mismo esquema porque salen del mismo
+`convert_rows`, y aquí se ve que también comparten la documentación.
+
+`rukh-elo-bins` añade una columna a la lista (`UCI_COLUMNS + [("bin", …)]`) en vez de escribir las
+once. Si mañana el esquema de `uci.py` gana una columna, las tres cards la ganan.
+
+```python title="src/rukh/data/publish.py"
+        DatasetSpec(
+            name="rukh-positions-eval",
+            repo_type="dataset",
+            local_dir="data/evals",
+            patterns=["positions-eval.parquet", "manifest.json"],
+            command="positions` and `rukh data evals",
+            pretty_name="Rukh positions with Stockfish evaluations",
+            description=(
+                "Distinct positions sampled from `rukh-games-1800`, keyed by the four-field FEN "
+                "and joined with `Lichess/chess-position-evaluations`. One row per position "
+                "with the best line and every analysed line, for value heads, reward models "
+                "and preference pairs without running an engine."
+            ),
+            columns=[
+                ("fen", "pieces, side to move, castling rights and en-passant square"),
+                ("game_id", "game of the first occurrence"),
+                ("ply", "half-move index of the first occurrence"),
+                ("last_move", "UCI move that reached the position"),
+                ("result", "result of that game"),
+                ("phase", "`opening` (ply <= 10), `middlegame` (14+ pieces) or `endgame`"),
+                ("n_seen", "occurrences in the sampled games"),
+                ("best_move", "first move of the best line for the side to move"),
+                ("cp", "centipawns of the best line, from White's point of view"),
+                ("mate", "moves to mate of the best line (positive: White mates)"),
+                ("depth", "search depth of the best line"),
+                ("knodes", "kilonodes searched"),
+                ("pvs", "every line as `{move, cp, mate, depth}`, best first"),
+            ],
+            source=(
+                "`Lichess/standard-chess-games` (positions) and "
+                "`Lichess/chess-position-evaluations` (evaluations)"
+            ),
+            source_datasets=["original"],
+            task_categories=["tabular-regression", "text-classification"],
+            tags=["positions", "stockfish"],
+            exclude_counts=["lines", "positions"],
+        ),
+        DatasetSpec(
+            name="rukh-puzzles-split",
+            repo_type="dataset",
+            local_dir="data/puzzles",
+            patterns=["puzzles.parquet", "manifest.json"],
+            command="puzzles",
+            pretty_name="Rukh puzzle splits",
+            description=(
+                "Lichess puzzles with rating deviation <= 100 and at least 100 plays, banded by "
+                "difficulty (1000-1500, 1500-2000, 2000+) and split into test and train by a "
+                "seeded hash of the puzzle id, for tactical evaluation and fine-tuning."
+            ),
+            columns=[
+                ("puzzle_id", "Lichess puzzle id"),
+                ("fen", "position before the opponent's last move (Lichess convention)"),
+                ("moves", "UCI moves: the opponent's move first, then the solution"),
+                ("rating", "puzzle rating"),
+                ("themes", "Lichess theme tags"),
+                ("band", "`1000-1500`, `1500-2000` or `2000+`"),
+                ("split", "`test` or `train`"),
+            ],
+            source="`Lichess/chess-puzzles` on the Hugging Face Hub",
+            source_datasets=["original"],
+            task_categories=["text-generation", "question-answering"],
+            tags=["puzzles"],
+        ),
+```
+
+<Src file="src/rukh/data/publish.py" tag="p1" lines="134-196" />
+
+Las descripciones de columnas de estos dos son la única documentación que existe de esos ficheros, y
+por eso están escritas con cuidado. Dos merecen leerse:
+
+`("fen", "position before the opponent's last move (Lichess convention)")` en los puzles. Un puzle de
+Lichess **no empieza en la posición del FEN**: empieza después de que el rival haga la primera jugada
+de `moves`. Quien lo descargue y empiece a resolver desde el FEN estará resolviendo otra cosa. Esa
+línea de documentación vale por media hora de depuración en M2.
+
+`("pvs", "every line as `{move, cp, mate, depth}`, best first")` en las evaluaciones: la estructura de
+la columna anidada y, sobre todo, **que el orden significa algo**.
+
+```python title="src/rukh/data/publish.py"
+        DatasetSpec(
+            name="rukh-pairs-dpo",
+            repo_type="dataset",
+            local_dir="data/pairs",
+            patterns=["pairs.parquet", "manifest.json"],
+            command="pairs",
+            pretty_name="Rukh DPO pairs",
+            description=(
+                "Preference pairs from the multi-PV Stockfish lines of `rukh-positions-eval`: "
+                "the best first move against a legal move at least 100 centipawns worse for the "
+                "side to move (mates count as 10000). One pair per position, balanced by phase."
+            ),
+            columns=[
+                ("fen", "four-field FEN of the position"),
+                ("chosen", "best move (UCI)"),
+                ("rejected", "clearly worse legal move (UCI)"),
+                ("cp_chosen", "score of `chosen` from White's point of view (mate = +/-10000)"),
+                ("cp_rejected", "score of `rejected` from White's point of view"),
+                ("phase", "`opening`, `middlegame` or `endgame`"),
+            ],
+            source="`rukh-positions-eval` (from `Lichess/chess-position-evaluations`)",
+            source_datasets=["original"],
+            task_categories=["text-generation"],
+            tags=["dpo", "preferences"],
+            exclude_counts=["candidates"],
+        ),
+        DatasetSpec(
+            name="rukh-tokenizer",
+            repo_type="model",
+            local_dir="artifacts/tokenizer",
+            patterns=["vocab.json", "bpe.json", "fixtures/games.json", "README.md"],
+            command="tokenize --export-fixture",
+            pretty_name="Rukh tokenizer",
+            description=(
+                "Fixed UCI vocabulary, BPE and char-level SAN tokenizers with a parity fixture."
+            ),
+            columns=[],
+            source="enumeration plus a BPE trained on `rukh-games-1800`",
+            source_datasets=["original"],
+            task_categories=[],
+            tags=["tokenizer"],
+        ),
+    ]
+}
+```
+
+<Src file="src/rukh/data/publish.py" tag="p1" lines="197-240" />
+
+La última entrada del registro no es un dataset: es el tokenizador, con `repo_type="model"`. Va en el
+mismo registro y por la misma orden, porque lo que hace `publish` —renderizar una card, crear el
+repositorio, subir unos ficheros— es idéntico; lo único que cambia es el tipo de repositorio y que su
+card no se genera, como se ve más abajo.
+
+```python title="src/rukh/data/publish.py"
+class PublishConfig(BaseConfig):
+    """Hub owner and where dry runs stage their output."""
+
+    owner: str = "chorcat"
+    publish_dir: str = "data/publish"
+
+
+class PublishResult(BaseModel):
+    """What was (or would be) uploaded."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    repo_id: str
+    repo_type: str
+    dry_run: bool
+    card_path: str
+    files: list[str]
+    rows: int
+
+
+def size_category(rows: int) -> str:
+    for limit, label in (
+        (1_000, "n<1K"),
+        (10_000, "1K<n<10K"),
+        (100_000, "10K<n<100K"),
+        (1_000_000, "100K<n<1M"),
+        (10_000_000, "1M<n<10M"),
+    ):
+        if rows < limit:
+            return label
+    return "10M<n<100M"
+```
+
+<Src file="src/rukh/data/publish.py" tag="p1" lines="243-274" />
+
+`size_category` traduce el número de filas a las etiquetas que el Hub entiende (`1M<n<10M`). Es una
+tabla de umbrales y un valor por defecto, y está aquí en vez de en la plantilla porque una plantilla
+con lógica es una plantilla que nadie prueba.
+
+```python title="src/rukh/data/publish.py"
+def local_files(spec: DatasetSpec) -> list[Path]:
+    root = resolve(spec.local_dir)
+    found: list[Path] = []
+    for pattern in spec.patterns:
+        found.extend(sorted(root.glob(pattern)))
+    return found
+
+
+def read_manifest(spec: DatasetSpec) -> Manifest | None:
+    path = resolve(spec.local_dir) / "manifest.json"
+    if not path.is_file():
+        return None
+    return Manifest.model_validate_json(path.read_text("utf-8"))
+
+
+def count_rows(spec: DatasetSpec, manifest: Manifest | None) -> int:
+    if manifest is None:
+        return 0
+    return sum(v for k, v in manifest.counts.items() if k not in spec.exclude_counts)
+```
+
+<Src file="src/rukh/data/publish.py" tag="p1" lines="277-295" />
+
+`local_files` expande los patrones del spec contra el directorio local. El `sorted` de cada patrón es
+lo que hace que la lista de ficheros de la card salga en el mismo orden en cualquier máquina: el
+orden de `glob` depende del sistema de ficheros.
+
+`count_rows` suma los conteos del manifiesto **saltándose** los de `exclude_counts`, que es donde ese
+campo cobra sentido. Y devuelve 0 cuando no hay manifiesto, en vez de fallar: un artefacto sin
+manifiesto se puede publicar, solo que su card dirá menos.
+
+```python title="src/rukh/data/publish.py"
+def render_card(spec: DatasetSpec, manifest: Manifest | None, owner: str) -> str:
+    """Render the dataset card; the tokenizer uses its own README as the card."""
+    if spec.repo_type == "model":
+        return (resolve(spec.local_dir) / "README.md").read_text("utf-8")
+    env = Environment(
+        loader=FileSystemLoader(str(CARDS_DIR)),
+        undefined=StrictUndefined,
+        autoescape=False,
+        keep_trailing_newline=True,
+    )
+    rows = count_rows(spec, manifest)
+    context = {
+        "repo_id": f"{owner}/{spec.name}",
+        "license": spec.license,
+        "license_text": spec.license_text,
+        "pretty_name": spec.pretty_name,
+        "task_categories": spec.task_categories,
+        "size_category": size_category(rows),
+        "source_datasets": spec.source_datasets,
+        "tags": spec.tags,
+        "description": spec.description,
+        "command": spec.command,
+        "columns": spec.columns,
+        "source": spec.source,
+        "rows": rows,
+        "files": manifest.files if manifest else [],
+        "months": manifest.months if manifest else [],
+        "filters_json": json.dumps(manifest.filters if manifest else {}, indent=2, default=str),
+        "counts_json": json.dumps(manifest.counts if manifest else {}, indent=2),
+        "created_at": manifest.created_at.date().isoformat() if manifest else "unknown",
+        "rukh_version": manifest.rukh_version if manifest else "unknown",
+    }
+    return env.get_template("dataset.md.jinja").render(**context)
+```
+
+<Src file="src/rukh/data/publish.py" tag="p1" lines="298-330" />
+
+Aquí está la pieza central, y la primera línea es una bifurcación importante: **el tokenizador usa su
+propio README como card**. No se genera nada; se lee `artifacts/tokenizer/README.md` y se sube tal
+cual. Es lo correcto porque lo que hay que contar de un tokenizador no cabe en la plantilla de un
+dataset —no tiene filas, ni columnas, ni filtros— y escribirlo a mano una vez es más honesto que
+inventar una plantilla para un solo caso.
+
+`StrictUndefined` es la decisión del fichero. Por defecto, Jinja **renderiza una variable inexistente
+como cadena vacía**: un `{{ licence }}` con la errata produciría una card con la línea `license:`
+vacía, que el Hub rechazaría o, peor, aceptaría. Con `StrictUndefined` la plantilla lanza al
+renderizar, antes de tocar la red. Es exactamente la misma decisión que `extra="forbid"` en las
+configuraciones de M0, aplicada a las plantillas: fallar al construir, no al usar.
+
+`autoescape=False` porque la salida es Markdown y no HTML; escapar convertiría cada `&` de una URL en
+`&amp;`. Y `keep_trailing_newline=True` porque un fichero de texto acaba en salto de línea.
+
+El `default=str` del `json.dumps` de los filtros es una red: los filtros de un manifiesto son un
+diccionario libre y alguno puede llevar un tipo que JSON no conoce. Mejor una representación fea que
+una excepción al publicar.
+
+```python title="src/rukh/data/publish.py"
+def _api():  # type: ignore[no-untyped-def]
+    """The ``HfApi`` client (tests monkeypatch this)."""
+    from huggingface_hub import HfApi
+
+    return HfApi()
+
+
+def upload_folder(api: object, spec: DatasetSpec, repo_id: str) -> str:
+    """Upload the whole local directory in one go; returns the method that was used.
+
+    The card is always uploaded separately from the staged copy, so ``README.md`` is excluded
+    here. A ``large`` dataset uses ``upload_large_folder`` (resumable, multi-threaded) when the
+    installed ``huggingface_hub`` provides it.
+    """
+    large = callable(getattr(api, "upload_large_folder", None))
+    if spec.large and large:
+        api.upload_large_folder(  # type: ignore[attr-defined]
+            repo_id=repo_id,
+            folder_path=str(resolve(spec.local_dir)),
+            repo_type=spec.repo_type,
+            allow_patterns=spec.patterns,
+            ignore_patterns=["README.md"],
+        )
+        return "upload_large_folder"
+    api.upload_folder(  # type: ignore[attr-defined]
+        repo_id=repo_id,
+        folder_path=str(resolve(spec.local_dir)),
+        repo_type=spec.repo_type,
+        allow_patterns=spec.patterns,
+        ignore_patterns=["README.md"],
+        commit_message="Upload data",
+    )
+    return "upload_folder"
+```
+
+<Src file="src/rukh/data/publish.py" tag="p1" lines="333-365" />
+
+`_api()` es la única función que crea el cliente del Hub, y su docstring dice por qué: los tests la
+sustituyen. Todo el fichero se puede probar sin red porque las tres llamadas de red salen de aquí.
+
+`upload_folder` tiene la decisión operativa del módulo. `rukh-games-1800` son casi 1 GB y
+`rukh-elo-bins` otro tanto; subirlos con `upload_folder` es una sola petición larga que, si se corta a
+los cuarenta minutos, se ha perdido entera. `upload_large_folder` trocea, sube en paralelo y
+**reanuda**: volver a lanzarlo continúa donde se quedó.
+
+El `callable(getattr(api, "upload_large_folder", None))` es una comprobación de capacidad y no de
+versión. Pedir la versión de `huggingface_hub` y compararla obligaría a mantener un número; preguntar
+si el método existe funciona con cualquier versión, y también con el doble que usan los tests.
+
+`ignore_patterns=["README.md"]` en las dos ramas: la card se sube aparte, desde la copia preparada, y
+sin esa exclusión se subiría dos veces —una desde el directorio local, si lo hubiera, y otra desde la
+copia— con la del directorio local ganando.
+
+```python title="src/rukh/data/publish.py"
+def publish(name: str, cfg: PublishConfig, dry_run: bool = False) -> PublishResult:
+    """Render the card and upload (or, with ``dry_run``, stage) one registry entry."""
+    if name not in DATASETS:
+        raise KeyError(f"unknown dataset {name!r}; known: {', '.join(DATASETS)}")
+    spec = DATASETS[name]
+    manifest = read_manifest(spec)
+    files = local_files(spec)
+    if not files:
+        raise FileNotFoundError(f"nothing to publish under {resolve(spec.local_dir)}")
+    repo_id = f"{cfg.owner}/{spec.name}"
+    card = render_card(spec, manifest, cfg.owner)
+    stage = resolve(cfg.publish_dir) / spec.name
+    stage.mkdir(parents=True, exist_ok=True)
+    card_path = stage / "README.md"
+    card_path.write_text(card, encoding="utf-8", newline="\n")
+    rel_files = [p.relative_to(resolve(spec.local_dir)).as_posix() for p in files]
+    if not dry_run:
+        api = _api()
+        api.create_repo(repo_id, repo_type=spec.repo_type, exist_ok=True)
+        upload_folder(api, spec, repo_id)
+        api.upload_file(
+            path_or_fileobj=str(card_path),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type=spec.repo_type,
+            commit_message="Update card",
+        )
+    return PublishResult(
+        name=spec.name,
+        repo_id=repo_id,
+        repo_type=spec.repo_type,
+        dry_run=dry_run,
+        card_path=card_path.as_posix(),
+        files=rel_files,
+        rows=count_rows(spec, manifest),
+    )
+```
+
+<Src file="src/rukh/data/publish.py" tag="p1" lines="368-403" />
+
+El orden de `publish` es el que importa. Primero comprueba que el nombre existe y que **hay ficheros
+que subir**, y las dos comprobaciones fallan con una excepción que la CLI convierte en un mensaje:
+publicar un dataset que no se ha generado es el error más fácil de cometer y el más caro, porque la
+alternativa es crear un repositorio vacío en el Hub.
+
+Después renderiza la card y **la escribe en disco siempre**, se vaya a subir o no. Eso es lo que hace
+que `--dry-run` sirva de algo: dejas la card en `data/publish/<nombre>/README.md`, la lees, y solo
+entonces publicas.
+
+Y las tres llamadas de red van en un orden concreto: crear el repositorio con `exist_ok=True` (así
+publicar dos veces actualiza en vez de fallar), subir los datos, subir la card la última. Si algo se
+corta, lo que queda a medias son los datos y no la documentación de unos datos que no están.
+
+<Transfer concept="La documentación se genera del artefacto, no se escribe al lado" where="Un modelo en un registro, un esquema de API, un dataset interno, un informe de evaluación.">
+  La regla que sigue esta lección es que **la card se rellena con el manifiesto**, y el manifiesto lo
+  escribió el paso que produjo los datos. Nadie teclea los conteos, ni los hashes, ni los filtros. La
+  consecuencia es que la documentación no puede quedarse vieja: si el dataset se regenera, la card
+  cambia sola.
+
+El modo de fallo que evita es el más común de todos: una card escrita a mano el día de la
+publicación, que dice `min_elo: 2000` porque así estaba entonces, junto a un fichero que se regeneró
+con 1800 tres meses después. Nadie miente; simplemente nadie vuelve a leer el README.
+
+Y el corolario práctico: si la documentación de tu artefacto contiene un número, ese número tiene que
+salir de un fichero que el proceso escribió, no de tu memoria.
+
+</Transfer>
+
+## La plantilla
+
+```jinja title="src/rukh/data/cards/dataset.md.jinja"
+---
+license: {{ license }}
+pretty_name: {{ pretty_name }}
+language:
+  - en
+task_categories:
+{%- for task in task_categories %}
+  - {{ task }}
+{%- endfor %}
+size_categories:
+  - {{ size_category }}
+source_datasets:
+{%- for source in source_datasets %}
+  - {{ source }}
+{%- endfor %}
+tags:
+  - chess
+  - rukh
+{%- for tag in tags %}
+  - {{ tag }}
+{%- endfor %}
+---
+```
+
+<Src file="src/rukh/data/cards/dataset.md.jinja" tag="p1" lines="1-22" />
+
+La cabecera es el bloque de metadatos YAML que el Hub lee para indexar el dataset: la licencia, las
+categorías de tarea, el tamaño, las etiquetas. Si falta o está mal, el dataset existe pero no aparece
+en las búsquedas.
+
+Los `{%- for %}` con el guion recortan el espacio en blanco anterior, que en YAML no es decorativo:
+sin el guion, cada elemento de la lista quedaría precedido de una línea en blanco y la indentación se
+rompería.
+
+`tags` siempre lleva `chess` y `rukh` antes de los específicos, así que los siete artefactos del
+proyecto se encuentran con una búsqueda.
+
+```jinja title="src/rukh/data/cards/dataset.md.jinja"
+# {{ repo_id }}
+
+{{ description }}
+
+Part of [Rukh](https://github.com/borja-glez/rukh), a chess language model built from scratch
+as a course on generative and agentic AI. Every derived dataset ships with the exact filters and
+counts of its `manifest.json`, so it can be regenerated with `rukh data {{ command }}`.
+
+## Files
+
+| File | Bytes | SHA-256 |
+|---|---:|---|
+{%- for file in files %}
+| `{{ file.path }}` | {{ file.bytes }} | `{{ file.sha256 }}` |
+{%- endfor %}
+
+Rows: **{{ rows }}**.
+
+## Columns
+
+| Column | Description |
+|---|---|
+{%- for name, doc in columns %}
+| `{{ name }}` | {{ doc }} |
+{%- endfor %}
+```
+
+<Src file="src/rukh/data/cards/dataset.md.jinja" tag="p1" lines="24-48" />
+
+La tabla de ficheros lleva **el sha256 de cada uno**. Es lo que permite a alguien que descargó el
+dataset hace dos meses comprobar si lo que tiene es lo que la card describe, sin preguntar a nadie.
+
+`| Bytes |` con `---:` lo alinea a la derecha, que es como se leen los números.
+
+````jinja title="src/rukh/data/cards/dataset.md.jinja"
+## Provenance and filters
+
+Source: {{ source }}{% if months %} (months {{ months | join(", ") }}){% endif %}.
+
+```json
+{{ filters_json }}
+```
+
+Counts:
+
+```json
+{{ counts_json }}
+```
+
+Generated on {{ created_at }} with `rukh` {{ rukh_version }}.
+
+## License
+
+{{ license_text }}
+````
+
+<Src file="src/rukh/data/cards/dataset.md.jinja" tag="p1" lines="50-68" />
+
+Y esta es la parte que hace que la card valga: los filtros y los conteos del manifiesto, **volcados
+literalmente como JSON**. No un resumen en prosa que alguien mantiene, sino el diccionario que el
+paso escribió. Para `rukh-games-1800` eso incluye el `min_elo`, el `limit`, los recuentos de la
+conversión por mes y, anidado bajo `raw`, los filtros de la descarga de M0.
+
+El pie lleva la fecha y la versión de `rukh` que lo generó. Ese `rukh_version` es la constante de tres
+líneas de `src/rukh/__init__.py` que M0 escribió y que entonces parecía que no servía para nada.
+
+<Callout kind="mundo-real" title="Cuatro licencias conviviendo">
+  El proyecto tiene el código en MIT, los pesos en Apache-2.0, los datos en CC0 con atribución a
+  Lichess, y usa Stockfish y `python-chess`, que son GPL-3. La línea que hay que tener clara es la
+  última: se usan como **herramienta externa en el lado del entrenamiento** —un proceso aparte con el
+  que se habla por UCI— y **no se redistribuyen con la demo**. Empaquetar un binario GPL-3 en una web
+  propietaria es el error que la sección de licencias del README existe para no cometer.
+
+Para los datos, lo que hay que hacer es lo que hace `LICHESS_CC0`: republicar con la misma licencia,
+citar el origen, y decir por qué. Y cuando el origen no declara licencia, como la base Elite, decirlo
+también en vez de elegir una.
+
+</Callout>
+
+## La orden
+
+```python title="src/rukh/cli.py"
+@data_app.command("publish")
+def data_publish(
+    name: Annotated[
+        str | None, typer.Option("--name", help="Registry entry, e.g. rukh-games-1800.")
+    ] = None,
+    config: PipelineOption = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Render the card and list files; no network.")
+    ] = False,
+    list_names: Annotated[bool, typer.Option("--list", help="List the registry and exit.")] = False,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the result as JSON.")] = False,
+) -> None:
+    """Render the dataset card and upload one dataset (or the tokenizer) to the Hub."""
+    from rukh.data.pipeline import load_pipeline
+    from rukh.data.publish import DATASETS, publish
+
+    if list_names:
+        for spec in DATASETS.values():
+            typer.echo(f"{spec.name:<22} {spec.repo_type:<8} {spec.local_dir}")
+        return
+    if name is None:
+        typer.echo("error: --name is required (see --list)", err=True)
+        raise typer.Exit(code=2)
+    cfg = load_pipeline(config).publish
+    try:
+        result = publish(name, cfg, dry_run=dry_run)
+    except (KeyError, FileNotFoundError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if as_json:
+        typer.echo(result.model_dump_json(indent=2))
+        return
+    typer.echo(f"repo:     {result.repo_id} ({result.repo_type})")
+    typer.echo(f"mode:     {'dry-run (card staged, nothing uploaded)' if dry_run else 'uploaded'}")
+    typer.echo(f"rows:     {result.rows}")
+    typer.echo(f"card:     {result.card_path}")
+    typer.echo("files:")
+    for path in result.files:
+        typer.echo(f"  {path}")
+```
+
+<Src file="src/rukh/cli.py" tag="p1" lines="277-315" />
+
+Tres modos en una orden. `--list` imprime el registro y sale, que es la forma de saber qué nombres
+acepta sin leer el código. Sin `--name` sale con código 2 y un mensaje que remite a `--list`. Y con
+nombre, publica o prepara.
+
+Las dos excepciones que captura son las dos comprobaciones de `publish`: `KeyError` (nombre
+desconocido) y `FileNotFoundError` (nada que subir). Las dos se convierten en un mensaje en `stderr`
+y un código 1, en vez de una traza. Es el mismo patrón que `engine check` en M0.
+
+La línea de `mode:` distingue `dry-run (card staged, nothing uploaded)` de `uploaded`, que es la
+información que hay que ver cuando uno no se acuerda de si puso la bandera.
+
+<Callout kind="hoy" title="Este es el paso donde intervienes tú">
+  Los ocho pasos anteriores se ejecutan solos. Este necesita un `HF_TOKEN` con permiso de escritura
+  en tu cuenta, y por eso la orden viene con `--dry-run`: la card se genera y se lee **antes** de
+  crear nada. El flujo normal es `--dry-run`, abrir `data/publish/<nombre>/README.md`, comprobar que
+  los filtros y los conteos son los que esperabas, y entonces repetir sin la bandera.
+</Callout>
+
+<Exercise n="01" title="Lee una card antes de publicarla">
+  Ejecuta `uv run rukh data publish --list` y después
+  `uv run rukh data publish --name rukh-games-1800 --dry-run`. Abre la card generada y responde: ¿qué
+  dice la sección de filtros sobre el mes de validación? ¿Cuántas filas declara y de dónde sale ese
+  número? Después ejecuta el `--dry-run` de `rukh-positions-eval` y compara: ¿por qué su `rows` no es
+  la suma de los conteos de su manifiesto?
+
+<Solution>
+  Los filtros de `rukh-games-1800` llevan `min_plies`, `max_plies`, `legal_only` y el desglose
+  `conversion` por mes, y anidado bajo `raw` están los de la descarga de M0 con
+  `min_plies_deferred`. Los meses aparecen en la línea de `Source:` —2025-01 y 2025-02— y no hay
+  ninguna marca de cuál valida: esa decisión es del entrenamiento, no del dataset, y está en el
+  `pipeline.yaml`.
+
+Las filas son la suma de `manifest.counts`, que para este dataset son las partidas conservadas de
+cada mes: 2 949 514 + 2 946 874 = 5 896 388. La categoría de tamaño sale de ahí: `1M<n<10M`.
+
+En `rukh-positions-eval`, `exclude_counts=["lines", "positions"]` deja fuera dos de los tres
+contadores, porque `lines` son líneas de análisis y `positions` son las de entrada, no filas del
+fichero publicado. Solo cuenta `evaluated`. Si no se excluyeran, la card declararía un dataset varias
+veces más grande de lo que es.
+
+</Solution>
+</Exercise>
+
+## El test que se queda en un enlace
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Fichero                                                                                               | Líneas | Qué garantiza                                                                                                                                                                                                                                                                                                                 |
+| ----------------------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`tests/unit/test_publish.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_publish.py) | 218    | Que los siete nombres del registro tienen directorio y patrones; que la card renderizada lleva la cabecera YAML, la tabla de ficheros con sus hashes y los filtros del manifiesto; que `--dry-run` no llama a la red; que `exclude_counts` se respeta; y que un `large` usa `upload_large_folder` cuando el cliente lo tiene. |
+
+</div>
+
+Se queda fuera por tamaño: 218 líneas de las que más de la mitad son el doble de `HfApi` que registra
+las llamadas para comprobarlas después. Merece abrirlo si vas a añadir un artefacto al registro,
+porque el primer test recorre `DATASETS` entero y falla en cuanto una entrada nueva se deja un campo.
+
+## Qué has aprendido
+
+Cómo se convierte un pipeline de datos en algo que otra persona puede descargar y entender: un
+registro de siete artefactos con sus licencias, una plantilla que se rellena con lo que los pasos ya
+registraron, y una subida que se puede ensayar sin tocar la red y reanudar si se corta.
+
+**Cómo se mide**: `uv run rukh data publish --list` imprime los siete, y
+`uv run rukh data publish --name <nombre> --dry-run` deja en `data/publish/<nombre>/README.md` una
+card cuya sección de filtros es, literalmente, el `manifest.json` del paso. Con `HF_TOKEN`, la misma
+orden sin `--dry-run` deja el repositorio en `huggingface.co/chorcat/<nombre>`.
+
+Lo siguiente es la otra implementación del tokenizador: la de TypeScript que corre en el navegador,
+sin compartir una línea de código con la de Python, y la fixture que comprueba que las dos dicen lo
+mismo.
