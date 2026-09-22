@@ -1,0 +1,1030 @@
+---
+title: 'Cabezas y casillas: tres preguntas y una segunda entrada'
+description:
+  '`models/heads.py` y `models/squares.py` enteros: por qué las tres cabezas son una capa lineal,
+  la pérdida conjunta con pesos y máscara, el FEN convertido en 69 tokens fijos, el vocabulario
+  con hash y el test de ida y vuelta que caza una transposición del tablero.'
+module: m3
+order: 4
+duration: 120
+level: medio
+status: vigente
+updated: 2026-09-22
+keywords:
+  - probe lineal
+  - cabezas
+  - pérdida multitarea
+  - FEN
+  - vocabulario
+  - hash
+artifacts:
+  - kind: repo
+    label: borja-glez/rukh
+    href: https://github.com/borja-glez/rukh/tree/p3
+---
+
+Lección 4 de 11 del módulo «El encoder». Viene de «El encoder a mano» y sigue en «Masked move
+modeling».
+
+## Qué vas a construir
+
+Dos ficheros que no se parecen en nada y que van juntos porque cierran el modelo: las tres cabezas
+que leen el vector agrupado (`models/heads.py`, 140 líneas) y el traductor que convierte
+un <Term id="fen">FEN</Term> en los 69 tokens de la segunda representación de entrada
+(`models/squares.py`, 215 líneas). Con esto, el modelo de M3 está completo y solo falta entrenarlo.
+
+## Las tres cabezas
+
+```python title="src/rukh/models/heads.py"
+"""The three supervised heads of M3, all of them reading one vector: ``PositionEncoder.pool``.
+
+The heads are deliberately tiny — one linear layer each — because that is what makes the
+experiment mean something. If a linear probe on the pooled representation can say how good a
+position is, whether the last move threw the game away and who is going to win, then the
+representation already contains those facts and masked move modeling put them there. A deep
+head would be able to learn them by itself and would tell us nothing about the encoder.
+
+* ``ValueHead``: one scalar through ``tanh``, matching the ``tanh(cp / 400)`` label, so the
+  output is bounded and a mate cannot dominate the loss.
+* ``BlunderHead``: one logit, because the label is missing for a good part of the rows (a
+  position whose predecessor is not in the table) and a masked binary cross entropy is the
+  honest way to skip them.
+* ``ResultHead``: three classes, White / draw / Black.
+
+``MultiHead`` trains them together over a shared encoder, with a weight per head: the three
+tasks have different scales (an MSE in ``[0, 4]``, two cross entropies) and different amounts of
+data, so "just add them up" would silently make one of them the only one that matters.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from rukh.config import BaseConfig
+from rukh.models.encoder import PositionEncoder
+
+HEADS = ("value", "blunder", "result")
+RESULT_CLASSES = 3
+```
+
+<Src file="src/rukh/models/heads.py" tag="p3" lines="1-33" />
+
+El docstring es el diseño del experimento, no una descripción del fichero, y por eso está escrito en
+prosa y no como una lista de clases. Lo que dice es que las cabezas son pequeñas **a propósito**: si
+una capa lineal sobre el vector agrupado basta para leer el valor de una posición, esa información ya
+estaba en el vector, porque una capa lineal no tiene capacidad para inventarla.
+
+`HEADS` es una tupla y no una lista, y eso es más que estilo: es la clave del orden en el que se
+recorren las cabezas al sumar la pérdida y al imprimir las métricas, y una tupla al nivel del módulo
+no la puede modificar nadie por accidente. Aparece también en los tests (`set(parts) == set(HEADS)`)
+y en la configuración de los pesos, así que es el único sitio donde está escrito cuántas cabezas hay.
+
+```python title="src/rukh/models/heads.py"
+class HeadWeights(BaseConfig):
+    """Weight of each head in the joint loss; ``0`` switches a head off without removing it."""
+
+    value: float = 1.0
+    blunder: float = 1.0
+    result: float = 0.5
+```
+
+<Src file="src/rukh/models/heads.py" tag="p3" lines="36-41" />
+
+Cinco líneas con dos decisiones. La primera: hereda de `BaseConfig`, así que los pesos se escriben en
+el YAML del entrenamiento y una clave mal escrita —`results: 0.5`— es un error al cargar y no un peso
+que nunca se aplicó.
+
+La segunda: `result: 0.5` y las otras dos a 1. La cabeza de resultado es la más ruidosa de las tres
+porque su etiqueta es una propiedad de la **partida** repetida en todas sus posiciones; la jugada 3
+de una partida que las blancas acabaron ganando no es una posición ganadora, y el modelo no puede
+acertar ahí. Pesarla la mitad es decir que su gradiente vale la mitad a la hora de mover el tronco
+compartido.
+
+Y la razón de que haya pesos en vez de una suma a pelo: las tres pérdidas viven en escalas distintas
+—un error cuadrático medio pequeño frente a dos entropías cruzadas— y tienen cantidades de datos
+distintas. Sumarlas sin más no es «tratarlas por igual»: es dejar que la que tenga los números más
+grandes decida sola en qué dirección se mueve el tronco, sin que nadie lo haya escrito en ninguna
+parte. Un peso explícito, aunque valga 1, al menos es una decisión visible. Y el `0` que «apaga una
+cabeza sin quitarla» es lo que permite medir qué aporta cada tarea sin cambiar la forma del
+checkpoint.
+
+```python title="src/rukh/models/heads.py"
+class ValueHead(nn.Module):
+    """How good is this position for White: a scalar in ``(-1, 1)``."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model, 1)
+
+    def forward(self, pooled: Tensor) -> Tensor:
+        return torch.tanh(self.proj(pooled)).squeeze(-1)
+
+
+class BlunderHead(nn.Module):
+    """Did the move that led here throw the game away: one logit (not a probability)."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model, 1)
+
+    def forward(self, pooled: Tensor) -> Tensor:
+        return self.proj(pooled).squeeze(-1)
+
+
+class ResultHead(nn.Module):
+    """How the game ended: logits over White / draw / Black."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model, RESULT_CLASSES)
+
+    def forward(self, pooled: Tensor) -> Tensor:
+        return self.proj(pooled)
+```
+
+<Src file="src/rukh/models/heads.py" tag="p3" lines="44-74" />
+
+Treinta líneas y tres clases que hacen lo mismo salvo por dos detalles. Merece la pena mirarlos
+porque los dos son la diferencia entre un número que se puede leer y uno que no.
+
+**`ValueHead` pasa por `tanh` y `BlunderHead` no.** La cabeza de valor tiene que producir algo
+comparable con su etiqueta, que es `tanh(cp / 400)`, un número acotado en `(-1, 1)`; el `tanh` en la
+salida garantiza que la predicción vive en el mismo sitio que la etiqueta y que ninguna posición
+extrema puede producir un error cuadrático arbitrariamente grande. La cabeza de errores, en cambio,
+emite un **logit** —un número sin acotar— y no una probabilidad, porque
+`binary_cross_entropy_with_logits` es numéricamente estable donde aplicar una sigmoide y luego el
+logaritmo no lo es: con una probabilidad de `1e-8`, el logaritmo se va al infinito en `float32`,
+mientras que la versión con logits calcula la misma cantidad sin pasar por ahí. Quien quiera la
+probabilidad la obtiene con un `torch.sigmoid` fuera, que es lo que hace la demo.
+
+**El `.squeeze(-1)`.** `nn.Linear(d, 1)` devuelve `(B, 1)`, y la etiqueta es `(B,)`. Sin el
+`squeeze`, `F.mse_loss((B,1), (B,))` no falla: difunde los dos tensores a `(B, B)` y calcula la
+media de **todas las parejas**, incluidas las que emparejan la predicción de una posición con la
+etiqueta de otra. La pérdida sale finita, el entrenamiento arranca, y lo que se minimiza es otra
+cosa. Es uno de los errores de forma más caros de PyTorch, y las tres líneas de arriba existen para
+que no ocurra.
+
+<Callout kind="roto" title="La difusión silenciosa entre `(B, 1)` y `(B,)`">
+  No hay aviso, no hay excepción, y la cifra que sale es plausible. La forma de cazarlo es un test
+  que compruebe la **forma** del resultado, no su valor: `assert value.shape == (5,)`. Está en
+  `test_heads.py`, y es la primera aserción del fichero.
+</Callout>
+
+```python title="src/rukh/models/heads.py"
+class MultiHead(nn.Module):
+    """An encoder plus the three heads, trained on one pooled representation."""
+
+    def __init__(
+        self,
+        encoder: PositionEncoder,
+        weights: HeadWeights | None = None,
+        pooling: Literal["cls", "mean"] = "mean",
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.weights = weights or HeadWeights()
+        self.pooling = pooling
+        d_model = encoder.cfg.d_model
+        self.value = ValueHead(d_model)
+        self.blunder = BlunderHead(d_model)
+        self.result = ResultHead(d_model)
+
+    def pooled(self, idx: Tensor, attention_mask: Tensor | None = None) -> Tensor:
+        """The position's representation, ``(B, d_model)``."""
+        return self.encoder.pool(idx, self.pooling, attention_mask)
+
+    def forward(self, idx: Tensor, attention_mask: Tensor | None = None) -> dict[str, Tensor]:
+        """``{"value": (B,), "blunder": (B,) logits, "result": (B, 3) logits}``."""
+        return self.from_pooled(self.pooled(idx, attention_mask))
+
+    def from_pooled(self, pooled: Tensor) -> dict[str, Tensor]:
+        """The three heads' outputs for an already pooled batch."""
+        return {
+            "value": self.value(pooled),
+            "blunder": self.blunder(pooled),
+            "result": self.result(pooled),
+        }
+```
+
+<Src file="src/rukh/models/heads.py" tag="p3" lines="77-109" />
+
+`MultiHead` **contiene** al encoder en vez de heredar de él, y eso pone el tronco en la clave
+`encoder.blocks.0…` de los checkpoints de las cabezas. Es la razón por la que los tests de la
+lección 6 comparan `after["encoder.blocks.0.mlp.fc.weight"]` con `before["blocks.0.mlp.fc.weight"]`:
+cargar un encoder preentrenado en un `MultiHead` es añadir el prefijo, y no hacerlo es la forma de
+entrenar cabezas sobre pesos aleatorios creyendo que están sobre un preentrenamiento.
+
+La separación entre `forward` y `from_pooled` no es una elegancia: **es lo que hace que el vector se
+calcule una vez**. Tres cabezas sobre la misma posición harían tres pasadas por ocho capas de
+Transformer si cada una llamara al encoder. Además, `from_pooled` es lo que usa el exportador de la
+lección 9 para meter el pooling una sola vez en el grafo ONNX, y lo que permitiría montar una cabeza
+nueva sobre embeddings ya calculados sin volver a pasar por el modelo.
+
+`forward` devuelve un **diccionario** y no una tupla de tres tensores. Con tres salidas de formas
+distintas, una tupla convierte cada llamada en un ejercicio de memoria sobre el orden, y el día que
+aparezca una cuarta cabeza todo lo que desempaquetaba tres valores se rompe. Con claves, el
+exportador, la pérdida y la demo hablan el mismo idioma: `outputs["value"]`.
+
+```python title="src/rukh/models/heads.py"
+    def loss(
+        self, outputs: dict[str, Tensor], targets: dict[str, Tensor]
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """``(total, per head)``; a head with no labelled row in the batch contributes zero.
+
+        ``targets`` carries ``value`` (float), ``blunder`` (0/1 float) with its ``blunder_mask``
+        (the rows that have a label at all) and ``result`` (class index).
+        """
+        zero = torch.zeros((), device=outputs["value"].device, dtype=outputs["value"].dtype)
+        parts = {
+            "value": F.mse_loss(outputs["value"], targets["value"].to(outputs["value"].dtype)),
+            "blunder": zero,
+            "result": F.cross_entropy(outputs["result"], targets["result"].long()),
+        }
+        mask = targets["blunder_mask"].bool()
+        if bool(mask.any()):
+            parts["blunder"] = F.binary_cross_entropy_with_logits(
+                outputs["blunder"][mask], targets["blunder"][mask].to(outputs["blunder"].dtype)
+            )
+        total = sum(
+            (getattr(self.weights, name) * parts[name] for name in HEADS),
+            start=torch.zeros_like(zero),
+        )
+        return total, parts
+```
+
+<Src file="src/rukh/models/heads.py" tag="p3" lines="111-134" />
+
+Veinticuatro líneas con cuatro decisiones, y la tercera es la que vale la lección.
+
+**Devuelve el total y las partes.** Cuando tres cabezas comparten tronco, una suma ponderada puede
+mejorar una tarea a costa de otra y el agregado nunca dice cuál. La lección 11 enseña exactamente
+eso: descongelando el modelo entero, la pérdida de la cabeza de errores empeora mientras el
+`val/loss` global mejora. Si `loss` devolviera solo el total, ese hecho sería invisible.
+
+**La máscara de la cabeza de errores.** Una buena parte de las filas **no tiene etiqueta de error en
+absoluto**: hace falta la posición anterior de la misma partida para saber cuánto se perdió, y la
+primera jugada no la tiene. `outputs["blunder"][mask]` selecciona solo las filas etiquetadas, así que
+las demás no aportan gradiente a esa cabeza —aunque sí a las otras dos, porque el mismo lote sigue
+valiendo para el valor y el resultado—. Etiquetar «no lo sé» como «no fue error» es una de las
+maneras más rápidas de arruinar un clasificador, y con una clase positiva del 3,72 % envenenaría la
+clase mayoritaria justo con las filas de las que hay menos evidencia.
+
+**El `if bool(mask.any())` y el `zero`.** Sin él, un lote sin ninguna fila etiquetada daría
+`binary_cross_entropy_with_logits` sobre tensores vacíos, que en PyTorch es `nan`, y ese `nan` se
+propagaría por la suma al total y de ahí a los gradientes de **las tres** cabezas y del tronco. Un
+solo lote desafortunado arruinaría la tirada entera. Con el `zero`, la cabeza sin datos aporta cero
+ese paso y las otras dos siguen aprendiendo.
+
+**`sum(..., start=torch.zeros_like(zero))`.** El `start` no es decorativo: `sum()` sin él empieza en
+el entero `0`, y `0 + Tensor` funciona, pero el resultado de un `sum` sobre un generador vacío sería
+un `int` en vez de un tensor, y el `.backward()` fallaría con un mensaje que no menciona la pérdida.
+Empezar en un tensor de la forma y el dispositivo correctos hace que el tipo del resultado no dependa
+de cuántas cabezas haya.
+
+El `.to(outputs["value"].dtype)` de las etiquetas es la concesión a <Term id="bf16">bf16</Term>: bajo
+autocast la salida es `bfloat16` y la etiqueta viene del `DataLoader` en `float32`, y `F.mse_loss`
+con tipos distintos lanza. Convertir la **etiqueta** al tipo de la salida y no al revés es lo
+correcto, porque convertir la salida a `float32` sacaría el cálculo del autocast.
+
+```python title="src/rukh/models/heads.py"
+    def head_parameters(self) -> list[nn.Parameter]:
+        """Every parameter of the three heads, the ones a ``probe`` run is allowed to move."""
+        return [
+            param for head in (self.value, self.blunder, self.result) for param in head.parameters()
+        ]
+```
+
+<Src file="src/rukh/models/heads.py" tag="p3" lines="136-140" />
+
+Cinco líneas que existen para que la lección 6 pueda escribir «descongela esto» en una línea. Que la
+lista de cabezas esté aquí y no en el módulo de entrenamiento es lo que hace que añadir una cuarta
+cabeza sea un cambio en un fichero.
+
+## Los tests de las cabezas
+
+```python title="tests/unit/test_heads.py"
+"""Tests for the three heads and their staged fine-tuning: gradients, freezing and the curve."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import polars as pl
+import pytest
+import torch
+
+from rukh.models import EncoderConfig, MultiHead, PositionEncoder
+from rukh.models.heads import HEADS, BlunderHead, HeadWeights, ResultHead, ValueHead
+from rukh.models.squares import SQUARE_TOKENS, fen_to_tokens
+from rukh.train import HeadsConfig, freeze_encoder, label_curve, train_heads
+from rukh.train.checkpoint import load_checkpoint, save_checkpoint
+from rukh.train.heads import LabelledPositions, build_frames, set_training_mode
+
+pytestmark = pytest.mark.unit
+
+TOY = EncoderConfig(input="squares", n_layer=3, n_head=2, d_model=32, dropout=0.0)
+# Four boards whose evaluation the encoder can actually read off the pieces: the full set, the
+# same without Black's queen, without White's queen, and without either. A toy task has to be
+# learnable or "the loss went down" measures nothing.
+BOARDS = (
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR",
+    "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR",
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR",
+    "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR",
+)
+BOARD_CP = (0, 300, -300, 0)
+BOARD_RESULT = ("1/2-1/2", "1-0", "0-1", "1/2-1/2")
+WHITE_TO_MOVE = f"{BOARDS[0]} w KQkq -"
+```
+
+<Src file="tests/unit/test_heads.py" tag="p3" lines="1-32" />
+
+El comentario de las cuatro posiciones es lo más importante del bloque, y es una regla general sobre
+tests de aprendizaje: **una tarea de juguete tiene que ser aprendible o «la pérdida bajó» no mide
+nada**. Los cuatro tableros son la posición inicial, la misma sin la dama negra, la misma sin la dama
+blanca y la misma sin ninguna de las dos, con evaluaciones 0, +300, −300 y 0. Un modelo que mire las
+piezas puede aprender eso; si las etiquetas fueran aleatorias, la pérdida también bajaría —por
+memorización— y el test pasaría sin comprobar nada.
+
+```python title="tests/unit/test_heads.py"
+def toy_batch(rows: int = 4) -> dict[str, torch.Tensor]:
+    idx = torch.tensor([fen_to_tokens(WHITE_TO_MOVE) for _ in range(rows)])
+    return {
+        "idx": idx,
+        "value": torch.linspace(-0.9, 0.9, rows),
+        "blunder": torch.tensor([1.0, 0.0] * (rows // 2)),
+        "blunder_mask": torch.tensor([True, False] * (rows // 2)),
+        "result": torch.tensor([0, 1, 2, 0][:rows]),
+    }
+```
+
+<Src file="tests/unit/test_heads.py" tag="p3" lines="45-53" />
+
+Un lote de juguete con la mitad de las filas sin etiqueta de error (`blunder_mask` alterna `True` y
+`False`), que es la proporción exagerada del caso real y lo que permite comprobar que la máscara
+funciona sin montar un conjunto de datos.
+
+```python title="tests/unit/test_heads.py"
+def test_each_head_has_the_shape_its_label_needs() -> None:
+    pooled = torch.randn(5, 32)
+    value = ValueHead(32)(pooled)
+    assert value.shape == (5,) and bool((value.abs() < 1.0).all())
+    assert BlunderHead(32)(pooled).shape == (5,)  # a logit, not a probability
+    assert ResultHead(32)(pooled).shape == (5, 3)
+
+
+def test_multihead_answers_the_three_questions_at_once() -> None:
+    model = MultiHead(toy_encoder())
+    batch = toy_batch()
+    outputs = model(batch["idx"])
+    assert set(outputs) == set(HEADS)
+    assert outputs["value"].shape == (4,)
+    assert outputs["blunder"].shape == (4,)
+    assert outputs["result"].shape == (4, 3)
+    assert model.pooled(batch["idx"]).shape == (4, 32)
+    assert model.encoder.cfg.seq == SQUARE_TOKENS
+```
+
+<Src file="tests/unit/test_heads.py" tag="p3" lines="106-123" />
+
+El primero es el que caza la difusión silenciosa del `squeeze` y, de paso, que el `tanh` está
+puesto: `value.abs() < 1.0` es falso en cuanto alguien quita la no linealidad de la cabeza de valor.
+
+```python title="tests/unit/test_heads.py"
+def test_multihead_propagates_the_three_gradients() -> None:
+    model = MultiHead(toy_encoder(), HeadWeights(value=1.0, blunder=1.0, result=1.0))
+    batch = toy_batch()
+    total, parts = model.loss(model(batch["idx"]), batch)
+    assert set(parts) == set(HEADS)
+    assert all(torch.isfinite(part) for part in parts.values())
+    total.backward()
+    for name in HEADS:
+        grad = getattr(model, name).proj.weight.grad
+        assert grad is not None and float(grad.abs().sum()) > 0.0, name
+    body = model.encoder.blocks[0].mlp.fc.weight.grad
+    assert body is not None and float(body.abs().sum()) > 0.0  # the encoder gets them too
+```
+
+<Src file="tests/unit/test_heads.py" tag="p3" lines="126-137" />
+
+El test que comprueba que la pérdida está **conectada**. Un `detach()` de más en cualquier punto del
+camino —una conversión de tipo escrita como `.data`, un `torch.no_grad()` que envuelve demasiado—
+produce un modelo que entrena sin aprender, y la única señal es que la pérdida no baja, que se
+confunde con cien cosas más. Aquí el fallo es inmediato y dice qué cabeza (`, name` al final del
+`assert`). La última aserción es la que exige que el gradiente **llegue al tronco**, que es lo que
+distingue un afinado de un probe.
+
+```python title="tests/unit/test_heads.py"
+def test_a_head_with_weight_zero_stops_contributing() -> None:
+    model = MultiHead(toy_encoder(), HeadWeights(value=1.0, blunder=0.0, result=0.0))
+    batch = toy_batch()
+    total, parts = model.loss(model(batch["idx"]), batch)
+    assert torch.allclose(total, parts["value"], atol=1e-6)
+    total.backward()
+    assert float(model.blunder.proj.weight.grad.abs().sum()) == 0.0
+    assert float(model.value.proj.weight.grad.abs().sum()) > 0.0
+
+
+def test_a_batch_without_a_blunder_label_costs_nothing_instead_of_nan() -> None:
+    model = MultiHead(toy_encoder())
+    batch = toy_batch()
+    batch["blunder_mask"] = torch.zeros_like(batch["blunder_mask"])
+    total, parts = model.loss(model(batch["idx"]), batch)
+    assert float(parts["blunder"]) == 0.0
+    assert torch.isfinite(total)
+```
+
+<Src file="tests/unit/test_heads.py" tag="p3" lines="140-156" />
+
+El segundo es el contrato del `if bool(mask.any())` escrito como aserción: **cero, no `nan`**. Es el
+test que impide que alguien «simplifique» esa rama en un futuro refactor, porque sin ella el test
+falla en la última línea con un total no finito.
+
+## `squares.py`: un FEN en 69 tokens
+
+La otra mitad de la lección es la segunda representación de entrada, y el fichero abre con la
+especificación del formato. Es largo y se lee entero una vez: después, el código son cuatro
+funciones evidentes.
+
+```python title="src/rukh/models/squares.py"
+"""The ``squares`` input scheme: a FEN as 69 fixed tokens, the didactic rival of ``moves``.
+
+The ``moves`` scheme feeds the encoder the game so far (the decoder's own UCI vocabulary); this
+one feeds it the position itself, so the two can be compared on the same heads. That comparison
+is the point of the module: it is the "what is a good representation?" lesson of M3.
+
+Layout (always exactly ``SQUARE_TOKENS`` = 69 positions, so no padding is ever needed)::
+
+    0        <cls>                 pooling anchor, the counterpart of the decoder's <bos>
+    1..64    the 64 squares        piece or <empty>, file-major (a1, a2, ..., a8, b1, ..., h8)
+    65       side to move          turn:w / turn:b
+    66       castling rights       castle:<KQkq subset>, 16 combinations in one token
+    67       en passant            ep:none or the file, ep:a ... ep:h
+    68       halfmove clock        clock:0 ... clock:3, the bucketed 50-move counter
+
+The square order is ``rukh.tokenize.uci_vocab.squares()``, file-major, the same enumeration the
+UCI vocabulary uses for move endpoints: one ordering for the whole project.
+
+The plan's arithmetic (64 + turn + 4 castling + en passant + clock) adds up to 71, not to the 69
+it fixes; 69 is the binding number, so the four castling rights travel in one token with 16
+values (they are four bits of one fact, and this keeps every other component in a slot of its
+own) and the position that frees up became ``<cls>``, which gives ``pool("cls")`` a real anchor
+in this scheme instead of borrowing square a1.
+
+Halfmove-clock buckets, chosen so that the boundaries mean something over the board:
+
+===========  ===================================================================
+``clock:0``  0-5 half-moves: a pawn moved or a piece was captured very recently
+``clock:1``  6-24: a normal manoeuvring stretch
+``clock:2``  25-49: the 50-move rule is in sight and shapes the plan
+``clock:3``  50 or more: a draw can be claimed
+===========  ===================================================================
+
+A four-field FEN (``fen4``, the key of the P1 positions and evaluations) carries no counters, so
+it reads back as ``clock:0``; that is the value every label built from P1 data will have.
+
+``SQUARE_VOCAB`` is fixed by construction, never learned from data, and ``vocab_hash`` pins it:
+a change to the enumeration invalidates every encoder trained with it, exactly like the UCI
+vocabulary of P1.
+"""
+```
+
+<Src file="src/rukh/models/squares.py" tag="p3" lines="1-40" />
+
+Cuatro cosas de esas cuarenta líneas son decisiones y no documentación.
+
+**El orden por columnas** (`a1, a2, …, a8, b1, …`) y no por filas. Es el mismo que el vocabulario UCI
+de M1 usa para los extremos de una jugada, y tenerlo igual en todo el proyecto es lo que permite que
+un índice de casilla signifique lo mismo en el tokenizador, en el encoder y en los embeddings que se
+exportan. Un FEN, en cambio, se escribe por filas y de la 8 a la 1; la transposición entre las dos
+convenciones es la parte peligrosa del fichero y tiene su propio test.
+
+**Los cuatro derechos de enroque en un token de 16 valores.** La aritmética obvia da 71 casillas y el
+número que manda es 69, así que había que juntar algo. Juntar los cuatro bits de un mismo hecho es la
+elección menos arbitraria de las posibles, y deja libre una posición para un `<cls>` de verdad en vez
+de pedirle prestada la casilla a1 al pooling.
+
+**Los tramos del reloj con fronteras que significan algo sobre el tablero**, no cuatro cuartiles. 0-5
+quiere decir «acaba de haber captura o jugada de peón», 25-49 quiere decir «la regla de las 50
+jugadas ya condiciona el plan». Un tramo que corresponde a un concepto ajedrecístico es una entrada
+que el modelo puede usar; un cuartil de una distribución no lo es.
+
+**Y el aviso que se lee entero antes de sacar conclusiones del experimento**: las filas de P1 se
+identifican por un FEN de cuatro campos, sin contadores, así que el token 68 vale `clock:0` en
+**toda** la tabla supervisada. En este afinado el tramo de reloj no aporta ni un bit, y el encoder
+aprende un sesgo para él. Se queda en el formato porque una posición en vivo de la demo sí trae los
+contadores, y una representación que cambia de forma entre el entrenamiento y el servicio sería peor
+que una ranura constante.
+
+```python title="src/rukh/models/squares.py"
+from __future__ import annotations
+
+import hashlib
+import json
+
+from rukh.tokenize.uci_vocab import FILES, squares
+
+PIECES = "PNBRQKpnbrqk"
+CASTLING_ORDER = "KQkq"
+N_SQUARES = 64
+SQUARE_TOKENS = 69
+"""Length of every ``squares`` sequence: 1 + 64 + 4."""
+
+CLOCK_EDGES = (6, 25, 50)
+"""Upper edges (exclusive) of the halfmove-clock buckets; see the module docstring."""
+
+
+def castling_strings() -> list[str]:
+    """The 16 castling combinations in a fixed order: ``-``, ``K``, ``Q``, ``KQ``, ``k``, ..."""
+    out: list[str] = []
+    for mask in range(16):
+        rights = "".join(right for bit, right in enumerate(CASTLING_ORDER) if mask >> bit & 1)
+        out.append(rights or "-")
+    return out
+
+
+def build_square_vocab() -> list[str]:
+    """The token list in id order; see the module docstring for the layout it serves."""
+    tokens = ["<pad>", "<mask>", "<cls>", "<empty>"]
+    tokens.extend(PIECES)
+    tokens.extend(["turn:w", "turn:b"])
+    tokens.extend(f"castle:{rights}" for rights in castling_strings())
+    tokens.append("ep:none")
+    tokens.extend(f"ep:{file}" for file in FILES)
+    tokens.extend(f"clock:{index}" for index in range(len(CLOCK_EDGES) + 1))
+    return tokens
+
+
+SQUARE_VOCAB: list[str] = build_square_vocab()
+SQUARE_IDS: dict[str, int] = {token: index for index, token in enumerate(SQUARE_VOCAB)}
+SQUARE_VOCAB_SIZE = len(SQUARE_VOCAB)
+
+PAD_ID = SQUARE_IDS["<pad>"]
+MASK_ID = SQUARE_IDS["<mask>"]
+CLS_ID = SQUARE_IDS["<cls>"]
+EMPTY_ID = SQUARE_IDS["<empty>"]
+CONTROL_IDS: frozenset[int] = frozenset({PAD_ID, MASK_ID, CLS_ID})
+"""Never masked by ``apply_masking``: they are the frame of the sequence, not a prediction."""
+```
+
+<Src file="src/rukh/models/squares.py" tag="p3" lines="42-89" />
+
+El <Term id="vocabulario">vocabulario</Term> **se construye, no se escribe**, y esa es la decisión
+del bloque. Una lista de 47 cadenas escrita a mano es una lista que alguien reordena sin querer al
+añadir un token; construirla con un orden explícito hace que la enumeración sea una consecuencia del
+código. `SQUARE_IDS` es el diccionario inverso, calculado una vez al importar, para que
+`fen_to_tokens` no busque linealmente 47 cadenas por cada una de las 64 casillas de cada posición.
+
+El orden de los primeros cuatro tokens no es casual: `<pad>` es el 0 en los **dos** esquemas, que es
+lo que permite que `PositionEncoder.padding_mask` sea `idx != 0` sin preguntar por el esquema.
+
+`CONTROL_IDS` es el contrato con el enmascarado de la lección siguiente: los tres tokens que son el
+marco de la secuencia y nunca una predicción. Tenerlo aquí, al lado del vocabulario, en vez de en el
+módulo de entrenamiento, es lo que hace que añadir un token de control sea un cambio en un sitio.
+
+```python title="src/rukh/models/squares.py"
+def vocab_hash() -> str:
+    """SHA-256 of the vocabulary as a JSON list: the identity of the ``squares`` scheme."""
+    payload = json.dumps(SQUARE_VOCAB, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
+def clock_bucket(halfmove: int) -> int:
+    """Index of the halfmove-clock bucket of ``halfmove`` (see ``CLOCK_EDGES``)."""
+    if halfmove < 0:
+        raise ValueError(f"the halfmove clock cannot be negative, got {halfmove}")
+    return sum(halfmove >= edge for edge in CLOCK_EDGES)
+```
+
+<Src file="src/rukh/models/squares.py" tag="p3" lines="92-102" />
+
+El hash es la identidad del esquema y existe por el mismo motivo que el del vocabulario UCI de M1:
+**un encoder solo significa algo con el vocabulario que vio**. Si alguien inserta un token en medio
+de la lista, todos los ids posteriores se desplazan, los pesos del embedding pasan a describir otras
+cosas, y el modelo sigue cargando y prediciendo. El hash convierte ese cambio en un test rojo.
+
+Dos detalles del hash que lo hacen reproducible y que conviene copiar: `ensure_ascii=True` y
+`separators=(",", ":")`. Sin el primero, un token con un carácter no ASCII se serializaría distinto
+según la versión; sin el segundo, `json.dumps` mete un espacio después de cada coma y el hash
+dependería de ese detalle de formato.
+
+`clock_bucket` usa `sum(halfmove >= edge …)`, que cuenta cuántas fronteras se han pasado: con
+`CLOCK_EDGES = (6, 25, 50)`, un 30 supera dos y cae en el tramo 2. Es más corto que tres `if` y, sobre
+todo, sigue siendo correcto si mañana hay cinco fronteras.
+
+```python title="src/rukh/models/squares.py"
+def _placement_ids(placement: str) -> list[int]:
+    """The 64 square ids, file-major, from the piece-placement field of a FEN."""
+    ranks = placement.split("/")
+    if len(ranks) != 8:
+        raise ValueError(f"a FEN placement needs 8 ranks, got {len(ranks)}: {placement!r}")
+    ids = [EMPTY_ID] * N_SQUARES
+    for row, rank_text in enumerate(ranks):
+        rank = 7 - row  # the placement is written from rank 8 down to rank 1
+        file = 0
+        for char in rank_text:
+            if char.isdigit():
+                file += int(char)
+            elif char in PIECES:
+                if file >= 8:
+                    raise ValueError(f"rank {rank + 1} of {placement!r} is too long")
+                ids[file * 8 + rank] = SQUARE_IDS[char]
+                file += 1
+            else:
+                raise ValueError(f"unknown piece {char!r} in {placement!r}")
+        if file != 8:
+            raise ValueError(f"rank {rank + 1} of {placement!r} covers {file} files, not 8")
+    return ids
+```
+
+<Src file="src/rukh/models/squares.py" tag="p3" lines="105-126" />
+
+La función peligrosa del fichero, y el peligro cabe en una expresión: `ids[file * 8 + rank]`. Un FEN
+se lee por filas de la 8 a la 1; el proyecto guarda por columnas. Equivocarse en esa transposición
+—escribir `rank * 8 + file`— produce un tablero **válido y distinto**, la posición reflejada en la
+diagonal. Ninguna comprobación de forma lo detecta, el modelo entrena tan contento, y lo que aprende
+es ajedrez en un tablero girado. De ahí que exista `tokens_to_fen` y su test de ida y vuelta: es la
+única forma barata de comprobar una permutación.
+
+Las tres validaciones cubren las tres formas de que un FEN mienta sobre el tablero. `file >= 8` caza
+una fila con piezas de más; `file != 8` al final caza una fila que no llega a cubrir las ocho
+columnas —una `7` donde debía haber una `8`, que es la errata típica de un FEN escrito a mano—; y el
+`else` caza un carácter que no es ni dígito ni pieza. Las tres mencionan la fila y el FEN completo en
+el mensaje, que es lo que hace falta para encontrar la fila mala entre ocho.
+
+```python title="src/rukh/models/squares.py"
+def _castling_id(field: str) -> int:
+    """Token id of a FEN castling field, normalized to the ``KQkq`` order."""
+    if field in ("-", ""):
+        return SQUARE_IDS["castle:-"]
+    unknown = [char for char in field if char not in CASTLING_ORDER]
+    if unknown:
+        raise ValueError(f"unsupported castling field {field!r} (Chess960 is out of scope)")
+    rights = "".join(right for right in CASTLING_ORDER if right in field)
+    return SQUARE_IDS[f"castle:{rights}"]
+```
+
+<Src file="src/rukh/models/squares.py" tag="p3" lines="129-137" />
+
+La **normalización al orden `KQkq`** es lo que hace que `qK` y `Kq` sean el mismo token. Sin ella, la
+misma posición escrita por dos generadores de FEN distintos daría dos entradas distintas al modelo, y
+el encoder tendría que aprender que dos símbolos quieren decir lo mismo con la mitad de los datos
+para cada uno.
+
+Y el mensaje de error menciona Chess960 porque ese es exactamente el caso que se está rechazando: en
+ajedrez aleatorio los derechos de enroque se escriben con la columna de la torre (`AHah`), no con
+`KQkq`. Decir en el error que la variante está fuera del alcance ahorra media hora a quien le llegue
+un volcado con partidas de Chess960 mezcladas.
+
+```python title="src/rukh/models/squares.py"
+def fen_to_tokens(fen: str) -> list[int]:
+    """The ``SQUARE_TOKENS`` ids of a FEN; four fields (``fen4``) or the full six are accepted.
+
+    Raises ``ValueError`` on a malformed FEN: the encoder must never be fed a position that was
+    silently repaired into a different one.
+
+    Token 68, the halfmove clock, is **constant** over every dataset this project builds. A
+    ``fen4`` has no counters, so it reads back as ``clock:0``, and P1's positions table is all
+    ``fen4``: the bucket carries exactly zero information there and the encoder learns a bias
+    term for it. It stays in the layout because a live position from the demo does have the
+    counters, and a representation that changes shape between training and serving would be
+    worse than one slot of constant.
+    """
+    fields = fen.split()
+    if len(fields) < 4:
+        raise ValueError(f"a FEN needs at least 4 fields, got {len(fields)}: {fen!r}")
+    placement, turn, castling, ep = fields[:4]
+    if turn not in ("w", "b"):
+        raise ValueError(f"the side to move must be 'w' or 'b', got {turn!r}")
+    halfmove = int(fields[4]) if len(fields) > 4 else 0
+    if ep in ("-", ""):
+        ep_token = "ep:none"
+    elif len(ep) == 2 and ep[0] in FILES and ep[1] in "36":
+        ep_token = f"ep:{ep[0]}"
+    else:
+        raise ValueError(f"unknown en-passant square {ep!r}")
+    return [
+        CLS_ID,
+        *_placement_ids(placement),
+        SQUARE_IDS[f"turn:{turn}"],
+        _castling_id(castling),
+        SQUARE_IDS[ep_token],
+        SQUARE_IDS[f"clock:{clock_bucket(halfmove)}"],
+    ]
+```
+
+<Src file="src/rukh/models/squares.py" tag="p3" lines="140-173" />
+
+La frase que manda está en el docstring: **un FEN mal formado lanza**. La tentación en un pipeline de
+datos es reparar y seguir —una fila menos no arregla nada, una excepción a las tres horas de
+tokenizar sí molesta— y aquí la política es la contraria, porque un tablero equivocado que entrena es
+peor que una corrida que se para. Es la misma regla que el `extra="forbid"` de M0, un nivel más
+abajo.
+
+Solo se guarda el campo del reloj (`fields[4]`) y se ignora el número de jugada (`fields[5]`): el
+número de jugada es redundante —se deduce del ply— y no dice nada de la posición.
+
+La comprobación de la casilla al paso, `ep[1] in "36"`, es más estricta de lo que parece y está bien
+así: la casilla al paso solo puede estar en la fila 3 (peón blanco que acaba de avanzar dos) o en la
+6 (peón negro). Un `e4` como casilla al paso es un FEN corrupto, y aceptarlo metería una columna
+plausible en la ranura 67.
+
+```python title="src/rukh/models/squares.py"
+def tokens_to_strings(tokens: list[int]) -> list[str]:
+    """The token strings of a sequence, for debugging and for the lesson's figures."""
+    return [SQUARE_VOCAB[token] for token in tokens]
+
+
+def tokens_to_fen(tokens: list[int]) -> str:
+    """The four-field FEN a token sequence encodes: the inverse of ``fen_to_tokens``.
+
+    The halfmove-clock bucket is dropped because it is lossy by construction, so the round trip
+    is exact for a ``fen4`` and exact up to the counters for a full FEN.
+    """
+    if len(tokens) != SQUARE_TOKENS:
+        raise ValueError(f"a squares sequence has {SQUARE_TOKENS} tokens, got {len(tokens)}")
+    names = tokens_to_strings(tokens)
+    if names[0] != "<cls>":
+        raise ValueError(f"a squares sequence starts with <cls>, got {names[0]!r}")
+    board = names[1 : 1 + N_SQUARES]
+    ranks: list[str] = []
+    for rank in range(7, -1, -1):
+        row, empty = "", 0
+        for file in range(8):
+            piece = board[file * 8 + rank]
+            if piece == "<empty>":
+                empty += 1
+                continue
+            if piece not in PIECES:
+                raise ValueError(f"{piece!r} is not a piece token")
+            row += (str(empty) if empty else "") + piece
+            empty = 0
+        ranks.append(row + (str(empty) if empty else ""))
+    turn = names[1 + N_SQUARES].removeprefix("turn:")
+    castling = names[2 + N_SQUARES].removeprefix("castle:")
+    ep_file = names[3 + N_SQUARES].removeprefix("ep:")
+    ep = "-" if ep_file == "none" else f"{ep_file}{'6' if turn == 'w' else '3'}"
+    return f"{'/'.join(ranks)} {turn} {castling} {ep}"
+
+
+def square_name(index: int) -> str:
+    """Name of the board square at position ``index`` of the 64-square block (0 = ``a1``)."""
+    return squares()[index]
+```
+
+<Src file="src/rukh/models/squares.py" tag="p3" lines="176-215" />
+
+La inversa existe **solo para poder comprobar la directa**, y eso ya justifica sus cuarenta líneas:
+sin ella, la única manera de saber que la transposición es correcta sería mirarla fijamente.
+
+La reconstrucción del campo al paso tiene una recuperación de información que merece verse:
+`'6' if turn == 'w' else '3'`. El token solo guarda la columna, no la fila, porque la fila es
+deducible: si mueven las blancas, el último avance doble fue de un peón negro y la casilla al paso
+está en la fila 6. Guardar un dato deducible habría costado ocho tokens más de vocabulario para
+cero información.
+
+El docstring dice qué se pierde en el viaje de ida y vuelta —los contadores, porque el tramo de reloj
+es una compresión con pérdida— y por eso el test de abajo compara contra el FEN de **cuatro** campos
+en los dos sentidos, en vez de exigir una igualdad que no puede darse.
+
+## El test que caza el tablero girado
+
+```python title="tests/unit/test_squares.py"
+"""Tests for rukh.models.squares: the 69-token FEN scheme, its vocabulary and the round trip."""
+
+from __future__ import annotations
+
+import chess
+import pytest
+
+from rukh.models.squares import (
+    CLOCK_EDGES,
+    SQUARE_IDS,
+    SQUARE_TOKENS,
+    SQUARE_VOCAB,
+    SQUARE_VOCAB_SIZE,
+    castling_strings,
+    clock_bucket,
+    fen_to_tokens,
+    square_name,
+    tokens_to_fen,
+    tokens_to_strings,
+    vocab_hash,
+)
+from rukh.tokenize.uci_vocab import squares
+
+pytestmark = pytest.mark.unit
+
+# Pinned like the UCI vocabulary: an encoder is only meaningful with the vocabulary it saw.
+SQUARE_VOCAB_SHA256 = "b0f530895c035c07423dfa246ad5e874c7406ffbaa1b2155601ebf09e89c98e9"
+OPENING = ["e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4", "f3d4", "g8f6", "b1c3", "a7a6"]
+
+
+def played(moves: list[str]) -> chess.Board:
+    board = chess.Board()
+    for move in moves:
+        board.push_uci(move)
+    return board
+
+
+def test_the_vocabulary_is_stable() -> None:
+    assert vocab_hash() == SQUARE_VOCAB_SHA256
+    assert len(SQUARE_VOCAB) == SQUARE_VOCAB_SIZE == 47
+    assert len(set(SQUARE_VOCAB)) == SQUARE_VOCAB_SIZE
+    assert SQUARE_VOCAB[:4] == ["<pad>", "<mask>", "<cls>", "<empty>"]
+    assert SQUARE_VOCAB[4:16] == list("PNBRQKpnbrqk")
+    assert len(castling_strings()) == 16
+    assert castling_strings()[0] == "-" and castling_strings()[-1] == "KQkq"
+```
+
+<Src file="tests/unit/test_squares.py" tag="p3" lines="1-45" />
+
+El SHA-256 escrito a mano en el test es la misma técnica del `test_lock_guard.py` de M0: una
+propiedad que vive en el código y cuya rotura no falla nada, convertida en un test que la lee. Un
+cambio deliberado del vocabulario obliga a cambiar el hash **y** a decidir qué pasa con los
+checkpoints entrenados con el anterior, que es exactamente la conversación que hay que tener.
+
+`len(set(SQUARE_VOCAB)) == SQUARE_VOCAB_SIZE` comprueba que no hay tokens repetidos, que es el error
+que produciría un `SQUARE_IDS` donde dos nombres apuntan al mismo id y uno de ellos nunca se usaría.
+
+```python title="tests/unit/test_squares.py"
+def test_a_position_is_exactly_69_tokens() -> None:
+    board = played(OPENING)
+    assert len(fen_to_tokens(board.fen())) == SQUARE_TOKENS == 69
+    fen4 = " ".join(board.fen().split()[:4])
+    assert len(fen_to_tokens(fen4)) == SQUARE_TOKENS  # the P1 four-field FEN is accepted too
+
+
+def test_the_layout_is_cls_board_turn_castling_en_passant_clock() -> None:
+    names = tokens_to_strings(fen_to_tokens(chess.Board().fen()))
+    assert names[0] == "<cls>"
+    assert names[65:] == ["turn:w", "castle:KQkq", "ep:none", "clock:0"]
+    assert names[1] == "R" and names[2] == "P" and names[3] == "<empty>"  # a1, a2, a3
+
+
+def test_every_square_matches_python_chess() -> None:
+    board = chess.Board()
+    for move in OPENING:
+        board.push_uci(move)
+        names = tokens_to_strings(fen_to_tokens(board.fen()))[1:65]
+        for index, name in enumerate(names):
+            piece = board.piece_at(chess.square(index // 8, index % 8))
+            assert name == (piece.symbol() if piece else "<empty>"), square_name(index)
+```
+
+<Src file="tests/unit/test_squares.py" tag="p3" lines="48-69" />
+
+El tercero es el que caza la transposición, y lo hace de la única manera fiable: **contra una
+implementación independiente**. `chess.square(file, rank)` de `python-chess` traduce columna y fila a
+su propio índice, y el test comprueba las 64 casillas de diez posiciones distintas contra esa
+traducción. Que la comparación sea con una librería externa es lo que le da valor; comprobar la
+transposición con otra función del mismo fichero solo demostraría que las dos se equivocan igual.
+
+El `index // 8, index % 8` es la lectura del orden por columnas: la casilla 9 es columna 1, fila 1,
+es decir b2. Y el `, square_name(index)` al final del `assert` hace que el fallo diga «g4» en vez de
+«índice 30».
+
+```python title="tests/unit/test_squares.py"
+def test_the_64_squares_round_trip_through_the_four_field_fen() -> None:
+    board = chess.Board()
+    for move in [*OPENING, "f1e2", "c8d7", "e1g1"]:
+        board.push_uci(move)
+        fen4 = " ".join(board.fen().split()[:4])
+        assert tokens_to_fen(fen_to_tokens(fen4)) == fen4
+        assert tokens_to_fen(fen_to_tokens(board.fen())) == fen4
+
+
+def test_castling_rights_are_distinguished() -> None:
+    board = played(OPENING)
+    fen4 = " ".join(board.fen().split()[:4])
+    fields = fen4.split()
+    variants = {
+        rights: fen_to_tokens(f"{fields[0]} {fields[1]} {rights} {fields[3]}")[66]
+        for rights in ("KQkq", "KQk", "Kq", "-")
+    }
+    assert len(set(variants.values())) == 4
+    assert variants["-"] == SQUARE_IDS["castle:-"]
+    # The order inside the field does not matter, the rights do.
+    assert fen_to_tokens(f"{fields[0]} {fields[1]} qK {fields[3]}")[66] == variants["Kq"]
+    with pytest.raises(ValueError, match="unsupported castling field"):
+        fen_to_tokens(f"{fields[0]} {fields[1]} AHah {fields[3]}")
+```
+
+<Src file="tests/unit/test_squares.py" tag="p3" lines="72-94" />
+
+La lista de jugadas del primero termina en `e1g1` —un enroque corto— a propósito: es la jugada que
+mueve dos piezas a la vez y quita derechos de enroque, o sea la que más cosas puede romper de una
+vez en una representación de tablero.
+
+El segundo comprueba que los cuatro estados de enroque de la muestra dan **cuatro ids distintos**
+(`len(set(...)) == 4`), que es lo que quedaría roto si el empaquetado en un token perdiera un bit, y
+que el orden dentro del campo no importa, que es la normalización de `_castling_id`.
+
+```python title="tests/unit/test_squares.py"
+def test_en_passant_is_distinguished_and_does_not_disturb_the_board() -> None:
+    board = played(["e2e4", "a7a6", "e4e5", "d7d5"])  # d6 is a legal en-passant target
+    with_ep = fen_to_tokens(board.fen())
+    without = fen_to_tokens(board.fen().replace(" d6 ", " - "))
+    assert with_ep[67] == SQUARE_IDS["ep:d"] and without[67] == SQUARE_IDS["ep:none"]
+    assert with_ep[:67] == without[:67]  # only the en-passant slot changes
+    assert tokens_to_fen(with_ep).split()[3] == "d6"
+    assert fen_to_tokens("8/8/8/8/8/8/8/8 b - c3")[67] == SQUARE_IDS["ep:c"]
+    assert tokens_to_fen(fen_to_tokens("8/8/8/8/8/8/8/8 b - c3")).split()[3] == "c3"
+    with pytest.raises(ValueError, match="en-passant square"):
+        fen_to_tokens("8/8/8/8/8/8/8/8 w - e4")
+
+
+def test_the_halfmove_clock_is_bucketed() -> None:
+    assert CLOCK_EDGES == (6, 25, 50)
+    assert [clock_bucket(n) for n in (0, 5, 6, 24, 25, 49, 50, 120)] == [0, 0, 1, 1, 2, 2, 3, 3]
+    start = chess.Board().fen().split()
+    fen = " ".join(start[:4])
+    assert fen_to_tokens(f"{fen} 0 1")[68] == SQUARE_IDS["clock:0"]
+    assert fen_to_tokens(f"{fen} 30 40")[68] == SQUARE_IDS["clock:2"]
+    assert fen_to_tokens(fen)[68] == SQUARE_IDS["clock:0"]  # a fen4 carries no counter
+    with pytest.raises(ValueError, match="cannot be negative"):
+        clock_bucket(-1)
+```
+
+<Src file="tests/unit/test_squares.py" tag="p3" lines="97-119" />
+
+`with_ep[:67] == without[:67]` es la aserción de **aislamiento**: cambiar un campo del FEN solo puede
+mover la ranura de ese campo. Es la forma general de comprobar que una codificación posicional no se
+desalinea, y se puede escribir para cada campo de cualquier formato de ancho fijo.
+
+Las dos últimas aserciones del reloj recorren las fronteras exactas: 5 todavía es el tramo 0, 6 ya es
+el 1; 24 es el 1, 25 es el 2. **Los tests de tramos se escriben siempre en las fronteras**, porque un
+`>` donde debía haber un `>=` solo se nota ahí.
+
+```python title="tests/unit/test_squares.py"
+def test_the_square_order_is_the_uci_vocabulary_order() -> None:
+    assert square_name(0) == "a1" and square_name(63) == "h8"
+    assert [square_name(i) for i in range(64)] == squares()
+
+
+def test_a_malformed_fen_is_refused() -> None:
+    with pytest.raises(ValueError, match="at least 4 fields"):
+        fen_to_tokens("8/8/8/8/8/8/8/8 w")
+    with pytest.raises(ValueError, match="8 ranks"):
+        fen_to_tokens("8/8/8 w - -")
+    with pytest.raises(ValueError, match="covers 7 files"):
+        fen_to_tokens("7/8/8/8/8/8/8/8 w - -")
+    with pytest.raises(ValueError, match="unknown piece"):
+        fen_to_tokens("xxxxxxxx/8/8/8/8/8/8/8 w - -")
+    with pytest.raises(ValueError, match="side to move"):
+        fen_to_tokens("8/8/8/8/8/8/8/8 x - -")
+    with pytest.raises(ValueError, match="69 tokens"):
+        tokens_to_fen([1, 2, 3])
+```
+
+<Src file="tests/unit/test_squares.py" tag="p3" lines="122-139" />
+
+El último es el que convierte «un FEN mal formado lanza» de una frase del docstring en una promesa:
+seis maneras de escribir mal un FEN y las seis con su mensaje. Los `match` no comprueban el texto
+entero, solo el trozo que identifica el caso, que es el equilibrio razonable: un test que exija el
+mensaje literal se rompe cada vez que alguien mejora la redacción.
+
+<Exercise n="01" title="Gira el tablero y mira qué tests sobreviven">
+  En una copia del repositorio, cambia `ids[file * 8 + rank]` por `ids[rank * 8 + file]` en
+  `_placement_ids` y ejecuta `uv run pytest tests/unit/test_squares.py -q`. ¿Cuáles de los nueve
+  tests fallan? Después deshazlo y quita el `<cls>` de `build_square_vocab` **y** de la lista que
+  devuelve `fen_to_tokens`, para que la secuencia tenga 68 tokens: ¿qué se rompe y qué no?
+
+<Solution>
+  Con la transposición girada fallan `test_the_layout_is_cls_board_turn_castling_en_passant_clock`
+  (la casilla 1 ya no es la torre de a1) y `test_every_square_matches_python_chess`, que es el que
+  lo dice bien: enseña la casilla concreta en la que discrepa de `python-chess`. Lo interesante es
+  **cuál no falla**: `test_the_64_squares_round_trip_through_the_four_field_fen` pasa
+  tranquilamente, porque `tokens_to_fen` usa la misma fórmula y las dos se equivocan igual. Ese es el
+  motivo de que la comprobación contra `python-chess` exista además del viaje de ida y vuelta: una
+  inversa consistente no demuestra que la directa sea correcta, solo que es invertible.
+
+Sin `<cls>`, lo primero que rompe es `test_the_vocabulary_is_stable`, por el hash y por el tamaño; y
+`test_a_position_is_exactly_69_tokens` y todos los que indexan 65, 66, 67 o 68. Lo que **no** rompe
+es el modelo: `EncoderConfig.seq` seguiría diciendo 69 porque lee `SQUARE_TOKENS`, así que habría
+que cambiar esa constante también, y entonces la tabla de posiciones de cualquier checkpoint
+entrenado antes dejaría de encajar. Esa cadena es la razón de que el hash del vocabulario sea un
+test y no un comentario.
+
+</Solution>
+</Exercise>
+
+## Qué has aprendido
+
+Que la sonda más tonta que funcione es la herramienta correcta para medir una representación, y que
+el precio de ponerle tres cabezas a un tronco es una pérdida con pesos explícitos, con las partes
+publicadas por separado y con una máscara para la tarea cuya etiqueta a veces no existe. Y que una
+representación de ancho fijo —69 ranuras— se defiende con tres cosas: un vocabulario construido y
+con hash, una inversa que solo existe para comprobar la directa, y una comparación contra una
+implementación ajena.
+
+**Cómo se mide**: `uv run pytest tests/unit/test_squares.py -q` pasa los nueve tests, y el hash
+`b0f5308…` es el del vocabulario de 47 tokens. Los cuatro primeros tests de `test_heads.py` pasan sin
+GPU y en menos de un segundo.
+
+Lo siguiente es el preentrenamiento: cómo se tapa el 15 % de las jugadas de una partida, por qué el
+sorteo son dos sorteos y qué comparte el bucle del encoder con el del decoder de M2.

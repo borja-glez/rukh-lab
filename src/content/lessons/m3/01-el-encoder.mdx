@@ -6,10 +6,10 @@ description:
   el afinado por etapas, la curva por número de etiquetas y las dos representaciones de una posición.'
 module: m3
 order: 1
-duration: 150
+duration: 50
 level: base
 status: vigente
-updated: '2026-09-21'
+updated: '2026-09-22'
 keywords:
   - encoder
   - bidireccional
@@ -48,7 +48,9 @@ import MaskCompare from '../../../components/figures/MaskCompare.astro';
 
 <RepoTag tag="p2" at="inicio" module="M2" next="m3" />
 
-Parte 1 de 3 del módulo «El encoder». Sigue en «El encoder: medir sin engañarse» y termina en «El encoder: los labs».
+Lección 1 de 11 del módulo «El encoder». Esta es la conceptual: qué se construye, qué teoría hace
+falta para decidir y qué decisiones lleva dentro el hito. Las diez siguientes traen el código del
+módulo entero, fichero a fichero, y empiezan por las capas que el decoder y el encoder comparten.
 
 ## Qué vas a construir
 
@@ -98,13 +100,13 @@ Al terminar tendrás:
 Una aclaración antes de la tarjeta de abajo, porque sus cifras no cuadran con las de arriba y no es
 un error: lo que hoy vive en `chorcat/rukh-encoder` es el **hermano mayor**, de 39 millones de
 parámetros —12 capas y 512 dimensiones, el tamaño del `small`—, que se entrenó con la misma receta
-después de cerrar el módulo y que la parte 3 cuenta al final. Los labs se hacen con el de 15
+después de cerrar el módulo y que la lección 11 cuenta al final. Los labs se hacen con el de 15
 millones, que se entrena en quince minutos, y la comparación entre los dos es parte de lo que se
 aprende.
 
 <ModelBadge repo="chorcat/rukh-encoder" />
 
-Todas las salidas de esta lección son de la tirada real del 19 de septiembre de 2026 en una RTX
+Todas las salidas del módulo son de la tirada real del 19 de septiembre de 2026 en una RTX
 5090 —los tres modos de afinado, la curva completa, la exportación y los embeddings—, y la figura
 del final dibuja un JSON generado con un checkpoint de verdad. No queda ningún hueco, y por eso la
 lección está `vigente`. Y adelantamos los titulares, porque un curso que esconde su resultado hasta
@@ -131,7 +133,7 @@ lo demás: la máscara, el objetivo, las cabezas y hasta las métricas.
 | Cómo se mide       | legalidad, exactitud, puzles, Elo  | F1 y correlación **contra una línea base**        | Con clases raras, un acierto alto puede no significar nada.               |
 | Qué se congela     | nada                               | el tronco, mientras se entrenan las cabezas       | Para saber si la cabeza aprende o el tronco se está reescribiendo.        |
 
-Las tres primeras filas son esta lección. Las tres últimas son la siguiente, «medir sin
+Las tres primeras filas son esta lección. Las tres últimas son la lección 8, «medir sin
 engañarse», que es la parte más transferible del módulo y la que cuesta más leer deprisa.
 
 ## Teoría justa
@@ -149,16 +151,14 @@ pila de bloques pre-norm y terminan en un `LayerNorm`. La atención es la misma 
 `F.scaled_dot_product_attention`, con las mismas proyecciones fusionadas. La diferencia cabe en un
 argumento:
 
-```python
-# decoder.py: cada posición solo mira hacia atrás
-layers.Block(d_model, n_head, ff, dropout, causal=True)
-
-# encoder.py: cada posición mira toda la secuencia
-layers.Block(d_model, n_head, ff, dropout, causal=False)
+```text title="Las dos líneas, una al lado de la otra"
+src/rukh/models/decoder.py:58   super().__init__(cfg.d_model, cfg.n_head, cfg.ff, cfg.dropout, causal=True)
+src/rukh/models/encoder.py:80   self.cfg.d_model, self.cfg.n_head, self.cfg.ff, self.cfg.dropout, causal=False
 ```
 
 Ese booleano acaba en el `is_causal` de la llamada de atención, que es lo que decide si la matriz de
-pesos se recorta a su triángulo inferior o se queda entera. Nada más.
+pesos se recorta a su triángulo inferior o se queda entera. Nada más. Los dos ficheros enteros están
+en las lecciones 2 y 3, con esas líneas en su contexto.
 
 <Figure
   n="01"
@@ -346,113 +346,9 @@ que no debería existir, y envenena tanto el entrenamiento como la evaluación. 
 una clase calculada por pupitres en vez de por alumnos: los pupitres vacíos cuentan como un cero, y
 la media de los mismos veinte alumnos cambia según el aula que les toque.
 
-En el código, `pool` lee la máscara del propio `idx` cuando no se la pasan. Y aquí está el fichero
-entero, que es el del decoder con el booleano cambiado y tres funciones más:
-
-```python title="src/rukh/models/encoder.py"
-PAD_ID = 0
-
-MMM_IGNORE_INDEX = -100
-"""La etiqueta de una posición que la pérdida de MMM tiene que saltarse. **No** el 0 del decoder."""
-
-
-class PositionEncoder(nn.Module):
-    """Encoder bidireccional: `forward` devuelve los estados ocultos `(B, T, d)`."""
-
-    def __init__(self, cfg: EncoderConfig | None = None) -> None:
-        super().__init__()
-        self.cfg = cfg or EncoderConfig()
-        self.tokens = nn.Embedding(self.cfg.tokens, self.cfg.d_model)
-        self.positions = (
-            nn.Embedding(self.cfg.seq, self.cfg.d_model) if self.cfg.pos == "learned" else None
-        )
-        self.drop = nn.Dropout(self.cfg.dropout)
-        self.blocks = nn.ModuleList(
-            layers.Block(self.cfg.d_model, self.cfg.n_head, self.cfg.ff,
-                         self.cfg.dropout, causal=False)     # <- la línea que lo cambia todo
-            for _ in range(self.cfg.n_layer)
-        )
-        self.ln_f = nn.LayerNorm(self.cfg.d_model)
-        self.mlm_head = nn.Linear(self.cfg.d_model, self.cfg.tokens, bias=False)
-        if self.cfg.tie_embeddings and self.cfg.input == "moves":
-            # Solo en `moves`: ahí el embedding y la cabeza describen las mismas 2 030 jugadas.
-            # Con 47 tokens de casillas no compensa y el código no lo hace.
-            self.mlm_head.weight = self.tokens.weight
-        self.apply(layers.init_weights)
-        scale = 0.02 / math.sqrt(2 * self.cfg.n_layer)
-        for name, param in self.named_parameters():
-            if name.endswith("proj.weight"):
-                nn.init.normal_(param, mean=0.0, std=scale)
-
-    @staticmethod
-    def padding_mask(idx):
-        """`True` donde `idx` es un token real, `False` en `<pad>`; forma `(B, T)`."""
-        return idx != PAD_ID
-
-    @staticmethod
-    def _key_mask(attention_mask):
-        """`(B, T)` a la máscara de claves booleana `(B, 1, 1, T)` que espera SDPA."""
-        if attention_mask is None:
-            return None
-        mask = attention_mask.bool()
-        if mask.dim() != 2:
-            raise ValueError(f"attention_mask tiene que ser (B, T), era {tuple(mask.shape)}")
-        if not _tracing() and not bool(mask.any(dim=-1).all()):
-            raise ValueError("cada secuencia necesita al menos un token sin enmascarar")
-        return mask[:, None, None, :]
-
-    def forward(self, idx, attention_mask=None):
-        seq = idx.shape[-1]
-        if seq > self.cfg.seq:
-            raise ValueError(f"secuencia de {seq} tokens, más larga que el bloque {self.cfg.seq}")
-        key_mask = self._key_mask(attention_mask)
-        x = self.tokens(idx)
-        if self.positions is not None:
-            x = x + self.positions(torch.arange(seq, device=idx.device))
-        x = self.drop(x)
-        for block in self.blocks:
-            x = block(x, None, None, key_mask)
-        return self.ln_f(x)
-
-    def masked_lm(self, idx, labels=None, attention_mask=None):
-        """Logits de jugada tapada `(B, T, V)` y, con `labels`, la pérdida escalar."""
-        logits = self.mlm_head(self(idx, attention_mask))
-        loss = None
-        if labels is not None:
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                labels.reshape(-1),
-                ignore_index=MMM_IGNORE_INDEX,
-            )
-        return logits, loss
-
-    def pool(self, idx, how="mean", attention_mask=None):
-        """Un vector por secuencia, `(B, d_model)`: la representación de la posición."""
-        if how not in ("cls", "mean"):
-            raise ValueError(f"how tiene que ser 'cls' o 'mean', era {how!r}")
-        mask = self.padding_mask(idx) if attention_mask is None else attention_mask.bool()
-        hidden = self(idx, mask)
-        if how == "cls":
-            return hidden[:, 0]
-        weights = mask.unsqueeze(-1).to(hidden.dtype)
-        return (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
-```
-
-El `pool` suma solo los tokens reales y divide por cuántos eran. El `clamp(min=1.0)` evita dividir
-por cero en el caso degenerado de una secuencia entera de relleno, que además está prohibido más
-arriba: una fila completamente enmascarada haría que el softmax de la atención devolviera `NaN`,
-así que el encoder la rechaza con un error explícito en vez de dejar que aparezca un `NaN` tres
-capas después.
-
-<Callout kind="hoy" title="Por qué esa comprobación se salta bajo el exportador">
-  `_key_mask` **lee un tensor** para decidir si lanza el error, y una bifurcación que depende de los
-  datos es precisamente lo que una captura de grafo no puede representar. Bajo `torch.export`
-  mandaría la exportación al tracer antiguo de TorchScript; bajo `torch.compile` es peor de una
-  forma más silenciosa: Dynamo no puede demostrar la condición, así que rompe el grafo en **cada**
-  paso enmascarado, lo que son un punto de sincronización y dos medios grafos por paso a cambio de
-  una comprobación que ya pasó. `_tracing()` la desactiva solo durante la captura, y en modo normal
-  el comportamiento no cambia: el grafo exportado es una función pura de su entrada de todos modos.
-</Callout>
+En el código todo eso son cuatro líneas de `pool`, que lee la máscara del propio `idx`
+cuando no se la pasan, suma solo los tokens reales y divide por cuántos eran. El fichero entero, con
+el pooling, la pérdida de MMM y la guarda que impide una fila entera de relleno, está en la lección 3.
 
 "Una representación de la posición" significa exactamente esto: un vector de 384 números del que se
 puede leer, con una transformación lineal, si las blancas están mejor, si la última jugada fue una
@@ -463,72 +359,11 @@ hizo su trabajo. Ese es el experimento, y el pooling es el sitio donde se hace l
 
 Las tres cabezas son **una capa lineal cada una**. No es pereza: es el diseño del experimento.
 
-```python title="src/rukh/models/heads.py"
-class ValueHead(nn.Module):
-    """Cuánto vale esta posición para las blancas: un escalar en `(-1, 1)`."""
-
-    def __init__(self, d_model: int) -> None:
-        super().__init__()
-        self.proj = nn.Linear(d_model, 1)
-
-    def forward(self, pooled):
-        return torch.tanh(self.proj(pooled)).squeeze(-1)
-
-
-class BlunderHead(nn.Module):
-    """¿La jugada que llevó aquí tiró la partida? Un **logit**, no una probabilidad."""
-
-    def __init__(self, d_model: int) -> None:
-        super().__init__()
-        self.proj = nn.Linear(d_model, 1)
-
-    def forward(self, pooled):
-        return self.proj(pooled).squeeze(-1)
-
-
-class ResultHead(nn.Module):
-    """Cómo acabó la partida: logits sobre blancas / tablas / negras."""
-
-    def __init__(self, d_model: int) -> None:
-        super().__init__()
-        self.proj = nn.Linear(d_model, 3)
-
-    def forward(self, pooled):
-        return self.proj(pooled)
-```
-
-Y la pérdida conjunta, que es donde está la decisión:
-
-```python title="src/rukh/models/heads.py"
-    def loss(self, outputs, targets) -> tuple[Tensor, dict[str, Tensor]]:
-        """`(total, por cabeza)`; una cabeza sin ninguna fila etiquetada aporta cero."""
-        zero = torch.zeros((), device=outputs["value"].device, dtype=outputs["value"].dtype)
-        value_target = targets["value"].to(outputs["value"].dtype)
-        value_loss = F.mse_loss(outputs["value"], value_target)
-        if self.weights.value_rank:
-            value_loss = value_loss + self.weights.value_rank * pairwise_rank_loss(
-                outputs["value"], value_target
-            )
-        parts = {
-            "value": value_loss,
-            "blunder": zero,
-            "result": F.cross_entropy(outputs["result"], targets["result"].long()),
-        }
-        # Una buena parte de las filas **no tiene etiqueta de error**: hace falta la posición
-        # anterior de la misma partida para saber cuánto se perdió, y la primera jugada no la
-        # tiene. La pérdida corre sobre una máscara y la ausencia es `null`, nunca un 0.
-        mask = targets["blunder_mask"].bool()
-        if bool(mask.any()):
-            parts["blunder"] = F.binary_cross_entropy_with_logits(
-                outputs["blunder"][mask], targets["blunder"][mask].to(outputs["blunder"].dtype)
-            )
-        total = sum((getattr(self.weights, n) * parts[n] for n in HEADS), start=torch.zeros_like(zero))
-        return total, parts
-```
-
-Fíjate en que devuelve las tres partes por separado además del total. Cuando tres cabezas comparten
-tronco, una suma ponderada puede mejorar una tarea a costa de otra y el agregado nunca dice cuál;
-el lab 3 lo enseña con la cabeza de errores empeorando mientras el `val/loss` global mejora.
+La pérdida conjunta devuelve las tres partes por separado además del total, y eso es donde está la
+decisión. Cuando tres cabezas comparten tronco, una suma ponderada puede mejorar una tarea a costa
+de otra y el agregado nunca dice cuál; la lección 11 lo enseña con la cabeza de errores empeorando
+mientras el `val/loss` global mejora. El fichero completo —las tres cabezas, `MultiHead` y la
+pérdida enmascarada— está en la lección 4.
 
 Si una capa lineal sobre el vector agrupado basta para decir cuánto vale una posición, entonces esa
 información **ya estaba** en el vector, porque una capa lineal no tiene capacidad para inventarla. Si
@@ -596,7 +431,7 @@ los cimientos: cambias la parte que usas de otra manera y dejas quieta la que so
 etiquetas?_ Se suele dar por hecho que da los mejores números, y es el que más etiquetas necesita,
 el que más rápido se sobreajusta y el que menos dice sobre el encoder: cuando todo se mueve, es
 imposible separar lo que aportó el preentrenamiento de lo que aportó el afinado. Guarda ese "se
-suele dar por hecho": en el lab 3 no se cumple.
+suele dar por hecho": en la lección 11 no se cumple.
 
 La comparación entre los tres es el resultado interesante, no el número del mejor. Si `probe` ya va
 bien, el preentrenamiento funcionó y tienes un modelo barato de adaptar a tareas nuevas. Si `probe`
@@ -621,7 +456,7 @@ pregunta de presupuesto: **¿cuántas etiquetas hacen falta de verdad?** Si se a
 etiquetar cuatro veces más fue tirar dinero y el cuello de botella está en el modelo, en la tarea o
 en el ruido de las propias etiquetas. Si sigue subiendo en el 100 %, la inversión más rentable que
 te queda es etiquetar más, y ninguna idea arquitectónica va a competir con eso. Adelanto para que
-leas el resto de la sección sabiendo adónde va: en este módulo se aplana en el 25 %, y el lab 3 trae
+leas el resto de la sección sabiendo adónde va: en este módulo se aplana en el 25 %, y la lección 11 trae
 las cuatro filas.
 
 Es la misma curva que la de una encuesta electoral. Con mil encuestados el margen de error ronda los
@@ -676,70 +511,9 @@ de las dos sustituye a la otra, y esa es exactamente la comparación que viene a
   moraleja es la misma: el número que manda es el que está en el spec y el que compila.
 </Callout>
 
-El traductor cabe en dos funciones, y las dos tienen una guarda que merece explicación:
-
-```python title="src/rukh/models/squares.py"
-def build_square_vocab() -> list[str]:
-    """La lista de tokens en orden de id: 47 entradas, fijadas por construcción."""
-    tokens = ["<pad>", "<mask>", "<cls>", "<empty>"]
-    tokens.extend("PNBRQKpnbrqk")
-    tokens.extend(["turn:w", "turn:b"])
-    tokens.extend(f"castle:{rights}" for rights in castling_strings())  # las 16 combinaciones
-    tokens.append("ep:none")
-    tokens.extend(f"ep:{file}" for file in FILES)
-    tokens.extend(f"clock:{index}" for index in range(len(CLOCK_EDGES) + 1))
-    return tokens
-
-
-def _placement_ids(placement: str) -> list[int]:
-    """Los 64 ids de casilla, por columnas, desde el campo de colocación de un FEN.
-
-    Un FEN escribe las filas de la 8 a la 1 y las columnas de la a a la h; el proyecto guarda las
-    casillas por columnas. Equivocarse en esa transposición da un tablero **válido y distinto**,
-    que ninguna comprobación de forma puede detectar: de ahí `tokens_to_fen` y su test de ida y
-    vuelta.
-    """
-    ranks = placement.split("/")
-    if len(ranks) != 8:
-        raise ValueError(f"la colocación de un FEN necesita 8 filas, tenía {len(ranks)}")
-    ids = [EMPTY_ID] * 64
-    for row, rank_text in enumerate(ranks):
-        rank = 7 - row
-        file = 0
-        for char in rank_text:
-            if char.isdigit():
-                file += int(char)
-            elif char in PIECES:
-                if file >= 8:
-                    raise ValueError(f"la fila {rank + 1} de {placement!r} es demasiado larga")
-                ids[file * 8 + rank] = SQUARE_IDS[char]
-                file += 1
-            else:
-                raise ValueError(f"pieza desconocida {char!r} en {placement!r}")
-        if file != 8:
-            raise ValueError(f"la fila {rank + 1} cubre {file} columnas, no 8")
-    return ids
-
-
-def fen_to_tokens(fen: str) -> list[int]:
-    """Los 69 ids de un FEN; se aceptan cuatro campos (`fen4`) o los seis completos.
-
-    Un FEN mal formado lanza. Al encoder no se le puede dar nunca una posición que se ha reparado
-    en silencio hasta convertirla en otra: un tablero equivocado que entrena es peor que una
-    corrida que se para.
-    """
-    fields = fen.split()
-    if len(fields) < 4:
-        raise ValueError(f"un FEN necesita al menos 4 campos, tenía {len(fields)}")
-    placement, turn, castling, ep = fields[:4]
-    if turn not in ("w", "b"):
-        raise ValueError(f"el bando que mueve tiene que ser 'w' o 'b', era {turn!r}")
-    halfmove = int(fields[4]) if len(fields) > 4 else 0
-    ...  # ep:none o la columna, y el tramo de reloj
-    return [CLS_ID, *_placement_ids(placement), SQUARE_IDS[f"turn:{turn}"],
-            _castling_id(castling), SQUARE_IDS[ep_token],
-            SQUARE_IDS[f"clock:{clock_bucket(halfmove)}"]]
-```
+El traductor son dos funciones y su inversa, y viven en `src/rukh/models/squares.py`, entero en la
+lección 4: ahí está el vocabulario de 47 tokens fijado por construcción, la transposición del FEN a
+las 64 casillas en orden por columnas y el test de ida y vuelta que la vigila.
 
 Cuál gana es una pregunta empírica, es la que el spec de diseño del proyecto pone como Componente 2 del hito, y
 ahora tiene respuesta. Las hipótesis razonables antes de medir eran que las casillas ganaran en
@@ -769,11 +543,11 @@ Dos columnas de esta tabla todavía no se han explicado, y basta con esto para l
 es la probabilidad de que, cogidos al azar un error y una jugada tranquila, el modelo puntúe más
 alto el error (0,5 sería una moneda), y **Spearman** mide si el orden de los valores predichos
 coincide con el del motor, sin mirar la escala; Pearson sí la mira. Las tres tienen su sección en
-la parte 2, y el umbral «ajustado» del F1 también.
+la lección 8, «medir sin engañarse», y el umbral «ajustado» del F1 también.
 
 La fila que cuenta es la del medio: **`last-n` es el checkpoint que se publicó al cerrar el
 módulo** (`checkpoints/encoder-heads-moves-20260919-101904/best.pt`), el que usan todas las cifras
-de estas tres partes, y afinar menos red gana en todo. La de `full` se queda porque es la
+de este módulo, y afinar menos red gana en todo. La de `full` se queda porque es la
 comparación que lo demuestra, y porque publicar el checkpoint de una y las métricas de otra es un
 error que este proyecto estuvo a punto de cometer: la decisión D-061 del registro existe por eso.
 
@@ -826,6 +600,6 @@ aproximación, y el margen de +3,5 puntos se lee sabiéndola.
 </Callout>
 
 Hasta aquí la arquitectura: qué cambia al leer en las dos direcciones, qué enseña el enmascarado y
-qué sale de cada esquema de entrada. La parte siguiente es la medición: por qué una exactitud alta
-sobre una clase rara no dice nada, contra qué línea base se mide y dónde se elige el umbral para no
-hacer trampa. Sigue en «El encoder: medir sin engañarse».
+qué sale de cada esquema de entrada. Lo que viene es el código, y empieza por donde el proyecto lo
+empezó: sacar de `decoder.py` los bloques que los dos modelos comparten, para que el encoder no sea
+una copia del decoder sino el mismo bloque con otro booleano. Sigue en «Las capas compartidas».

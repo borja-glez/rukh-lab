@@ -172,6 +172,71 @@ lines.push(
   '`tests/fixtures/`, `gold/` y `docs/`. Están enlazados desde la lección que los menciona.',
 );
 lines.push('');
+lines.push('## Por hito: lo que el lector tiene escrito al cerrar cada módulo');
+lines.push('');
+lines.push(
+  'La tabla de arriba mide contra `p6`, que es el estado final, y por eso castiga a los ficheros que',
+);
+lines.push(
+  'varios módulos editan: el curso enseña la versión de cada etiqueta, y una línea que cambió después',
+);
+lines.push(
+  'no aparece igual en `p6`. La pregunta que de verdad importa es otra: **al cerrar el módulo N, ¿está',
+);
+lines.push(
+  'en el curso cada línea del motor tal como está en `pN`?** Eso es lo que mide esta tabla, contando',
+);
+lines.push('todo lo que enseñaron ese módulo y los anteriores.');
+lines.push('');
+lines.push(
+  'Las dos son un **suelo**, no una medida exacta. Una línea mostrada en una etiqueta anterior se',
+);
+lines.push(
+  'reconoce por su texto, y en un fichero repetitivo (`cli.py` tiene decenas de `) -> None:`) varias',
+);
+lines.push(
+  'líneas idénticas se acreditan una sola vez. Donde el número baja, mira la tabla de abajo: dice qué',
+);
+lines.push('lección muestra cada fichero, y casi siempre son varias.');
+lines.push('');
+lines.push('| Hito | Líneas mostradas | Total en `src/rukh` | Cobertura |');
+lines.push('| ---- | ---------------- | ------------------- | --------- |');
+for (let n = 0; n <= 6; n += 1) {
+  const tag = `p${n}`;
+  let total = 0;
+  let hit = 0;
+  for (const file of filesAt(tag)) {
+    if (!file.startsWith('src/') || file.startsWith('src/rukh/data/cards/')) continue;
+    const text = fileAt(workspace, 'rukh', tag, file);
+    if (text === null) continue;
+    const body = normalise(text).split('\n');
+    const code = new Set(
+      body.map((line, i) => (line.trim() === '' ? 0 : i + 1)).filter((i) => i > 0),
+    );
+    total += code.size;
+    /* Any earlier tag counts, as long as the text of that line is the same at this one. */
+    for (const earlier of ['p0', 'p1', 'p2', 'p3', 'p4', 'p5', 'p6'].slice(0, n + 1)) {
+      const entry = shown.get(`${file}@${earlier}`);
+      if (!entry) continue;
+      const at = fileAt(workspace, 'rukh', earlier, file);
+      if (at === null) continue;
+      const there = normalise(at).split('\n');
+      for (const l of entry.lines) {
+        const line = there[l - 1];
+        if (line === undefined) continue;
+        if (body[l - 1] === line && code.has(l)) {
+          hit += code.delete(l) ? 1 : 0;
+          continue;
+        }
+        const i = body.indexOf(line);
+        if (i !== -1 && code.has(i + 1)) hit += code.delete(i + 1) ? 1 : 0;
+      }
+    }
+  }
+  const pctTag = total === 0 ? '—' : `${((100 * hit) / total).toFixed(1)} %`;
+  lines.push(`| \`${tag}\` (M${n}) | ${hit} | ${total} | ${pctTag} |`);
+}
+lines.push('');
 lines.push('## Ficheros que no están completos');
 lines.push('');
 const missing = rows.filter((r) => r.covered < r.total).sort((a, b) => b.total - a.total);

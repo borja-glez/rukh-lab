@@ -19,17 +19,23 @@ const root = resolve(__dirname, '..');
 const haveRukh = existsSync(resolve(root, '../rukh/.git'));
 
 describe('code blocks in lessons', () => {
-  it.runIf(haveRukh)('are the files they claim to be, verbatim, at the module tag', () => {
-    let output: string;
-    try {
-      output = execFileSync('node', ['scripts/course-code.mjs', 'verify'], {
-        cwd: root,
-        encoding: 'utf8',
-      });
-    } catch (error) {
-      const failure = error as { stdout?: string; stderr?: string };
-      expect.fail(`${failure.stdout ?? ''}${failure.stderr ?? ''}`);
-    }
-    expect(output).toContain('verbatim');
-  });
+  /* 1 400 citations, each resolved with a `git show` against the tag it cites: well past the
+     five-second default, and the check is worth the wall clock. */
+  it.runIf(haveRukh).concurrent(
+    'are the files they claim to be, verbatim, at the module tag',
+    () => {
+      let output: string;
+      try {
+        output = execFileSync('node', ['scripts/course-code.mjs', 'verify'], {
+          cwd: root,
+          encoding: 'utf8',
+        });
+      } catch (error) {
+        const failure = error as { stdout?: string; stderr?: string };
+        expect.fail(`${failure.stdout ?? ''}${failure.stderr ?? ''}`);
+      }
+      expect(output).toContain('verbatim');
+    },
+    120_000,
+  );
 });

@@ -1,0 +1,1232 @@
+---
+title: 'Evaluar el encoder: qué se mide y qué sale'
+description:
+  'La primera mitad de `eval/encoder.py`: los cuatro modelos de resultado que son el catálogo de
+  lo que se publica, de dónde salen las filas con su posición anterior, la tokenización en el
+  esquema del checkpoint, la caché de la línea base y la fila del encoder en la tabla única.'
+module: m3
+order: 7
+duration: 155
+runtime: 5
+level: avanzado
+status: vigente
+updated: 2026-09-22
+keywords:
+  - evaluación
+  - informe
+  - caché
+  - tabla única
+  - pydantic
+artifacts:
+  - kind: repo
+    label: borja-glez/rukh
+    href: https://github.com/borja-glez/rukh/tree/p3
+---
+
+Lección 7 de 11 del módulo «El encoder». Viene de «Entrenar las cabezas» y sigue en «Medir sin
+engañarse».
+
+## Qué vas a construir
+
+`src/rukh/eval/encoder.py` es el fichero más grande del módulo —1 195 líneas— y se lee en dos
+lecciones que no son «parte 1» y «parte 2». Esta es **qué mide la suite y qué produce**: la
+configuración, los modelos de datos que definen lo que se publica, de dónde salen las filas, cómo
+se tokenizan en el esquema que el checkpoint diga, cómo se calculan las predicciones del modelo y
+las de la línea base, y cómo se escribe el informe y la fila de la tabla única. La lección siguiente
+es **cómo se evita engañarse**: las métricas a mano y el reparto del umbral.
+
+Va también lo que el módulo cambió alrededor: la fila de encoder de la tabla de resultados
+(`eval/report.py`), los reexportes de `eval/__init__.py` y la orden `rukh eval encoder`.
+
+## El contrato de la suite
+
+```python title="src/rukh/eval/encoder.py"
+"""The encoder's own suite: blunder detection against the baseline, value correlation, result.
+
+``rukh eval`` measures a decoder by the moves it plays; an encoder plays nothing, so it is
+measured by what it knows about a position it has never seen. The held-out split is the one
+``rukh.data.labels`` draws **by game** (two positions of the same game are not independent), and
+every number here is computed on the very same rows for the model and for
+``rukh.eval.heuristic``, because ``GOAL.md`` asks for a margin between the two and a margin
+measured on two different sets is not a margin.
+
+Four questions, four numbers:
+
+``blunder``
+    precision, recall and F1 over the rows that have a blunder label at all, for the encoder
+    *and* for the material baseline. The headline is the difference in F1 points.
+
+    A blunder is rare (about 3.7 % of the labelled rows) and that changes what an F1 at a
+    fixed threshold means. The head's probabilities are not calibrated (nobody calibrated
+    them), so at 0.5 a perfectly informative head can fire on nothing at all and score an F1 of
+    zero while ranking the positions almost right. Scoring the *threshold* instead of the
+    representation is not a measurement, so the rows are cut in two **by game** (the policy of
+    ``rukh.data.labels``, for the same reason): the ``tune`` half chooses the threshold that
+    maximises F1, and the ``score`` half is where the reported F1, precision and recall are
+    measured. The number at the fixed 0.5 is printed next to it, on the same ``score`` half, so
+    nothing is hidden, and ``ROC AUC`` and ``average precision`` are printed too because they
+    are the two summaries that do not depend on an operating point at all. The baseline is a
+    hard yes/no rule with no threshold to tune, which the report says out loud: the comparison
+    gives the model a sweep the baseline cannot have.
+
+``value``
+    Spearman **and** Pearson between the predicted value and ``tanh(cp / 400)``, the bounded
+    score the head was trained on — never raw ``cp``, where a forced mate is ``±9 99x`` and a
+    handful of rows would decide Pearson for the whole set. Spearman is the headline (it asks
+    only whether the ranking is right, which is what "the model knows which position is better"
+    means) and the ``GOAL.md`` bar of 0.80 is checked against it; Pearson is printed next to it
+    because the two disagree exactly when the order is right and the scale is not. Spearman is
+    Pearson over average ranks, written out here rather than imported: ``scipy`` is not a
+    dependency.
+
+``result``
+    plain accuracy over the three classes.
+
+``label curve``
+    the 10/25/50/100 % points of the fine-tuning run, when the checkpoint carries them.
+
+The heuristic is the slow part (a ``python-chess`` board per row), so its verdicts go through
+``rukh.eval.cache`` under a key of their own: they do not depend on the weights, so a second
+checkpoint evaluated on the same rows pays nothing for them.
+"""
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="1-48" />
+
+Cuarenta y ocho líneas de docstring antes de una sola de código, y son la lección 8 entera escrita
+por adelantado. Vale la pena leerlas dos veces, porque **el fichero se diseñó desde ellas**: cada
+párrafo describe una decisión que luego tiene su función.
+
+La primera frase es la que justifica que exista una suite aparte: `rukh eval` mide un decoder por
+las jugadas que hace, y un encoder no hace ninguna. Medirlo con la misma herramienta habría
+significado inventarle una forma de jugar.
+
+Y la segunda es la regla que hace que el margen signifique algo: **el encoder y la heurística se
+miden sobre exactamente las mismas filas**. Un margen medido sobre dos conjuntos distintos no es un
+margen, es una comparación de anécdotas.
+
+```python title="src/rukh/eval/encoder.py"
+from __future__ import annotations
+
+import json
+import logging
+import math
+import zlib
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import chess
+import numpy as np
+import polars as pl
+from pydantic import BaseModel, ConfigDict, Field
+
+from rukh import paths
+from rukh.config import BaseConfig
+from rukh.data.labels import LabelsConfig, build_labels
+from rukh.eval import heuristic
+from rukh.eval.cache import EvalCache, config_sha, file_sha
+from rukh.eval.report import (
+    ReportPaths,
+    encoder_row_of,
+    write_report_files,
+)
+
+log = logging.getLogger(__name__)
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="50-77" />
+
+Los imports dicen de qué depende la suite, y hay dos ausencias que merecen notarse: no hay `scipy` ni
+`scikit-learn`. Las cuatro métricas de la lección siguiente están escritas a mano sobre `numpy`, que
+ya es dependencia del proyecto, y son cuarenta líneas. Y `torch` no aparece al nivel del módulo: se
+importa dentro de `predict`, porque cargarlo cuesta más de un segundo y `rukh eval encoder --help`
+tiene que responder al instante.
+
+```python title="src/rukh/eval/encoder.py"
+SUITE = "encoder"
+HEURISTIC_SUITE = "heuristic"
+HEURISTIC_KEY = "material-mobility-v1"
+"""Cache key of the baseline: bump it when the heuristic's verdicts change."""
+CURVE_KEY = "label_curve"
+"""The payload key ``rukh.train.checkpoint.CURVE_KEY`` writes; a test pins the two together."""
+GOAL_MARGIN = 5.0
+"""F1 points the encoder has to add to the baseline (``GOAL.md``)."""
+TUNE_HALF = "tune"
+"""Half of the labelled rows the operating point is chosen on, and never scored on."""
+SCORE_HALF = "score"
+"""Half of the labelled rows every reported blunder number is measured on."""
+GOAL_VALUE_CORRELATION = 0.80
+"""The second acceptance criterion of ``GOAL.md``: value against Stockfish, at least 0.8.
+
+Measured as **Spearman against the bounded score**, and both halves of that sentence matter.
+The target is ``tanh(score / 400)``, so the head cannot reproduce centipawns and was never
+asked to: correlating a bounded output against raw ``cp`` would compare a number in ``(-1, 1)``
+with one that a forced mate sends to ``±9 99x``, and a handful of mates would decide Pearson for
+the whole set. Rank correlation is also the honest reading of "the model knows which position is
+better", which is what the bar is about. Pearson on the same bounded pair is reported next to it.
+"""
+DEFAULT_CONFIG = "encoder.yaml"
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="79-101" />
+
+Los dos <Term id="criterio-de-aceptacion">criterios de aceptación</Term> del hito son dos constantes
+en el código, y eso es la mitad de por qué no se pueden mover después de medir. La otra mitad es que
+están escritas en el plan antes de que existiera el modelo.
+
+`HEURISTIC_KEY = "material-mobility-v1"` con el `v1` al final: es la clave de la caché de los
+veredictos de la línea base, y el docstring dice lo que hay que hacer cuando la heurística cambie:
+subir el número. Sin eso, un cambio en el cálculo del material se quedaría oculto tras miles de
+veredictos cacheados y la comparación mezclaría dos líneas base.
+
+`CURVE_KEY` es un duplicado deliberado de `rukh.train.checkpoint.CURVE_KEY` —el que escribe la
+curva— y el docstring dice que hay un test que los ata. Es una alternativa razonable a importar la
+constante: `rukh.eval` no depende de `rukh.train` al nivel del módulo, y un test que compruebe la
+igualdad cuesta una línea.
+
+```python title="src/rukh/eval/encoder.py"
+class EncoderEvalConfig(BaseConfig):
+    """What the encoder suite measures and where it reads and writes."""
+
+    stage: str | None = None
+    """Name of the row in the results table; defaults to the checkpoint's run directory."""
+    labels: LabelsConfig = Field(default_factory=LabelsConfig)
+    split: str = "val"
+    """Which side of the by-game split to measure; never ``train`` for a published number."""
+    positions: int = 10_000
+    """Cap on the rows evaluated; ``0`` means the whole split."""
+    batch_size: int = 256
+    threshold: float = 0.5
+    """Probability above which the encoder's ``blunder`` logit counts as a blunder."""
+    mobility_weight: float = heuristic.MOBILITY_WEIGHT
+    blunder_material: float = heuristic.BLUNDER_MATERIAL
+    seed: int = 42
+    out_dir: str = "artifacts/eval"
+    web_results: str | None = "artifacts/web/results.json"
+    cache_db: str = "artifacts/eval/cache.sqlite"
+    device: str | None = None
+    """Where the model runs; ``None`` means ``rukh.train.pick_device()`` (CUDA when present)."""
+    track: bool = True
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="104-125" />
+
+`labels: LabelsConfig` embebida es lo que garantiza que la evaluación reconstruya **la misma tabla**
+que el entrenamiento: la misma semilla, la misma fracción de validación, el mismo umbral de
+centipeones para definir un error. Con dos configuraciones separadas, un `blunder_cp: 150` en una y
+`100` en la otra daría una métrica sobre una definición de «error» que el modelo nunca vio.
+
+`stage: None` con el valor por defecto «el directorio del checkpoint» es una comodidad con un
+efecto que conviene conocer: como las tiradas llevan marca de tiempo, sin `--stage` cada evaluación
+escribiría en una carpeta distinta y añadiría una fila nueva a la tabla en vez de actualizar la que
+hay. Por eso los comandos del módulo lo fijan.
+
+`positions: 10_000` es un tope, y es de donde sale el «10 000 posiciones» de todos los informes del
+módulo. Con `0` se evalúa la partición entera, que son unas cuarenta mil.
+
+```python title="src/rukh/eval/encoder.py"
+    def heuristic_fields(self) -> dict[str, Any]:
+        """The settings a cached *baseline* verdict depends on: never the weights.
+
+        ``labels`` is in here even though the verdict is a function of the position alone,
+        because it says *which table the positions came from*: pointing ``positions_eval`` at a
+        different parquet has to invalidate the cache, and a cached verdict is keyed by the
+        position itself (see ``heuristic_predictions``) precisely so that two tables sharing a
+        position share the answer instead of overwriting each other's.
+        """
+        return {
+            "heuristic": HEURISTIC_KEY,
+            "mobility_weight": self.mobility_weight,
+            "blunder_material": self.blunder_material,
+            "labels": self.labels.model_dump(mode="json"),
+        }
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="127-141" />
+
+La lista de lo que invalida una entrada de la caché, y lo interesante es lo que **no** está: los
+pesos del modelo. El veredicto de la línea base es una función de la posición y de dos constantes,
+así que evaluar un segundo checkpoint sobre las mismas filas no vuelve a pagar la parte lenta.
+
+## Los modelos de resultado, que son el catálogo de lo publicable
+
+```python title="src/rukh/eval/encoder.py"
+class ClassificationResult(BaseModel):
+    """Precision, recall and F1 of one binary detector over one set of items."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    items: int
+    positives: int
+    """Rows whose label is 1."""
+    predicted: int
+    true_positives: int
+    false_positives: int
+    false_negatives: int
+    precision: float
+    recall: float
+    f1: float
+    accuracy: float
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="144-160" />
+
+Fíjate en que además de las tres métricas guarda **los cuatro conteos que las explican**. Es una
+decisión con consecuencias: cualquiera que lea el `results.json` puede recalcular la precisión y la
+exhaustividad, y sobre todo puede ver la fila que de verdad cuenta la historia —`predicted`, cuántas
+posiciones se marcaron—. Una precisión del 11,7 % y una del 4,7 % suenan parecidas hasta que se ve
+que una marcó 488 posiciones y la otra 2 359.
+
+Y `accuracy` está aquí, guardada, aunque el informe la califique de inútil. No es una contradicción:
+se guarda porque es la cifra que todo el mundo va a buscar, y tenerla al lado de la tasa base es
+justo lo que hace visible el problema.
+
+```python title="src/rukh/eval/encoder.py"
+class RankingResult(BaseModel):
+    """What a detector's *score* is worth before anyone picks a threshold for it.
+
+    ROC AUC is the probability that a random blunder is ranked above a random quiet move, and
+    average precision is the area under the precision-recall curve, which is the right summary
+    when the positive class is rare: a coin flip scores 0.5 on the first and the base rate on
+    the second, so the two say different things about the same ranking. The span of the
+    probabilities is here as well, because it is what makes a fixed threshold reasonable or
+    absurd: a head whose largest output is 0.26 fires on nothing at 0.5.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    items: int
+    positives: int
+    base_rate: float
+    """Share of the rows that are blunders; also what average precision is compared against."""
+    roc_auc: float | None = None
+    average_precision: float | None = None
+    min_score: float | None = None
+    max_score: float | None = None
+    mean_score: float | None = None
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="163-185" />
+
+**El rango de las probabilidades es un campo del resultado**, y esa es una de las mejores ideas del
+fichero. `min_score`, `max_score` y `mean_score` no son métricas de calidad: son el dato que explica
+por qué un F1 en un umbral fijo vale cero. Una cabeza cuya probabilidad más alta es 0,31 no se
+dispara nunca en 0,5, y sin esa línea en el informe el lector se queda pensando que el modelo está
+roto.
+
+Es una regla general que vale fuera del ajedrez: **cuando publiques una métrica que depende de un
+umbral, publica también la distribución de lo que se umbraliza.**
+
+`base_rate` en el mismo registro que `average_precision` no es redundante: la precisión media se lee
+**contra la tasa base** —un orden aleatorio saca exactamente la tasa base— y publicar una sin la otra
+es publicar un número sin su referencia.
+
+```python title="src/rukh/eval/encoder.py"
+class CorrelationResult(BaseModel):
+    """How well a predicted value tracks Stockfish's score."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    items: int
+    pearson: float | None = None
+    spearman: float | None = None
+    target: str = "tanh(cp / value_scale)"
+    """What the prediction was correlated against; never raw ``cp``.
+
+    See ``GOAL_VALUE_CORRELATION`` for why."""
+
+
+class CurvePoint(BaseModel):
+    """One point of the label-count curve, as the fine-tuning run recorded it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    fraction: float
+    train_labels: int | None = None
+    metrics: dict[str, float] = {}
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="188-210" />
+
+`target` como **campo del resultado** y no como conocimiento implícito: el informe imprime contra qué
+se correlacionó. Una correlación sin decir contra qué es medio número, y aquí la diferencia entre
+`cp` y `tanh(cp/400)` cambia el resultado por completo.
+
+Los `float | None` en vez de `nan` son deliberados: una correlación indefinida —una de las dos series
+constante— es `None`, que en JSON es `null` y se distingue de un cero. Un `nan` en JSON no es válido
+y algunos lectores lo convierten en cero sin avisar.
+
+```python title="src/rukh/eval/encoder.py"
+class EncoderResult(BaseModel):
+    """Everything one encoder evaluation produced; serialised verbatim as ``results.json``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: str
+    suite: str = SUITE
+    checkpoint: str
+    model_sha: str
+    params: int
+    date: str
+    device: str = "cpu"
+    run_id: str | None = None
+    items: int = 0
+    blunder_items: int = 0
+    """Rows that carry a blunder label; they are split in two halves by ``game_id``."""
+    blunder_positives: int = 0
+    """How many of those rows are blunders."""
+    blunder_base_rate: float | None = None
+    """Share of blunders among the labelled rows: the number every metric here has to be read
+    against, and the reason accuracy says nothing (see ``BASE_RATE_CAVEAT``)."""
+    tune_items: int = 0
+    """Rows of the ``tune`` half: where the threshold is chosen and where nothing is reported."""
+    score_items: int = 0
+    """Rows of the ``score`` half: where every reported blunder number is measured."""
+    tune_games: int = 0
+    score_games: int = 0
+    """Games behind each half; no ``game_id`` is ever in both."""
+    threshold_fixed: float | None = None
+    """The configured threshold, reported as a second operating point and never as the headline."""
+    threshold_tuned: float | None = None
+    """The threshold that maximises F1 on the ``tune`` half; the headline is measured with it."""
+    tune_f1: float | None = None
+    """F1 of the tuned threshold **on the half it was chosen on**: the optimistic number, kept
+    next to the honest one so the distance between the two is visible."""
+    threshold_split_degenerate: bool = False
+    """True when the by-game split could not give both halves blunders, so the threshold had to
+    be chosen and measured on the same rows; the report says so and the number is optimistic."""
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="213-250" />
+
+Esta clase es **el catálogo de todo lo que este módulo se compromete a publicar**, y merece leerse
+como tal. Tres campos son los que hacen que sea un instrumento honesto y no un escaparate.
+
+`model_sha` es el SHA-256 del fichero de pesos. Es lo que hace que una fila de la tabla de
+resultados esté atada a un checkpoint concreto y no a «el mejor de esa carpeta». En este módulo se
+estuvo a punto de publicar un checkpoint con las métricas de otro, y esta línea es lo que convierte
+esa confusión en un dato comprobable.
+
+`tune_f1` es **el número optimista guardado a propósito** al lado del honesto. Es el F1 que el umbral
+alcanza en la mitad donde se eligió, y publicarlo permite ver cuánto cuesta elegir un punto de
+operación. Casi nadie publica ese par.
+
+`threshold_split_degenerate` es un campo para decir «esta vez no pude hacerlo bien». Cuando el
+reparto por partida no consigue dejar errores en las dos mitades —pocas partidas, o todos los
+errores en una— no hay forma honesta de retener filas, así que el umbral se elige y se mide en las
+mismas, y el informe lo dice. Un booleano que admite una limitación vale más que un número sin
+asterisco.
+
+```python title="src/rukh/eval/encoder.py"
+    encoder_blunder: ClassificationResult | None = None
+    """The headline: the encoder at the tuned threshold, on the ``score`` half."""
+    encoder_blunder_fixed: ClassificationResult | None = None
+    """The same rows at the fixed threshold, so the operating point cannot hide anything."""
+    encoder_blunder_ranking: RankingResult | None = None
+    """ROC AUC and average precision on the ``score`` half: no threshold involved."""
+    heuristic_blunder: ClassificationResult | None = None
+    """The baseline on the very same ``score`` half. It is a yes/no rule: nothing was tuned."""
+    f1_margin: float | None = None
+    """Encoder F1 minus baseline F1, in points; ``GOAL.md`` asks for at least five."""
+    meets_goal: bool | None = None
+    """The **blunder** criterion alone; ``GOAL.md`` has two and this is the first."""
+    encoder_value: CorrelationResult | None = None
+    heuristic_value: CorrelationResult | None = None
+    value_correlation_meets_goal: bool | None = None
+    """The second criterion: Spearman of the value head against the bounded score >= 0.80."""
+    meets_all_goals: bool | None = None
+    """Both criteria at once, which is what "P3 is done" means."""
+    result_accuracy: float | None = None
+    label_curve: list[CurvePoint] = []
+    notes: list[str] = []
+    config: dict[str, Any] = {}
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="251-272" />
+
+Tres booleanos de criterio —`meets_goal`, `value_correlation_meets_goal`, `meets_all_goals`— y no
+uno. Separarlos es lo que impide el resumen cómodo: en este hito el primero es `True`, el segundo es
+`False` y el tercero es `False`. Con un solo booleano, «el hito no se cumple» habría escondido que la
+detección de errores sí lo hace; con tres, la tabla del informe enseña las dos cosas con el mismo
+tamaño de letra.
+
+Los tres son `bool | None` y no `bool`, y ese tercer estado es «no medido». Un criterio que no se
+pudo medir no es un criterio incumplido, y `None` es lo que permite que el informe escriba «not
+measured» en vez de «no».
+
+`config: dict[str, Any]` guarda la configuración entera dentro del resultado. Con eso, un
+`results.json` de hace seis meses dice con qué umbral, con qué semilla y sobre qué tabla se midió.
+
+## De dónde salen las filas
+
+```python title="src/rukh/eval/encoder.py"
+def config_path() -> Path:
+    """Where the encoder suite's YAML lives inside the source tree."""
+    return paths.package_root() / "configs" / "eval" / DEFAULT_CONFIG
+
+
+def load_encoder_suite(config: Path | None = None) -> EncoderEvalConfig:
+    """Load the encoder suite config: an explicit path wins over the packaged one."""
+    from rukh.config import load_yaml
+
+    return load_yaml(config if config is not None else config_path(), EncoderEvalConfig)
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="275-284" />
+
+`paths.package_root()` y no `paths.root()`, y esa es la distinción que M0 dejó preparada: la
+configuración de la suite es **código**, vive en el árbol de fuentes, y no se mueve con `RUKH_HOME`.
+Los datos sí.
+
+```python title="src/rukh/eval/encoder.py"
+def build_items(cfg: EncoderEvalConfig, source: pl.DataFrame | None = None) -> pl.DataFrame:
+    """The held-out rows to evaluate, each with the position that preceded it.
+
+    The blunder label judges ``last_move``, the move that *led to* ``fen``, so the baseline needs
+    the position before it: the same ``(game_id, ply - 1)`` self-join ``rukh.data.labels`` uses
+    to build the label in the first place. Exactly the rows with a predecessor carry a label.
+    """
+    frame = build_labels(cfg.labels, source)
+    previous = frame.select(
+        pl.col("game_id"),
+        (pl.col("ply") + 1).alias("ply"),
+        pl.col("fen").alias("fen_before"),
+    )
+    items = (
+        frame.join(previous, on=["game_id", "ply"], how="left")
+        .filter(pl.col("split") == cfg.split)
+        .sort(["order", "game_id", "ply"])
+    )
+    return items.head(cfg.positions) if cfg.positions else items
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="526-544" />
+
+El mismo auto-join desplazado de la lección 6, esta vez para traer el **FEN** anterior en vez de su
+puntuación. La heurística lo necesita porque juzga una jugada volviéndola a jugar en un tablero, y
+para eso hace falta la posición de partida.
+
+La última frase del docstring es una propiedad que cierra el círculo: exactamente las filas con
+predecesor tienen etiqueta. Como el `left join` es el mismo en los dos sitios, el conjunto de filas
+que el modelo puede puntuar y el conjunto que la línea base puede juzgar son **el mismo conjunto**,
+por construcción y no por casualidad.
+
+El `.sort(["order", "game_id", "ply"])` antes del `head` es lo que hace que «las primeras 10 000
+filas» sea una muestra reproducible y no «las que polars devolviera hoy». Es el mismo CRC-32 de la
+curva: un orden barajado de forma determinista.
+
+```python title="src/rukh/eval/encoder.py"
+def encoder_items(items: pl.DataFrame, model: Any, labels: LabelsConfig) -> list[list[int]]:
+    """Tokenize the rows in the scheme the model was trained on, whichever that is.
+
+    ``squares`` reads the FEN and nothing else; ``moves`` needs the line that reached the
+    position, so ``rukh.data.labels.game_moves`` joins the P1 games back in exactly as
+    ``rukh.train.heads`` does — the evaluation has to feed the model the shape it was fine-tuned
+    on, and hard-coding ``fen_to_tokens`` here would silently evaluate a ``moves`` encoder on
+    tokens from another vocabulary.
+    """
+    from rukh.data.labels import game_moves
+    from rukh.train.heads import LabelledPositions
+
+    scheme = str(model.encoder.cfg.input)
+    moves = game_moves(items, labels.games_dir) if scheme == "moves" else None
+    dataset = LabelledPositions(items, scheme, moves, model.encoder.cfg.block)
+    return [dataset.tokens(index) for index in range(len(dataset))]
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="547-562" />
+
+**El esquema lo dice el modelo, no la configuración.** `model.encoder.cfg.input` sale del checkpoint,
+así que evaluar un encoder de jugadas con una configuración que menciona casillas no puede producir
+un número: produce los tokens correctos o falla al cargar.
+
+Y la evaluación **reutiliza el `LabelledPositions` del entrenamiento** en vez de tokenizar por su
+cuenta. Es la misma regla que el `prompt_ids` compartido de la lección 6, un nivel más arriba: si la
+evaluación tokenizara distinto, mediría un modelo alimentado con una entrada que nunca vio, y la
+diferencia sería pequeña, plausible y muy difícil de encontrar.
+
+Los dos `import` dentro de la función son la convención del proyecto para romper un ciclo:
+`rukh.train.heads` importa de `rukh.data.labels`, y `rukh.eval.encoder` importa de los dos.
+
+```python title="src/rukh/eval/encoder.py"
+def predict(
+    model: Any,
+    items: Sequence[Sequence[int]],
+    batch_size: int = 256,
+    device: str | None = None,
+) -> dict[str, np.ndarray]:
+    """Run the three heads over the tokenized rows: ``value``, ``blunder`` (a probability) and
+    ``result``; short sequences are padded and the padding is masked out."""
+    import torch
+
+    from rukh.train.heads import collate
+
+    where = torch.device(device or "cpu")
+    values: list[np.ndarray] = []
+    blunders: list[np.ndarray] = []
+    results: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, len(items), max(1, batch_size)):
+            chunk = [list(tokens) for tokens in items[start : start + max(1, batch_size)]]
+            batch = collate(
+                [{"idx": torch.tensor(tokens, dtype=torch.long)} for tokens in chunk]  # type: ignore[misc]
+            )
+            outputs = model(batch["idx"].to(where), batch["attention_mask"].to(where))
+            values.append(outputs["value"].detach().float().cpu().numpy())
+            blunders.append(torch.sigmoid(outputs["blunder"].detach().float()).cpu().numpy())
+            results.append(outputs["result"].detach().float().argmax(dim=-1).cpu().numpy())
+    empty = np.zeros(0, dtype=np.float32)
+    return {
+        "value": np.concatenate(values) if values else empty,
+        "blunder": np.concatenate(blunders) if blunders else empty,
+        "result": np.concatenate(results) if results else np.zeros(0, dtype=np.int64),
+    }
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="565-596" />
+
+Aquí es donde el logit se convierte en probabilidad: `torch.sigmoid(outputs["blunder"])`. La cabeza
+emite un logit por las razones numéricas de la lección 4, y la evaluación necesita una probabilidad
+porque el umbral y su barrido se definen ahí. Que la conversión esté en un sitio y no en cada
+métrica es lo que hace que el `min_score`/`max_score` del `RankingResult` esté en la misma escala que
+el umbral de la configuración.
+
+El `.detach().float().cpu().numpy()` en ese orden es la secuencia obligatoria: `detach` saca del
+grafo, `float` convierte de `bf16` —que numpy no conoce— a `float32`, `cpu` trae los datos y
+`numpy` los comparte sin copiar. Cualquier otro orden falla o copia de más.
+
+`collate` es **el del entrenamiento**, con los ítems sin etiquetas. Ese es el motivo por el que la
+lección 6 puso las etiquetas detrás de un `if key in items[0]`: una función de agrupación que sirve
+para las dos cosas es una función que no se puede desincronizar.
+
+## La línea base y su caché
+
+```python title="src/rukh/eval/encoder.py"
+def _verdict(fen_before: str, move: str, cfg: EncoderEvalConfig) -> tuple[int, float]:
+    verdict = heuristic.judge(fen_before, move, cfg.blunder_material, cfg.mobility_weight)
+    return int(verdict.blunder), verdict.loss
+
+
+def heuristic_predictions(
+    items: pl.DataFrame, cfg: EncoderEvalConfig, cache: EvalCache | None = None
+) -> dict[str, np.ndarray]:
+    """The baseline's value for every row and its blunder call wherever a move can be judged.
+
+    A row whose predecessor is missing gets ``nan`` for the blunder call, exactly like its label:
+    the two sides of the comparison skip the same rows.
+    """
+    values = np.full(items.height, np.nan, dtype=np.float64)
+    calls = np.full(items.height, np.nan, dtype=np.float64)
+    columns = items.select("game_id", "ply", "fen", "fen_before", "last_move").rows()
+    for index, (_game_id, _ply, fen, fen_before, last_move) in enumerate(columns):
+        # Keyed by the position judged, never by ``game_id:ply``: the payload is a function of
+        # these three strings and of nothing else, so the same position reached from another
+        # table reuses the answer, and a *different* position that happens to sit at the same
+        # ply of the same game cannot silently inherit a stale verdict. ``fen_before`` is part
+        # of the key because ``fen`` plus ``last_move`` does not recover the captured piece,
+        # and the baseline's whole judgement is the material difference between the two.
+        item_id = f"{fen}|{fen_before or ''}|{last_move or ''}"
+        payload = cache.get(HEURISTIC_SUITE, item_id) if cache is not None else None
+        if payload is None:
+            board_value = heuristic.value(chess.Board(fen), cfg.mobility_weight)
+            call: float | None = None
+            if fen_before and last_move:
+                call = float(_verdict(str(fen_before), str(last_move), cfg)[0])
+            payload = {"value": board_value, "blunder": call}
+            if cache is not None:
+                cache.put(HEURISTIC_SUITE, item_id, payload)
+        values[index] = float(payload["value"])
+        called = payload.get("blunder")
+        calls[index] = np.nan if called is None else float(called)
+    return {"value": values, "blunder": calls}
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="599-635" />
+
+Seis líneas de comentario sobre la clave de la caché, y las seis valen. **La entrada se indexa por la
+posición juzgada, no por `game_id:ply`.**
+
+La diferencia parece técnica y no lo es. Con `game_id:ply` como clave, la caché sería una promesa
+sobre una tabla concreta: si mañana se reconstruye `positions-eval.parquet` con otro muestreo, el
+ply 30 de la partida 1 713 puede ser otra posición, y heredaría el veredicto de la anterior sin que
+nada fallara. Con la posición como clave, dos tablas que comparten una posición comparten la
+respuesta —que es el ahorro que se quiere— y una posición distinta nunca puede heredar un veredicto
+viejo.
+
+El `fen_before` está en la clave por un motivo concreto que merece pararse: **`fen` más `last_move`
+no recuperan la pieza capturada**. Si la jugada fue una captura, la pieza comida ya no está en el
+tablero resultante y no hay forma de saber cuál era. Y todo el juicio de la línea base es la
+diferencia de material entre el antes y el después. Sin `fen_before` en la clave, dos jugadas
+distintas que llevan al mismo tablero compartirían un veredicto que solo vale para una.
+
+El `nan` para las filas sin predecesor es la otra mitad del «las dos partes se saltan las mismas
+filas»: la etiqueta es nula y la predicción de la línea base también, así que la máscara de filas
+puntuables sale de la intersección de las dos.
+
+```python title="src/rukh/eval/encoder.py"
+def _heuristic_cache(cfg: EncoderEvalConfig, use_cache: bool) -> EvalCache:
+    """The one cache this suite has: the baseline's verdicts, which outlive the weights.
+
+    There is deliberately no cache for the model's own predictions. A forward pass over ten
+    thousand positions is seconds, the heuristic is a ``python-chess`` board per row, and a
+    second cache keyed by the weights would only ever be read when the very same checkpoint is
+    evaluated twice on the very same rows.
+    """
+    database = paths.resolve(cfg.cache_db) if use_cache else None
+    return EvalCache(
+        database,
+        HEURISTIC_KEY,
+        enabled=use_cache,
+        config_sha=config_sha(cfg.heuristic_fields()),
+    )
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="890-904" />
+
+«There is deliberately no cache for the model's own predictions» es el tipo de frase que hay que
+escribir, porque la ausencia de una optimización obvia parece un olvido. El razonamiento cabe en una
+línea: lo caro es la heurística —un tablero de `python-chess` por fila— y lo barato es la pasada
+hacia delante, que además cambia con cada checkpoint.
+
+## La curva, leída del checkpoint
+
+```python title="src/rukh/eval/encoder.py"
+def label_curve_points(payload: dict[str, Any]) -> list[CurvePoint]:
+    """The label-count curve a fine-tuning run may have written into its checkpoint.
+
+    ``rukh train heads --curve`` trains one run per fraction; when the run that produced this
+    checkpoint recorded them, they travel in the payload (or in its ``cfg``) under
+    ``label_curve`` and are reported as they are. Nothing is invented when they are absent.
+    """
+    found = payload.get(CURVE_KEY)
+    if found is None:
+        found = (payload.get("cfg") or {}).get(CURVE_KEY)
+    if not isinstance(found, list):
+        return []
+    points: list[CurvePoint] = []
+    for entry in found:
+        if not isinstance(entry, dict) or "fraction" not in entry:
+            continue
+        metrics = entry.get("metrics") or {}
+        points.append(
+            CurvePoint(
+                fraction=float(entry["fraction"]),
+                train_labels=(
+                    int(entry["train_labels"]) if entry.get("train_labels") is not None else None
+                ),
+                metrics={
+                    str(key): float(value)
+                    for key, value in metrics.items()
+                    if isinstance(value, (int, float))
+                },
+            )
+        )
+    return sorted(points, key=lambda point: point.fraction)
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="638-668" />
+
+«Nothing is invented when they are absent»: un checkpoint sin curva produce una lista vacía y una
+nota en el informe que dice cómo generarla. La alternativa —rellenar con ceros o con la métrica del
+100 % repetida— sería una tabla llena que miente.
+
+Las comprobaciones de tipo (`isinstance(found, list)`, `"fraction" not in entry`) parecen
+paranoicas. No lo son: el payload de un checkpoint es un diccionario que alguien escribió con
+`torch.save`, no un modelo validado, y puede venir de una versión anterior del código o de un
+experimento a mano. **Todo lo que se lee de un fichero se trata como dato no fiable**, y esta es la
+frontera donde eso se aplica.
+
+## La fila del encoder en la tabla única
+
+El módulo tuvo que decidir cómo meter un modelo que no juega en la tabla de resultados que M2
+construyó para modelos que juegan. La respuesta está en `eval/report.py`.
+
+```python title="src/rukh/eval/report.py"
+class EncoderWebRow(BaseModel):
+    """One row of the same table for a model that judges positions instead of playing them.
+
+    An encoder has no legality, no Elo and no puzzles, and a decoder has no blunder F1: forcing
+    the two into one schema would fill the table with columns that are structurally ``null``.
+    The rows share the key (``stage``) and nothing else, and this one says so with ``kind``; a
+    row without a ``kind`` is a decoder row, which is what every row written before M3 is.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: str
+    kind: Literal["encoder"] = "encoder"
+    params: int
+    blunder_f1: float | None = None
+    """F1 of the blunder head at its tuned operating point, on the half it was not tuned on."""
+    blunder_f1_fixed: float | None = None
+    """F1 of the same head on the same rows at the configured threshold, usually 0.5.
+
+    On a class this rare the two differ by a lot, and publishing only one of them would be
+    publishing a threshold instead of a model."""
+    blunder_threshold: float | None = None
+    """The threshold behind ``blunder_f1``, chosen on the other half of the labelled rows."""
+    blunder_f1_heuristic: float | None = None
+    """F1 of the material baseline on the very same rows. It is a rule: nothing was tuned."""
+    blunder_f1_margin: float | None = None
+    """The difference above, in F1 points; ``GOAL.md`` asks for five."""
+    blunder_precision: float | None = None
+    blunder_recall: float | None = None
+    blunder_roc_auc: float | None = None
+    """Threshold-free: the probability that a blunder is ranked above a quiet move."""
+    blunder_average_precision: float | None = None
+    """Threshold-free: area under the precision-recall curve; a coin flip scores the base rate."""
+    blunder_base_rate: float | None = None
+    """Share of blunders among the scored rows; without it the two numbers above mean nothing."""
+    value_pearson: float | None = None
+    value_spearman: float | None = None
+    result_accuracy: float | None = None
+    positions: int = 0
+    date: str
+    run_id: str | None = None
+
+
+TableRow = WebRow | EncoderWebRow
+"""What ``upsert_row`` accepts: one row of the single results table, of either kind."""
+```
+
+<Src file="src/rukh/eval/report.py" tag="p3" lines="62-106" />
+
+**Dos esquemas y una tabla**, en vez de un esquema con el doble de columnas medio vacías. La
+justificación está en el docstring y es la decisión de diseño de datos más transferible del módulo:
+un encoder no tiene legalidad, ni Elo, ni puzles, y un decoder no tiene F1 de errores. Forzarlos a un
+esquema común llenaría la tabla de columnas que son `null` **por construcción** y no por falta de
+medida, y esas dos cosas no se pueden distinguir después.
+
+El campo `kind` con `Literal["encoder"]` y valor por defecto es lo que convierte la unión en una
+**unión discriminada**: una fila con `kind: "encoder"` es del encoder, y una fila sin `kind` es del
+decoder, que es exactamente lo que son todas las filas escritas antes de M3. La compatibilidad hacia
+atrás sale gratis por elegir bien qué campo falta.
+
+```python title="src/rukh/eval/report.py"
+def encoder_row_of(result: EncoderResult) -> EncoderWebRow:
+    """The table row a finished encoder evaluation produces."""
+    encoder = result.encoder_blunder
+    fixed = result.encoder_blunder_fixed
+    baseline = result.heuristic_blunder
+    measured = result.encoder_blunder_ranking
+    value = result.encoder_value
+    return EncoderWebRow(
+        stage=result.stage,
+        params=result.params,
+        blunder_f1=encoder.f1 if encoder else None,
+        blunder_f1_fixed=fixed.f1 if fixed else None,
+        blunder_threshold=result.threshold_tuned,
+        blunder_f1_heuristic=baseline.f1 if baseline else None,
+        blunder_f1_margin=result.f1_margin,
+        blunder_precision=encoder.precision if encoder else None,
+        blunder_recall=encoder.recall if encoder else None,
+        blunder_roc_auc=measured.roc_auc if measured else None,
+        blunder_average_precision=measured.average_precision if measured else None,
+        blunder_base_rate=result.blunder_base_rate,
+        value_pearson=value.pearson if value else None,
+        value_spearman=value.spearman if value else None,
+        result_accuracy=result.result_accuracy,
+        positions=result.items,
+        date=result.date,
+        run_id=result.run_id,
+    )
+```
+
+<Src file="src/rukh/eval/report.py" tag="p3" lines="140-166" />
+
+Una proyección del resultado completo a la fila que ve la web. Lo que decide qué entra es una
+pregunta: ¿se puede leer esta cifra sin el informe al lado? Por eso van juntos el F1 ajustado, el
+fijo, el umbral, el de la línea base y **la tasa base**: sin ella, ni el ROC AUC ni la precisión
+media significan nada.
+
+```python title="src/rukh/eval/report.py"
+def write_report_files(
+    stage: str,
+    markdown_text: str,
+    payload: Any,
+    out_dir: Path,
+    web_results: Path | None,
+    row: TableRow,
+) -> ReportPaths:
+    """Write one stage's ``report.md`` and ``results.json`` and upsert its row for the web.
+
+    The two suites (the decoder's and the encoder's) measure different things and render
+    different reports, but they write them in the same place, in the same shape and into the
+    same table, so the part that is the same lives here once.
+    """
+    directory = Path(out_dir) / stage
+    directory.mkdir(parents=True, exist_ok=True)
+    markdown = directory / REPORT_NAME
+    markdown.write_text(markdown_text, encoding="utf-8", newline="\n")
+    results = directory / RESULTS_NAME
+    results.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n"
+    )
+    web: str | None = None
+    if web_results is not None:
+        upsert_row(Path(web_results), row)
+        web = Path(web_results).as_posix()
+    return ReportPaths(markdown=markdown.as_posix(), results=results.as_posix(), web=web)
+```
+
+<Src file="src/rukh/eval/report.py" tag="p3" lines="359-385" />
+
+El mismo refactor de la lección 2 en otro sitio: lo que las dos suites hacen igual —crear el
+directorio, escribir los dos ficheros, insertar la fila— se saca a una función y `write_report` de
+M2 pasa a llamarla con lo suyo. El `newline="\n"` en las dos escrituras es la precaución de Windows:
+sin él, Python traduce los saltos de línea a `\r\n` y los ficheros del repositorio dejarían de ser
+comparables entre máquinas.
+
+## La configuración de la suite
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/encoder.yaml"
+# Encoder suite (docs/spec/02, component 2): blunder detection against the material baseline,
+# the correlation of the value head with Stockfish's `cp`, and the accuracy of the result head.
+# Everything is measured on the held-out split of `rukh.data.labels`, which is drawn by game.
+stage: null # defaults to the checkpoint's run directory
+split: val # never `train` for a published number
+positions: 10000 # 0 evaluates the whole split
+batch_size: 256
+# The fixed operating point, reported next to the tuned one and never as the headline: a
+# blunder is ~3.7 % of the rows and the head's sigmoid is not calibrated, so the F1 at 0.5
+# measures the threshold rather than the model. The reported F1 uses the threshold that
+# maximises F1 on the `tune` half of the labelled rows (split by game_id, like everything
+# else here) and is measured on the `score` half, together with ROC AUC and average precision.
+threshold: 0.5 # probability above which the blunder logit counts as a blunder
+# The baseline of GOAL.md: material (1/3/3/5/9) plus mobility, one ply of captures ahead.
+mobility_weight: 0.05
+blunder_material: 1.0
+labels:
+  positions_eval: data/evals/positions-eval.parquet
+  out_dir: data/labels
+  value_scale: 400.0
+  blunder_cp: 100
+  val_fraction: 0.1
+  seed: 42
+seed: 42
+out_dir: artifacts/eval
+web_results: artifacts/web/results.json
+cache_db: artifacts/eval/cache.sqlite
+# device: null -> CUDA when it is available (rukh.train.pick_device)
+track: true
+```
+
+<Src file="configs/eval/encoder.yaml" tag="p3" lines="1-29" />
+
+Veintinueve líneas de las que nueve son comentarios que explican un `0.5`. Es proporcionado: ese
+valor es el que la lección 8 desmonta, y dejar escrito **en el fichero** por qué se publica al lado
+del ajustado y nunca como titular es lo que impide que alguien lo lea como el número bueno.
+
+El bloque `labels` repite la configuración del entrenamiento porque tiene que ser **la misma**: la
+semilla 42, la fracción de validación 0,1 y los 100 centipeones que definen un error. Si el
+entrenamiento hubiera usado 150 y la evaluación 100, el modelo se estaría midiendo contra una
+definición de «error» que nunca vio.
+
+`split: val` con el comentario «never `train` for a published number» es la regla de una línea que
+más veces se rompe en un proyecto que va con prisa.
+
+## La orden
+
+```python title="src/rukh/cli.py"
+@eval_app.command("encoder")
+def eval_encoder_cmd(
+    model: Annotated[
+        Path,
+        typer.Option(
+            "--model", exists=True, dir_okay=False, readable=True, help="Fine-tuned checkpoint."
+        ),
+    ],
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config", exists=True, dir_okay=False, readable=True, help="Suite YAML override."
+        ),
+    ] = None,
+    stage: Annotated[
+        str | None, typer.Option("--stage", help="Row name in the results table.")
+    ] = None,
+    device: Annotated[
+        str | None,
+        typer.Option("--device", help="Where to run: cuda, cpu... (default: the training device)."),
+    ] = None,
+    no_cache: Annotated[
+        bool, typer.Option("--no-cache", help="Recompute every baseline verdict.")
+    ] = False,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the result as JSON only.")] = False,
+) -> None:
+    """Measure the encoder's heads against the labels and the material baseline."""
+    from rukh.eval.encoder import load_encoder_suite, run_encoder_suite
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    cfg = load_encoder_suite(config)
+    if stage is not None:
+        cfg = cfg.model_copy(update={"stage": stage})
+    try:
+        result, report = run_encoder_suite(model, cfg, use_cache=not no_cache, device=device)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if as_json:
+        typer.echo(result.model_dump_json(indent=2))
+        return
+```
+
+<Src file="src/rukh/cli.py" tag="p3" lines="629-669" />
+
+`--config` es **opcional** aquí y obligatorio en las órdenes de entrenamiento, y la diferencia tiene
+sentido: la suite trae una configuración empaquetada que es la buena, y pasar otra es la excepción.
+En un entrenamiento no hay «la buena».
+
+`--no-cache` recalcula los veredictos de la línea base, que es lo que hay que hacer después de tocar
+`heuristic.py` si no se ha subido la versión de `HEURISTIC_KEY`.
+
+```python title="src/rukh/cli.py"
+    typer.echo(f"stage:    {result.stage} ({result.params:,} parameters)")
+    typer.echo(
+        f"items:    {result.items} positions, {result.blunder_items} with a blunder label "
+        f"on {result.device}"
+    )
+    typer.echo(
+        f"split:    tune {result.tune_items} rows / {result.tune_games} games, "
+        f"score {result.score_items} rows / {result.score_games} games "
+        f"(base rate {(result.blunder_base_rate or 0.0) * 100:.2f} %)"
+    )
+    tuned = "n/a" if result.threshold_tuned is None else f"{result.threshold_tuned:.4g}"
+    fixed = "n/a" if result.threshold_fixed is None else f"{result.threshold_fixed:.4g}"
+    for measured, point in (
+        (result.encoder_blunder, f"p>={tuned} tuned"),
+        (result.encoder_blunder_fixed, f"p>={fixed} fixed"),
+        (result.heuristic_blunder, "rule, untuned"),
+    ):
+        if measured is not None:
+            typer.echo(
+                f"blunder:  {measured.name:<15} {point:<16} P {measured.precision:.4f}  "
+                f"R {measured.recall:.4f}  F1 {measured.f1:.4f}"
+            )
+    if result.encoder_blunder_ranking is not None:
+        rank = result.encoder_blunder_ranking
+        auc = "n/a" if rank.roc_auc is None else f"{rank.roc_auc:.4f}"
+        average = "n/a" if rank.average_precision is None else f"{rank.average_precision:.4f}"
+        typer.echo(
+            f"ranking:  roc auc {auc}  average precision {average}  "
+            f"(a coin flip scores 0.5000 and {rank.base_rate:.4f})"
+        )
+```
+
+<Src file="src/rukh/cli.py" tag="p3" lines="670-699" />
+
+Fíjate en la línea del `ranking`: imprime **lo que sacaría una moneda** al lado de las dos cifras.
+`0.5000` para el ROC AUC y la tasa base para la precisión media. Es una idea pequeña con mucho
+efecto: un 0,112 de precisión media parece un desastre hasta que al lado pone que el azar saca
+0,0370.
+
+Y la línea del `split` imprime las dos mitades con sus filas **y sus partidas**. Que las partidas
+aparezcan es lo que hace comprobable de un vistazo que el reparto se hizo por partida y no por fila.
+
+```python title="src/rukh/cli.py"
+    if result.f1_margin is not None:
+        verdict = "meets the bar" if result.meets_goal else "below the bar"
+        typer.echo(f"margin:   {result.f1_margin:+.1f} F1 points over the baseline ({verdict})")
+    if result.encoder_value is not None:
+        from rukh.eval.encoder import GOAL_VALUE_CORRELATION
+
+        met = result.value_correlation_meets_goal
+        verdict = "not measured" if met is None else ("meets the bar" if met else "below the bar")
+        typer.echo(
+            f"value:    vs {result.encoder_value.target}  "
+            f"spearman {result.encoder_value.spearman}  "
+            f"pearson {result.encoder_value.pearson}  "
+            f"(>= {GOAL_VALUE_CORRELATION:.2f}: {verdict})"
+        )
+    if result.result_accuracy is not None:
+        typer.echo(f"result:   {result.result_accuracy:.4f} accuracy")
+    for point in result.label_curve:
+        typer.echo(f"curve:    {point.fraction:>5.0%} of the labels ({point.train_labels} rows)")
+    for note in result.notes:
+        typer.echo(f"note:     {note}")
+    typer.echo(f"report:   {report.markdown}")
+    typer.echo(f"results:  {report.results}")
+    if report.web:
+        typer.echo(f"table:    {report.web}")
+```
+
+<Src file="src/rukh/cli.py" tag="p3" lines="700-723" />
+
+**Las notas se imprimen en el terminal, no solo en el informe.** Son siete u ocho líneas que dicen
+dónde se eligió el umbral, que la línea base no tuvo ninguno que ajustar, que la exactitud no
+significa nada con esta tasa base y que los dos detectores no ven lo mismo. Ponerlas donde el que
+ejecuta la orden las va a leer, en lugar de en un fichero que abrirá el que no ejecutó nada, es una
+decisión de producto sobre honestidad.
+
+```python title="src/rukh/eval/encoder.py"
+def write_encoder_report(
+    result: EncoderResult, out_dir: Path, web_results: Path | None = None
+) -> ReportPaths:
+    """Write ``report.md`` and ``results.json`` and upsert the encoder's row for the web."""
+    return write_report_files(
+        result.stage,
+        render_markdown(result),
+        json.loads(result.model_dump_json()),
+        Path(out_dir),
+        web_results,
+        encoder_row_of(result),
+    )
+
+
+def run_encoder_suite(
+    ckpt: Path | str,
+    cfg: EncoderEvalConfig,
+    use_cache: bool = True,
+    device: str | None = None,
+) -> tuple[EncoderResult, ReportPaths]:
+    """Evaluate, track and report: the whole of ``rukh eval encoder`` in one call."""
+    result = evaluate_encoder(ckpt, cfg, use_cache=use_cache, device=device)
+    if cfg.track:
+        result.run_id = track_result(result, cfg)
+    report = write_encoder_report(
+        result,
+        paths.resolve(cfg.out_dir),
+        paths.resolve(cfg.web_results) if cfg.web_results else None,
+    )
+    return result, report
+```
+
+<Src file="src/rukh/eval/encoder.py" tag="p3" lines="1166-1195" />
+
+Las dos últimas funciones del fichero, y la de abajo es la que la CLI llama: medir, registrar,
+escribir. El orden importa en un detalle: `track_result` va **antes** del informe, porque devuelve el
+identificador de la corrida de MLflow y ese identificador entra en el informe y en la fila de la
+tabla. Sin ese orden, la tabla tendría una fila que no sabe a qué corrida corresponde.
+
+`json.loads(result.model_dump_json())` en vez de `result.model_dump()` parece un rodeo y no lo es:
+el volcado a JSON de pydantic convierte tipos que `json.dumps` no sabe serializar, y volverlo a
+cargar da un diccionario que solo tiene tipos básicos. Es el camino corto para «dame esto tal como
+quedará en el fichero».
+
+```python title="src/rukh/eval/__init__.py"
+from rukh.eval.encoder import (
+    ClassificationResult,
+    CorrelationResult,
+    CurvePoint,
+    EncoderEvalConfig,
+    EncoderResult,
+    classification,
+    evaluate_encoder,
+    load_encoder_suite,
+    pearson,
+    ranks,
+    run_encoder_suite,
+    spearman,
+)
+```
+
+<Src file="src/rukh/eval/__init__.py" tag="p3" lines="21-34" />
+
+```python title="src/rukh/eval/__init__.py"
+from rukh.eval.report import (
+    EncoderWebRow,
+    ReportPaths,
+    WebRow,
+    elo_line,
+    encoder_row_of,
+    render_markdown,
+    row_of,
+    upsert_row,
+    write_report,
+)
+```
+
+<Src file="src/rukh/eval/__init__.py" tag="p3" lines="52-62" />
+
+`EncoderWebRow` y `encoder_row_of` salen aquí porque cualquiera que lea la tabla de resultados
+necesita el esquema de la fila del encoder, no solo el de la del decoder.
+
+```python title="src/rukh/eval/__init__.py"
+    "file_sha",
+    "fit_elo",
+    "hub_checkpoint",
+    "is_hub_id",
+    "legality",
+    "load_encoder_suite",
+    "load_puzzles",
+    "load_suite",
+    "model_source",
+    "one_sided_bound",
+    "pearson",
+    "play_rung",
+    "play_rungs",
+    "position_at",
+    "ranks",
+    "record_of",
+    "render_markdown",
+    "resolve_model",
+    "row_of",
+    "run_encoder_suite",
+    "run_puzzles",
+    "run_suite",
+    "sample_positions",
+    "score_of",
+    "separation",
+    "solve_puzzle",
+    "spearman",
+    "upsert_row",
+    "write_report",
+]
+```
+
+<Src file="src/rukh/eval/__init__.py" tag="p3" lines="109-138" />
+
+El resto de la lista, ordenada por `ruff`. Una frase basta.
+
+Los reexportes del paquete de evaluación. Que `pearson`, `spearman` y `ranks` estén en la superficie
+pública dice algo del proyecto: son utilidades de medida escritas a mano que cualquier otra parte
+puede usar, y el sitio donde viven —dentro de la suite del encoder— es un accidente de dónde se
+necesitaron primero.
+
+<Exercise n="01" title="¿Por qué la caché no lleva el `game_id` en la clave?">
+  Supón que la caché se indexara por `f"{game_id}:{ply}"` en vez de por los tres FEN. Enumera dos
+  situaciones concretas en las que eso daría un número equivocado sin que nada falle, y di cuál de
+  las dos es peor.
+
+<Solution>
+  La primera: se reconstruye `positions-eval.parquet` con otro muestreo o con otro mes de partidas.
+  Los `game_id` se reasignan, así que `1713:30` puede ser ahora una posición completamente
+  distinta, y hereda el veredicto de la anterior. El informe sale con una línea base que juzgó otras
+  posiciones.
+
+La segunda: dos evaluaciones con `positions` distinto —10 000 y 40 000— sobre la misma tabla. Aquí
+no hay problema, porque la clave sigue apuntando a la misma posición. Es el caso que enseña que el
+peligro no es el tamaño de la muestra sino la **reasignación** de los identificadores.
+
+La peor es la primera, y no por el error en sí: es peor porque el síntoma es una línea base que
+cambia sin que nadie haya tocado la heurística, y lo primero que se piensa es que el modelo mejoró.
+Con la posición como clave, ese fallo es imposible por construcción, y el precio es una clave más
+larga.
+
+</Solution>
+</Exercise>
+
+## Qué has aprendido
+
+Que una suite de evaluación es sobre todo un **catálogo de lo que te comprometes a publicar**, y que
+los campos que la hacen honesta son los que casi nadie guarda: el rango de las probabilidades, el
+número optimista al lado del honesto, la tasa base junto a cada métrica que depende de ella, y un
+booleano que admite cuándo la medida no se pudo hacer bien.
+
+Y dos reglas de ingeniería que se transfieren: una caché se indexa por **aquello de lo que el
+resultado es función**, nunca por un identificador de fila que puede reasignarse; y dos cosas que
+miden fenómenos distintos van en dos esquemas con una clave común, no en uno con el doble de
+columnas nulas.
+
+**Cómo se mide**: `uv run rukh eval encoder --model <checkpoint> --stage encoder` escribe
+`artifacts/eval/encoder/report.md`, `results.json` y una fila en `artifacts/web/results.json`, e
+imprime las notas en el terminal. Las cifras reales están en la lección 11.
+
+Lo siguiente es la otra mitad del fichero: las métricas escritas a mano, por qué el umbral se elige
+en unas filas y se mide en otras, y la heurística de material contra la que se compara todo.

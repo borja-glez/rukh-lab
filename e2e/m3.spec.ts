@@ -3,8 +3,8 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 
 /** M3 is three lessons: the theory, the measurement, and the labs with the ValueBar island. */
 const THEORY = '/curso/m3/01-el-encoder/';
-const MEASURE = '/curso/m3/02-medir-sin-enganarse/';
-const LABS = '/curso/m3/03-labs-del-encoder/';
+const MEASURE = '/curso/m3/08-medir-sin-enganarse/';
+const LABS = '/curso/m3/11-labs-del-encoder/';
 
 function directive(csp: string, name: string): string | undefined {
   return csp

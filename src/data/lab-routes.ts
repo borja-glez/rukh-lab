@@ -178,7 +178,7 @@ export const labRoutes: Record<string, LabRoute[]> = {
       skip: 'rukh pull medium-v4',
     },
   ],
-  'm3/03-labs-del-encoder': [
+  'm3/11-labs-del-encoder': [
     {
       lab: 'Lab 1',
       what: 'El encoder bidireccional y el enmascarado',

@@ -16,10 +16,36 @@ const themeInit = readFileSync(new URL('./src/scripts/theme-init.js', import.met
 /** @type {`sha256-${string}`} */
 const themeInitHash = `sha256-${createHash('sha256').update(themeInit).digest('base64')}`;
 
+/**
+ * Lessons that were renumbered when phase 1 grew from nineteen lessons to fifty-seven.
+ *
+ * These URLs are not ours to retire. `rukh` writes them into every model and dataset card it
+ * publishes (`hub.py` and `publish/links.py` hold them by hand), so they are live on Hugging Face,
+ * in posts and in whatever anyone bookmarked. A static build turns each one into a redirect page,
+ * which costs nothing and keeps them working. The cards should be updated in `rukh` too; until
+ * then, these are what stands between a reader and a 404.
+ */
+const renumberedLessons = {
+  '/curso/m1/02-labs-del-pipeline/': '/curso/m1/10-labs-del-pipeline/',
+  /* M2 split this lesson in two; the training it was cited for is in the recipe. */
+  '/curso/m2/02-entrenar-y-medir/': '/curso/m2/03-la-receta-de-entrenamiento/',
+  '/curso/m2/03-exportar-y-mirar-dentro/': '/curso/m2/07-exportar-a-onnx/',
+  '/curso/m2/04-mas-datos-no-mas-red/': '/curso/m2/11-mas-datos-no-mas-red/',
+  '/curso/m3/02-medir-sin-enganarse/': '/curso/m3/08-medir-sin-enganarse/',
+  '/curso/m3/03-labs-del-encoder/': '/curso/m3/11-labs-del-encoder/',
+  '/curso/m4/02-lo-que-salio/': '/curso/m4/09-lo-que-salio/',
+  '/curso/m4/03-labs-de-afinado/': '/curso/m4/10-labs-de-afinado/',
+  '/curso/m5/02-lo-que-salio/': '/curso/m5/08-lo-que-salio/',
+  '/curso/m5/03-labs-de-alineamiento/': '/curso/m5/09-labs-de-alineamiento/',
+  '/curso/m6/02-lo-que-salio/': '/curso/m6/08-lo-que-salio/',
+  '/curso/m6/03-labs-de-cierre/': '/curso/m6/09-labs-de-cierre/',
+};
+
 // https://astro.build/config
 export default defineConfig({
   site: 'https://lab.rukh.borjaglez.com',
   trailingSlash: 'always',
+  redirects: renumberedLessons,
   integrations: [
     expressiveCode({
       themes: ['github-light', 'github-dark'],

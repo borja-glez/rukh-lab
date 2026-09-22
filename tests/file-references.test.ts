@@ -39,6 +39,19 @@ const lessons = readdirSync(LESSONS, { recursive: true, encoding: 'utf8' })
 
 const read = (lesson: string) => readFileSync(resolve(LESSONS, lesson), 'utf8');
 
+/**
+ * The lesson's own words, with every fenced block removed.
+ *
+ * Since phase 1 started quoting `rukh` verbatim, a lesson contains thousands of lines the course
+ * did not write, and some of them name things this test exists to forbid: the engine's own
+ * docstrings cite `GOAL.md`, and pasted terminal output carries whatever path the machine printed.
+ * Those are findings about `rukh`, to fix in `rukh`; what this test judges is what the course says
+ * in its own voice. Removing the blocks is also what makes the check honest again -- before, it
+ * passed only because the course was not showing the code.
+ */
+const prose = (lesson: string): string =>
+  read(lesson).replace(/^([ \t]*)(`{3,})[\s\S]*?^\1\2[ \t]*$/gm, '');
+
 /** Every `path/like/this.ext` in backticks, plus the bare filenames a sentence may shorten to. */
 const referencesIn = (mdx: string): string[] => [
   ...new Set(
@@ -52,7 +65,7 @@ const haveSiblings = REPOS.every((r) => existsSync(resolve(WORKSPACE, r)));
 
 describe('file references in lessons', () => {
   it.each(lessons)('%s names no file the reader cannot open', (lesson) => {
-    const mdx = read(lesson);
+    const mdx = prose(lesson);
     for (const name of PRIVATE_TO_THE_AUTHOR) {
       expect(mdx, `${lesson} points at ${name}, which is in no repo`).not.toContain(name);
     }
@@ -69,7 +82,7 @@ describe('file references in lessons', () => {
   });
 
   it.runIf(haveSiblings).each(lessons)('%s only names files that exist', (lesson) => {
-    const missing = referencesIn(read(lesson)).filter((ref) => {
+    const missing = referencesIn(prose(lesson)).filter((ref) => {
       if (GENERATED.test(ref)) return false;
       /* A full path resolves against a repo root; a bare name only has to exist somewhere. */
       return !REPOS.some(

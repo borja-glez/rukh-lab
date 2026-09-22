@@ -19,7 +19,7 @@ describe('AttentionMap opening head', () => {
 
   it('opens the lesson on the previous-move head it discusses (L9H4)', () => {
     const lesson = readFileSync(
-      resolve(root, 'src/content/lessons/m2/03-exportar-y-mirar-dentro.mdx'),
+      resolve(root, 'src/content/lessons/m2/07-exportar-a-onnx.mdx'),
       'utf8',
     );
     expect(lesson).toMatch(/<AttentionMap[^>]*\blayer=\{9\}[^>]*\bhead=\{4\}/);
