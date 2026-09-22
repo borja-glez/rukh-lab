@@ -34,6 +34,16 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const workspace = resolve(root, '..');
 const [command = 'verify', ...rest] = process.argv.slice(2);
 
+/**
+ * `--module=m2` narrows every check and every rewrite to one module's lessons.
+ *
+ * Six modules are written in parallel, and `fix` writes files: without the filter two writers race
+ * over the same twenty lessons and one of them loses an edit.
+ */
+const only = rest.find((a) => /^--module=/.test(a))?.split('=')[1] ?? null;
+const lessonsHere = () =>
+  lessonFiles(root).filter((rel) => only === null || rel.startsWith(`${only}/`));
+
 /** Files the course quotes by link instead of inlining: generated, or noise. See docs/codigo.md. */
 const LINKED_ONLY = [
   /^uv\.lock$/,
@@ -81,7 +91,7 @@ function fix() {
   let changed = 0;
   let reindented = 0;
   const problems = [];
-  for (const rel of lessonFiles(root)) {
+  for (const rel of lessonsHere()) {
     const lesson = readLesson(root, rel);
     const lines = lesson.mdx.split('\n');
     for (const block of blocksIn(lesson.mdx)) {
@@ -132,7 +142,7 @@ function fix() {
 /** Every citation in the course: one entry per block that claims to be a repo file. */
 function citations() {
   const out = [];
-  for (const rel of lessonFiles(root)) {
+  for (const rel of lessonsHere()) {
     const lesson = readLesson(root, rel);
     for (const block of blocksIn(lesson.mdx)) {
       if (!looksLikeRepoFile(block.title)) continue;
@@ -156,7 +166,7 @@ function inlineAtLineStart() {
      paragraph, which is fine. Anything else means the sentence above runs into it. */
   const opensAParagraph = (line) =>
     line === undefined || line.startsWith('#') || /[>.:!?]$/.test(line.trim());
-  for (const rel of lessonFiles(root)) {
+  for (const rel of lessonsHere()) {
     const lines = readLesson(root, rel).mdx.split('\n');
     lines.forEach((line, i) => {
       if (!/^<(Term|ModelBadge|NotebookLink)\b/.test(line)) return;
@@ -202,7 +212,7 @@ const PRETTIER_KNOWS = new Set([
 
 function unguardedFences() {
   const problems = [];
-  for (const rel of lessonFiles(root)) {
+  for (const rel of lessonsHere()) {
     const { mdx } = readLesson(root, rel);
     const lines = mdx.split('\n');
     for (const block of blocksIn(mdx)) {
@@ -267,9 +277,7 @@ function verify() {
       );
     }
   }
-  console.log(
-    `course-code: ${all.length} code citation(s) in ${lessonFiles(root).length} lesson(s)`,
-  );
+  console.log(`course-code: ${all.length} code citation(s) in ${lessonsHere().length} lesson(s)`);
   if (problems.length > 0) {
     for (const p of problems) console.error(`  ✗ ${p}`);
     console.error(`course-code: ${problems.length} problem(s).`);
