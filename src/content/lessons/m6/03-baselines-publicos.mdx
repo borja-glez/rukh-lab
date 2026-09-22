@@ -1,0 +1,1394 @@
+---
+title: 'El baseline público: el nanoGPT de Karvonen en nuestra escalera'
+description:
+  'Una fila de la tabla que no entrenó nadie de aquí: nanoGPT reimplementado en cien líneas para no
+  depender del repositorio de entrenamiento de otro, su formato de prompt reproducido a la letra, un
+  jugador que escribe SAN carácter a carácter con la misma contabilidad de fallos que Qwen, y la
+  suite prestada entera para que la comparación sea del modelo y no del harness.'
+module: m6
+order: 3
+duration: 180
+level: avanzado
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - baseline público
+  - nanoGPT
+  - carácter a carácter
+  - SAN
+  - control del instrumento
+  - puzles
+  - Elo
+artifacts:
+  - kind: repo
+    label: borja-glez/rukh
+    href: https://github.com/borja-glez/rukh/tree/p6
+  - kind: model
+    label: adamkarvonen/chess_llms
+    href: https://huggingface.co/adamkarvonen/chess_llms
+---
+
+## Qué vas a construir
+
+Dos ficheros nuevos, 652 líneas, con un solo producto: una fila de la tabla única que mide un
+modelo **que no entrenó nadie de este curso**, con el mismo instrumento que todas las demás.
+
+El modelo es el nanoGPT de ajedrez de Adam Karvonen: 8 capas, 25,7 M de parámetros, entrenado sobre
+16 millones de partidas de Lichess escritas en PGN carácter a carácter. Tiene números publicados por
+su autor, así que si nuestra fila cae donde esos números dicen, el harness es creíble; y si no cae
+ahí, la primera cosa que hay que explicar es la diferencia.
+
+`eval/karvonen.py` reimplementa la red y la convierte en un `Player` del proyecto.
+`eval/karvonen_suite.py` le pasa la suite entera —posiciones, puzles, escalera— sin cambiar una sola
+regla. Todo lo que hay dentro está en tensión entre dos cosas: reproducir el modelo del autor
+**exactamente** y medirlo con **nuestro** código exactamente.
+
+## Por qué una fila que no es nuestra
+
+Una tabla de modelos propios medidos con un harness propio no demuestra nada sobre el harness. El
+docstring del fichero lo dice en su primer párrafo y merece leerse antes que el código.
+
+```python title="src/rukh/eval/karvonen.py"
+"""Adam Karvonen's chess nanoGPT as a ``Player``: the public baseline of the results table.
+
+A table of our own models measured by our own harness proves nothing about the harness. One row
+has to be a model somebody else built, published and described, put through *exactly* the same
+ladder, positions and puzzles as ours -- if that row lands where its author's own numbers say it
+should, the harness is credible; if it does not, the difference is the first thing to explain.
+
+The baseline is the 8-layer, 25 M parameter character-level GPT of ``adamkarvonen/chess_llms``
+(``lichess_8layers_ckpt_no_optimizer.pt``), trained with Karpathy's nanoGPT on 16 M Lichess games
+written as ``;1.e4 e5 2.Nf3 Nc6`` -- one character per token, a ``;`` before every game, no space
+after the move number. That format is reproduced here to the character, because the author's
+own README warns that performance drops without the ``;``; the model has no Elo header and no
+result, so it is asked the same question as ours with less information, which the reader should
+keep in mind when comparing rows.
+
+The network is nanoGPT's ``GPT`` reimplemented in a hundred lines rather than imported: the
+checkpoint is a ``torch.compile`` state dict with ``_orig_mod.`` prefixes and nothing else, and
+a baseline that pulls in a training repository to run inference is a baseline nobody rebuilds.
+The vocabulary (``meta.pkl`` in his ``chess_llm_interpretability`` repository) is 32 characters,
+pinned here by SHA-256 and by value.
+"""
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="1-21" />
+
+Tres decisiones están anunciadas ahí y las tres se ven abajo en código.
+
+**Se reimplementa la red en vez de importarla.** nanoGPT es un repositorio de entrenamiento, no una
+librería: instalarlo para hacer inferencia arrastra dependencias, scripts y una configuración global.
+Un <Term id="baseline-publico">baseline público</Term> que solo corre si otro repositorio sigue
+existiendo y sigue siendo compatible no es un baseline; es una promesa que caduca. Cien líneas de
+`nn.Module` con los mismos nombres de parámetros pesan menos.
+
+**El formato del prompt se copia a la letra.** El README del autor avisa de que el rendimiento cae
+sin el `;` inicial. Reproducirlo es la diferencia entre medir su modelo y medir su modelo mal
+preguntado, y esa segunda cosa es exactamente la forma más fácil de que un baseline salga bajo.
+
+**Se dice lo que el modelo no tiene.** No lleva cabecera de Elo ni resultado, así que se le pregunta
+lo mismo que a los nuestros con **menos información**. Eso no se compensa ni se disimula: se escribe
+en el docstring, en las notas del resultado y en la card.
+
+## El vocabulario, clavado por hash y por valor
+
+```python title="src/rukh/eval/karvonen.py"
+HF_REPO = "adamkarvonen/chess_llms"
+CHECKPOINT_FILE = "lichess_8layers_ckpt_no_optimizer.pt"
+LOCAL_DIR = "checkpoints/karvonen-8l"
+META_URL = (
+    "https://raw.githubusercontent.com/adamkarvonen/chess_llm_interpretability/main/models/meta.pkl"
+)
+META_SHA256 = "f1121191e401988851de5744fe27fe463c3a086fc8c9a5538ef7fc12162bfb09"
+"""The vocabulary file is not on the Hub, so it is fetched from GitHub and pinned by hash."""
+VOCAB = " #+-.0123456789;=BKNOQRabcdefghx"
+"""``meta.pkl`` by value: character ``i`` of this string is token ``i``. Every SAN move
+python-chess writes (``exd5``, ``Nbd2``, ``O-O-O``, ``e8=Q+``, ``Qxf7#``) spells with these."""
+STOI = {char: index for index, char in enumerate(VOCAB)}
+MAX_NEW_CHARS = 10
+"""A SAN move is at most seven characters (``exd8=Q+``); the author's harness also stops at 10."""
+COMPILED_PREFIX = "_orig_mod."
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="60-74" />
+
+El <Term id="vocabulario">vocabulario</Term> está escrito **dos veces**: como los 32 caracteres de
+`VOCAB` y como el SHA-256 del `meta.pkl` del autor. No es redundancia, es la única forma de tener las
+dos propiedades que hacen falta. La constante permite correr sin red y sin descargar nada, que es lo
+que necesitan los tests. El hash permite comprobar, cuando el fichero sí está, que la constante no se
+ha desincronizado del original. Si el autor cambiara el vocabulario, `read_meta` lo diría en vez de
+producir un modelo que escribe basura con una tabla de tokens de otro.
+
+Esos 32 caracteres son todo el <Term id="token">vocabulario</Term>: un espacio, los dígitos, el punto,
+el punto y coma, las letras de las piezas en mayúscula y las de las casillas en minúscula, y los
+signos de captura, jaque, mate, promoción y enroque. Con eso se escribe cualquier <Term id="san">SAN</Term>
+que `python-chess` pueda producir, y ninguna otra cosa: el modelo no tiene forma de escribir un token
+de Elo aunque quisiera.
+
+`MAX_NEW_CHARS = 10` es un tope de seguridad, no una regla del modelo. Una jugada SAN ocupa siete
+caracteres en el peor caso (`exd8=Q+`), así que diez sobran; lo que el número garantiza es que un
+modelo que se olvide de escribir el espacio final no genere para siempre.
+
+## nanoGPT, en cien líneas
+
+La red es la de Karpathy, y está escrita tan lejos como el diccionario de estado necesita: los mismos
+nombres, las mismas formas, ni un módulo de más.
+
+```python title="src/rukh/eval/karvonen.py"
+@dataclass(frozen=True)
+class GPTConfig:
+    """nanoGPT's ``model_args`` as the checkpoint carries them; ``dropout`` is unused here."""
+
+    n_layer: int = 8
+    n_head: int = 8
+    n_embd: int = 512
+    block_size: int = 1023
+    bias: bool = False
+    vocab_size: int = 32
+    dropout: float = 0.0
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="77-87" />
+
+Un `dataclass` congelado y no una configuración de pydantic como el resto del proyecto. La razón es
+que este objeto no se valida contra un YAML escrito por una persona: se construye desde el
+`model_args` que el checkpoint del autor lleva dentro. Los valores por defecto son los de **su**
+modelo de 8 capas, así que un checkpoint que no traiga alguna clave se construye igual.
+
+`block_size: 1023` y no 1024: es el valor de su entrenamiento. Copiar el número raro en vez de
+redondearlo es la diferencia entre reproducir y aproximar.
+
+```python title="src/rukh/eval/karvonen.py"
+class _Attention(nn.Module):
+    def __init__(self, cfg: GPTConfig) -> None:
+        super().__init__()
+        self.n_head, self.n_embd = cfg.n_head, cfg.n_embd
+        self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
+        self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        batch, length, width = x.shape
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        shape = (batch, length, self.n_head, width // self.n_head)
+        q, k, v = (t.view(shape).transpose(1, 2) for t in (q, k, v))
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.c_proj(y.transpose(1, 2).contiguous().view(batch, length, width))
+
+
+class _MLP(nn.Module):
+    def __init__(self, cfg: GPTConfig) -> None:
+        super().__init__()
+        self.c_fc = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=cfg.bias)
+        self.c_proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd, bias=cfg.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.c_proj(F.gelu(self.c_fc(x)))
+
+
+class _Block(nn.Module):
+    def __init__(self, cfg: GPTConfig) -> None:
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(cfg.n_embd, bias=cfg.bias)
+        self.attn = _Attention(cfg)
+        self.ln_2 = nn.LayerNorm(cfg.n_embd, bias=cfg.bias)
+        self.mlp = _MLP(cfg)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.attn(self.ln_1(x))
+        return x + self.mlp(self.ln_2(x))
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="90-126" />
+
+Si vienes de M2, esto te va a resultar familiar y distinto a la vez, y las diferencias son
+precisamente lo que separa un decoder de 2022 del nuestro.
+
+**Los nombres son los de nanoGPT y no los nuestros.** `c_attn`, `c_proj`, `c_fc`, `ln_1`, `ln_2`: son
+los nombres con los que el autor guardó sus tensores. Un `load_state_dict` compara claves, así que
+llamar a la proyección `out_proj` porque nos gusta más significa que el checkpoint no carga. Cuando
+se reimplementa un modelo ajeno, los nombres son parte del formato del fichero.
+
+**`c_attn` produce las tres proyecciones de golpe** (`3 * n_embd`) y luego se parten con `split`. Es
+lo que hace nanoGPT y es más rápido que tres capas lineales: una sola multiplicación de matrices
+grande en vez de tres pequeñas.
+
+**Posición absoluta aprendida, no <Term id="rope">RoPE</Term>.** Se ve en el bloque siguiente:
+`wpe` es una tabla de embeddings indexada por posición. Nuestro decoder usa RoPE porque generaliza
+mejor a longitudes que no vio; el suyo no, y por eso `block_size` es un límite duro y no una
+preferencia.
+
+**<Term id="pre-norm">Pre-norm</Term> con `LayerNorm` sin sesgo, y GELU.** Es la receta de GPT-2 que
+nanoGPT copia. Nuestro decoder también es pre-norm; las diferencias están en la normalización y en la
+activación, y ninguna de las dos cambia lo que aquí se mide.
+
+`F.scaled_dot_product_attention(..., is_causal=True)` es la <Term id="mascara-causal">máscara
+causal</Term> delegada a PyTorch. nanoGPT original construía la máscara triangular a mano; usar la
+función de la librería da el mismo resultado numérico y elige el kernel rápido cuando puede. Es uno
+de los dos sitios donde este código **no** es literalmente el del autor, y es seguro porque la
+operación está especificada.
+
+```python title="src/rukh/eval/karvonen.py"
+class GPT(nn.Module):
+    """Karpathy's nanoGPT, exactly as far as the state dict needs: same names, same shapes."""
+
+    def __init__(self, cfg: GPTConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.transformer = nn.ModuleDict(
+            {
+                "wte": nn.Embedding(cfg.vocab_size, cfg.n_embd),
+                "wpe": nn.Embedding(cfg.block_size, cfg.n_embd),
+                "h": nn.ModuleList([_Block(cfg) for _ in range(cfg.n_layer)]),
+                "ln_f": nn.LayerNorm(cfg.n_embd, bias=cfg.bias),
+            }
+        )
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight  # tied, as nanoGPT ties them
+
+    def forward(self, idx: Tensor) -> Tensor:
+        """Logits over the vocabulary at every position of ``idx`` (``batch, length``)."""
+        length = idx.shape[1]
+        if length > self.cfg.block_size:
+            raise ValueError(f"sequence of {length} exceeds block size {self.cfg.block_size}")
+        pos = torch.arange(length, device=idx.device)
+        x = self.transformer.wte(idx) + self.transformer.wpe(pos)
+        for block in self.transformer.h:
+            x = block(x)
+        return self.lm_head(self.transformer.ln_f(x))
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="129-155" />
+
+El `nn.ModuleDict` llamado `transformer` con las claves `wte`, `wpe`, `h` y `ln_f` es, otra vez, el
+formato del fichero y no una elección de diseño: así se llaman los tensores dentro del checkpoint.
+
+`self.transformer.wte.weight = self.lm_head.weight` ata los <Term id="tied-embeddings">tied
+embeddings</Term> **asignando el mismo objeto**, no copiando valores. Es lo que hace nanoGPT y es lo
+que el test comprueba con `data_ptr()`: un solo tensor, no dos copias que podrían divergir.
+
+El `forward` no acepta etiquetas ni devuelve pérdida: aquí solo se hace inferencia. Un modelo
+reimplementado para medirlo es más corto que el original justamente porque la mitad del original es
+entrenamiento, y cada línea que no está es una línea que no puede estar mal.
+
+## Cargar un checkpoint que pasó por `torch.compile`
+
+```python title="src/rukh/eval/karvonen.py"
+def strip_compiled(state: dict[str, Any]) -> dict[str, Any]:
+    """The state dict without the ``_orig_mod.`` that ``torch.compile`` leaves on every key."""
+    return {key.removeprefix(COMPILED_PREFIX): value for key, value in state.items()}
+
+
+def load_karvonen(checkpoint: Path | str, device: str | None = None) -> GPT:
+    """The model of a nanoGPT checkpoint (``model_args`` plus ``model``), in eval mode."""
+    payload = torch.load(Path(checkpoint), map_location="cpu", weights_only=True)
+    args = {k: v for k, v in payload["model_args"].items() if k in GPTConfig.__dataclass_fields__}
+    model = GPT(GPTConfig(**args))
+    model.load_state_dict(strip_compiled(payload["model"]))
+    return model.to(device or "cpu").eval()
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="158-169" />
+
+`torch.compile` envuelve el modelo en un objeto que se llama `_orig_mod`, y al guardar el estado ese
+nombre se cuela delante de **todas** las claves. Un checkpoint compilado no carga en un modelo sin
+compilar y el error es una lista de doscientas claves inesperadas que no dice por qué. Quitar el
+prefijo con `removeprefix` —que no hace nada si no está— es una línea que hace el cargador
+indiferente a cómo se entrenó.
+
+El filtro `if k in GPTConfig.__dataclass_fields__` tira las claves de `model_args` que la
+configuración no tiene. Es la decisión inversa a `extra="forbid"` de M0, y aquí es la correcta: el
+`model_args` es un fichero de **otro proyecto**, que puede llevar claves de entrenamiento (`bias` de
+un optimizador, `dropout` de una variante) que no describen la arquitectura. Prohibirlas sería
+negarse a cargar un modelo perfectamente cargable por un campo que no se usa.
+
+`.eval()` antes de devolver, siempre. No hay dropout activo en este modelo, pero un modelo devuelto
+en modo entrenamiento es la clase de detalle que produce números ligeramente distintos sin fallar
+nunca.
+
+```python title="src/rukh/eval/karvonen.py"
+def read_meta(path: Path | str) -> dict[str, int]:
+    """``stoi`` of ``meta.pkl``, refused unless it is byte for byte the pinned file."""
+    raw = Path(path).read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != META_SHA256:
+        raise ValueError(f"{path}: sha256 {digest} is not the pinned {META_SHA256}")
+    stoi = dict(pickle.loads(raw)["stoi"])  # noqa: S301 - the hash above pins the bytes
+    if stoi != STOI:
+        raise ValueError(f"{path}: vocabulary differs from the one this player writes")
+    return stoi
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="172-181" />
+
+El orden de las tres operaciones es toda la seguridad de esta función y no se puede alterar: se
+comprueba el hash **antes** de deserializar. `pickle.loads` sobre un fichero descargado de internet
+ejecuta código arbitrario, y por eso ruff lo marca con `S301`. El `noqa` lleva su razón al lado: los
+bytes ya están fijados por el hash de la línea de arriba, así que no hay entrada del atacante que
+llegue a `pickle`.
+
+La segunda comprobación —que el `stoi` del fichero sea igual a nuestra constante— es la que mantiene
+honestas las dos copias del vocabulario. Un fichero con el hash correcto y un contenido distinto es
+imposible; lo que esta línea atrapa es que alguien edite `VOCAB` en el código.
+
+```python title="src/rukh/eval/karvonen.py"
+def ensure_karvonen(download: bool = True, local_dir: Path | str | None = None) -> Path:
+    """The checkpoint on disk (downloading it and ``meta.pkl`` when allowed), and its path.
+
+    The Hub repository is somebody else's, so this is not a ``rukh pull`` artefact -- nothing here
+    is published by the course, nothing can be. ``huggingface_hub`` caches the 100 MB file once.
+    """
+    directory = Path(local_dir) if local_dir is not None else paths.resolve(LOCAL_DIR)
+    checkpoint = directory / CHECKPOINT_FILE
+    meta = directory / "meta.pkl"
+    if not checkpoint.is_file():
+        if not download:
+            raise FileNotFoundError(f"{checkpoint} is not on disk (rukh eval karvonen pulls it)")
+        import huggingface_hub
+
+        log.info("downloading %s/%s", HF_REPO, CHECKPOINT_FILE)
+        directory.mkdir(parents=True, exist_ok=True)
+        huggingface_hub.hf_hub_download(HF_REPO, CHECKPOINT_FILE, local_dir=str(directory))
+    if not meta.is_file() and download:
+        import urllib.request
+
+        log.info("downloading %s", META_URL)
+        with urllib.request.urlopen(META_URL, timeout=60) as response:  # noqa: S310 - https, pinned
+            meta.write_bytes(response.read())
+    if meta.is_file():
+        read_meta(meta)
+    return checkpoint
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="184-209" />
+
+`download=False` existe para el `nightly` de la lección siguiente: con `--no-pull`, una etapa que no
+tiene su fichero falla ella sola con un mensaje que dice qué orden lo trae, en vez de arrancar una
+descarga de 100 MB en medio de una tirada de tres horas.
+
+El `meta.pkl` no está en el Hub, así que se baja de GitHub con `urllib` a pelo. Es el otro `noqa` del
+fichero (`S310`, «URL de esquema arbitrario»), y su justificación es la misma de antes: la URL es una
+constante `https` del módulo y lo que llega se valida contra el hash.
+
+La comprobación final, `if meta.is_file(): read_meta(meta)`, se hace **siempre que el fichero esté**,
+incluso si no se ha descargado en esta llamada. Así un `meta.pkl` que alguien dejó a mano en el
+directorio también pasa por la guarda.
+
+<Callout kind="hoy" title="Lo que no se publica">
+  Este es el único modelo del curso que no está en la colección del Hub y no lo trae `rukh pull`.
+  Los pesos son de su autor, con su licencia y en su repositorio; el curso los descarga para
+  medirlos y no republica ni un byte. La fila de la tabla es nuestra; el modelo, no.
+</Callout>
+
+## La transcripción, a la letra
+
+```python title="src/rukh/eval/karvonen.py"
+def transcript(board: chess.Board) -> str:
+    """The game on ``board`` in the author's format: ``;1.e4 e5 2.Nf3`` and, for White, ``3.``.
+
+    When Black is to move the text ends on White's move with no trailing space: the model writes
+    the space itself, as it did in training, and a prompt that carried it would be a spelling it
+    never saw. Replayed from the root because SAN depends on the position it is written in.
+    """
+    replay = board.root()
+    parts: list[str] = []
+    for move in board.move_stack:
+        san = replay.san(move)
+        parts.append(f"{replay.fullmove_number}.{san}" if replay.turn == chess.WHITE else san)
+        replay.push(move)
+    if replay.turn == chess.WHITE:
+        parts.append(f"{replay.fullmove_number}.")
+    return ";" + " ".join(parts)
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="212-227" />
+
+Quince líneas con tres trampas, y las tres son de las que no fallan: producen un prompt razonable que
+el modelo responde peor.
+
+**El espacio final.** Cuando le toca a las negras, el texto acaba en la jugada de las blancas **sin
+espacio**. El modelo escribe el espacio él mismo, porque así lo vio en el entrenamiento. Un prompt
+que ya lo trajera sería una ortografía que nunca vio, y el modelo respondería a otra pregunta. Por
+eso `write` acepta que el primer carácter escrito sea un espacio y no lo trata como final de jugada.
+
+**El número de jugada solo delante de las blancas, sin espacio detrás.** `1.e4` y no `1. e4`. Es el
+formato del autor y son dos tokens de diferencia en un vocabulario de 32.
+
+**El <Term id="san">SAN</Term> se escribe en su posición.** `replay.san(move)` con el tablero en el
+estado **anterior** a la jugada, no después. SAN depende del contexto: `Nbd2` solo se escribe así
+donde los dos caballos llegan a d2, y `exd5` necesita saber que hay una captura. Calcularlo sobre el
+tablero final daría notaciones que el modelo no reconoce en posiciones donde la ambigüedad ya no
+existe.
+
+`board.root()` y no `chess.Board()`: si el tablero empezó en una posición dada por FEN, la raíz es esa
+y no la inicial. Aquí casi siempre coinciden, y la función es correcta en el caso en que no.
+
+## El jugador
+
+`KarvonenPlayer` es un `Player` del proyecto: la misma interfaz que usa el decoder para jugar contra
+Stockfish, así que entra en `play_rungs` sin adaptadores.
+
+```python title="src/rukh/eval/karvonen.py"
+class KarvonenPlayer:
+    """A ``rukh.infer.Player`` that writes SAN one character at a time from the transcript.
+
+    Same accounting as ``QwenPlayer`` (``QwenStats``, ``parse_san_answer``, first legal move as the
+    fallback and never a second sample), so its failure breakdown is comparable with that row.
+    """
+
+    def __init__(
+        self,
+        model: GPT,
+        stats: QwenStats | None = None,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+        seed: int | None = None,
+        max_new_chars: int = MAX_NEW_CHARS,
+        max_plies: int = DECODER_PLIES,
+    ) -> None:
+        self.model = model
+        self.stats = stats if stats is not None else QwenStats()
+        self.temperature, self.top_k, self.max_new_chars = temperature, top_k, max_new_chars
+        self.max_plies = max_plies
+        self.device = next(model.parameters()).device
+        self.generator: torch.Generator | None = None
+        if seed is not None:
+            self.generator = torch.Generator(device="cpu").manual_seed(seed)
+
+    @property
+    def limit(self) -> int:
+        """Plies this player can carry: the decoder's number, so every row plays the same game."""
+        return self.max_plies
+
+    def start(self, white_elo: int, black_elo: int) -> None:
+        """Nothing to set: this model has no rating header, which is part of what it is."""
+
+    def observe(self, move: chess.Move) -> None:
+        """Nothing to record: the board carries the history and the transcript is built from it."""
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="230-265" />
+
+Los dos métodos vacíos son la parte interesante. `start` y `observe` existen porque el protocolo los
+pide, y aquí no hacen nada: este modelo no tiene cabecera de Elo que configurar, y no necesita llevar
+la cuenta de la partida porque la reconstruye del tablero cada vez. Un método vacío con un docstring
+que dice **por qué** está vacío es información; un método vacío sin él parece un olvido.
+
+`max_plies = DECODER_PLIES` importa el límite de plies del decoder en vez de definir uno propio.
+Es la misma idea que `limit`: la partida tiene que durar lo mismo para todas las filas, porque una
+partida que se corta antes se adjudica, y adjudicar más veces cambia el resultado.
+
+`torch.Generator(device="cpu")` aunque el modelo esté en GPU: un generador de CPU da la misma
+secuencia en cualquier máquina, mientras que uno de CUDA depende de la arquitectura. A temperatura 0
+no se usa ninguno; existe para los barridos.
+
+```python title="src/rukh/eval/karvonen.py"
+    def _next(self, logits: Tensor) -> int:
+        if self.temperature <= 0 or self.top_k == 1:
+            return int(logits.argmax())
+        logits = logits / self.temperature
+        if self.top_k is not None and self.top_k < logits.numel():
+            cutoff = torch.topk(logits, self.top_k).values[-1]
+            logits = logits.masked_fill(logits < cutoff, -math.inf)
+        probs = F.softmax(logits, dim=-1).cpu()
+        return int(torch.multinomial(probs, 1, generator=self.generator))
+
+    def write(self, prompt: str) -> str:
+        """Characters the model appends to ``prompt``, up to the space that ends the move."""
+        ids = [STOI[char] for char in prompt]
+        written: list[str] = []
+        with torch.no_grad():
+            for _ in range(self.max_new_chars):
+                window = ids[-self.model.cfg.block_size :]
+                logits = self.model(torch.tensor([window], device=self.device))[0, -1]
+                char = VOCAB[self._next(logits.float())]
+                if char == ";" or (char == " " and "".join(written).strip()):
+                    break  # a new game, or the end of the move
+                written.append(char)
+                ids.append(STOI[char])
+        return "".join(written)
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="267-290" />
+
+`_next` es el muestreo de M2 otra vez: <Term id="temperatura">temperatura</Term> y <Term id="top-k">top-k</Term>, con el atajo de `argmax` cuando la temperatura es cero o `top_k` es 1. El atajo no es solo velocidad: dividir por cero explotaría, y `top_k == 1` con `multinomial`
+daría el mismo resultado por un camino más caro y con una fuente de aleatoriedad que no hace falta.
+
+La condición de parada de `write` es la línea que merece leerse dos veces:
+
+```
+if char == ";" or (char == " " and "".join(written).strip()):
+```
+
+Para en el punto y coma porque eso significa que el modelo ha decidido empezar otra partida: para él,
+la actual se acabó, y lo que haya escrito antes no es una jugada. Y para en el espacio **solo si ya
+ha escrito algo que no es espacio**. Ese `strip()` es el que permite el caso de las negras: el primer
+carácter del turno de las negras es el espacio que el modelo escribe él mismo, y tratarlo como fin de
+jugada devolvería la cadena vacía siempre que jugaran negras.
+
+`logits.float()` convierte antes de muestrear porque el modelo puede correr en media precisión y
+`multinomial` sobre fp16 pierde resolución en la cola. `window = ids[-block_size:]` recorta por la
+izquierda: una partida larga en caracteres se sale de las 1023 posiciones del modelo, y quedarse con
+las últimas es lo único que se puede hacer con posición absoluta aprendida.
+
+```python title="src/rukh/eval/karvonen.py"
+    def answer(self, board: chess.Board) -> str:
+        """The raw continuation the model writes for this position."""
+        return self.write(transcript(board))
+
+    def propose(self, board: chess.Board) -> tuple[chess.Move | None, str]:
+        """What the model wrote, parsed, with the outcome named. No mask, no rescue."""
+        move, outcome = parse_san_answer(board, self.answer(board))
+        self.stats.record(outcome)
+        return move, outcome
+
+    def choose(self, board: chess.Board) -> tuple[chess.Move | None, bool]:
+        """The move to play and whether its own answer was usable; ``QwenPlayer``'s rule exactly."""
+        move, _ = self.propose(board)
+        if move is not None:
+            return move, True
+        legal = list(board.legal_moves)
+        return (legal[0] if legal else None), False
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="292-308" />
+
+Tres métodos en capas, y la separación es deliberada. `propose` mide: devuelve lo que el modelo
+propuso y lo apunta en las estadísticas, sin rescatar nada. `choose` juega: si la propuesta no sirve,
+toma la primera jugada legal para que la partida siga, y devuelve `False` para que quien cuente sepa
+que esa no la eligió el modelo.
+
+La regla del rescate es **la primera jugada legal**, no una al azar ponderada por los logits como en
+el decoder. Y es la correcta aquí por una razón de comparabilidad: es exactamente lo que hace
+`QwenPlayer`, la otra fila externa, así que las dos filas de baseline tienen el mismo rescate y su
+desglose de fallos se lee en la misma escala.
+
+<Callout kind="mundo-real" title="Una regla más dura que la del autor">
+  El harness del propio Karvonen reintenta hasta cinco veces con más temperatura cuando el modelo
+  escribe una jugada ilegal. Aquí se pregunta **una vez** y se cuenta lo que salga. No es por
+  fastidiar: si a un modelo se le dan cinco intentos y a los nuestros uno, la columna de legalidad
+  deja de comparar modelos y pasa a comparar protocolos. La consecuencia es que nuestro 99,6 % para
+  su modelo es un número más exigente que el suyo, y eso se dice en la card.
+</Callout>
+
+## Los puzles: reconstruir la partida que el modelo no puede leer
+
+Un puzle llega como una posición FEN y la historia vive solo en los tokens que lee el decoder. Este
+modelo no sabe leer un FEN: una transcripción que empieza en la jugada 23 sin ninguna jugada delante
+es un texto que nunca vio.
+
+```python title="src/rukh/eval/karvonen.py"
+def prefix_board(board: chess.Board, history: list[int], tok: Any) -> chess.Board:
+    """``board`` with the real game in front of it, rebuilt from the decoder's prompt ids.
+
+    A puzzle board starts from a FEN and its history lives only in the tokens the decoder reads.
+    This model cannot read a FEN at all -- a transcript that begins at move 23 with no moves is
+    text it never saw -- so the game is replayed from the UCI tokens and used when it reaches the
+    puzzle's position. When it does not (a line-only parquet), the board is returned as it is and
+    the caller counts that the model played blind.
+    """
+    replay = chess.Board()
+    for token in tok.decode(history):
+        if token.startswith("<"):
+            continue
+        try:
+            replay.push_uci(token)
+        except ValueError:
+            return board
+    same = replay.fen().split(" ")[:4] == board.fen().split(" ")[:4]
+    return replay if same else board
+
+
+class KarvonenSource:
+    """The ``MoveSource`` the puzzle suite expects; ``blind`` counts the prompts with no game."""
+
+    def __init__(self, player: KarvonenPlayer, tok: Any) -> None:
+        self.player, self.tok = player, tok
+        self.blind = 0
+
+    def __call__(self, board: chess.Board, history: list[int]) -> chess.Move | None:
+        prompted = prefix_board(board, history, self.tok)
+        if prompted is board:
+            self.blind += 1
+        move, _ = self.player.choose(prompted)
+        return move
+
+
+def karvonen_source(player: KarvonenPlayer, tok: Any) -> KarvonenSource:
+    """Puzzles are scored on the move the model *chooses*, fallback included, as for Qwen."""
+    return KarvonenSource(player, tok)
+```
+
+<Src file="src/rukh/eval/karvonen.py" tag="p6" lines="311-349" />
+
+La traducción entre los dos mundos es `prefix_board`: coge los identificadores de token del prompt
+del decoder, los decodifica a UCI, los reproduce en un tablero desde el principio, y comprueba que la
+posición a la que llega es la del puzle.
+
+**La comprobación es lo importante.** `replay.fen().split(" ")[:4] == board.fen().split(" ")[:4]`
+compara los cuatro primeros campos del FEN: piezas, turno, enroques y al paso. Deja fuera los dos
+contadores —la regla de las 50 jugadas y el número de jugada—, que pueden diferir legítimamente sin
+que la posición sea otra. Si la comparación falla, se devuelve el tablero original **sin inventarse
+nada**, y quien llama cuenta ese caso.
+
+**`prompted is board` como señal.** La identidad del objeto es lo que distingue «se reconstruyó» de
+«no se pudo»: no hace falta un segundo valor de retorno ni una excepción, porque la función devuelve
+literalmente el mismo objeto que recibió cuando no ha hecho nada. Es un truco pequeño y legible, y
+el test lo comprueba con `is`.
+
+**`blind` se cuenta y se publica.** Un puzle respondido a ciegas es una respuesta casi segura a una
+pregunta imposible. Si el parquet de puzles no trae el prefijo de la partida, el porcentaje de
+aciertos de este modelo es **un suelo**, no una medición, y esa frase acaba en las notas del
+resultado. Esconder el conteo sería publicar una tasa baja como si midiera al modelo.
+
+<Transfer concept="Los datos que un sistema no puede leer" where="Cualquier evaluación que compara modelos con interfaces distintas: uno que ve imágenes y otro que ve su descripción, uno con memoria y otro sin ella.">
+  Cuando dos sistemas no aceptan la misma entrada, hay tres opciones: traducir la entrada al formato
+  de cada uno, empobrecer la de todos hasta el mínimo común, o medir a cada uno como puede y decir
+  qué le faltó. La primera es la que se hace aquí con `prefix_board`, y es la mejor cuando la
+  traducción no pierde nada. La tercera es lo que se hace cuando la traducción falla, y exige la
+  disciplina de contar los casos: **un número sin el conteo de lo que no se pudo traducir mide otra
+  cosa**.
+
+La segunda —bajar a todos al mínimo— parece la más justa y casi nunca lo es: quitarle al decoder la
+cabecera de Elo para igualarlo con este modelo empeoraría nuestra medida sin mejorar la suya, y la
+comparación resultante no describiría a ninguno de los dos como se usa.
+
+</Transfer>
+
+## La suite prestada, entera
+
+El segundo fichero es el que pasa la suite del decoder a este jugador. Su docstring es la política.
+
+```python title="src/rukh/eval/karvonen_suite.py"
+"""The decoder's suite on the public baseline, so the table has one row nobody here trained.
+
+Everything is borrowed, on purpose: the validation positions of ``rukh.eval.legality``, the
+puzzle split of ``rukh.eval.puzzles``, the Stockfish ladder (node budget included) and the
+bootstrap of ``rukh.eval.elo``, and the failure accounting of ``rukh.eval.qwen_source``. Only
+the player differs. A baseline measured by different code from the models it is compared with
+would be a second harness, and the point of the row is to check the first one.
+
+Two things this model cannot be given, and the report says so rather than papering over them.
+It has no rating header, so ``header_elo`` is silently not a condition for this row. And it
+cannot read a FEN, so a puzzle whose parquet carries no game prefix is answered blind -- from a
+transcript that starts at move 23 with no moves in it -- and the number of such prompts is
+written next to the puzzle rate.
+"""
+```
+
+<Src file="src/rukh/eval/karvonen_suite.py" tag="p6" lines="1-14" />
+
+«Solo el jugador cambia» es la frase que hay que poder decir de cualquier baseline. Si además del
+modelo cambia el muestreo, el corte de partidas o la definición de puzle resuelto, lo que se compara
+no es el modelo.
+
+```python title="src/rukh/eval/karvonen_suite.py"
+class KarvonenResult(BaseModel):
+    """One evaluation of the public baseline on the decoder's own suite."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: str
+    source: str
+    """Where the weights come from: the Hub repository and file of their author."""
+    checkpoint: str
+    model_sha: str
+    params: int
+    date: str
+    device: str
+    positions: int
+    written: QwenStats
+    """How its answers came out, by failure mode, over the validation positions only."""
+    top1: float | None = None
+    puzzles: PuzzleResult | None = None
+    puzzles_blind: int = 0
+    """Puzzle prompts that carried no game prefix and were answered from the FEN position alone,
+    which this model cannot read. A rate over many of these is a floor, not a measurement."""
+    elo: EloResult | None = None
+    notes: list[str] = []
+    config: dict[str, Any] = {}
+```
+
+<Src file="src/rukh/eval/karvonen_suite.py" tag="p6" lines="54-77" />
+
+Dos campos que el resultado del decoder no tiene: `source`, porque de un modelo ajeno hay que decir
+de dónde salió, y `puzzles_blind`, por lo de arriba. `config` guarda la configuración entera con la
+que se midió, así que el JSON del resultado se puede leer dentro de un año sin buscar qué YAML se usó.
+
+Todo lo que no se midió es `None` y no `0.0`, igual que en el resto del proyecto: un cero es un valor
+y entra en una media; un hueco explícito es información.
+
+```python title="src/rukh/eval/karvonen_suite.py"
+def evaluate_karvonen(
+    cfg: EvalConfig,
+    stage: str = DEFAULT_STAGE,
+    use_cache: bool = True,
+    device: str | None = None,
+    checkpoint: Path | str | None = None,
+) -> KarvonenResult:
+    """Run legality, next-move accuracy, puzzles and Elo on the published nanoGPT."""
+    from rukh.engine import EngineNotFound
+    from rukh.eval.cache import EvalCache, config_sha, file_sha
+    from rukh.train import pick_device
+
+    ckpt = Path(checkpoint) if checkpoint is not None else ensure_karvonen()
+    where = device or pick_device()
+    model = load_karvonen(ckpt, device=where)
+    sha = file_sha(ckpt)
+    tok = UciTokenizer()
+    notes: list[str] = [
+        "this model has no rating header: header_elo does not condition this row",
+    ]
+    positions: list[Position] = _positions(cfg, tok, notes)
+    player = KarvonenPlayer(model, temperature=cfg.temperature, top_k=cfg.top_k, seed=cfg.seed)
+
+    log.info("legality and accuracy over %s positions", min(len(positions), cfg.accuracy_positions))
+    scored = positions[: cfg.accuracy_positions]
+    hits = 0
+    for position in scored:
+        move, _ = player.propose(_board_of(position))
+        if move is not None and position.target is not None and move.uci() == position.target:
+            hits += 1
+    written = player.stats.model_copy(deep=True)
+```
+
+<Src file="src/rukh/eval/karvonen_suite.py" tag="p6" lines="87-117" />
+
+La nota sobre la cabecera de Elo se añade **antes** de medir nada, como primer elemento de la lista.
+Así no hay ninguna rama por la que un resultado salga sin ella.
+
+`_positions(cfg, tok, notes)` es una función privada de `suite.py` importada con su guion bajo por
+delante. Importar un privado de otro módulo es normalmente una señal de mal diseño; aquí es la señal
+correcta: la alternativa es duplicar la selección de posiciones de validación, y dos selecciones que
+puedan divergir son exactamente lo que este fichero existe para evitar. El guion bajo avisa de que
+son el mismo proyecto y de que la firma puede cambiar sin aviso.
+
+`written = player.stats.model_copy(deep=True)` congela el desglose de fallos **justo aquí**, cuando
+solo se han hecho las posiciones de validación. El jugador sigue contando durante los puzles y las
+partidas, pero esas respuestas tienen otro denominador: la legalidad del decoder se mide también
+sobre las posiciones de validación, y mezclar puzles dentro pondría dos poblaciones distintas bajo el
+mismo porcentaje.
+
+La legalidad de esta fila, por cierto, no sale de `rukh.eval.legality` sino de este bucle: es
+`stats.legal / stats.asked` sobre las mismas posiciones. La razón es que `legality` mira los logits
+del decoder sobre su vocabulario de jugadas, y aquí no hay tal cosa: hay un texto que se parsea. La
+pregunta —«¿de cada cien respuestas, cuántas son jugadas legales sin ayudar?»— es la misma, y esa es
+la que la columna dice.
+
+```python title="src/rukh/eval/karvonen_suite.py"
+    cache_path = paths.resolve(cfg.cache_db) if use_cache else None
+    games_cache = EvalCache(
+        cache_path, sha, enabled=use_cache, config_sha=config_sha(cfg.cache_fields("games"))
+    )
+    puzzles_cache = EvalCache(
+        cache_path, sha, enabled=use_cache, config_sha=config_sha(cfg.cache_fields("puzzles"))
+    )
+    try:
+        puzzle_path = paths.resolve(cfg.puzzles)
+        if puzzle_path.is_file():
+            items = load_puzzles(
+                puzzle_path, cfg.puzzles_per_band, seed=cfg.seed, split=cfg.puzzle_split
+            )
+            log.info("puzzles: %s", len(items))
+            source = karvonen_source(player, tok)
+            result.puzzles = run_puzzles(
+                source,
+                tok,
+                items,
+                cache=puzzles_cache,
+                header_elo=cfg.header_elo,
+                force_header=cfg.force_header,
+            )
+            result.puzzles_blind = source.blind
+            if source.blind:
+                notes.append(
+                    f"{source.blind} puzzle prompts had no game prefix and were answered from "
+                    "the position alone, which this model cannot read: the rate is a floor"
+                )
+        else:
+            notes.append(f"puzzles not found at {puzzle_path}: puzzle suite skipped")
+```
+
+<Src file="src/rukh/eval/karvonen_suite.py" tag="p6" lines="133-163" />
+
+Las dos cachés por familia son las de la lección anterior, tal cual. Que este fichero las use sin
+saber nada de ellas es la prueba de que el cambio se hizo en el sitio correcto.
+
+Un parquet de puzles que no está **no es un error**: es una nota y un `None` en la columna. Es la
+regla de toda la suite del proyecto: una entrada que falta se apunta y se sigue, porque una tirada de
+tres horas que muere en el minuto dos por un fichero opcional es una tarde perdida.
+
+```python title="src/rukh/eval/karvonen_suite.py"
+        if cfg.elo_games:
+            log.info("elo: %s games per rung", cfg.elo_games)
+            try:
+                records = play_rungs(
+                    None,
+                    tok,
+                    cfg.elo_rungs,
+                    cfg.elo_games,
+                    cfg.sampling(),
+                    move_time=cfg.elo_move_time,
+                    max_plies=cfg.elo_max_plies,
+                    cache=games_cache,
+                    header_elo=cfg.header_elo,
+                    player=player,
+                    nodes=cfg.elo_nodes,
+                )
+            except EngineNotFound as exc:
+                notes.append(f"Elo skipped: {exc}")
+            else:
+                result.elo = estimate(records, samples=cfg.bootstrap, seed=cfg.seed)
+    finally:
+        games_cache.close()
+        puzzles_cache.close()
+```
+
+<Src file="src/rukh/eval/karvonen_suite.py" tag="p6" lines="164-186" />
+
+`play_rungs(None, tok, ...)` con `player=player`: el primer argumento es el decoder y aquí no hay
+ninguno. Esa ruta la abrió M4 para poner a Qwen3 en la escalera, y aquí se reutiliza sin tocar una
+línea. Es la señal de que el diseño de M4 era el correcto: un `Player` es todo lo que la escalera
+necesita saber.
+
+`nodes=cfg.elo_nodes` llega hasta aquí, así que el baseline se puede medir con presupuesto de nodos
+igual que los nuestros. La misma línea se añadió en `eval/qwen_suite.py`, y es todo lo que ese fichero
+cambió en el hito:
+
+```python title="src/rukh/eval/qwen_suite.py"
+                max_plies=cfg.elo_max_plies,
+                cache=cache,
+                header_elo=cfg.header_elo,
+                nodes=cfg.elo_nodes,
+                player=player,
+            )
+```
+
+<Src file="src/rukh/eval/qwen_suite.py" tag="p6" lines="137-142" />
+
+Una línea, y la propiedad que compra es que las tres suites del proyecto —decoder, Qwen y Karvonen—
+puedan medirse con el mismo límite. Un baseline que solo se pudiera medir por reloj quedaría fuera de
+cualquier experimento por nodos, que es tanto como decir fuera de la mitad de la lección 8.
+
+## La fila, marcada como externa
+
+```python title="src/rukh/eval/report.py"
+    date: str
+    run_id: str | None = None
+    baseline: bool = False
+    """A model somebody else trained, measured here as a control on the harness itself. Off for
+    every model of the course, and for every row written before the flag existed."""
+```
+
+<Src file="src/rukh/eval/report.py" tag="p6" lines="61-65" />
+
+Un booleano con `False` por defecto, que es lo que hace que las filas escritas antes de que el campo
+existiera se sigan leyendo. La marca es del **origen** del modelo, no de su calidad: dice quién lo
+entrenó, no si es bueno.
+
+```python title="src/rukh/eval/karvonen_suite.py"
+def row_of(result: KarvonenResult) -> WebRow:
+    """The row this model contributes to the single results table, flagged as a baseline."""
+    elo = result.elo
+    interval = (
+        [elo.ci_low, elo.ci_high]
+        if elo and not elo.separated and elo.ci_low is not None and elo.ci_high is not None
+        else None
+    )
+    return WebRow(
+        stage=result.stage,
+        params=result.params,
+        legality=result.written.legal_rate or None,
+        top1=result.top1,
+        puzzles=result.puzzles.by_band() if result.puzzles else {},
+        elo=elo.elo if elo else None,
+        elo_ci=interval,
+        elo_lower=elo.elo_lower if elo else None,
+        elo_upper=elo.elo_upper if elo else None,
+        elo_separated=bool(elo.separated) if elo else False,
+        date=result.date,
+        baseline=True,
+    )
+```
+
+<Src file="src/rukh/eval/karvonen_suite.py" tag="p6" lines="260-281" />
+
+El `interval` solo se rellena si el resultado **no** está separado. «Separado» quiere decir que todas
+las partidas fueron en la misma dirección, y entonces el ajuste logístico no identifica un punto: la
+verosimilitud crece indefinidamente. En ese caso la tabla lleva una cota (`< 807` en la fila de
+Qwen3) y no un intervalo. Poner unos percentiles de bootstrap ahí sería inventarse una precisión que
+no existe.
+
+`legality=result.written.legal_rate or None` convierte un 0,0 en `None`. Es la única línea del fichero
+donde ese truco de Python es discutible —un modelo con legalidad cero pasaría por «no medido»—, y se
+sostiene porque una tasa exactamente cero sobre mil posiciones significa que no se preguntó nada.
+
+## El informe, con la columna que el decoder no tiene
+
+```python title="src/rukh/eval/karvonen_suite.py"
+def render_markdown(result: KarvonenResult) -> str:
+    """The report, with the failure breakdown the decoder's report has no column for."""
+    stats = result.written
+
+    def share(count: int) -> str:
+        return f"{100 * count / stats.asked:.2f} %" if stats.asked else "n/a"
+
+    lines = [
+        f"# Evaluation of `{result.stage}` (public baseline)",
+        "",
+        f"- Source: `{result.source}`",
+        f"- Checkpoint: `{result.checkpoint}`",
+        f"- Weights SHA-256: `{result.model_sha}`",
+        f"- Parameters: {result.params:,}",
+        f"- Device: `{result.device}`",
+        f"- Date: {result.date}",
+        "",
+        "A character-level nanoGPT trained by Adam Karvonen on 16 M Lichess games written as "
+        "`;1.e4 e5 2.Nf3`, measured here with the same positions, puzzles and Stockfish ladder "
+        "as every other row. It was not trained by this course and nothing about it was tuned.",
+        "",
+        "## Headline",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| Legal moves written, no mask | {share(stats.legal)} |",
+        f"| Top-1 next move | {'n/a' if result.top1 is None else f'{result.top1 * 100:.1f} %'} |",
+        f"| Puzzles solved | "
+        f"{'n/a' if result.puzzles is None else f'{result.puzzles.rate * 100:.1f} %'} |",
+        f"| Estimated Elo | {elo_line(result.elo)} |",
+        "",
+        "## How the answers failed",
+        "",
+        "| Outcome | Count | Share |",
+        "|---|---:|---:|",
+        f"| legal | {stats.legal} | {share(stats.legal)} |",
+        f"| illegal here | {stats.illegal} | {share(stats.illegal)} |",
+        f"| not a move at all | {stats.unparseable} | {share(stats.unparseable)} |",
+        f"| ambiguous SAN | {stats.ambiguous} | {share(stats.ambiguous)} |",
+        f"| nothing written | {stats.empty} | {share(stats.empty)} |",
+        f"| **asked** | **{stats.asked}** | |",
+        "",
+    ]
+```
+
+<Src file="src/rukh/eval/karvonen_suite.py" tag="p6" lines="194-236" />
+
+La tabla de fallos es lo que un modelo que escribe texto necesita y un decoder con vocabulario de
+jugadas no: aquí una respuesta puede fallar de cuatro maneras distintas y son diagnósticos distintos.
+«Ilegal aquí» es un modelo que entiende la notación y se equivoca de posición. «No es una jugada» es
+un modelo que ha perdido el hilo del formato. «SAN ambiguo» es `Nd2` donde dos caballos llegan, que
+es un fallo de precisión y no de comprensión. «No escribió nada» es el modelo decidiendo que la
+partida acabó. Un solo porcentaje de legalidad los mete a los cuatro en el mismo saco.
+
+`share()` devuelve `"n/a"` cuando no se preguntó nada, en vez de dividir por cero. La misma regla de
+siempre: el hueco se escribe.
+
+```python title="src/rukh/eval/karvonen_suite.py"
+    if result.puzzles is not None:
+        lines += [
+            "## Puzzles by band",
+            "",
+            f"Prompts answered without a game prefix: {result.puzzles_blind}.",
+            "",
+            "| Band | Attempted | Solved | Rate |",
+            "|---|---:|---:|---:|",
+        ]
+        lines += [
+            f"| {band.band} | {band.attempted} | {band.solved} | {band.rate * 100:.1f} % |"
+            for band in result.puzzles.bands
+        ]
+        lines.append("")
+    if result.elo is not None:
+        lines += ["## Games against Stockfish", "", "| Rung | Games | Score |", "|---|---:|---:|"]
+        lines += [f"| {rung.name} | {rung.games} | {rung.score:.3f} |" for rung in result.elo.rungs]
+        lines.append("")
+    if result.notes:
+        lines += ["## Notes", ""] + [f"- {note}" for note in result.notes] + [""]
+    return "\n".join(lines)
+```
+
+<Src file="src/rukh/eval/karvonen_suite.py" tag="p6" lines="237-257" />
+
+El conteo de puzles a ciegas va **encima** de la tabla de tramos, no en una nota al pie. Es la
+información que cambia cómo se lee la tabla que viene debajo, y ponerla después sería contar el
+truco cuando ya nadie mira.
+
+```python title="src/rukh/eval/karvonen_suite.py"
+def run_karvonen_suite(
+    cfg: EvalConfig,
+    stage: str = DEFAULT_STAGE,
+    use_cache: bool = True,
+    device: str | None = None,
+    checkpoint: Path | str | None = None,
+) -> tuple[KarvonenResult, ReportPaths]:
+    """Evaluate and report, so the row lands in the same table as every other stage."""
+    result = evaluate_karvonen(
+        cfg, stage=stage, use_cache=use_cache, device=device, checkpoint=checkpoint
+    )
+    report = write_report_files(
+        result.stage,
+        render_markdown(result),
+        json.loads(result.model_dump_json()),
+        paths.resolve(cfg.out_dir),
+        paths.resolve(cfg.web_results) if cfg.web_results else None,
+        row_of(result),
+    )
+    return result, report
+```
+
+<Src file="src/rukh/eval/karvonen_suite.py" tag="p6" lines="284-303" />
+
+`write_report_files` es la misma función que escribe el informe de cualquier etapa: el `report.md`, el
+`results.json` y la fila de la tabla salen del mismo objeto, no uno del otro. Es lo que impide la
+divergencia clásica de un informe que dice una cosa y una tabla que dice otra porque alguien copió un
+número a mano.
+
+## La orden
+
+```python title="src/rukh/cli.py"
+@eval_app.command("karvonen")
+def eval_karvonen_cmd(
+    suite: Annotated[str, typer.Option("--suite", help="Suite name: full or quick.")] = "full",
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config", exists=True, dir_okay=False, readable=True, help="Suite YAML override."
+        ),
+    ] = None,
+    stage: Annotated[str, typer.Option("--stage", help="Row name in the results table.")] = (
+        "karvonen-8l"
+    ),
+    checkpoint: Annotated[
+        Path | None,
+        typer.Option(
+            "--checkpoint",
+            exists=True,
+            dir_okay=False,
+            help="A nanoGPT checkpoint to measure instead of the published 8-layer one.",
+        ),
+    ] = None,
+    no_cache: Annotated[bool, typer.Option("--no-cache", help="Recompute everything.")] = False,
+    device: Annotated[str | None, typer.Option("--device", help="Where to run.")] = None,
+) -> None:
+    """Put Adam Karvonen's public chess nanoGPT through the decoder's own suite.
+
+    The one row of the table nobody here trained: same positions, same puzzles, same Stockfish
+    ladder as every other stage, so a reader can check the harness against a model with
+    published numbers of its own. The 100 MB checkpoint is downloaded from his Hub repository
+    on first use; nothing of it is published back.
+    """
+    from rukh.eval import load_suite
+    from rukh.eval.karvonen_suite import run_karvonen_suite
+    from rukh.eval.report import elo_line
+    from rukh.eval.suite import SUITES
+
+    if suite not in SUITES:
+        typer.echo(f"error: --suite must be one of {', '.join(SUITES)}", err=True)
+        raise typer.Exit(code=2)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    cfg = load_suite(suite, config)
+    try:
+        result, report = run_karvonen_suite(
+            cfg, stage=stage, use_cache=not no_cache, device=device, checkpoint=checkpoint
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    stats = result.written
+    typer.echo(f"stage:    {result.stage} ({result.params:,} parameters, baseline)")
+    typer.echo(f"source:   {result.source}")
+    typer.echo(f"legal:    {stats.legal_rate:.4f} of {stats.asked} answers")
+    typer.echo(
+        f"failures: {stats.illegal} illegal, {stats.unparseable} not a move, "
+        f"{stats.ambiguous} ambiguous, {stats.empty} empty"
+    )
+    if result.top1 is not None:
+        typer.echo(f"accuracy: top1 {result.top1:.4f}")
+    if result.puzzles is not None:
+        typer.echo(
+            f"puzzles:  {result.puzzles.rate:.4f} solved ({result.puzzles_blind} without a prefix)"
+        )
+    if result.elo is not None:
+        typer.echo(f"elo:      {elo_line(result.elo)} over {result.elo.games} games")
+    typer.echo(f"report:   {report.markdown}")
+```
+
+<Src file="src/rukh/cli.py" tag="p6" lines="1320-1384" />
+
+Las opciones son deliberadamente **las mismas** que las de `rukh eval qwen` menos `--adapter`, que
+aquí no tiene sentido. Hay un test que lo comprueba comparando los dos conjuntos de opciones, y no es
+una manía: dos baselines con banderas distintas producen dos formas de equivocarse al lanzarlos.
+
+`--checkpoint` permite medir otro nanoGPT —el autor publicó varios tamaños— sin tocar el código.
+`--stage` permite que esa medición vaya a otra fila en vez de pisar la publicada.
+
+## Los tests que impiden que la fila esté mal en silencio
+
+El fichero de tests empieza diciendo qué merece un test y qué no.
+
+```python title="tests/unit/test_karvonen.py"
+"""Tests for rukh.eval.karvonen: the public baseline goes through the harness unchanged.
+
+Nothing here downloads anything. What is worth testing is the part that could silently make the
+row wrong: that the checkpoint format loads (the ``_orig_mod.`` prefix of ``torch.compile``),
+that the prompt is the author's spelling to the character, that what the model writes is read
+the same way Qwen's answers are, and that a failed proposal is rescued *and* counted.
+"""
+```
+
+<Src file="tests/unit/test_karvonen.py" tag="p6" lines="1-7" />
+
+«Nada aquí descarga nada» es la primera condición: un test que necesite 100 MB de internet no corre en
+la CI y acaba desactivado.
+
+```python title="tests/unit/test_karvonen.py"
+TOY = GPTConfig(n_layer=2, n_head=2, n_embd=32, block_size=64, bias=False, vocab_size=32)
+
+
+def _board(*sans: str) -> chess.Board:
+    board = chess.Board()
+    for san in sans:
+        board.push_san(san)
+    return board
+
+
+def test_the_vocabulary_is_the_32_characters_of_meta_pkl() -> None:
+    assert len(VOCAB) == 32 and len(STOI) == 32
+    assert STOI[" "] == 0 and STOI[";"] == 15 and STOI["x"] == 31
+    # Every SAN python-chess can write spells with it: captures, promotions, checks, castling.
+    for san in ("exd5", "Nbd2", "O-O-O", "e8=Q+", "Qxf7#", "R1a3"):
+        assert all(char in STOI for char in san), san
+
+
+def test_a_compiled_checkpoint_loads_with_its_prefix_stripped(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    original = GPT(TOY)
+    compiled = {f"_orig_mod.{key}": value for key, value in original.state_dict().items()}
+    assert all(key.startswith("_orig_mod.") for key in compiled)
+    torch.save(
+        {"model_args": {**asdict(TOY), "dropout": 0.0}, "model": compiled}, tmp_path / "ckpt.pt"
+    )
+
+    loaded = load_karvonen(tmp_path / "ckpt.pt")
+    assert set(strip_compiled(compiled)) == set(loaded.state_dict())
+    weight = loaded.transformer.h[1].mlp.c_fc.weight
+    assert torch.equal(weight, original.transformer.h[1].mlp.c_fc.weight)
+    # The head is tied to the embedding, as nanoGPT ties it: one tensor, not two copies.
+    assert loaded.lm_head.weight.data_ptr() == loaded.transformer.wte.weight.data_ptr()
+    assert not loaded.training
+    idx = torch.tensor([[STOI[c] for c in ";1.e4"]])
+    assert loaded(idx).shape == (1, 5, 32)
+```
+
+<Src file="tests/unit/test_karvonen.py" tag="p6" lines="41-76" />
+
+`TOY` es el mismo modelo con dos capas y 32 dimensiones: la arquitectura entera en un objeto que cabe
+en memoria y se construye en milisegundos. Todo el fichero se apoya en él.
+
+El test del checkpoint compilado **fabrica** el problema en vez de esperar a encontrarlo: guarda un
+estado con los prefijos puestos a mano y comprueba que se carga. Las cuatro aserciones del final son
+cuatro formas distintas de que el cargador esté mal: que falte una clave, que un peso se cargue en
+otro sitio, que la cabeza deje de estar atada, que el modelo vuelva en modo entrenamiento.
+
+```python title="tests/unit/test_karvonen.py"
+@pytest.mark.parametrize(
+    ("sans", "expected"),
+    [
+        ((), ";1."),
+        (("e4",), ";1.e4"),
+        (("e4", "e5"), ";1.e4 e5 2."),
+        (("e4", "e5", "Nf3"), ";1.e4 e5 2.Nf3"),
+        (("e4", "e5", "Nf3", "Nc6", "Bb5"), ";1.e4 e5 2.Nf3 Nc6 3.Bb5"),
+    ],
+    ids=["start", "black-to-move", "white-to-move", "three-plies", "five-plies"],
+)
+def test_the_transcript_is_the_authors_format_to_the_character(
+    sans: tuple[str, ...], expected: str
+) -> None:
+    """``;`` first, no space after the move number, no trailing space when Black is to move."""
+    assert transcript(_board(*sans)) == expected
+
+
+def test_the_transcript_writes_san_in_the_position_it_belongs_to() -> None:
+    """``Nbd2`` only reads as such where both knights reach d2; a replay from the root knows."""
+    board = _board("Nf3", "d5", "d4", "Nf6", "Nbd2")
+    assert transcript(board) == ";1.Nf3 d5 2.d4 Nf6 3.Nbd2"
+```
+
+<Src file="tests/unit/test_karvonen.py" tag="p6" lines="86-107" />
+
+Cinco casos parametrizados con nombre, y los nombres son los que salen cuando uno falla. Esto es un
+test de **formato exacto**: cada carácter del literal esperado es una decisión del autor del modelo, y
+cualquiera de ellos que cambie produce un prompt que el modelo responde peor sin quejarse nunca. Un
+test de cadena literal es lo correcto precisamente porque no hay nada que abstraer.
+
+```python title="tests/unit/test_karvonen.py"
+class _Scripted(nn.Module):
+    """A stand-in for the network that writes a fixed string, one character per call."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.cfg = TOY
+        self.script = list(text)
+        self.dummy = nn.Parameter(torch.zeros(1))
+
+    def forward(self, idx: Tensor) -> Tensor:
+        logits = torch.full((1, idx.shape[1], 32), -10.0)
+        char = self.script.pop(0) if self.script else " "
+        logits[0, -1, STOI[char]] = 10.0
+        return logits
+
+
+def test_writing_stops_at_the_space_that_ends_the_move() -> None:
+    assert KarvonenPlayer(_Scripted("Nf3 Nc6 3.")).write(";1.e4 e5 2.") == "Nf3"
+    # Black's move starts with the space the model writes itself; the second space ends it.
+    assert KarvonenPlayer(_Scripted(" e5 2.Nf3")).write(";1.e4") == " e5"
+    # A new game delimiter means the model thinks the game is over: nothing was written.
+    assert KarvonenPlayer(_Scripted(";1.e4")).write(";1.e4 e5 2.") == ""
+    # A cap, so a model that never writes a space cannot run for ever.
+    assert KarvonenPlayer(_Scripted("a" * 40), max_new_chars=5).write(";1.") == "aaaaa"
+```
+
+<Src file="tests/unit/test_karvonen.py" tag="p6" lines="110-133" />
+
+`_Scripted` es la pieza que hace comprobable la lógica de generación: una red falsa que devuelve el
+siguiente carácter de un guion. Con ella, la condición de parada se puede probar en sus cuatro ramas
+—jugada normal, turno de negras, punto y coma, tope— en cuatro líneas y sin pesos.
+
+`self.dummy = nn.Parameter(...)` está ahí solo para que `next(model.parameters())` no explote cuando
+el jugador busca el dispositivo. Es el detalle que uno descubre a la primera ejecución.
+
+```python title="tests/unit/test_karvonen.py"
+def test_an_illegal_proposal_falls_back_and_is_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same rule as the decoder and Qwen: the game goes on, the count does not hide it.
+
+    The queen is boxed in at the start, so ``Qh5`` is well formed and illegal; the rescue is the
+    first legal move in the position's own order, and the model is not asked again.
+    """
+    player = KarvonenPlayer(_Scripted(""))
+    monkeypatch.setattr(player, "write", lambda prompt: "Qh5")
+    move, was_legal = player.choose(chess.Board())
+    assert was_legal is False
+    assert move in chess.Board().legal_moves
+    assert player.stats.illegal == 1 and player.stats.asked == 1
+
+    monkeypatch.setattr(player, "write", lambda prompt: "Nf9")
+    _, was_legal = player.choose(chess.Board())
+    assert was_legal is False and player.stats.unparseable == 1
+
+    mate = chess.Board("7k/5KQ1/8/8/8/8/8/8 b - - 0 1")
+    assert player.choose(mate) == (None, False)
+```
+
+<Src file="tests/unit/test_karvonen.py" tag="p6" lines="145-163" />
+
+Los tres casos son las tres cosas que pueden pasar y tienen que contarse distinto: una jugada bien
+escrita e ilegal (`Qh5` en la posición inicial), un texto que no es una jugada (`Nf9`), y una posición
+sin jugadas legales, donde no hay rescate posible y se devuelve `None`. El tercero existe porque
+`legal[0]` sobre una lista vacía sería un `IndexError` en medio de una partida.
+
+```python title="tests/unit/test_karvonen.py"
+def test_a_puzzle_prompt_is_rebuilt_from_the_games_own_moves() -> None:
+    """The model cannot read a FEN, so the puzzle gets the game in front of it when there is one."""
+    tok = UciTokenizer()
+    header = [tok.bos_id, tok.vocab[elo_token(1800, "w")], tok.vocab[elo_token(1800, "b")]]
+    history = header + [tok.vocab[uci] for uci in ("e2e4", "e7e5", "g1f3")]
+    position = chess.Board(_board("e4", "e5", "Nf3").fen())  # a FEN board: no move stack
+    assert not position.move_stack
+
+    rebuilt = prefix_board(position, history, tok)
+    assert transcript(rebuilt) == ";1.e4 e5 2.Nf3"
+    # A prefix that does not lead to this position is not this game: the board is kept as is.
+    elsewhere = chess.Board(_board("d4", "d5").fen())
+    assert prefix_board(elsewhere, history, tok) is elsewhere
+
+    source = karvonen_source(KarvonenPlayer(_Scripted(" Nc6")), tok)
+    assert source(position, history) == chess.Move.from_uci("b8c6")
+    assert source.blind == 0
+    source(elsewhere, history)
+    assert source.blind == 1
+```
+
+<Src file="tests/unit/test_karvonen.py" tag="p6" lines="175-193" />
+
+`chess.Board(board.fen())` construye un tablero **sin historial**, que es exactamente como llega un
+puzle, y la aserción siguiente lo confirma. Reproducir la condición real en la primera línea del test
+es lo que hace que el test signifique algo.
+
+El `is` de la tercera aserción no es un descuido de estilo: comprueba la identidad del objeto, que es
+la señal con la que `KarvonenSource` decide si el modelo jugó a ciegas.
+
+```python title="tests/unit/test_karvonen.py"
+def test_the_row_is_marked_as_a_baseline_and_older_rows_are_not() -> None:
+    row = row_of(_result())
+    assert row.baseline is True
+    assert row.stage == "karvonen-8l" and row.legality == pytest.approx(0.75)
+    # Rows written before the flag existed carry no key and read as the course's own models.
+    assert WebRow.model_validate({"stage": "tiny", "params": 1, "date": "2026-09-19"}).baseline is (
+        False
+    )
+
+
+def test_the_benchmarks_table_marks_the_external_row_and_still_renders() -> None:
+    rows = [
+        row_of(_result()).model_dump(),
+        {"stage": "tiny-greedy", "legality": 0.945, "date": "2026-09-20"},
+    ]
+    table = render_benchmarks(rows)
+    assert "| `karvonen-8l` (externo) | 75.0 %" in table
+    assert "| `tiny-greedy` | 94.5 %" in table
+    assert "2 etapas medidas con la misma suite, 1 de ellas externas" in table
+```
+
+<Src file="tests/unit/test_karvonen.py" tag="p6" lines="212-230" />
+
+La segunda aserción del primero es la que protege la compatibilidad hacia atrás: una fila antigua, sin
+la clave, se lee como `False`. Sin ese test, un cambio a `baseline: bool` obligatorio rompería la
+lectura de `artifacts/web/results.json` y nadie lo vería hasta desplegar la web.
+
+Los cuatro tests que quedan —el rechazo de un `meta.pkl` que no es el fijado, el informe, el plan del
+nightly y la paridad de banderas con `rukh eval qwen`— están enlazados y no pegados porque repiten
+contratos que estos bloques ya enseñan:
+[`tests/unit/test_karvonen.py`](https://github.com/borja-glez/rukh/blob/p6/tests/unit/test_karvonen.py).
+
+<Exercise n="01" title="Rompe el prompt de una forma que no falla">
+  Quita el `;` inicial de `transcript` y corre el lab del baseline con `--stage karvonen-sin-punto`.
+  El código no falla, los tests de formato sí. Antes de medir, escribe qué columna esperas que caiga
+  más: legalidad, top-1 o puzles.
+
+  <Solution>
+    La legalidad, con diferencia. El `;` es el delimitador que el modelo vio al principio de los 16
+    millones de partidas de su entrenamiento, así que sin él lo que recibe es el final de una partida
+    anterior y responde en un contexto que no es el suyo. El autor lo avisa en su README, y es la
+    razón de que la primera frase del docstring de `karvonen.py` hable del formato antes que de la
+    red. La lección general: un baseline mal preguntado sale bajo y no se queja, y por eso el
+    formato del prompt se prueba con cadenas literales.
+  </Solution>
+</Exercise>
+
+<Exercise n="02" title="Qué haría falta para que Maia-2 fuera una fila">
+  Maia-2 quedó fuera de este hito (D-138) porque fija `torch 2.8` frente al 2.11 del proyecto. Con
+  `KarvonenPlayer` delante, enumera qué piezas habría que escribir para meterlo en la tabla y cuál es
+  la que el conflicto de versiones hace imposible resolver dentro del mismo proceso.
+
+  <Solution>
+    Harían falta cuatro: cargar sus pesos, traducir la posición a su entrada, convertir su salida en
+    una `chess.Move`, y contar los fallos con `QwenStats` para que el desglose sea comparable. Las
+    cuatro son las mismas que aquí. Lo que no se puede resolver es la primera: dos versiones de
+    `torch` no conviven en un intérprete, así que el modelo tendría que correr en un proceso hijo con
+    su propio entorno y hablar por una tubería. El `Player` sería un cliente de ese proceso, y esa es
+    precisamente la forma del diseño que quedó en el backlog.
+  </Solution>
+</Exercise>
+
+## Qué has aprendido
+
+Un baseline público no es un número copiado de un paper: es un modelo ajeno traído a tu instrumento.
+Y traerlo bien cuesta dos ficheros, porque hay que reproducir **su** formato a la letra y medirlo con
+**tu** código sin excepciones.
+
+Las decisiones que se repiten fuera del ajedrez son tres. Reimplementar en vez de importar cuando lo
+que se importaría es un repositorio de entrenamiento. Fijar por hash lo que se descarga y validarlo
+antes de deserializarlo. Y contar explícitamente lo que el modelo ajeno **no** pudo responder —los
+puzles a ciegas, la cabecera que no tiene— porque un porcentaje sin ese conteo mide otra cosa.
+
+La lección siguiente junta las doce etapas en un solo comando y una sola fecha.

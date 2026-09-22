@@ -1,0 +1,704 @@
+---
+title: 'int8 y el jugador ONNX: un grafo exportado en la escalera'
+description:
+  'El objeto más pequeño que puede jugar en lugar de un checkpoint, para responder por fin cuánto
+  cuesta el int8 en Elo; los nombres de corrida estables que hacen que una orden de una lección
+  funcione tanto si descargaste el modelo como si lo entrenaste; y el muestreo de pares que mete el
+  brazo de control de M5 dentro de su configuración.'
+module: m6
+order: 6
+duration: 100
+level: medio
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - ONNX
+  - cuantización
+  - paridad
+  - int8
+  - checkpoint
+  - DPO
+artifacts:
+  - kind: repo
+    label: borja-glez/rukh
+    href: https://github.com/borja-glez/rukh/tree/p6
+---
+
+## Qué vas a construir
+
+Tres cosas pequeñas y sin relación aparente, que tienen una cosa en común: las tres convierten en
+código algo que hasta ahora era un script suelto o una pregunta abierta.
+
+`infer/onnx_player.py` son 68 líneas que ponen un grafo <Term id="onnx">ONNX</Term> dentro del mismo
+jugador que usa un checkpoint, para que una exportación pueda subirse a la escalera de Stockfish. Es
+lo que responde a la pregunta que M2 dejó abierta: la <Term id="paridad">paridad</Term> dice que el
+int8 elige otra jugada una de cada veinte veces, pero no dice cuánto cuesta eso en fuerza.
+
+`resolve_run` en `train/checkpoint.py` hace que `checkpoints/medium-v4/best.pt` encuentre también el
+`checkpoints/medium-v4-20260919-174623/best.pt` que deja un entrenamiento propio. Son cuarenta líneas
+y un cambio de una línea en nueve configuraciones.
+
+Y `limit_pairs` en `train/dpo.py` mete dentro de la configuración el muestreo que M5 hacía con un
+script fuera del repositorio.
+
+## El objeto más pequeño que puede jugar
+
+```python title="src/rukh/infer/onnx_player.py"
+"""An exported ONNX graph standing in for the decoder, so an export can sit on the Elo ladder.
+
+Parity (M2) says in how many positions the exported model picks the same move as the checkpoint.
+It does not say what the other positions cost: an int8 export that agrees 95 % of the time is a
+different player, and the only way to learn how different is to let it play the same ladder the
+checkpoint played. ``OnnxDecoder`` is the smallest object that ``pick_move`` accepts in place of a
+``MoveDecoder`` -- ``next_logits``, ``parameters`` (for the device) and ``cfg.block`` -- so the
+export goes through ``DecoderPlayer`` and the very same masking, sampling and rescue as every
+published number. A comparison whose two halves went through different code is not a comparison.
+"""
+```
+
+<Src file="src/rukh/infer/onnx_player.py" tag="p6" lines="1-10" />
+
+«El objeto más pequeño que `pick_move` acepta» es la frase de diseño. Nadie hereda de `MoveDecoder`,
+nadie define una interfaz abstracta: se mira **qué tres cosas** usa el muestreador de un modelo, y se
+escribe un objeto que tenga exactamente esas tres.
+
+Eso es <Term id="tipado-pato">tipado pato</Term> —_duck typing_— usado a propósito y no por pereza, y la
+ventaja concreta es que el camino que recorre la exportación es **literalmente el mismo código**: la
+misma máscara de legalidad, el mismo muestreo con su semilla, el mismo rescate ante una jugada
+ilegal. La alternativa —escribir un segundo bucle de partida para ONNX— habría dado dos números que
+no se pueden restar.
+
+```python title="src/rukh/infer/onnx_player.py"
+METADATA_BLOCK = "rukh_block"
+
+
+def _session(onnx_path: Path) -> Any:
+    """An ONNX Runtime session on the CPU provider (tests monkeypatch this)."""
+    import onnxruntime as ort
+
+    return ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+
+
+class _Config:
+    """The one field of ``DecoderConfig`` the sampler reads."""
+
+    def __init__(self, block: int) -> None:
+        self.block = block
+```
+
+<Src file="src/rukh/infer/onnx_player.py" tag="p6" lines="23-37" />
+
+`_session` existe como función aparte por una sola razón, y el docstring la dice: los tests la
+sustituyen. Si la sesión se construyera en línea dentro del constructor, probar este fichero exigiría
+un `.onnx` de verdad en disco y `onnxruntime` instalado, y el test dejaría de correr en la CI.
+
+`_Config` es una clase de tres líneas que solo tiene `block`. Podría ser un `SimpleNamespace` o un
+`dataclass`; es una clase con su docstring porque ese docstring es la documentación de **qué parte
+de `DecoderConfig` depende el muestreador**, que es información difícil de encontrar de otra forma.
+
+`providers=["CPUExecutionProvider"]` fija la CPU explícitamente en vez de dejar que ONNX Runtime
+elija. Es la decisión que hace que el lab de la lección 9 use el rival por nodos: si el jugador corre
+en CPU y el motor también, un rival por reloj mediría además cuánto se estorban.
+
+```python title="src/rukh/infer/onnx_player.py"
+class OnnxDecoder:
+    """``model.onnx`` (or its fp16/int8 sibling) with the surface ``pick_move`` needs.
+
+    ``block`` comes from the metadata ``rukh export`` writes; pass it when the file has none.
+    """
+
+    def __init__(self, onnx_path: Path, block: int | None = None) -> None:
+        self.path = Path(onnx_path)
+        self.session = _session(self.path)
+        if block is None:
+            meta = self.session.get_modelmeta().custom_metadata_map
+            if METADATA_BLOCK not in meta:
+                raise ValueError(f"{self.path.as_posix()} carries no {METADATA_BLOCK}; pass block=")
+            block = int(meta[METADATA_BLOCK])
+        self.cfg = _Config(block)
+        self._anchor = torch.zeros(1)
+
+    def parameters(self):  # type: ignore[no-untyped-def]
+        """One CPU tensor: the sampler asks where the weights live, and ORT runs on the CPU."""
+        yield self._anchor
+
+    def next_logits(self, idx: Tensor) -> Tensor:
+        """Logits of the last step only, ``(B, vocab_size)``, cropped to the block size."""
+        cropped = idx[:, -self.cfg.block :].detach().cpu().numpy().astype(np.int64)
+        logits = self.session.run(None, {INPUT_NAME: cropped})[0]
+        return torch.from_numpy(np.asarray(logits, dtype=np.float32))
+
+    def eval(self) -> OnnxDecoder:
+        return self
+```
+
+<Src file="src/rukh/infer/onnx_player.py" tag="p6" lines="40-68" />
+
+Veintiocho líneas y cinco decisiones que merecen nombre.
+
+**El `block` viaja dentro del `.onnx`.** `rukh export` escribe `rukh_block` en los metadatos
+personalizados del grafo, y aquí se lee. La alternativa —pedírselo siempre a quien construye el
+objeto— convertiría el fichero en algo que hay que acompañar de una nota. Un artefacto que lleva
+dentro lo que hace falta para usarlo es un artefacto que se puede pasar a otra persona.
+
+**El error cuando no está dice qué hacer.** `carries no rukh_block; pass block=` nombra la clave que
+falta y la salida. Un `KeyError` pelado habría dicho `'rukh_block'` y nada más.
+
+**`parameters()` devuelve un tensor de un elemento, y es un generador.** Esta es la línea más
+divertida del fichero: el muestreador solo llama a `parameters()` para preguntar `next(...).device`,
+porque necesita saber dónde poner los tensores de entrada. ONNX Runtime corre en CPU, así que la
+respuesta correcta es un tensor cualquiera que esté en CPU. `torch.zeros(1)` es el objeto más barato
+que contesta esa pregunta. Está guardado en `self._anchor` y no creado en cada llamada para que sea
+siempre el mismo y para no asignar memoria en el bucle de una partida.
+
+**`astype(np.int64)` explícito.** El grafo exportado declara su entrada como `int64`; los tensores de
+PyTorch de índices ya lo son, pero `numpy()` sobre un tensor que vino de otro sitio podría dar
+`int32`, y ONNX Runtime rechaza el tipo con un error que habla de nombres de tensores y no de
+tipos. Convertir a la fuerza es una línea contra un error incomprensible.
+
+**El recorte a `block` está aquí y no en quien llama.** `idx[:, -self.cfg.block:]` se queda con las
+últimas posiciones que el grafo puede aceptar. El decoder de PyTorch hace lo mismo internamente, así
+que ponerlo aquí es lo que mantiene la equivalencia: el jugador no tiene que saber con cuál de los
+dos está hablando.
+
+`eval()` devuelve `self` y no hace nada. Existe porque el código que carga un modelo escribe
+`model.eval()` por costumbre, y un grafo exportado no tiene modos. Tres líneas para no obligar a
+poner un `if` en el llamador.
+
+<Callout kind="teoria" title="Paridad y fuerza no son lo mismo">
+  Un 95,4 % de paridad no es «casi el mismo modelo». Es un modelo que en una de cada veinte
+  posiciones juega otra cosa, y que por tanto tiene **otro Elo**. El error de redondeo de la
+  <Term id="cuantizacion-dinamica">cuantización dinámica</Term> no se reparte uniformemente: se
+  concentra donde los logits de las dos mejores jugadas están cerca, que es justo donde la decisión
+  era difícil. Redondear al euro los precios de una tienda no cambia cuál es más caro entre 3,20 y
+  9,80; cambia cuál es más caro entre 5,49 y 5,51. Esas son las comparaciones en las que uno se lo
+  pensaba, y por eso la pregunta «¿cuánto cuesta el int8?» no se responde contando coincidencias: se
+  responde jugando.
+</Callout>
+
+## Los dos tests que hacen esto comprobable sin ONNX
+
+```python title="tests/unit/test_onnx_player.py"
+"""An ONNX export plays through the same player as the checkpoint it came from."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import chess
+import numpy as np
+import pytest
+import torch
+
+from rukh.export.onnx import INPUT_NAME, LastStepLogits
+from rukh.infer import DecoderPlayer, SampleConfig
+from rukh.infer import onnx_player as module
+from rukh.infer.onnx_player import OnnxDecoder
+from rukh.models.decoder import DecoderConfig, MoveDecoder
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+pytestmark = pytest.mark.unit
+
+TOY = DecoderConfig(vocab_size=2030, n_layer=2, n_head=2, d_model=32, block=64)
+
+
+class FakeSession:
+    """Stands in for ``onnxruntime.InferenceSession`` with the checkpoint's own logits."""
+
+    def __init__(self, model: MoveDecoder, block: int | None = TOY.block) -> None:
+        self.wrapper = LastStepLogits(model).eval()
+        self.block = block
+        self.seen: list[int] = []
+
+    def get_modelmeta(self) -> Any:
+        meta = {} if self.block is None else {module.METADATA_BLOCK: str(self.block)}
+        return type("Meta", (), {"custom_metadata_map": meta})()
+
+    def run(self, _outputs: Any, feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+        idx = feed[INPUT_NAME]
+        assert idx.dtype == np.int64
+        self.seen.append(idx.shape[1])
+        with torch.no_grad():
+            return [self.wrapper(torch.from_numpy(idx)).numpy()]
+```
+
+<Src file="tests/unit/test_onnx_player.py" tag="p6" lines="1-42" />
+
+`FakeSession` es la idea que hace todo esto probable: una sesión falsa que devuelve **los logits del
+propio checkpoint**, envuelto en el mismo `LastStepLogits` que usa la exportación. Así el test puede
+comprobar que las dos rutas —`DecoderPlayer` sobre el modelo y `DecoderPlayer` sobre `OnnxDecoder`—
+producen exactamente las mismas jugadas, que es la propiedad que importa, sin exportar nada.
+
+Las dos aserciones dentro de `run` son tests dentro del doble: comprueba que lo que le llega es
+`int64`, que es la conversión de arriba, y apunta la longitud de cada secuencia para que el test de
+fuera pueda comprobar que nunca se pasó del `block`.
+
+El `type("Meta", (), {...})()` construye una clase anónima con un atributo. Es más corto que definir
+una segunda clase de dos líneas para imitar un objeto de metadatos de ONNX Runtime.
+
+```python title="tests/unit/test_onnx_player.py"
+def test_the_export_picks_the_checkpoints_move_greedily(
+    model: MoveDecoder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = FakeSession(model)
+    monkeypatch.setattr(module, "_session", lambda _path: session)
+    tok = UciTokenizer()
+    cfg = SampleConfig(temperature=0, top_k=None, mask_illegal=False, seed=0)
+
+    reference = DecoderPlayer(model, tok, cfg)
+    exported = DecoderPlayer(OnnxDecoder(Path("model.onnx")), tok, cfg)  # type: ignore[arg-type]
+    assert exported.limit == reference.limit
+
+    board = chess.Board()
+    for player in (reference, exported):
+        player.start(1800, 1800)
+    for _ in range(6):
+        a, legal_a = reference.choose(board)
+        b, legal_b = exported.choose(board)
+        assert a == b and legal_a == legal_b
+        if a is None:
+            break
+        board.push(a)
+        reference.observe(a)
+        exported.observe(a)
+    assert session.seen and max(session.seen) <= TOY.block
+```
+
+<Src file="tests/unit/test_onnx_player.py" tag="p6" lines="51-75" />
+
+`temperature=0` y `mask_illegal=False`: el test compara **la elección del modelo**, no la del rescate.
+Con máscara, los dos jugadores coincidirían aunque sus logits fueran distintos en las jugadas
+ilegales, y el test dejaría pasar un error en la traducción de la entrada.
+
+El bucle mueve los dos jugadores en paralelo sobre **el mismo tablero**, y ahí está el detalle: se
+empuja la jugada de `reference` y se avisa a los dos con `observe`. Si se dejara a cada uno con su
+tablero, las dos partidas podrían divergir por una jugada distinta y el test diría dónde, pero mucho
+más tarde. Compararlos jugada a jugada sobre la misma posición señala la primera discrepancia.
+
+`assert exported.limit == reference.limit` comprueba lo que el `_Config` promete: que el límite de
+plies que el jugador deduce del `block` es el mismo por los dos caminos.
+
+```python title="tests/unit/test_onnx_player.py"
+def test_the_block_comes_from_the_metadata_or_the_caller(
+    model: MoveDecoder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "_session", lambda _path: FakeSession(model, block=None))
+    with pytest.raises(ValueError, match="rukh_block"):
+        OnnxDecoder(Path("model.onnx"))
+    assert OnnxDecoder(Path("model.onnx"), block=32).cfg.block == 32
+    monkeypatch.setattr(module, "_session", lambda _path: FakeSession(model, block=48))
+    assert OnnxDecoder(Path("model.onnx")).cfg.block == 48
+```
+
+<Src file="tests/unit/test_onnx_player.py" tag="p6" lines="78-86" />
+
+Los tres casos son los tres caminos del constructor: sin metadatos y sin argumento, error; sin
+metadatos y con argumento, el argumento; con metadatos, los metadatos. El tercero usa `block=48` y no
+el valor por defecto de `TOY` a propósito, para que un constructor que ignorara los metadatos y
+usara una constante pasara igual.
+
+## Un nombre de corrida que sirve a los dos lectores
+
+El segundo cambio es el que hace que las lecciones funcionen tal cual para dos lectores distintos.
+
+Cuando entrenas algo, `unique_run_name` le pone una marca de tiempo a la carpeta:
+`medium-v4-20260919-174623`. Es lo correcto —dos entrenamientos del mismo nombre no se pisan, y la
+carpeta dice cuándo se hizo—, y tiene un efecto colateral: las configuraciones del repositorio
+llevaban dentro **la marca de tiempo de la máquina de referencia**.
+
+{/* prettier-ignore */}
+```yaml title="configs/train/medium-masters.yaml"
+init_from: checkpoints/medium-v4/best.pt
+```
+
+<Src file="configs/train/medium-masters.yaml" tag="p6" lines="13-13" />
+
+Esa línea decía antes `checkpoints/medium-v4-20260919-174623/best.pt`. Un lector que entrenara
+`medium-v4` en su máquina tendría otra fecha y la configuración no encontraría nada; uno que lo
+descargara con `rukh pull` lo tendría en `checkpoints/medium-v4/` y tampoco. La configuración del
+repositorio solo funcionaba en la máquina donde se escribió, que es la definición de lo contrario de
+reproducible.
+
+El mismo cambio está en nueve ficheros: los dos DPO, GRPO, los dos LoRA, `medium-elo`,
+`medium-masters`, los tres de cabezas del encoder y `configs/data/onpolicy.yaml`. Y la pieza que lo
+hace funcionar es esta:
+
+```python title="src/rukh/train/checkpoint.py"
+RUN_STAMP = re.compile(r"^(?P<name>.+)-(?P<stamp>\d{8}-\d{6})$")
+"""What ``unique_run_name`` appends to a run folder: ``medium-v4`` becomes
+``medium-v4-20260919-174623``. The stamp sorts as text, so the newest run of a name is the last."""
+
+
+def resolve_run(path: str | Path) -> Path:
+    """The path as given when it exists; otherwise the same thing inside the newest stamped run.
+
+    Configs and lessons name a checkpoint by its run: ``checkpoints/medium-v4/best.pt``. That is
+    the spelling ``rukh pull`` writes, and it is not the one a reader who trained the run has,
+    because ``unique_run_name`` stamps every folder (``medium-v4-20260919-174623``). Both mean
+    "the run called medium-v4", so when the stable folder is missing this looks for the stamped
+    ones beside it and takes the newest **by name**, never by modification time: copying a
+    folder must not change which run a config points at. A folder spec (``checkpoints/lora-e4``)
+    resolves the same way. Anything with no candidate comes back unchanged, and whoever opens it
+    reports the missing file with the path the user wrote.
+    """
+    path = Path(path)
+    if path.exists():
+        return path
+    is_file = bool(path.suffix)
+    run_dir = path.parent if is_file else path
+    parent, name = run_dir.parent, run_dir.name
+    if not parent.is_dir():
+        return path
+    stamped = sorted(
+        candidate
+        for candidate in parent.iterdir()
+        if candidate.is_dir()
+        and (match := RUN_STAMP.match(candidate.name)) is not None
+        and match.group("name") == name
+        and (not is_file or (candidate / path.name).is_file())
+    )
+    if not stamped:
+        return path
+    found = stamped[-1] / path.name if is_file else stamped[-1]
+    log.info("%s is not there; using the newest run of that name, %s", path, found)
+    return found
+```
+
+<Src file="src/rukh/train/checkpoint.py" tag="p6" lines="30-67" />
+
+Cuarenta líneas con seis decisiones, y casi todas son sobre **no adivinar de más**.
+
+**Lo que existe gana.** Primera línea del cuerpo: si la ruta existe, se devuelve tal cual. Una
+carpeta estable —porque la escribió `rukh pull`, o porque el lector la renombró— tiene prioridad
+sobre cualquier corrida con marca. Sin eso, un modelo descargado quedaría tapado por un
+entrenamiento viejo.
+
+**El más nuevo _por nombre_, no por fecha de modificación.** Está en negrita en el docstring porque
+es la decisión contraintuitiva. `sorted()` sobre los nombres funciona porque la marca es
+`AAAAMMDD-HHMMSS`, que ordena igual como texto que como fecha. Usar `st_mtime` habría sido más
+directo y habría tenido un fallo feo: copiar una carpeta, restaurar una copia de seguridad o
+sincronizarla con la nube cambia la fecha de modificación, y entonces una configuración empezaría a
+apuntar a otra corrida sin que nadie haya entrenado nada.
+
+**`bool(path.suffix)` distingue un fichero de una carpeta.** `checkpoints/lora-e4` es una carpeta de
+adaptador y `checkpoints/medium-v4/best.pt` es un fichero; los dos se resuelven, y la heurística es
+si hay extensión. Es frágil ante una carpeta con un punto en el nombre, y no hay ninguna en el
+proyecto.
+
+**El candidato tiene que contener el fichero.** `(not is_file or (candidate / path.name).is_file())`
+descarta las corridas que existen pero no tienen el fichero pedido. El caso es real y el test lo
+comprueba: una corrida que acaba de empezar tiene su carpeta y todavía no ha escrito `best.pt`, y
+ser la más nueva no la convierte en la respuesta.
+
+**El prefijo tiene que ser el nombre entero.** `match.group("name") == name` y no
+`candidate.name.startswith(name)`. Con `startswith`, `small` encontraría `small-v3-20260921-000000`,
+que es **otra corrida**. El test tiene ese caso con el nombre `decoy`.
+
+**Lo que no se resuelve vuelve intacto.** No se levanta ninguna excepción: se devuelve la ruta que
+pidieron, y quien la abra dará el error con el nombre que el usuario escribió. Un `FileNotFoundError`
+lanzado aquí diría el nombre de una carpeta con marca de tiempo que el usuario no ha escrito nunca.
+
+El `log.info` cuando sí resuelve es importante: el lector tiene que enterarse de que la orden que
+escribió está usando otro fichero. Una resolución silenciosa es magia, y la magia se paga cuando dos
+corridas del mismo nombre dan números distintos.
+
+```python title="src/rukh/train/checkpoint.py"
+def load_checkpoint(path: Path, map_location: str | torch.device = "cpu") -> dict[str, Any]:
+    """Read a checkpoint written by ``save_checkpoint`` (see ``resolve_run`` for the path)."""
+    payload = torch.load(resolve_run(path), map_location=map_location, weights_only=True)
+    if not isinstance(payload, dict) or "model_state" not in payload:
+        raise ValueError(f"{path} is not a rukh checkpoint")
+    return payload
+```
+
+<Src file="src/rukh/train/checkpoint.py" tag="p6" lines="191-196" />
+
+Un solo `resolve_run` en el cargador central, y con eso lo heredan todos los caminos que cargan un
+checkpoint. Fíjate en que el mensaje de error sigue usando `path`, la ruta **que pidieron**, y no la
+resuelta: el error habla del lenguaje del usuario.
+
+```python title="src/rukh/train/common.py"
+    if init_from is None:
+        return None
+    path = resolve_run(paths.resolve(init_from))
+    if not path.is_file():
+        raise FileNotFoundError(f"init_from checkpoint not found: {path}")
+```
+
+<Src file="src/rukh/train/common.py" tag="p6" lines="215-219" />
+
+Aquí sí hace falta una segunda llamada, porque `load_init_weights` comprueba que el fichero existe
+**antes** de abrirlo, para dar un error con el nombre de la clave de configuración (`init_from`) en
+vez de una traza de `torch.load`. Y aquí el mensaje sí usa la ruta resuelta, porque en este punto lo
+que el lector necesita saber es qué fichero se buscó de verdad.
+
+```python title="src/rukh/train/__init__.py"
+    read_vocab_hash,
+    resolve_run,
+    restore,
+```
+
+<Src file="src/rukh/train/__init__.py" tag="p6" lines="17-19" />
+
+Y el reexporte, para que el resto del proyecto la importe desde `rukh.train` como todo lo demás.
+
+```python title="src/rukh/cli.py"
+def _run_path(value: Path | None) -> Path | None:
+    """A checkpoint or run folder; a missing stable name resolves to the newest stamped run.
+
+    A path is validated here instead of with ``exists=True`` so that a command written against
+    the stable spelling of a run (``checkpoints/small/best.pt``, what ``rukh pull`` writes) also
+    works for the reader whose own training left ``checkpoints/small-20260919-062911/`` behind.
+    """
+    if value is None:
+        return None
+    from rukh.train.checkpoint import resolve_run
+
+    found = resolve_run(value)
+    if not found.exists():
+        run = value.parent.name if value.suffix else value.name
+        raise typer.BadParameter(f"{value} does not exist, and no stamped run `{run}-*` holds it")
+    return found
+
+
+def _run_exists(spec: str) -> bool:
+    """Whether ``spec`` names a checkpoint on disk, directly or through ``resolve_run``."""
+    from rukh.train.checkpoint import resolve_run
+
+    return resolve_run(Path(spec)).is_file()
+```
+
+<Src file="src/rukh/cli.py" tag="p6" lines="45-67" />
+
+El cambio en la CLI es sustituir `exists=True` por `callback=_run_path` en **diez** opciones:
+`--resume` de los dos entrenamientos, `--ckpt` de `play`, `export` y `encoder embed`, `--adapter` de
+`eval qwen` y de `export`, `--model` de `eval encoder`, y `--run` de los dos publicadores.
+
+La razón para no dejar que typer valide la existencia es exactamente la del docstring: `exists=True`
+comprueba la ruta **literal**, antes de que nadie pueda resolverla. Un `callback` corre después de
+convertir el tipo y puede devolver un valor distinto del que llegó, que es lo que hace falta aquí.
+
+El mensaje del `BadParameter` dice las dos cosas que el lector necesita: que la ruta que escribió no
+existe, y que tampoco hay ninguna corrida con marca que la contenga (`no stamped run
+\`medium-v4-\*\` holds it`). Con solo la primera mitad, alguien que tenga la carpeta con marca
+delante se queda sin saber por qué no se encontró.
+
+<Transfer concept="Un nombre estable y un nombre único" where="Cualquier sistema que versione ejecuciones: despliegues, migraciones, ejecuciones de un pipeline de datos, experimentos.">
+  Toda ejecución quiere dos nombres a la vez y por motivos opuestos. Uno **único**, para que dos
+  ejecuciones no se pisen y para poder decir cuál fue; y uno **estable**, para que la configuración,
+  la documentación y el compañero de al lado puedan referirse a «la última» sin editar nada.
+
+El patrón que resuelve esto es siempre el mismo: el artefacto se guarda con el nombre único, y el
+nombre estable se resuelve en el momento de leerlo, con una regla determinista y ruidosa. Las dos
+propiedades de la regla importan: determinista, para que no dependa de una fecha de fichero que
+cualquier copia cambia; y ruidosa, para que quien pidió el nombre estable se entere de cuál le
+tocó. Un enlace simbólico «latest» hace lo mismo y tiene el defecto de que hay que mantenerlo.
+
+</Transfer>
+
+```python title="tests/unit/test_checkpoint.py"
+def test_a_stable_run_name_resolves_to_the_newest_stamped_run(tmp_path: Path) -> None:
+    """``checkpoints/small/best.pt`` finds ``checkpoints/small-<newest stamp>/best.pt``.
+
+    This is what lets a config or a lesson name a run without its date: the reader who trained
+    it has the stamped folder, the reader who pulled it from the Hub has the stable one, and the
+    same spelling serves both.
+    """
+    from rukh.train.checkpoint import resolve_run
+
+    root = tmp_path / "checkpoints"
+    older = root / "small-20260919-062911"
+    newer = root / "small-20260920-150000"
+    decoy = root / "small-v3-20260921-000000"  # another run whose name merely starts the same
+    for folder in (older, newer, decoy):
+        folder.mkdir(parents=True)
+        (folder / "best.pt").write_bytes(b"x")
+    (root / "small-20260921-000000").mkdir()  # newest stamp, but it holds no best.pt yet
+
+    assert resolve_run(root / "small" / "best.pt") == newer / "best.pt"
+    assert resolve_run(root / "small") == root / "small-20260921-000000"
+    assert resolve_run(root / "small-v3" / "best.pt") == decoy / "best.pt"
+    # A stable folder wins over any stamped one, and an unknown name comes back untouched.
+    (root / "small").mkdir()
+    (root / "small" / "best.pt").write_bytes(b"y")
+    assert resolve_run(root / "small" / "best.pt") == root / "small" / "best.pt"
+    assert resolve_run(root / "medium" / "best.pt") == root / "medium" / "best.pt"
+    assert resolve_run(tmp_path / "nowhere" / "run" / "best.pt") == (
+        tmp_path / "nowhere" / "run" / "best.pt"
+    )
+
+
+def test_load_checkpoint_reads_through_the_stable_name(tmp_path: Path) -> None:
+    model, optimizer = make_pair()
+    run = tmp_path / "checkpoints" / "tiny-20260919-060101"
+    save_checkpoint(
+        run / "best.pt",
+        step=5,
+        model=model,
+        optimizer=optimizer,
+        cfg={},
+        model_cfg=TOY.model_dump(),
+    )
+    payload = load_checkpoint(tmp_path / "checkpoints" / "tiny" / "best.pt")
+    assert payload["step"] == 5
+```
+
+<Src file="tests/unit/test_checkpoint.py" tag="p6" lines="112-155" />
+
+El montaje del primer test es la mitad del valor: cuatro carpetas colocadas para que cada aserción
+falle con una implementación plausible pero equivocada.
+
+- Si se ordenara mal, saldría `older` en vez de `newer`.
+- Si no se comprobara que el fichero está dentro, la segunda aserción devolvería
+  `small-20260921-000000/best.pt`, que no existe. Y fíjate en la tercera línea de aserciones: esa
+  misma carpeta **sí** es la respuesta cuando se pregunta por la carpeta y no por el fichero, porque
+  entonces la condición del fichero no aplica. Dos aserciones consecutivas sobre la misma carpeta
+  con respuestas distintas, y las dos correctas.
+- Si se usara `startswith`, `small-v3` encontraría `small-…` o al revés.
+- Si lo estable no ganara, la penúltima aserción devolvería la carpeta con marca.
+- Y la última comprueba que una ruta cuyo padre ni siquiera existe vuelve intacta, sin excepción.
+
+## El brazo de control, dentro de la configuración
+
+El último cambio es de M5 y se paga aquí.
+
+La comparación de M5 tenía dos brazos: DPO sobre los pares de las evaluaciones de Lichess (fuera de
+política) y DPO sobre los pares que el propio modelo propuso (en política). Para que la comparación
+midiera **de dónde salen los pares** y no cuántos hay, los dos brazos tenían que ver la misma
+cantidad de datos, y eso se hacía con un script de una vez que escribía una carpeta
+`data/pairs-offpolicy-matched/` que no estaba en el repositorio.
+
+```python title="src/rukh/train/dpo.py"
+    pairs: str = "data/pairs/dpo-prompts.parquet"
+    max_pairs: int | None = Field(default=None, ge=1)
+    """Subsample the pairs to this many, with ``seed``, before the split. Two arms compared on
+    two pair sources must see the same amount of data, or the comparison measures the amount."""
+```
+
+<Src file="src/rukh/train/dpo.py" tag="p6" lines="39-42" />
+
+`ge=1` en el `Field`: cero pares no es un experimento pequeño, es un error de escritura, y el test
+comprueba que `max_pairs=0` no valida.
+
+```python title="src/rukh/train/dpo.py"
+def limit_pairs(frame: Any, cfg: DpoConfig) -> Any:
+    """At most ``cfg.max_pairs`` rows, drawn with ``cfg.seed`` from the whole file.
+
+    A sample and never the head: the pairs are balanced by phase in blocks, so the first rows
+    of the file are two thirds openings against a third in the whole (D-114). With no limit the
+    frame comes back untouched.
+    """
+    if cfg.max_pairs is None or frame.height <= cfg.max_pairs:
+        return frame
+    LOGGER.info("dpo: %d pares muestreados de %d", cfg.max_pairs, frame.height)
+    return frame.sample(n=cfg.max_pairs, seed=cfg.seed, shuffle=True)
+```
+
+<Src file="src/rukh/train/dpo.py" tag="p6" lines="194-204" />
+
+«Una muestra y nunca la cabeza» es toda la lección de esta función. El fichero de pares está
+equilibrado por fase **en bloques**: primero las aperturas, luego el medio juego, luego los finales.
+Coger las primeras 6 386 filas daría dos tercios de aperturas donde el fichero entero tiene un tercio,
+y el brazo de control estaría entrenado sobre otra distribución. Es D-114, y es la clase de error que
+no falla y produce un número.
+
+`frame.sample(..., seed=cfg.seed)` con la misma semilla del entrenamiento: dos ejecuciones de la
+misma configuración ven los mismos pares.
+
+<Callout kind="roto" title="Una línea de registro en español">
+  `LOGGER.info("dpo: %d pares muestreados de %d", ...)` está en español, y es la única línea de
+  registro del paquete que lo está: la convención del repositorio es código y comentarios en inglés
+  y prosa publicada en español. No rompe nada y se cuenta aquí porque una inconsistencia que nadie
+  nombra es una inconsistencia que se extiende.
+</Callout>
+
+{/* prettier-ignore */}
+```yaml title="configs/train/dpo-offpolicy.yaml"
+# DPO on the pairs Lichess's evaluations produced: off-policy, and the control arm of M5's
+# comparison. The only lines that differ from `dpo-onpolicy.yaml` are `pairs` and `max_pairs`.
+pairs: data/pairs/dpo-prompts.parquet
+# Matched to the on-policy pair count (6 386), as a fixed-seed sample of the whole file, so the
+# two arms see the same amount of data and the comparison measures the source of the pairs and
+# not their number. P5 did this with a one-off script that wrote `data/pairs-offpolicy-matched/`;
+# the config now says it, so the run can be rebuilt from the config alone.
+max_pairs: 6386
+checkpoint: checkpoints/medium-v4/best.pt
+```
+
+<Src file="configs/train/dpo-offpolicy.yaml" tag="p6" lines="1-9" />
+
+El comentario del fichero es el que cierra la deuda: dice el número, dice de dónde sale y dice qué
+había antes. «La corrida se puede reconstruir solo desde la configuración» es el criterio, y la forma
+de comprobarlo es preguntarse si queda algún paso que solo esté en la cabeza de quien lo hizo.
+
+```python title="tests/unit/test_dpo.py"
+def test_max_pairs_samples_the_whole_file_with_the_seed() -> None:
+    """The off-policy arm is matched to the on-policy count here, not by a script outside git."""
+    from rukh.train.dpo import limit_pairs
+
+    frame = pl.DataFrame({"phase": ["opening"] * 6 + ["endgame"] * 6, "i": list(range(12))})
+    same = limit_pairs(frame, DpoConfig())
+    assert same.height == 12
+    cut = limit_pairs(frame, DpoConfig(max_pairs=4, seed=7))
+    assert cut.height == 4
+    assert cut["i"].to_list() == limit_pairs(frame, DpoConfig(max_pairs=4, seed=7))["i"].to_list()
+    assert cut["i"].to_list() != [0, 1, 2, 3]  # not the head of the file
+    assert limit_pairs(frame, DpoConfig(max_pairs=50)).height == 12
+    with pytest.raises(ValueError):
+        DpoConfig(max_pairs=0)
+```
+
+<Src file="tests/unit/test_dpo.py" tag="p6" lines="160-173" />
+
+El marco de juguete tiene seis aperturas seguidas de seis finales, que es la estructura en bloques
+del fichero real en miniatura. Y las dos aserciones centrales son las dos propiedades: la muestra
+**repite** con la misma semilla, y **no** es la cabeza.
+
+La segunda tiene una probabilidad pequeña de fallar por azar —con doce filas, que la muestra de
+cuatro salga exactamente `[0, 1, 2, 3]` ocurre una vez de cada 495— y está fijada por la semilla 7,
+así que o pasa siempre o no pasa nunca. Un test aleatorio con semilla fija es determinista; uno sin
+semilla habría sido una bomba de relojería en la CI.
+
+<Exercise n="01" title="Qué le falta a `rukh eval match` para enfrentar dos exportaciones">
+  `OnnxDecoder` ya entra en `DecoderPlayer`. Con eso delante, di qué le falta exactamente a
+  `rukh eval match --a … --b …` para poder enfrentar el fp16 contra el int8 del mismo modelo, y por
+  qué eso no estaba hecho en este hito.
+
+  <Solution>
+    Solo que `--a` y `--b` acepten un directorio ONNX con su precisión, y construyan `OnnxDecoder`
+    en vez de cargar un checkpoint. El jugador ya existe y pasa por el mismo `DecoderPlayer` que usa
+    el lab de la lección 9. No se hizo porque el enfrentamiento que respondería la pregunta necesita
+    miles de partidas —el lab 3 mide 11 puntos de diferencia, y separar 11 del cero pide unas 3 800
+    partidas por pareja— y ese gasto no cabía en el hito. El código está; la decisión de pagarlo,
+    no.
+  </Solution>
+</Exercise>
+
+<Exercise n="02" title="Rompe `resolve_run` de la forma tentadora">
+  Cambia `sorted(...)` por un orden según `st_mtime` y describe una secuencia de acciones normales
+  —ninguna de ellas un entrenamiento— que hagan que una configuración apunte a otra corrida.
+
+  <Solution>
+    Copiar el directorio `checkpoints/` a otro disco, restaurar una copia de seguridad, o
+    sincronizarlo con una carpeta en la nube: las tres reescriben las fechas de modificación, a
+    menudo en un orden que no es el original. Después de cualquiera de ellas,
+    `checkpoints/medium-v4/best.pt` podría resolverse a una corrida de hace tres semanas, el
+    entrenamiento arrancaría sin protestar y la única pista sería la línea de `log.info` que nadie
+    mira. El nombre, en cambio, viaja con la carpeta.
+  </Solution>
+</Exercise>
+
+## Qué has aprendido
+
+El adaptador más útil suele ser el más pequeño. `OnnxDecoder` no implementa un modelo: implementa las
+tres cosas que el muestreador mira, y eso basta para que una exportación juegue por el mismo camino
+que el checkpoint. Cuando quieras comparar dos implementaciones de algo, la pregunta no es qué
+interfaz definir, sino **qué usa de verdad el consumidor**.
+
+Y dos deudas pagadas, las dos de la misma forma: sacando de la cabeza de quien lo hizo algo que
+estaba solo ahí. Una ruta con la marca de tiempo de una máquina se convirtió en un nombre que se
+resuelve en las dos; un script de una vez se convirtió en una clave de configuración con su número y
+su razón al lado.
+
+La lección siguiente cambia de repositorio: la demo con la que se juega contra todo esto.

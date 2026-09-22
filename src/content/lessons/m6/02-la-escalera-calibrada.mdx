@@ -1,0 +1,926 @@
+---
+title: 'La escalera calibrada: el rival por nodos y la identidad de unos pesos'
+description:
+  'El código del instrumento antes de fiarse de él: las dos configuraciones que miden cuánto se
+  mueve la escalera cuando no cambias nada, el presupuesto de nodos que sustituye al reloj dentro
+  de Stockfish, la caché partida en dos familias para que subir las partidas no tire los puzles, y
+  el hash de los tensores que reconoce dos ficheros con los mismos pesos.'
+module: m6
+order: 2
+duration: 105
+level: medio
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - límite por nodos
+  - reproducibilidad
+  - caché de evaluación
+  - hash de pesos
+  - Stockfish
+  - DPO
+  - prompts
+artifacts:
+  - kind: repo
+    label: borja-glez/rukh
+    href: https://github.com/borja-glez/rukh/tree/p6
+---
+
+## Qué vas a construir
+
+Cuatro cambios pequeños que son la condición para que la tabla del módulo signifique algo. Dos
+configuraciones nuevas que no miden ningún modelo sino el propio montaje; un presupuesto de nodos
+dentro de `StockfishOpponent` para que el rival deje de depender de lo que esté haciendo la
+máquina; una caché partida por familias para que subir el número de partidas no tire a la basura
+las que ya se jugaron; y un hash de los pesos —no del fichero— para que una copia descargada del
+Hub se reconozca como el modelo que se midió.
+
+Y de propina, el fichero que M5 leía sin que nadie pudiera regenerarlo: `dpo-prompts.parquet`.
+
+Ninguno de los cinco produce una fila de la tabla. Los cinco deciden si las filas se pueden leer.
+
+## Dos configuraciones que no miden un modelo
+
+D-107 dejó una hipótesis sin cerrar: `medium-elo` medido dos veces con la misma semilla dio 1498 y
+1558, y la explicación candidata era el reloj. Stockfish jugaba con un límite de **tiempo**, y a 0,1
+segundos por jugada el número de posiciones que explora depende de lo que esté haciendo la máquina.
+La forma de comprobarlo es correr la escalera cuatro veces, dos con cada límite, y para eso hacen
+falta dos ficheros de configuración cuyo único trabajo es medir el instrumento.
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/ladder-time.yaml"
+# The ladder on the clock, run for the instrument and not for the table.
+#
+# M6 measures how well the ladder repeats itself before rebuilding the results table with it.
+# Two runs of this file on the same weights, with the cache off, are two independent draws of
+# the instrument as P4 knew it: Stockfish on 0.1 s per move with `UCI_LimitStrength`, which
+# gave 1498 and 1558 for the same model and seed (D-107). Everything else is `greedy.yaml`.
+#
+# `web_results: null` on purpose: these runs are the instrument being measured, not a stage, and
+# a row for them in the single table would be a number about nothing.
+games: data/uci/year=2025/month=02/games.parquet
+puzzles: data/puzzles/puzzles.parquet
+puzzle_split: test
+legality_positions: 0
+accuracy_positions: 0
+position_pool: 20000
+puzzles_per_band: 0
+elo_games: 20
+elo_move_time: 0.1
+bootstrap: 500
+diversity_games: 0
+temperature: 0.05
+top_k: 1
+block: 200
+seed: 42
+header_elo: 1800
+out_dir: artifacts/eval
+web_results: null
+cache_db: artifacts/eval/cache-ladder.sqlite
+track: false
+```
+
+<Src file="configs/eval/ladder-time.yaml" tag="p6" lines="1-29" />
+
+Los ceros son la mitad del fichero y son la decisión. `legality_positions: 0`,
+`accuracy_positions: 0`, `puzzles_per_band: 0` y `diversity_games: 0` apagan todo lo que **no**
+juega contra el motor. Medir la legalidad cuatro veces no aporta nada: a temperatura 0,05 esa
+columna sale idéntica hasta el tercer decimal, como comprueba la lección 8. Lo único que se quiere
+medir aquí son las 160 partidas, y cada minuto gastado en otra cosa son cuatro minutos en las
+cuatro tiradas.
+
+`web_results: null` es la línea que impide un accidente. Todas las configuraciones de evaluación
+del proyecto escriben su fila en `artifacts/web/results.json`, que es lo que alimenta la tabla de
+esta web. Estas dos no: no son una etapa, son el instrumento midiéndose, y una fila llamada
+`ladder-time-a` en la tabla pública sería un número sobre nada.
+
+`cache_db` apunta a una base propia, `cache-ladder.sqlite`, en vez de a la del resto de la suite.
+Con `--no-cache` en la línea de órdenes da igual, pero el día que alguien lance esto sin el flag
+—y pasará— no envenena la caché de la tabla con partidas jugadas para otro experimento.
+
+La segunda configuración cambia una línea, y es la que se compara con la primera.
+
+{/* prettier-ignore */}
+```yaml title="configs/eval/ladder-nodes.yaml"
+# The ladder on a node budget, run for the instrument and not for the table.
+#
+# The same eight rungs as `ladder-time.yaml`, but every opponent searches exactly 200 000 nodes
+# per move instead of 0.1 s: that is what 0.1 s bought on the reference machine at these
+# settings (median over three positions at `UCI_Elo` 1320, 2000 and `Skill Level` 0), so the
+# opponents are meant to be about as strong, and now indifferent to what else the machine is
+# doing. Two runs of this file with the cache off say how much of D-107's 60-Elo gap was the
+# clock. The Elo scale of a node-limited ladder is its own: the rungs are recalibrated with
+# `labs/m6/ladder_check.py` before any number from it is compared with a published one.
+games: data/uci/year=2025/month=02/games.parquet
+puzzles: data/puzzles/puzzles.parquet
+puzzle_split: test
+legality_positions: 0
+accuracy_positions: 0
+position_pool: 20000
+puzzles_per_band: 0
+elo_games: 20
+elo_move_time: 0.1
+elo_nodes: 200000
+bootstrap: 500
+diversity_games: 0
+temperature: 0.05
+top_k: 1
+block: 200
+seed: 42
+header_elo: 1800
+out_dir: artifacts/eval
+web_results: null
+cache_db: artifacts/eval/cache-ladder.sqlite
+track: false
+```
+
+<Src file="configs/eval/ladder-nodes.yaml" tag="p6" lines="1-30" />
+
+La única clave nueva es `elo_nodes: 200000`. El número no es redondo por casualidad: es lo que 0,1
+segundos compraban en la máquina de referencia con estos ajustes, medido como mediana sobre tres
+posiciones a `UCI_Elo` 1320, a 2000 y a `Skill Level` 0. La intención es que los ocho peldaños sean
+**aproximadamente igual de fuertes** que en el fichero anterior, para que la comparación entre las
+dos parejas de tiradas hable de la varianza y no de la fuerza del rival.
+
+`elo_move_time: 0.1` se queda ahí aunque no se use, y eso también es deliberado: la clave sigue en
+el fichero para que las dos configuraciones se lean en paralelo y se vea que solo se añadió una
+línea.
+
+<Callout kind="teoria" title="Por qué un presupuesto de nodos no es una escala de Elo">
+  Cambiar el límite del rival cambia al rival, y por tanto cambia la escala del número que sale. Un
+  <Term id="elo-estimado">Elo estimado</Term> contra ocho peldaños por reloj y uno contra ocho
+  peldaños por nodos son dos escalas distintas aunque las etiquetas de los peldaños digan lo mismo,
+  y el comentario de cabecera del fichero lo dice en su segunda mitad: antes de comparar un número
+  de aquí con uno publicado hay que recalibrar los peldaños, que es lo que hace
+  `labs/m6/ladder_check.py`. Es la misma disciplina de M5: dos medidas solo se restan si salieron
+  del mismo instrumento.
+</Callout>
+
+## El rival, con presupuesto de nodos
+
+Toda la mecánica del <Term id="limite-por-nodos">límite por nodos</Term> son quince líneas en
+`StockfishOpponent`, la clase que M2 escribió para hablar con el motor por <Term id="uci">UCI</Term>.
+
+```python title="src/rukh/infer/game.py"
+    def __init__(
+        self,
+        elo: int = 1400,
+        move_time: float = MOVE_TIME_SECONDS,
+        path: Path | None = None,
+        skill: int | None = None,
+        nodes: int | None = None,
+    ) -> None:
+        from rukh.engine import EngineNotFound, find_stockfish
+
+        binary = path or find_stockfish()
+        if binary is None:
+            raise EngineNotFound("Stockfish not found; set RUKH_STOCKFISH or run get_stockfish.py")
+        self.move_time = move_time
+        # A node budget instead of a clock: the search stops after ``nodes`` positions whatever
+        # the machine is doing, so the opponent no longer weakens under CPU load (D-068) and two
+        # identical runs see the same opponent. 0.1 s is about 200 000 nodes on the reference
+        # machine at these settings, which is where `elo_nodes` in the suite starts from.
+        self.nodes = nodes
+        self.engine = chess.engine.SimpleEngine.popen_uci(str(binary))
+        if skill is None:
+            self.engine.configure({"UCI_LimitStrength": True, "UCI_Elo": elo})
+        else:
+            self.engine.configure({"UCI_LimitStrength": False, "Skill Level": skill})
+
+    @property
+    def limit(self) -> chess.engine.Limit:
+        """How far the opponent searches: a node budget when given, the clock otherwise."""
+        if self.nodes is not None:
+            return chess.engine.Limit(nodes=self.nodes)
+        return chess.engine.Limit(time=self.move_time)
+
+    def choose(self, board: chess.Board) -> chess.Move:
+        played = self.engine.play(board, self.limit)
+        if played.move is None:
+            raise chess.engine.EngineError("Stockfish returned no move")
+        return played.move
+```
+
+<Src file="src/rukh/infer/game.py" tag="p6" lines="116-152" />
+
+Antes, `choose` construía su límite en línea: `chess.engine.Limit(time=self.move_time)`. Ahora el
+límite es una propiedad y `choose` no sabe cuál es. Eso es lo único que se hizo, y merece
+detenerse en las dos decisiones que hay dentro.
+
+**`nodes=None` por omisión, y no un valor.** El argumento nuevo no cambia el comportamiento de nadie
+que no lo pida: todas las partidas de M2 a M5 se jugaron por reloj, y una firma que cambiara el
+límite por defecto habría recalibrado en silencio los cinco módulos anteriores. La `Limit` de
+`python-chess` acepta los dos campos a la vez, y ahí estaba la trampa: pasar `time` y `nodes`
+juntos le dice al motor que pare cuando se cumpla **lo primero** de los dos, así que un presupuesto
+de nodos con el reloj puesto seguiría dependiendo del reloj. Por eso la propiedad devuelve uno **o**
+el otro y nunca los dos.
+
+**La propiedad en vez de un campo calculado en `__init__`.** Es lo que hace posible el test de más
+abajo sin Stockfish instalado: `StockfishOpponent.__new__` construye un objeto sin ejecutar
+`__init__`, se le ponen los dos atributos a mano y se comprueba qué `Limit` sale. Si el límite se
+calculara en el constructor, comprobar la decisión exigiría un motor en disco, y ese test no
+correría en la CI.
+
+<Callout kind="mundo-real" title="Un examen con reloj y un examen con preguntas">
+  La diferencia entre los dos límites es la que hay entre un examen con tiempo fijo y uno con
+  preguntas fijas. Con una hora de reloj, cuántas preguntas contestas depende de si el de al lado
+  tose; con veinte preguntas, contestas veinte tarde lo que tarde. El rival por nodos contesta
+  siempre sus 200 000 preguntas. Lo que la lección 8 mide es que eso **no** basta para que la
+  escalera repita, porque `UCI_LimitStrength` aleatoriza a propósito por debajo, y esa es
+  exactamente la clase de hipótesis razonable que solo se cae midiendo.
+</Callout>
+
+## Cómo llega el presupuesto hasta el motor
+
+Desde la configuración hasta `StockfishOpponent` hay dos funciones, y el cambio en las dos es el
+mismo: un argumento más que se pasa hacia abajo.
+
+```python title="src/rukh/eval/elo.py"
+def play_rung(
+    model: MoveDecoder | None,
+    tok: UciTokenizer,
+    rung: EloRung,
+    games: int,
+    cfg: SampleConfig,
+    move_time: float = MOVE_TIME,
+    max_plies: int | None = None,
+    cache: EvalCache | None = None,
+    header_elo: int = 1800,
+    player: Player | None = None,
+    nodes: int | None = None,
+) -> list[GameRecord]:
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p6" lines="365-377" />
+
+El argumento va al final de una firma que ya tenía diez, y eso no es descuido: todos se pasan por
+nombre en las llamadas, así que el orden no importa, y añadirlo al final es el cambio que no puede
+romper a ningún llamador existente.
+
+```python title="src/rukh/eval/elo.py"
+    opponent = StockfishOpponent(
+        elo=rung.uci_elo or 1320, skill=rung.skill, move_time=move_time, nodes=nodes
+    )
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p6" lines="401-403" />
+
+`move_time` se sigue pasando siempre, incluso cuando hay nodos. Es la propiedad `limit` la que
+decide cuál usar, y dejar que el objeto guarde los dos valores tiene una ventaja concreta: el
+objeto sabe a qué tiempo por jugada se pidió el rival aunque haya jugado por nodos, que es
+información y no ruido.
+
+```python title="src/rukh/eval/elo.py"
+def play_rungs(
+    model: MoveDecoder | None,
+    tok: UciTokenizer,
+    rungs: Sequence[EloRung],
+    games: int,
+    cfg: SampleConfig,
+    move_time: float = MOVE_TIME,
+    max_plies: int | None = None,
+    cache: EvalCache | None = None,
+    header_elo: int = 1800,
+    player: Player | None = None,
+    nodes: int | None = None,
+) -> list[GameRecord]:
+    """Play every rung and return all the game records."""
+    records: list[GameRecord] = []
+    for rung in rungs:
+        records.extend(
+            play_rung(
+                model,
+                tok,
+                rung,
+                games,
+                cfg,
+                move_time=move_time,
+                max_plies=max_plies,
+                cache=cache,
+                header_elo=header_elo,
+                player=player,
+                nodes=nodes,
+            )
+        )
+    return records
+```
+
+<Src file="src/rukh/eval/elo.py" tag="p6" lines="443-474" />
+
+`play_rungs` no hace nada más que recorrer los peldaños, y por eso el cambio es mecánico. Lo que
+importa es que **no** hay una segunda ruta: la suite del decoder, la de Qwen3 de la lección 3 y la
+de Karvonen entran todas por aquí, así que el presupuesto de nodos llega a las tres o a ninguna.
+
+## El aviso que viaja con el número
+
+La configuración de la suite gana la clave, y el informe gana la frase que la explica. Primero la
+clave.
+
+```python title="src/rukh/eval/suite.py"
+    elo_games: int = 100
+    elo_rungs: list[EloRung] = Field(default_factory=lambda: list(DEFAULT_RUNGS))
+    elo_move_time: float = 0.1
+    elo_nodes: int | None = None
+    """Search budget of the opponent in nodes. When set, the clock (``elo_move_time``) is not
+    used: the rung searches the same number of positions on any machine under any load, which is
+    what makes two runs of the ladder comparable (D-107 measured 1498 and 1558 on the clock)."""
+    elo_max_plies: int | None = None
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p6" lines="112-119" />
+
+Un `int | None` y no un `int` con un cero mágico. `EvalConfig` hereda de `BaseConfig`, así que
+`extra="forbid"` ya protege de las erratas; lo que el `None` añade es que «no hay presupuesto» sea
+un valor distinto de «un presupuesto de cero nodos», que es un motor que no juega.
+
+```python title="src/rukh/eval/suite.py"
+ELO_CAVEAT_NODES = (
+    "the Elo interval covers sampling noise only: the four ``skill-*`` rungs are nominal "
+    "``Skill Level`` anchors rather than measured ratings, and Stockfish searches {nodes} nodes "
+    "per move (what 0.1 s bought on the reference machine), far below any setting ``UCI_Elo`` "
+    "is calibrated for; the same position always gets the same reply (D-137)"
+)
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p6" lines="63-68" />
+
+Es la gemela de `ELO_CAVEAT`, que está justo encima y dice lo mismo con el reloj. Dos plantillas
+casi idénticas parecen una duplicación que pide refactor, y no lo es: la nota de un resultado es
+prosa que alguien va a leer en una card dentro de un año, y lo que cambia no es solo el número
+—«searches 200 000 nodes» frente a «plays at 0.1 s»— sino la frase final, que en la versión por
+nodos añade la consecuencia (`the same position always gets the same reply`) y en la versión por
+reloj no puede prometerla. Fundirlas en una plantilla con condicionales daría una frase que no dice
+ni una cosa ni la otra.
+
+```python title="src/rukh/eval/suite.py"
+def _elo_notes(elo: EloResult | None, cfg: EvalConfig, notes: list[str]) -> None:
+    """Everything the Elo number has to be read with, in words."""
+    if elo is None:
+        return
+    if cfg.elo_nodes:
+        notes.append(ELO_CAVEAT_NODES.format(nodes=f"{cfg.elo_nodes:,}".replace(",", " ")))
+    else:
+        notes.append(ELO_CAVEAT.format(move_time=cfg.elo_move_time))
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p6" lines="498-505" />
+
+`f"{cfg.elo_nodes:,}".replace(",", " ")` formatea 200000 como `200 000`, con espacio en vez de
+coma, porque la nota se lee en español y en inglés y la coma de millares es ambigua entre los dos.
+Es una línea tonta que evita que alguien lea «200,000 nodos» como doscientos con tres decimales.
+
+```python title="src/rukh/eval/suite.py"
+            move_time=cfg.elo_move_time,
+            max_plies=cfg.elo_max_plies,
+            cache=cache,
+            header_elo=cfg.header_elo,
+            nodes=cfg.elo_nodes,
+        )
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p6" lines="270-275" />
+
+Y eso es todo lo que hacía falta dentro de `_elo`: la configuración ya viajaba entera hasta aquí.
+
+## La caché, partida en dos familias
+
+El segundo cambio es el que se nota al usar el módulo, y sale de un apunte del backlog de P4.
+
+La <Term id="clave-de-cache">clave de caché</Term> de la suite es la promesa de que dos corridas
+con la misma clave midieron lo mismo. Hasta ahora había **una** clave para todo lo que se guarda:
+las partidas contra el motor y los intentos de puzle. Con doce etapas en la tabla, eso salía caro.
+Subir `elo_games` de 20 a 40 tiraba las veinte partidas ya jugadas, aunque la partida `uci-1500:0`
+sigue siendo exactamente la misma partida (su semilla es `seed + index`, no depende del total). Y
+forzar la cabecera de los puzles para un barrido invalidaba todas las partidas, que no tienen nada
+que ver con la cabecera de un puzle.
+
+```python title="src/rukh/eval/suite.py"
+    def cache_fields(self, family: str = "games") -> dict[str, Any]:
+        """The settings that change what a cached item of ``family`` means.
+
+        One key per family, not one for the suite: a game is the same game whatever the puzzle
+        settings are, and a puzzle attempt does not care how long the engine thinks. Under one
+        shared key, raising ``elo_games`` from 20 to 40 threw away the twenty games already
+        played although game ``rung:index`` is exactly the same game (its seed is ``seed +
+        index``), and forcing the header for a sweep invalidated every game (P4 backlog). The
+        number of games is deliberately absent: it changes how many items are read, not what
+        any of them is.
+        """
+        shared: dict[str, Any] = {
+            "temperature": self.temperature,
+            "top_k": self.top_k,
+            "seed": self.seed,
+            "block": self.block,
+        }
+        if family == "games":
+            fields = {
+                **shared,
+                "elo_max_plies": self.elo_max_plies,
+                "rungs": [rung.model_dump(mode="json") for rung in self.elo_rungs],
+            }
+            # The clock and the node budget are two different opponents; only the one in use
+            # is in the key, so a run on the clock keeps its games when ``elo_nodes`` appears
+            # in the config later with ``null``.
+            if self.elo_nodes is not None:
+                fields["elo_nodes"] = self.elo_nodes
+            else:
+                fields["elo_move_time"] = self.elo_move_time
+            return fields
+        if family == "puzzles":
+            fields = dict(shared)
+            # Only when it is on: a flag that is off *is* the behaviour every cached attempt was
+            # played under, and the key keeps the old name so a sweep's paid-for attempts survive.
+            if self.force_header:
+                fields["puzzles_use_header"] = True
+            return fields
+        raise ValueError(f"unknown cache family {family!r}: games or puzzles")
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p6" lines="145-183" />
+
+Tres decisiones, y las tres son sobre qué **no** entra en la clave.
+
+**`elo_games` no está.** Es lo que arregla el apunte del backlog: el número de partidas cambia
+cuántos elementos se leen, no qué es ninguno de ellos. Una fecha de caducidad por producto y no por
+nevera: que caduque la leche no obliga a tirar el arroz.
+
+**El reloj entra solo si no hay nodos, y los nodos solo si los hay.** Es más sutil de lo que
+parece. Si la clave llevara siempre las dos claves, el día que `elo_nodes` apareciera con `null` en
+una configuración existente —y apareció, porque el campo nuevo del modelo de pydantic lo puso en
+todas— la clave habría cambiado y los megabytes de partidas que P2 y P3 pagaron se habrían tirado
+sin que nadie lo pidiera. Una clave que incluye un campo apagado promete menos de lo que parece.
+
+**`puzzles_use_header` conserva el nombre antiguo.** El campo se llama `force_header` en la
+configuración desde M4, pero la clave sigue escribiendo `puzzles_use_header`, que es el nombre con
+el que se guardaron los intentos de un barrido que ya está pagado. Renombrar una clave de caché es
+invalidarla; el nombre viejo es un compromiso con el disco, no con el lector.
+
+<Callout kind="roto" title="Una sola clave y doce etapas">
+  Antes de este cambio, tocar cualquier línea de `configs/eval/greedy.yaml` volvía a jugar todo: las
+  160 partidas y los 6 000 puzles de cada etapa. Con doce etapas eso era una tarde de reloj para
+  cambiar una cabecera. El síntoma no era un error, era la tentación de **no** tocar la
+  configuración por miedo al coste, que es la forma más silenciosa de que un instrumento se quede
+  sin revisar.
+</Callout>
+
+La función levanta `ValueError` ante una familia que no conoce en vez de devolver la clave
+compartida. Es la misma regla que `extra="forbid"` de M0 un nivel más abajo: una familia mal escrita
+es un error, no una caché nueva vacía que se llena en silencio y parece funcionar.
+
+El resto del cambio es construir dos cachés en vez de una.
+
+```python title="src/rukh/eval/suite.py"
+    weights_sha = file_sha(ckpt)
+    cache_path = paths.resolve(cfg.cache_db) if use_cache else None
+    games_cache = EvalCache(
+        cache_path, weights_sha, enabled=use_cache, config_sha=config_sha(cfg.cache_fields("games"))
+    )
+    puzzles_cache = EvalCache(
+        cache_path,
+        weights_sha,
+        enabled=use_cache,
+        config_sha=config_sha(cfg.cache_fields("puzzles")),
+    )
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p6" lines="416-426" />
+
+Las dos apuntan al mismo fichero SQLite y se diferencian solo por su `config_sha`, que es parte de
+la clave primaria de la tabla. No hay dos bases de datos: hay dos vistas de la misma con distinta
+promesa.
+
+<Callout kind="roto" title="Una variable local que se llama como una función">
+  Esa primera línea es un nombre desafortunado y conviene verlo ahora para no tropezar después: la
+  variable local `weights_sha` guarda el hash **del fichero** (`file_sha`), mientras que la función
+  `weights_sha` de la sección siguiente devuelve el hash **de los tensores**. El módulo la importa
+  como `tensor_sha` precisamente para que las dos convivan. Funciona, y aun así es la clase de
+  nombre que dentro de seis meses hace leer el bloque dos veces.
+</Callout>
+
+## La identidad de unos pesos
+
+Y ahora el cambio que costó una tarde de no poder publicar.
+
+La evaluación registraba el SHA-256 del fichero que midió. Cuando `rukh publish` sube un checkpoint
+al Hub, le quita el estado del optimizador y la cabeza atada, porque nadie que descargue un modelo
+para jugar necesita cientos de megas de momentos de AdamW. El resultado son **los mismos pesos en
+otro fichero**: distinto tamaño, distinto hash. La guarda que comprobaba que la card hablaba del
+fichero medido decía, con razón desde su punto de vista, que eran dos modelos distintos.
+
+```python title="src/rukh/eval/cache.py"
+def weights_sha(path: Path) -> str:
+    """SHA-256 of the tensors under ``model_state``, independent of how the file was written.
+
+    Two files can hold the same weights and differ byte for byte: ``best.pt`` keeps the optimizer
+    and the run's provenance, the copy ``rukh publish`` uploads (and ``rukh pull`` brings back)
+    does not, and ``torch.save`` is not even stable across versions. What an evaluation measured
+    is the weights, so this is the identity a pulled checkpoint shares with the one that was
+    evaluated. Names, dtypes, shapes and bytes, in name order; a tied head (``lm_head.weight``
+    when it is the embedding under another name) is left out, because the publisher drops it
+    and the loader re-ties it, so both files hold the same model.
+    """
+    import torch
+
+    from rukh.train.checkpoint import TIED_SOURCES
+
+    try:
+        payload = torch.load(Path(path), map_location="cpu", weights_only=True)
+    except Exception:  # noqa: BLE001 - reward checkpoints carry objects the safe loader refuses
+        payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+    state = None
+    if isinstance(payload, dict):
+        # ``model_state`` is ours; ``model`` is nanoGPT's (the Karvonen baseline).
+        state = payload.get("model_state") or payload.get("model")
+    if not isinstance(state, dict) or not state:
+        raise ValueError(f"{Path(path).as_posix()} holds no model_state to hash")
+    names = sorted(state)
+    for head, embedding in TIED_SOURCES.items():
+        if head in state and embedding in state and torch.equal(state[head], state[embedding]):
+            names.remove(head)
+    digest = hashlib.sha256()
+    for name in names:
+        tensor = state[name].detach().cpu().contiguous()
+        digest.update(f"{name}|{tensor.dtype}|{tuple(tensor.shape)}|".encode())
+        raw = tensor.view(torch.int16) if tensor.dtype == torch.bfloat16 else tensor
+        digest.update(raw.numpy().tobytes())
+    return digest.hexdigest()
+```
+
+<Src file="src/rukh/eval/cache.py" tag="p6" lines="54-89" />
+
+Es el <Term id="hash-de-pesos">hash de pesos</Term> de D-135, y cada línea tapa una forma de que dos
+ficheros con el mismo modelo dieran hashes distintos.
+
+**`sorted(state)`.** Un diccionario de estado conserva el orden de inserción, y ese orden depende de
+cómo se construyó el modelo. Recorrer los nombres ordenados hace el hash independiente de eso.
+
+**Nombre, `dtype` y forma dentro del digest, no solo los bytes.** Sin ellos, dos tensores de la
+misma forma con los mismos bytes en distinto sitio darían el mismo hash: un modelo con las capas
+permutadas sería «el mismo modelo». Meter el nombre y la forma en la cadena antes de los bytes es lo
+que separa un contenido de una estructura.
+
+**La cabeza atada se salta, y solo cuando de verdad está atada.** El decoder de M2 comparte los
+pesos de la matriz de embeddings con la capa de salida (<Term id="tied-embeddings">tied
+embeddings</Term>). El publicador borra la copia duplicada y el cargador la vuelve a atar, así que
+los dos ficheros tienen el mismo modelo con un tensor de diferencia. La condición no se limita a
+mirar si la clave existe: comprueba con `torch.equal` que los dos tensores son **iguales**, porque
+un modelo con una cabeza de salida de verdad independiente no debe perderla del hash.
+
+**`view(torch.int16)` para bfloat16.** `numpy` no conoce ese tipo, así que `tobytes()` fallaría.
+`view` reinterpreta los mismos dos bytes como un entero sin copiar nada y sin cambiar un solo bit,
+que es exactamente lo que un hash necesita.
+
+**El `except Exception` con su `noqa`.** `weights_only=True` es la forma segura de cargar un `.pt`:
+se niega a deserializar objetos de Python arbitrarios. Los checkpoints del reward model de M5 llevan
+uno, así que para ellos hay un segundo intento sin la red. El comentario está ahí porque un
+`except Exception` desnudo es normalmente un error y ruff lo señala; la razón por la que aquí no lo
+es tiene que estar escrita al lado.
+
+<Callout kind="mundo-real" title="La misma novela en tapa dura y en bolsillo">
+  Distinto lomo, distinto peso, distinto código de barras, y el mismo texto de la primera línea a la
+  última. Una guarda que compara códigos de barras dice que son libros distintos; la que compara el
+  texto dice que es el mismo libro, y **sigue** distinguiéndolo de una edición con un capítulo
+  cambiado. Eso último es lo que hace que esto no sea aflojar la guarda: el hash de tensores acepta
+  un fichero distinto con los mismos pesos y rechaza unos pesos distintos.
+</Callout>
+
+<Transfer concept="Identidad de contenido frente a identidad de fichero" where="Cualquier cosa que se publique en un sitio distinto del que se produjo: una imagen de contenedor, un artefacto de compilación, un índice de embeddings.">
+  La pregunta «¿es este el mismo artefacto que probé?» casi nunca se responde con el hash del
+  fichero, porque entre la prueba y el despliegue algo lo reempaqueta: se recomprime, se le quitan
+  metadatos, se le añade una firma. La respuesta está en hashear **lo que el artefacto significa**
+  —los tensores, las capas, los vectores— y no el sobre en el que viaja.
+
+Cuesta más de escribir y hay que decidir explícitamente qué forma parte de la identidad y qué no, y
+esa decisión es justamente la parte valiosa: aquí obligó a contestar si una cabeza atada es parte
+del modelo. Una respuesta escrita en código es mejor que un hash que nunca coincide.
+
+</Transfer>
+
+El resultado guarda las dos identidades, no una.
+
+```python title="src/rukh/eval/suite.py"
+    stage: str
+    suite: str
+    checkpoint: str
+    model_sha: str
+    weights_sha: str | None = None
+    """SHA-256 of the tensors alone, so a pulled copy of the same weights is recognised."""
+    params: int
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p6" lines="200-206" />
+
+`str | None` con valor por omisión, y no `str`: los resultados que P2 a P5 dejaron en disco no
+tienen el campo, y una validación con el campo obligatorio los rechazaría. Un campo nuevo opcional
+es lo que permite leer el pasado; volver a medir doce etapas para rellenarlo habría costado tres
+horas.
+
+```python title="src/rukh/eval/suite.py"
+            model_sha=weights_sha,
+            weights_sha=tensor_sha(ckpt),
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p6" lines="434-435" />
+
+Aquí se ven las dos juntas, y aquí se entiende el alias del `import`: `model_sha` recibe el hash del
+fichero y `weights_sha` el de los tensores, calculado por la función que el módulo importó como
+`tensor_sha` para que no choque con el nombre del campo.
+
+Y el último cambio de `suite.py` es una línea que va a importar en la lección 5.
+
+```python title="src/rukh/eval/suite.py"
+def resolve_model(spec: str | Path) -> Path:
+    """A checkpoint path from either a local file or a Hub id (downloaded on demand)."""
+    from rukh.train.checkpoint import resolve_run
+
+    text = str(spec)
+    if is_hub_id(text):
+        return hub_checkpoint(text)
+    path = resolve_run(text)
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} is neither a checkpoint nor a Hub id (owner/name)")
+    return path
+```
+
+<Src file="src/rukh/eval/suite.py" tag="p6" lines="381-391" />
+
+Antes decía `path = Path(text)`. Ahora pasa por `resolve_run`, la función que la lección 6
+construye: un `checkpoints/medium-v4/best.pt` que no existe se resuelve al
+`medium-v4-20260919-174623/best.pt` que sí. Es lo que permite que una orden escrita en una lección
+funcione tal cual tanto para quien descargó el modelo como para quien lo entrenó.
+
+## El fichero de prompts que nadie podía regenerar
+
+El último cambio no es del instrumento: es una deuda de M5 que se paga aquí.
+
+`configs/train/dpo-*.yaml`, `grpo.yaml` y la configuración del reward model leen todas
+`data/pairs/dpo-prompts.parquet`. Ese fichero existía, y lo había producido un cruce de una sola vez
+que no estaba en el repositorio: un lector que llegara a M5 con los pares recién construidos no
+tenía cómo escribirlo. El par es un <Term id="fen">FEN</Term>, y el decoder no sabe leer un FEN;
+necesita la secuencia de jugadas que llegó a la posición.
+
+```python title="src/rukh/data/pairs.py"
+LOGGER = logging.getLogger(__name__)
+PAIRS_FILE = "pairs.parquet"
+PROMPTS_FILE = "dpo-prompts.parquet"
+PHASES = ("opening", "middlegame", "endgame")
+BATCH_ROWS = 50_000
+PROMPT_COLUMNS = [
+    "game_id",
+    "ply",
+    "chosen",
+    "rejected",
+    "cp_chosen",
+    "cp_rejected",
+    "phase",
+    "white_elo",
+    "black_elo",
+    "prefix",
+]
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p6" lines="30-46" />
+
+Las columnas en una constante y no en el `select` final: es la lista que el cargador del DPO espera,
+y tenerla arriba con nombre es lo que permite que el test la compare entera en vez de comprobar que
+«están las que hacen falta».
+
+```python title="src/rukh/data/pairs.py"
+    positions_eval: str = "data/evals/positions-eval.parquet"
+    out_dir: str = "data/pairs"
+    games_dir: str = "data/uci"
+    """The converted games the pairs came from, to recover the moves that led to each position."""
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p6" lines="52-55" />
+
+Un campo más en la configuración, con su valor por omisión igual a donde `rukh data uci` escribe.
+Que tenga valor por defecto y no sea obligatorio es lo que hace que las configuraciones de M5 sigan
+cargando sin tocarlas.
+
+```python title="src/rukh/data/pairs.py"
+def build_prompts(pairs: pl.DataFrame, games_dir: Path, block: int = 200) -> pl.DataFrame:
+    """Every pair joined back to its game: the moves that led to the position, and the ratings.
+
+    A pair is a FEN, and the decoder cannot read a FEN: it reads the move sequence that reached
+    the position, behind the three header tokens. ``game_id`` and ``ply`` say which game and how
+    far into it, so the prompt is the first ``ply`` moves of that game and the two Elo columns
+    fill the header. This is the file every DPO, GRPO, reward-model and on-policy config reads;
+    until it was written here it existed only as a one-off join nobody could rerun.
+
+    A prompt has to fit the decoder's context whole -- three header tokens plus ``ply`` moves,
+    at most ``block`` -- because truncating its front would hand the model a position that never
+    happened. Pairs deeper than that are dropped and counted, and so is a pair whose game is not
+    under ``games_dir``; neither is ever invented.
+    """
+    parquets = sorted(games_dir.glob("year=*/month=*/games.parquet"))
+    if not parquets:
+        raise FileNotFoundError(f"no converted games under {games_dir} (run `rukh data uci`)")
+    games = (
+        pl.scan_parquet([p.as_posix() for p in parquets])
+        .select("game_id", "uci", "white_elo", "black_elo")
+        # The games carry the id as a signed 64-bit hash; the evaluations, and therefore the
+        # pairs, carry it as text. Matching on text loses nothing and refuses nothing.
+        .with_columns(pl.col("game_id").cast(pl.String))
+    )
+    header = 3  # <bos> and the two Elo tokens, exactly what `rukh.infer.game._history` builds
+    joined = (
+        pairs.lazy()
+        .filter(pl.col("ply") + header <= block)
+        .join(games, on="game_id", how="inner")
+        .collect()
+    )
+    prefixes = [
+        " ".join(str(uci).split()[:ply])
+        for uci, ply in zip(joined["uci"], joined["ply"], strict=True)
+    ]
+    return joined.with_columns(pl.Series("prefix", prefixes, dtype=pl.String)).select(
+        PROMPT_COLUMNS
+    )
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p6" lines="164-201" />
+
+Cinco decisiones, en orden de aparición.
+
+**`scan_parquet` y no `read_parquet`.** El corpus convertido son varios gigabytes repartidos por
+meses; `scan_parquet` construye un plan perezoso y `polars` empuja el filtro y la selección de
+columnas hasta el lector (<Term id="predicate-pushdown">predicate pushdown</Term>), así que de cada
+fichero solo se leen las cuatro columnas que hacen falta.
+
+**El filtro antes del cruce.** `filter(ply + header <= block)` está en el lado de los pares, que es
+el lado pequeño, y se aplica antes de cruzar. Cruzar primero y filtrar después daría el mismo
+resultado leyendo millones de filas para tirarlas.
+
+**El `cast(pl.String)` con su comentario.** Las partidas guardan `game_id` como un hash entero de 64
+bits con signo; las evaluaciones de Lichess, y por tanto los pares, lo traen como texto. Un cruce
+entre un `Int64` y un `String` en `polars` no cruza nada y no falla: devuelve cero filas. El `cast`
+en el lado de las partidas es la línea que evita un fichero vacío que parece correcto.
+
+**`header = 3` como variable con comentario y no como literal dentro de la fórmula.** Los tres
+tokens son `<bos>` y los dos de Elo, exactamente lo que construye `_history` en `rukh.infer.game`.
+Escrito así, el día que la cabecera cambie de tamaño hay un sitio donde cambiarlo y una pista de
+dónde está la otra mitad de la verdad.
+
+**Los pares demasiado profundos se tiran, no se cortan.** Es la decisión que el docstring subraya y
+la única que no es mecánica: un prompt recortado por delante es una posición que nunca se jugó,
+porque las primeras jugadas son las que determinan el resto. Preferir menos datos honestos a más
+datos con una posición inventada es la misma regla que M3 aplicó con el `-100` de las etiquetas que
+no se sabían.
+
+```python title="src/rukh/data/pairs.py"
+    balanced = balance(raw, cfg.max_per_phase, cfg.seed)
+    target = out_dir / PAIRS_FILE
+    balanced.write_parquet(target.as_posix(), compression="zstd")
+    prompts = build_prompts(balanced, resolve(cfg.games_dir))
+    prompts_target = out_dir / PROMPTS_FILE
+    prompts.write_parquet(prompts_target.as_posix(), compression="zstd")
+    dropped = int(balanced.height - prompts.height)
+    if dropped:
+        LOGGER.info(
+            "%d pairs got no prompt: deeper than the context or with no game under %s",
+            dropped,
+            cfg.games_dir,
+        )
+    counts = phase_counts(balanced)
+    counts["candidates"] = int(raw.height)
+    counts["prompts"] = int(prompts.height)
+    counts["prompts_dropped"] = dropped
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p6" lines="220-236" />
+
+Los prompts se construyen desde `balanced`, el mismo marco que se acaba de escribir, y no releyendo
+el parquet. Así las filas de los dos ficheros se corresponden por construcción y no por
+coincidencia.
+
+`prompts_dropped` va al <Term id="manifiesto">manifiesto</Term> aunque valga cero. Un conteo que
+solo aparece cuando es distinto de cero obliga a distinguir «no se tiró nada» de «esta versión del
+código no lo contaba», y eso es justo lo que un manifiesto está para no tener que hacer.
+
+```python title="src/rukh/data/pairs.py"
+        files=[
+            FileHash(path=PAIRS_FILE, sha256=sha256_file(target), bytes=target.stat().st_size),
+            FileHash(
+                path=PROMPTS_FILE,
+                sha256=sha256_file(prompts_target),
+                bytes=prompts_target.stat().st_size,
+            ),
+        ],
+```
+
+<Src file="src/rukh/data/pairs.py" tag="p6" lines="252-259" />
+
+Y el fichero nuevo entra en la lista de hashes del manifiesto, que es lo que hace comprobable el
+dataset publicado en el Hub. La lección 5 verá la otra mitad: `data/publish.py` añade
+`dpo-prompts.parquet` a los patrones que se suben.
+
+## Los dos tests que fijan las decisiones
+
+De los tests que cambian en este hito, dos enseñan un contrato y van enteros.
+
+```python title="tests/unit/test_cache.py"
+def test_one_key_per_family_so_more_games_reuse_the_ones_already_played() -> None:
+    """The P4 backlog item: raising ``elo_games`` must not throw away the games on disk.
+
+    A game is ``rung:index`` with seed ``seed + index``, the same game whatever the total is, and
+    the same game whatever the puzzle settings are. So the games key ignores the count and the
+    puzzle flags, and the puzzles key ignores the clock and the rungs.
+    """
+    from rukh.eval.suite import EvalConfig
+
+    base = EvalConfig(elo_games=20)
+    games_key = config_sha(base.cache_fields("games"))
+    puzzles_key = config_sha(base.cache_fields("puzzles"))
+    assert config_sha(EvalConfig(elo_games=40).cache_fields("games")) == games_key
+    assert config_sha(EvalConfig(elo_games=40).cache_fields("puzzles")) == puzzles_key
+    # What changes a game: the sampler, the clock (or the node budget), the plies, the rungs.
+    assert config_sha(EvalConfig(temperature=0.05).cache_fields("games")) != games_key
+    assert config_sha(EvalConfig(elo_move_time=0.05).cache_fields("games")) != games_key
+    assert config_sha(EvalConfig(elo_nodes=200_000).cache_fields("games")) != games_key
+    assert config_sha(EvalConfig(elo_max_plies=100).cache_fields("games")) != games_key
+    # What does not: the puzzle header flag.
+    assert config_sha(EvalConfig(force_header=True).cache_fields("games")) == games_key
+    # And the mirror image for puzzles.
+    assert config_sha(EvalConfig(elo_move_time=0.05).cache_fields("puzzles")) == puzzles_key
+    assert config_sha(EvalConfig(elo_nodes=200_000).cache_fields("puzzles")) == puzzles_key
+    assert config_sha(EvalConfig(force_header=True).cache_fields("puzzles")) != puzzles_key
+    assert config_sha(EvalConfig(temperature=0.05).cache_fields("puzzles")) != puzzles_key
+    with pytest.raises(ValueError, match="unknown cache family"):
+        base.cache_fields("weather")
+
+
+def test_the_node_budget_replaces_the_clock_in_the_opponent() -> None:
+    """With ``nodes`` the opponent's limit is a node count; without it, the clock."""
+    from rukh.infer.game import StockfishOpponent
+
+    on_clock = StockfishOpponent.__new__(StockfishOpponent)
+    on_clock.move_time, on_clock.nodes = 0.1, None
+    assert on_clock.limit.time == 0.1 and on_clock.limit.nodes is None
+    on_nodes = StockfishOpponent.__new__(StockfishOpponent)
+    on_nodes.move_time, on_nodes.nodes = 0.1, 200_000
+    assert on_nodes.limit.nodes == 200_000 and on_nodes.limit.time is None
+```
+
+<Src file="tests/unit/test_cache.py" tag="p6" lines="110-149" />
+
+El primero es la tabla de verdad de la clave escrita como aserciones, y esa forma es deliberada:
+cada línea es una frase de la política («subir las partidas no invalida nada», «la cabecera de los
+puzles no toca las partidas»), y cuando una se rompa, la línea que falla dice qué promesa se rompió.
+Un test que solo comprobara que dos configuraciones distintas dan claves distintas no habría
+detectado el problema de P4, porque ahí el error era precisamente que **sí** las daban.
+
+El segundo es el que justifica que `limit` sea una propiedad: `__new__` sin `__init__`, dos
+atributos a mano, y ninguna necesidad de que Stockfish esté instalado. Corre en la CI, que no tiene
+motor.
+
+Los cambios de `tests/unit/test_pairs.py` son otras 79 líneas: un `_games_parquet` que escribe una
+partida convertida en el mismo formato por meses que `rukh data uci`, el test que comprueba las diez
+columnas y los prefijos, y el que comprueba que un par más profundo que el contexto se tira y se
+cuenta. Van enlazados en vez de pegados porque son la versión con datos de juguete de lo que el
+bloque de `build_prompts` ya explica, y porque la política del curso es mostrar enteros los tests
+que enseñan un contrato nuevo y enlazar los que repiten uno ya visto:
+[`tests/unit/test_pairs.py`](https://github.com/borja-glez/rukh/blob/p6/tests/unit/test_pairs.py).
+
+<Exercise n="01" title="¿Qué clave cambia?">
+  Con la tabla de `cache_fields` delante, di para cada cambio si invalida las partidas, los puzles,
+  las dos cosas o ninguna: (a) `temperature: 0.05` → `0.6`; (b) `elo_games: 20` → `160`; (c)
+  `bootstrap: 500` → `1000`; (d) añadir un peldaño a `elo_rungs`; (e) `elo_nodes: null` → `200000`.
+
+  <Solution>
+    (a) las dos, porque `temperature` está en `shared`: a otra temperatura el modelo juega otras
+    partidas y responde otros puzles. (b) ninguna: `elo_games` no entra en ninguna clave, que es
+    justo el arreglo de esta sección. (c) ninguna: el bootstrap se calcula sobre los resultados
+    guardados y no cambia ninguna partida. (d) las partidas; los puzles no llevan `rungs`. (e) las
+    partidas, y además cambian de escala, así que sus Elo no se comparan con los anteriores.
+  </Solution>
+</Exercise>
+
+<Exercise n="02" title="El hash que no distinguiría dos modelos">
+  Quita del digest de `weights_sha` la línea que mete el nombre, el `dtype` y la forma, dejando solo
+  los bytes de cada tensor. Construye dos diccionarios de estado que a partir de ese momento darían
+  el mismo hash y que son modelos distintos. ¿Cuál es el más plausible en este proyecto?
+
+  <Solution>
+    Basta con dos tensores de la misma forma intercambiados de nombre: `{"a": t1, "b": t2}` y
+    `{"a": t2, "b": t1}` recorridos en orden alfabético dan la misma concatenación de bytes. El caso
+    plausible aquí es el encoder de M3 con sus tres cabezas de la misma forma: permutarlas da un
+    modelo que predice el resultado donde debería predecir el material, y sin el nombre en el digest
+    el hash no lo vería. El `dtype` tapa otro: el mismo tensor en dos precisiones puede compartir
+    bytes con la mitad de otro.
+  </Solution>
+</Exercise>
+
+## Qué has aprendido
+
+El instrumento tiene código, y ese código tiene decisiones tan defendibles como las del modelo. Dos
+configuraciones cuyo único producto es saber cuánto se mueve la escalera; un límite por nodos que
+hace al rival indiferente a la carga de la máquina sin cambiar el comportamiento de nadie que no lo
+pida; una clave de caché partida por familias porque una promesa demasiado ancha cuesta una tarde de
+reloj; y un hash de contenido en vez de un hash de fichero, que es la única forma de que «este es el
+modelo que medí» siga siendo comprobable después de publicarlo.
+
+Lo que no se ha medido todavía es si el presupuesto de nodos sirve para lo que se puso. La respuesta
+está en la lección 8, y es que no: una hipótesis razonable, un instrumento para comprobarla, y un
+«no» publicado con los cuatro números al lado.
+
+La lección siguiente mete en esta misma escalera un modelo que no entrenó nadie de aquí.

@@ -1,0 +1,896 @@
+---
+title: 'La tabla cada noche: doce etapas, un comando, una fecha'
+description:
+  'El orquestador que reconstruye la tabla única: recorre el catálogo de modelos publicados, trae de
+  Hugging Face lo que falte, funde cada adaptador LoRA sobre su base, mide cada etapa con la misma
+  configuración, deja constancia de qué fichero midió con qué hash y cuánto tardó, y sobrevive a que
+  una etapa falle.'
+module: m6
+order: 4
+duration: 130
+level: medio
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - tabla única
+  - nightly
+  - catálogo
+  - LoRA
+  - reproducibilidad
+  - benchmarks
+artifacts:
+  - kind: report
+    label: Tabla única de resultados
+  - kind: repo
+    label: borja-glez/rukh
+    href: https://github.com/borja-glez/rukh/tree/p6
+---
+
+## Qué vas a construir
+
+`rukh eval nightly`: 272 líneas que producen la tabla entera del proyecto, todas las etapas medidas
+con la misma configuración el mismo día.
+
+Hasta aquí cada módulo había medido lo suyo, el día que cerró, con el harness de aquel día. Eso da
+trece filas con trece fechas y trece configuraciones, y la palabra «tabla» para ese montón es
+generosa: una tabla es una cosa en la que las filas se comparan entre sí, y dos filas medidas con
+instrumentos distintos no se comparan.
+
+El problema de fondo no es escribir el bucle. Es que **cada etapa se mide de forma distinta**: el
+decoder con su suite, el encoder con otra, el Qwen3 afinado con la suya, el baseline de Karvonen con
+la de la lección anterior, y dos de las filas ni siquiera son un checkpoint sino un adaptador de
+1,6 MB que hay que fundir sobre su base antes de que nadie pueda medirlo. Todo eso lo sabe el
+catálogo, y el nightly se limita a recorrerlo.
+
+## Lo que el fichero promete
+
+```python title="src/rukh/eval/nightly.py"
+"""``rukh eval nightly``: the whole results table from the published models, with one command.
+
+Twelve decoder rows and four encoder rows were written one ``rukh eval`` at a time over five
+milestones, each with the config of its day. This walks the catalogue of ``rukh.hub`` -- every
+model the course published, with the stage name its row carries and the suite that measures it
+-- and evaluates each one under the **same** config, pulling from the Hub whatever is not on
+disk. What the caches already hold is not replayed, so a nightly after a nightly is minutes;
+the first one is hours of engine.
+
+It writes three things: the rows of ``artifacts/web/results.json`` it measured (upserted by
+stage, the rows it did not measure are left alone), ``docs/benchmarks.md`` rendered from the
+whole table, and ``artifacts/eval/nightly.json``: which stage came from which checkpoint with
+which sha, how long each took and what went wrong. A table is reproducible when the last file
+says how it was made.
+"""
+```
+
+<Src file="src/rukh/eval/nightly.py" tag="p6" lines="1-15" />
+
+La última frase es la tesis del fichero, y conviene desconfiar de ella un momento antes de aceptarla.
+Una tabla no es reproducible porque exista el comando que la regenera: es reproducible porque existe
+el fichero que dice **qué fichero exacto** produjo cada fila, con qué hash, cuánto tardó y qué salió
+mal. El comando dice cómo se haría; `nightly.json` dice cómo se hizo, y son cosas distintas en cuanto
+una etapa falla y se relanza a mano.
+
+«Los rows que no midió se dejan en paz» es la otra decisión estructural. El nightly hace un _upsert_
+por nombre de etapa: escribe las filas que midió y no toca las demás. Así se puede lanzar con `--only`
+sobre una etapa sin perder las otras once, que es lo que permite relanzar el baseline de Karvonen
+después de que fallara sin volver a jugar 1 760 partidas.
+
+```python title="src/rukh/eval/nightly.py"
+NIGHTLY_FILE = "artifacts/eval/nightly.json"
+BENCHMARKS_FILE = "docs/benchmarks.md"
+MERGED_DIR = "artifacts/eval/merged"
+
+KARVONEN = Artefact(
+    "karvonen-8l",
+    HF_REPO,
+    "decoder",
+    f"{LOCAL_DIR}/{CHECKPOINT_FILE}",
+    (),
+    "Adam Karvonen's 8-layer chess nanoGPT: the public baseline of the table",
+    stage="karvonen-8l",
+    measure="karvonen",
+)
+"""The one row of the table that is not the course's. It lives here and not in ``rukh.hub``
+because the catalogue is what ``rukh pull``, the model cards and the Hub collection walk, and a
+repository that is not ours must never be pulled as ours, carded or collected; ``nightly`` only
+needs to measure it, so it is the only place that lists it."""
+```
+
+<Src file="src/rukh/eval/nightly.py" tag="p6" lines="33-50" />
+
+`Artefact` es el tipo del catálogo, que construye la lección 5; aquí basta saber que describe un
+modelo publicado con su repositorio, su ruta en disco, el nombre de etapa que lleva su fila y la
+suite que lo mide.
+
+Y aquí está una de las decisiones más finas del módulo, escrita entera en ese docstring: el baseline
+de Karvonen **no está en el catálogo**. Está declarado aquí, en el único sitio que necesita
+conocerlo. La razón es que el catálogo no es una lista de modelos: es la lista de cosas que
+`rukh pull` descarga como nuestras, que `rukh publish cards` documenta con una card nuestra y que
+`rukh publish collection` mete en nuestra colección del Hub. Un repositorio ajeno dentro de esa lista
+acabaría, tres funciones más allá, con una card nuestra encima del modelo de otro. Declararlo donde
+se usa es más feo y es correcto.
+
+<Callout kind="teoria" title="Una lista por propósito, no una lista por tipo">
+  La tentación es tener «la lista de todos los modelos» y filtrarla en cada consumidor. Funciona
+  hasta que un consumidor nuevo se olvida del filtro, y entonces el fallo es que se publica algo que
+  no se debía publicar. Aquí la lista se define por **lo que se hace con ella** —lo que el proyecto
+  publica— y lo que no cumple esa definición vive fuera aunque sea del mismo tipo. El coste es una
+  concatenación explícita en `plan()`; el beneficio es que ningún consumidor futuro puede
+  equivocarse por omisión.
+</Callout>
+
+## El registro de lo que pasó
+
+```python title="src/rukh/eval/nightly.py"
+class NightlyRecord(BaseModel):
+    """One stage of the run: what was measured, from what, and how it went."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    stage: str
+    measure: str
+    checkpoint: str | None = None
+    model_sha: str | None = None
+    weights_sha: str | None = None
+    seconds: float = 0.0
+    status: str = "planned"
+    """``planned`` (dry run), ``measured``, ``skipped`` or ``failed``."""
+    detail: str | None = None
+
+
+class NightlyReport(BaseModel):
+    """What one nightly did; serialised as ``artifacts/eval/nightly.json``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    date: str
+    config: str
+    encoder_config: str | None
+    records: list[NightlyRecord]
+    results: str
+    benchmarks: str | None
+    seconds: float
+```
+
+<Src file="src/rukh/eval/nightly.py" tag="p6" lines="53-81" />
+
+`name` y `stage` son dos cosas distintas y por eso hay dos campos. `name` es como se llama el
+artefacto en el catálogo (`tiny`, `lora-e4`), que es lo que se escribe en `rukh pull`. `stage` es el
+nombre de la fila en la tabla (`tiny-greedy`), que lleva el sufijo del muestreo porque un Elo es del
+par modelo y muestreo. Confundirlos daría una fila llamada como el modelo, y entonces la tabla dejaría
+de decir con qué muestreo se midió.
+
+Los dos hashes van los dos, y ahora se entiende por qué: `model_sha` identifica el fichero que se
+abrió en esta máquina, `weights_sha` identifica los pesos, que es lo que la card va a afirmar. Con los
+dos, un lector que descargue el modelo puede comprobar que tiene los mismos pesos aunque su fichero
+pese otra cosa.
+
+`status` es una cadena con cuatro valores documentados y no un `Enum`. Es discutible; la razón
+práctica es que el JSON se lee desde un notebook y desde la web, y un `Enum` de pydantic serializa
+igual pero obliga a mantener el vocabulario sincronizado en dos sitios cuando aparezca un quinto
+estado.
+
+## El plan
+
+```python title="src/rukh/eval/nightly.py"
+def plan(only: set[str] | None = None) -> list[Artefact]:
+    """The catalogue entries a nightly measures, in course order."""
+    wanted = [artefact for artefact in (*catalogue(), KARVONEN) if artefact.measure != "none"]
+    if only:
+        wanted = [a for a in wanted if a.name in only or (a.stage or "") in only]
+    return wanted
+```
+
+<Src file="src/rukh/eval/nightly.py" tag="p6" lines="84-89" />
+
+Cuatro líneas y tres decisiones.
+
+`measure != "none"` deja fuera lo que no se puede medir con esta suite: los datasets, el tokenizador,
+el reward model (que juzga pares, no juega) y el encoder de preentrenamiento. Que esa propiedad viva
+en el catálogo y no en una lista negra aquí significa que añadir un artefacto nuevo obliga a decir
+cómo se mide o a decir que no se mide, y no hay una tercera opción silenciosa.
+
+`--only` acepta **el nombre del artefacto o el nombre de la etapa**. Es una comodidad con una razón:
+en la terminal se escribe lo que se acaba de leer, y lo que se lee en la tabla es `tiny-greedy`
+mientras que lo que se lee en `rukh pull` es `tiny`. Aceptar los dos evita el «no encuentro la
+etapa» que sigue a mirar el sitio equivocado.
+
+El orden es el del catálogo, que es el orden del curso. Nada lo ordena por tamaño ni por Elo: la
+salida del comando se lee de arriba abajo como se recorrió el proyecto.
+
+## Cuatro suites detrás de una firma
+
+```python title="src/rukh/eval/nightly.py"
+def _run_decoder(checkpoint: Path, config: Path | None, stage: str, use_cache: bool, device):
+    from rukh.eval.suite import load_suite, run_suite
+
+    cfg = load_suite("full", config).model_copy(update={"stage": stage})
+    return run_suite(checkpoint, cfg, suite="full", use_cache=use_cache, device=device)
+
+
+def _run_encoder(checkpoint: Path, config: Path | None, stage: str, use_cache: bool, device):
+    from rukh.eval.encoder import load_encoder_suite, run_encoder_suite
+
+    cfg = load_encoder_suite(config).model_copy(update={"stage": stage})
+    return run_encoder_suite(checkpoint, cfg, use_cache=use_cache, device=device)
+
+
+def _run_qwen(adapter_dir: Path, config: Path | None, stage: str, use_cache: bool, device):
+    from rukh.eval.qwen_suite import run_qwen_suite
+    from rukh.eval.suite import load_suite
+
+    cfg = load_suite("full", config)
+    return run_qwen_suite(adapter_dir, cfg, stage=stage, use_cache=use_cache, device=device)
+
+
+def _run_karvonen(checkpoint: Path, config: Path | None, stage: str, use_cache: bool, device):
+    from rukh.eval.karvonen_suite import run_karvonen_suite
+    from rukh.eval.suite import load_suite
+
+    cfg = load_suite("full", config)
+    return run_karvonen_suite(
+        cfg, stage=stage, use_cache=use_cache, device=device, checkpoint=checkpoint
+    )
+```
+
+<Src file="src/rukh/eval/nightly.py" tag="p6" lines="92-121" />
+
+Cuatro funciones con **la misma firma** y cuerpos distintos: es la capa de adaptación que permite que
+el bucle de más abajo no sepa nada de suites. Cada una importa lo suyo dentro de la función, que es la
+regla de M0 aplicada aquí con una consecuencia concreta: `rukh eval nightly --dry-run` no importa
+`torch` ni `transformers`, así que imprime el plan en un segundo.
+
+`model_copy(update={"stage": stage})` para el decoder y el encoder, y `stage=stage` como argumento
+para Qwen y Karvonen. La diferencia no es capricho: las dos primeras suites toman el nombre de la
+etapa de la configuración —es donde lo llevaban desde M2— y las dos segundas lo reciben como
+parámetro. Igualarlo exigiría cambiar una de las dos convenciones en cuatro ficheros; la capa de
+adaptación existe precisamente para absorber esta clase de diferencia sin propagarla.
+
+Los tipos de `device` y del retorno están sin anotar, y eso en un proyecto con ruff en `UP` y `B`
+llama la atención. Es deliberado por el retorno: cada suite devuelve su propio tipo de resultado, y
+una anotación honesta sería una unión de cuatro tipos que nadie usa, porque el bucle tira el valor.
+
+## Fundir un adaptador antes de medirlo
+
+Dos filas de la tabla no son un checkpoint. Son adaptadores <Term id="lora">LoRA</Term> de M4: 1,6 MB
+de factores que no miden nada por sí solos.
+
+```python title="src/rukh/eval/nightly.py"
+def merged_checkpoint(base: Path, adapter_dir: Path, out: Path) -> Path:
+    """The base with the adapter folded in, as an ordinary checkpoint the suite can open.
+
+    A style adapter is 1.6 MB of factors and measures nothing on its own; the row of the table
+    is the base *with* it. ``load_adapter`` wraps the adapted matrices and reads the factors,
+    ``merge_lora`` folds them back into plain ``nn.Linear`` weights, and what is saved has the
+    state dict of a normal decoder -- the same thing the LoRA training run wrote as ``best.pt``.
+    """
+    from rukh.models.lora import ADAPTER_FILE, load_adapter, merge_lora
+    from rukh.train.checkpoint import load_model, save_checkpoint
+
+    model, payload = load_model(base)
+    load_adapter(model, adapter_dir / ADAPTER_FILE)
+    merge_lora(model)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    return save_checkpoint(
+        out,
+        step=int(payload.get("step") or 0),
+        model=model,
+        optimizer=None,
+        cfg={"merged_from": base.as_posix(), "adapter": adapter_dir.as_posix()},
+        model_cfg=payload["model_cfg"],
+        vocab_hash=payload.get("vocab_hash"),
+        data_manifest_sha=payload.get("data_manifest_sha"),
+        git_sha=payload.get("git_sha"),
+    )
+```
+
+<Src file="src/rukh/eval/nightly.py" tag="p6" lines="124-149" />
+
+Fundir y guardar en vez de medir con el adaptador puesto. La alternativa —enseñar a la suite a cargar
+un adaptador— parece más limpia y es peor por dos motivos. El primero es que el camino con adaptador
+**no es el mismo camino**: las matrices envueltas calculan `Wx + BAx` en dos multiplicaciones, y eso
+no da exactamente los mismos bits que la matriz fundida, así que la fila mediría una ruta de código
+que nadie usa en producción. El segundo es que el checkpoint fundido es un fichero que se puede abrir
+después para investigar una fila rara, y una envoltura en memoria no.
+
+`cfg={"merged_from": ..., "adapter": ...}` deja escrito dentro del fichero de dónde salió. Sin eso,
+`artifacts/eval/merged/lora-e4.pt` es un checkpoint anónimo de 150 MB del que nadie sabe nada dentro
+de un mes.
+
+La procedencia se arrastra entera: `vocab_hash`, `data_manifest_sha` y `git_sha` se copian del `base`
+en vez de recalcularse o dejarse vacíos. El modelo fundido se entrenó con los mismos datos y el mismo
+vocabulario que su base, y perder esa cadena convertiría la fila en un número sin origen.
+
+## Dónde está cada cosa
+
+```python title="src/rukh/eval/nightly.py"
+def _checkpoint_of(artefact: Artefact, pull_missing: bool) -> Path:
+    """Where the artefact is on disk, pulling it from the Hub when it is not and allowed."""
+    if artefact.measure == "karvonen":
+        from rukh.eval.karvonen import ensure_karvonen
+
+        return ensure_karvonen(download=pull_missing)
+    target = resolve_run(paths.resolve(artefact.target))
+    if not target.exists() and pull_missing:
+        target = pull(artefact)
+    if not target.exists():
+        raise FileNotFoundError(
+            f"{artefact.name}: {target} is not on disk (rukh pull {artefact.name})"
+        )
+    if artefact.base is not None:
+        base = resolve_run(paths.resolve(artefact.base))
+        if not base.exists() and pull_missing:
+            from rukh.hub import lookup
+
+            base = pull(lookup("medium-v4"))
+        if not base.exists():
+            raise FileNotFoundError(f"{artefact.name}: base {base} is not on disk")
+        return merged_checkpoint(base, target, paths.resolve(MERGED_DIR) / f"{artefact.name}.pt")
+    return target
+```
+
+<Src file="src/rukh/eval/nightly.py" tag="p6" lines="152-174" />
+
+Tres caminos en una función, y el orden en que se prueban importa.
+
+El baseline sale primero porque **no se descarga como los nuestros**: su función propia,
+`ensure_karvonen`, sabe de qué repositorio ajeno viene y de dónde sale su `meta.pkl`. Es el mismo
+aislamiento de antes, aquí en forma de rama temprana.
+
+`resolve_run` envuelve la ruta del catálogo. Es la función de la lección 6 que convierte
+`checkpoints/medium-v4/best.pt` en el `medium-v4-20260919-174623/best.pt` que tiene quien entrenó el
+modelo en vez de descargarlo. Se aplica **antes** de decidir si hay que descargar, y ese orden es la
+decisión: un lector que entrenó `tiny` él mismo no vuelve a bajarlo del Hub.
+
+El mensaje del `FileNotFoundError` lleva dentro la orden que lo arregla: `rukh pull {name}`. Un error
+que se produce en el minuto 40 de una tirada de tres horas y que el lector va a leer al día siguiente
+en un JSON tiene que decir qué hacer, no solo qué pasó.
+
+La rama de `artefact.base` es la del adaptador. Y ahí hay un detalle que no se sostendría en un
+proyecto más grande: si la base no está, se descarga **`medium-v4`** por su nombre literal, aunque
+`artefact.base` apunte a otra cosa. Para los dos adaptadores del catálogo es correcto —los dos van
+sobre `medium-v4`—, y aun así es el tipo de atajo que hay que ver escrito, porque el día que haya un
+adaptador sobre `small-v3` esta línea traerá el modelo equivocado y la fila medirá otra cosa sin
+fallar.
+
+## El bucle
+
+```python title="src/rukh/eval/nightly.py"
+def run_nightly(
+    config: Path | None = None,
+    encoder_config: Path | None = None,
+    only: set[str] | None = None,
+    dry_run: bool = False,
+    pull_missing: bool = True,
+    use_cache: bool = True,
+    device: str | None = None,
+    results: Path | None = None,
+    benchmarks: Path | None = None,
+    out: Path | None = None,
+) -> NightlyReport:
+    """Measure every catalogued stage under one config and rewrite the table around them."""
+    from rukh.eval.cache import file_sha, weights_sha
+    from rukh.eval.report import write_benchmarks
+
+    started = time.perf_counter()
+    records: list[NightlyRecord] = []
+    for artefact in plan(only):
+        record = NightlyRecord(
+            name=artefact.name, stage=artefact.stage or artefact.name, measure=artefact.measure
+        )
+        records.append(record)
+        if dry_run:
+            record.checkpoint = paths.resolve(artefact.target).as_posix()
+            continue
+        tick = time.perf_counter()
+        try:
+            checkpoint = _checkpoint_of(artefact, pull_missing)
+            record.checkpoint = checkpoint.as_posix()
+            if checkpoint.is_file():
+                record.model_sha = file_sha(checkpoint)
+                record.weights_sha = weights_sha(checkpoint)
+            log.info("nightly: %s as %s from %s", artefact.name, record.stage, checkpoint)
+            if artefact.measure == "decoder":
+                _run_decoder(checkpoint, config, record.stage, use_cache, device)
+            elif artefact.measure == "encoder":
+                _run_encoder(checkpoint, encoder_config, record.stage, use_cache, device)
+            elif artefact.measure == "qwen":
+                _run_qwen(checkpoint, config, record.stage, use_cache, device)
+            elif artefact.measure == "karvonen":
+                _run_karvonen(checkpoint, config, record.stage, use_cache, device)
+            record.status = "measured"
+        except Exception as exc:  # noqa: BLE001 - one stage failing must not lose the others
+            log.exception("nightly: %s failed", artefact.name)
+            record.status = "failed"
+            record.detail = f"{type(exc).__name__}: {exc}"
+        record.seconds = round(time.perf_counter() - tick, 1)
+```
+
+<Src file="src/rukh/eval/nightly.py" tag="p6" lines="177-224" />
+
+**`records.append(record)` antes del `try`.** El registro entra en la lista en cuanto se crea, con
+estado `planned`, y las ramas de abajo lo mutan. Así ninguna salida —ni una excepción, ni un `continue`
+de `--dry-run`— puede producir un informe al que le falte una etapa. Un `append` al final del cuerpo
+sería más habitual y perdería exactamente las filas que más interesan.
+
+**El `except Exception` con su `noqa`, y es el correcto aquí.** Una tirada de tres horas con doce
+etapas no puede morir porque la novena tenga un problema; lo que tiene que hacer es apuntar el fallo
+en su fila y seguir. La política general del proyecto —capturar solo lo que se espera— cede ante una
+propiedad que se compra a cambio: **el trabajo de las otras once no se pierde**. Y no se traga nada:
+`log.exception` deja la traza entera en la salida, y `detail` guarda el tipo y el mensaje en el JSON.
+
+Esa rama se ejecutó de verdad en el hito. El baseline de Karvonen falló en la primera tirada con
+`ValueError: … holds no model_state to hash`, porque su checkpoint guarda los tensores bajo `model` y
+no bajo `model_state`. Sin esta captura, las once etapas ya medidas —dos horas y media de motor— se
+habrían perdido con él.
+
+**El hash se calcula solo si el objetivo es un fichero.** El Qwen3 afinado es un directorio de
+adaptador, no un `.pt`, y `file_sha` sobre un directorio fallaría. Un `if` en vez de una excepción
+capturada, porque esto no es un error: es una etapa que no tiene un fichero único que hashear.
+
+**Los segundos se miden por etapa y se redondean a una décima.** Es lo que convierte
+`nightly.json` en un presupuesto: al leerlo se ve que el encoder tarda siete segundos y cada decoder
+catorce minutos, y de ahí sale la decisión de qué se puede relanzar y qué no.
+
+```python title="src/rukh/eval/nightly.py"
+    results_path = results or paths.resolve("artifacts/web/results.json")
+    benchmarks_path: Path | None = None
+    if not dry_run and results_path.is_file():
+        benchmarks_path = benchmarks or paths.resolve(BENCHMARKS_FILE)
+        if benchmarks_path.is_file():
+            write_benchmarks(results_path, benchmarks_path)
+        else:
+            benchmarks_path = None
+    report = NightlyReport(
+        date=datetime.now(UTC).date().isoformat(),
+        config=(config or Path("configs/eval/full.yaml")).as_posix(),
+        encoder_config=encoder_config.as_posix() if encoder_config else None,
+        records=records,
+        results=results_path.as_posix(),
+        benchmarks=benchmarks_path.as_posix() if benchmarks_path else None,
+        seconds=round(time.perf_counter() - started, 1),
+    )
+    if not dry_run:
+        target = out or paths.resolve(NIGHTLY_FILE)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8", newline="\n")
+    return report
+```
+
+<Src file="src/rukh/eval/nightly.py" tag="p6" lines="226-247" />
+
+`docs/benchmarks.md` se reescribe **solo si ya existe**, y si no, `benchmarks_path` vuelve a `None` y
+el informe lo dice (`benchmarks: not rewritten`). Crear el fichero sería más servicial y sería peor:
+ese documento tiene una cabecera escrita a mano y una sección marcada donde va la tabla, y un
+`write_benchmarks` sobre un fichero inexistente produciría un documento sin nada alrededor de la
+tabla. Negarse y decirlo es la conducta correcta de una herramienta que edita un fichero de otro.
+
+`newline="\n"` en la escritura, en Windows. Sin eso, `write_text` traduce los saltos a CRLF y el JSON
+cambia de bytes en cada máquina, lo que ensucia el `git diff` de cada tirada sin que nada haya
+cambiado.
+
+```python title="src/rukh/eval/nightly.py"
+def render_plan(report: NightlyReport) -> str:
+    """One line per stage, for the terminal."""
+    lines = [f"{'stage':<32}{'measure':<9}{'status':<10}{'seconds':>8}  checkpoint"]
+    for record in report.records:
+        lines.append(
+            f"{record.stage:<32}{record.measure:<9}{record.status:<10}{record.seconds:>8.1f}  "
+            f"{record.checkpoint or '-'}" + (f"  ({record.detail})" if record.detail else "")
+        )
+    return "\n".join(lines)
+```
+
+<Src file="src/rukh/eval/nightly.py" tag="p6" lines="250-258" />
+
+Una función aparte para la salida legible, separada del objeto que se serializa. Es la misma regla de
+M0: el informe JSON es para los scripts y la salida alineada es para ti, y como salen del mismo
+objeto no pueden decir cosas distintas.
+
+El detalle del fallo se imprime **en la misma línea de la etapa**, entre paréntesis. Doce líneas con
+una de ellas acabando en `(ValueError: … holds no model_state to hash)` es una salida que se lee de
+una pasada; un bloque de errores al final obliga a cruzar dos listas.
+
+## La marca de «externo» en el documento
+
+`docs/benchmarks.md` se renderiza desde la tabla entera, y este hito le añadió una sola cosa: que se
+vea qué filas no son nuestras.
+
+```python title="src/rukh/eval/report.py"
+    for row in playing:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    f"`{row.get('stage')}`" + (" (externo)" if row.get("baseline") else ""),
+                    _percent(row.get("legality")),
+                    _percent(row.get("top1")),
+                    _percent(row.get("top3")),
+                    _band(row, "puzzles", "1000-1500"),
+                    _band(row, "puzzles", "1500-2000"),
+                    _band(row, "puzzles", "2000+"),
+                    _elo_cell(row),
+                    "n/a" if row.get("delta_cp") is None else f"{row['delta_cp']:.1f}",
+                    "n/a"
+                    if row.get("first_move_entropy") is None
+                    else f"{row['first_move_entropy']:.4f}",
+                    str(row.get("date") or ""),
+                ]
+            )
+            + " |"
+        )
+```
+
+<Src file="src/rukh/eval/report.py" tag="p6" lines="320-341" />
+
+La marca va **pegada al nombre de la etapa** y no en una columna propia. Con once columnas ya, una
+doceava con un booleano ocuparía tanto como la información que da; y sobre todo, la marca tiene que
+viajar con el nombre cuando alguien copie una fila a otro sitio.
+
+`row.get('baseline')` y no `row['baseline']`: las filas que P2 a P5 escribieron no tienen la clave, y
+`get` devuelve `None`, que es falso. La misma compatibilidad hacia atrás que el campo con valor por
+defecto, aquí en el renderizador.
+
+```python title="src/rukh/eval/report.py"
+    lines.append("")
+    external = sum(1 for row in playing if row.get("baseline"))
+    lines.append(
+        f"{len(playing)} etapas medidas con la misma suite"
+        + (
+            f", {external} de ellas externas (modelos de otros autores, marcados como "
+            "`(externo)`, medidos con este mismo harness como control)"
+            if external
+            else ""
+        )
+        + ". Las filas del encoder viven aparte porque no comparten una sola columna con "
+        "estas; las que una medición retiró no están (`rukh eval drop`)."
+    )
+```
+
+<Src file="src/rukh/eval/report.py" tag="p6" lines="342-354" />
+
+El pie explica la marca donde está la marca. Y la frase sobre las externas solo aparece si hay alguna:
+un documento que dice «0 de ellas externas» obliga al lector a procesar una negación para no aprender
+nada.
+
+Esta es también la única parte del código de `rukh` escrita en español, porque es el texto que se
+publica en `docs/benchmarks.md` y ese documento se lee en español. El resto del repositorio —nombres,
+docstrings, comentarios— está en inglés.
+
+## La orden
+
+```python title="src/rukh/cli.py"
+@eval_app.command("nightly")
+def eval_nightly_cmd(
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config",
+            exists=True,
+            dir_okay=False,
+            help="Suite YAML every decoder is measured with (default: configs/eval/greedy.yaml).",
+        ),
+    ] = None,
+    encoder_config: Annotated[
+        Path | None,
+        typer.Option("--encoder-config", exists=True, dir_okay=False, help="Encoder suite YAML."),
+    ] = None,
+    only: Annotated[
+        str | None, typer.Option("--only", help="Comma-separated names or stages to measure.")
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="List what would be measured and exit.")
+    ] = False,
+    no_pull: Annotated[
+        bool, typer.Option("--no-pull", help="Never download; a missing checkpoint fails.")
+    ] = False,
+    no_cache: Annotated[bool, typer.Option("--no-cache", help="Replay every game.")] = False,
+    device: Annotated[str | None, typer.Option("--device", help="Where to run.")] = None,
+) -> None:
+    """Measure every published stage under one config and rewrite the whole table.
+
+    The catalogue of `rukh pull` says which stage each model is and how it is measured; what the
+    caches hold is not replayed, so a nightly after a nightly costs minutes. `artifacts/eval/
+    nightly.json` records what came from where, with which sha, and how long it took.
+    """
+    from rukh.eval.nightly import render_plan, run_nightly
+    from rukh.paths import resolve
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    wanted = {part.strip() for part in (only or "").split(",") if part.strip()} or None
+    report = run_nightly(
+        config=config or resolve("configs/eval/greedy.yaml"),
+        encoder_config=encoder_config,
+        only=wanted,
+        dry_run=dry_run,
+        pull_missing=not no_pull,
+        use_cache=not no_cache,
+        device=device,
+    )
+    typer.echo(render_plan(report))
+    if not dry_run:
+        typer.echo(f"results:    {report.results}")
+        typer.echo(f"benchmarks: {report.benchmarks or 'not rewritten'}")
+        typer.echo(f"seconds:    {report.seconds:.0f}")
+    if any(record.status == "failed" for record in report.records):
+        raise typer.Exit(code=1)
+```
+
+<Src file="src/rukh/cli.py" tag="p6" lines="862-915" />
+
+La configuración por defecto es `greedy.yaml` y no `full.yaml`: todas las filas de decoder de la tabla
+se miden a temperatura 0,05 y `top_k` 1, porque son las que se comparan entre sí. El nombre de la
+etapa lleva el sufijo `-greedy` por eso mismo.
+
+`--only` se escribe separado por comas y se convierte aquí en un conjunto, con `strip()` por elemento
+y descartando los vacíos. Es una comodidad que evita que `--only "tiny, rm"` —con el espacio que
+cualquiera escribe— no encuentre `rm`.
+
+**La orden sale con código 1 si alguna etapa falló.** Eso la hace utilizable desde un script o una
+tarea programada sin leer la salida: quien la lance sabe si la tabla está completa. Y aun así escribe
+`results.json`, `benchmarks.md` y `nightly.json` con lo que sí midió, porque las once filas buenas son
+mejores que ninguna.
+
+Los tres `typer.echo` finales solo aparecen fuera del `--dry-run`: en seco no hay resultados que
+anunciar ni segundos que valga la pena contar.
+
+## Los tests: el catálogo manda, y el informe lo cuenta
+
+```python title="tests/unit/test_nightly.py"
+"""Tests for rukh.eval.nightly: the catalogue drives the run, and the run says what it did."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+import torch
+from typer.testing import CliRunner
+
+from rukh.cli import app
+from rukh.eval import nightly
+from rukh.hub import catalogue
+from rukh.models import DecoderConfig, MoveDecoder
+from rukh.train import load_model, save_checkpoint
+
+pytestmark = pytest.mark.unit
+
+TOY = DecoderConfig(vocab_size=64, n_layer=1, n_head=2, d_model=16, block=32)
+
+
+def test_every_published_model_the_table_cites_is_in_the_plan() -> None:
+    """The stages of `docs/benchmarks.md` that a reader can pull are all measured by nightly."""
+    stages = {a.stage for a in nightly.plan()}
+    assert stages >= {
+        "tiny-greedy",
+        "small-v3-greedy",
+        "medium-v4-greedy",
+        "medium-elo",
+        "medium-masters",
+        "lora-e4",
+        "lora-d4",
+        "qwen3-pgn-qlora",
+        "medium-v4-dpo-onpolicy-greedy",
+        "medium-v4-grpo-greedy",
+        "encoder-v4",
+    }
+    # Nothing without a way to measure it: datasets, the reward model, the pretraining encoder.
+    assert all(a.measure != "none" for a in nightly.plan())
+    assert {a.name for a in catalogue() if a.measure == "none"} >= {"rm", "encoder-mmm-v4"}
+    assert [a.name for a in nightly.plan({"tiny", "encoder-v4"})] == ["tiny", "encoder-v4"]
+    assert [a.stage for a in nightly.plan({"medium-elo"})] == ["medium-elo"]
+```
+
+<Src file="tests/unit/test_nightly.py" tag="p6" lines="1-43" />
+
+Este primer test es el que impide la laguna más fácil de este módulo: que un modelo publicado se
+quede sin fila. La aserción es `>=` y no `==` a propósito, para que añadir una etapa nueva no rompa
+el test; lo que se prohíbe es **quitar** una.
+
+Las dos últimas líneas comprueban que `--only` acepta las dos formas, el nombre y la etapa, que es la
+comodidad de antes convertida en contrato.
+
+```python title="tests/unit/test_nightly.py"
+def _toy(path: Path, seed: int = 0) -> Path:
+    torch.manual_seed(seed)
+    return save_checkpoint(
+        path, step=1, model=MoveDecoder(TOY), optimizer=None, cfg={}, model_cfg=TOY.model_dump()
+    )
+
+
+def test_a_dry_run_lists_the_plan_and_writes_nothing(rukh_home: Path) -> None:
+    report = nightly.run_nightly(dry_run=True, only={"tiny", "encoder-v4"})
+    assert [r.status for r in report.records] == ["planned", "planned"]
+    assert not (rukh_home / "artifacts" / "eval" / "nightly.json").exists()
+    assert nightly.render_plan(report).count("planned") == 2
+```
+
+<Src file="tests/unit/test_nightly.py" tag="p6" lines="46-57" />
+
+«No escribe nada» se comprueba mirando que el fichero **no existe**, no que no ha cambiado. Es la
+diferencia entre un `--dry-run` de verdad y uno que reescribe el mismo contenido.
+
+```python title="tests/unit/test_nightly.py"
+def test_the_run_measures_in_catalogue_order_and_records_what_it_did(
+    rukh_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    measured: list[tuple[str, str]] = []
+
+    def fake_decoder(checkpoint, config, stage, use_cache, device):  # noqa: ANN001
+        measured.append((stage, Path(checkpoint).name))
+        return None
+
+    def fake_encoder(checkpoint, config, stage, use_cache, device):  # noqa: ANN001
+        measured.append((stage, Path(checkpoint).name))
+        return None
+
+    monkeypatch.setattr(nightly, "_run_decoder", fake_decoder)
+    monkeypatch.setattr(nightly, "_run_encoder", fake_encoder)
+    monkeypatch.setattr(
+        nightly, "_run_qwen", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no gpu"))
+    )
+    # `tiny` under its stamped run folder: the stable name resolves to it.
+    _toy(rukh_home / "checkpoints" / "tiny-20260919-060101" / "best.pt")
+    _toy(rukh_home / "checkpoints" / "encoder-heads-v4" / "step-4000.pt")
+    (rukh_home / "checkpoints" / "qwen3-pgn-qlora").mkdir(parents=True)
+    results = rukh_home / "artifacts" / "web" / "results.json"
+    results.parent.mkdir(parents=True)
+    results.write_text(json.dumps({"rows": [{"stage": "kept", "params": 1}]}), encoding="utf-8")
+    benchmarks = rukh_home / "docs" / "benchmarks.md"
+    benchmarks.parent.mkdir(parents=True)
+    benchmarks.write_text("# B\n\ntexto\n\n## Resultados\n\nold\n", encoding="utf-8")
+
+    report = nightly.run_nightly(
+        only={"tiny", "encoder-v4", "qwen3-pgn-qlora", "medium-v4"},
+        pull_missing=False,
+        results=results,
+        benchmarks=benchmarks,
+    )
+    assert measured == [("tiny-greedy", "best.pt"), ("encoder-v4", "step-4000.pt")]
+    by_name = {r.name: r for r in report.records}
+    assert by_name["tiny"].status == "measured" and by_name["tiny"].model_sha
+    assert by_name["tiny"].checkpoint.endswith("tiny-20260919-060101/best.pt")
+    assert by_name["qwen3-pgn-qlora"].status == "failed"
+    assert "no gpu" in (by_name["qwen3-pgn-qlora"].detail or "")
+    # A model that is not on disk and may not be pulled fails on its own, not the run.
+    assert by_name["medium-v4"].status == "failed"
+    assert "rukh pull medium-v4" in (by_name["medium-v4"].detail or "")
+    # The rows nightly did not measure are untouched; the benchmarks doc was rewritten.
+    assert json.loads(results.read_text(encoding="utf-8"))["rows"] == [
+        {"stage": "kept", "params": 1}
+    ]
+    assert "texto" in benchmarks.read_text(encoding="utf-8")
+    assert "old" not in benchmarks.read_text(encoding="utf-8")
+    written = json.loads((rukh_home / "artifacts" / "eval" / "nightly.json").read_text("utf-8"))
+    assert [r["name"] for r in written["records"]] == [
+        "tiny",
+        "medium-v4",
+        "encoder-v4",
+        "qwen3-pgn-qlora",
+    ]
+```
+
+<Src file="tests/unit/test_nightly.py" tag="p6" lines="60-116" />
+
+Es el test más largo del fichero y comprueba **seis** propiedades a la vez, lo cual normalmente sería
+un defecto. Aquí no: todas son propiedades de la misma ejecución, y separarlas obligaría a repetir el
+montaje seis veces y perdería lo importante, que es que ocurren **juntas**.
+
+Las seis, en orden: que solo se midieron las etapas medibles y en orden de catálogo; que `tiny` se
+resolvió a su carpeta con marca de tiempo (que es lo que hace `resolve_run`); que un fallo de la
+suite se apunta con su mensaje y no mata la tirada; que un modelo que no está y no se puede descargar
+falla él solo con la orden que lo arregla; que las filas que el nightly no midió **siguen ahí**; y que
+la sección marcada de `benchmarks.md` se reescribió sin tocar el texto de alrededor.
+
+Esa quinta es la que más se agradece en la práctica y la más fácil de romper: la fila `kept` sigue
+intacta después de una tirada que no la midió. Sin ella, un `--only` destruiría la tabla.
+
+El `(_ for _ in ()).throw(...)` es el truco para lanzar una excepción desde una lambda. Es feo, y aquí
+es lo que evita escribir una tercera función falsa de tres líneas para un caso de una.
+
+```python title="tests/unit/test_nightly.py"
+def test_an_adapter_is_merged_onto_its_base_before_it_is_measured(
+    rukh_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rukh.models.lora import LoraConfig, apply_lora, save_adapter
+
+    base = _toy(rukh_home / "checkpoints" / "medium-v4" / "best.pt")
+    torch.manual_seed(1)
+    model = MoveDecoder(TOY)
+    model.load_state_dict(load_model(base)[0].state_dict())
+    apply_lora(model, LoraConfig(r=2, alpha=4, targets=["q", "v"]))
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if ".b." in name:
+                parameter.add_(0.5)
+    adapter_dir = rukh_home / "checkpoints" / "lora-e4"
+    adapter_dir.mkdir(parents=True)
+    save_adapter(
+        model, adapter_dir / "adapter.safetensors", LoraConfig(r=2, alpha=4, targets=["q", "v"])
+    )
+
+    seen: dict[str, Path] = {}
+    monkeypatch.setattr(
+        nightly, "_run_decoder", lambda ckpt, *a, **k: seen.__setitem__("ckpt", Path(ckpt))
+    )
+    report = nightly.run_nightly(only={"lora-e4"}, pull_missing=False)
+    assert report.records[0].status == "measured"
+    merged, payload = load_model(seen["ckpt"])
+    assert payload["cfg"]["adapter"].endswith("lora-e4")
+    plain, _ = load_model(base)
+    # The merged weights differ from the base exactly where the adapter pushed.
+    assert not torch.equal(merged.blocks[0].attn.qkv.weight, plain.blocks[0].attn.qkv.weight)
+    assert not any(".lora" in k or ".a." in k for k in merged.state_dict())
+```
+
+<Src file="tests/unit/test_nightly.py" tag="p6" lines="119-150" />
+
+El `parameter.add_(0.5)` sobre las matrices `b` es lo que hace el test significativo. LoRA inicializa
+`B` a ceros, así que un adaptador recién creado **no cambia nada** al fundirse, y un test sobre él
+pasaría con una implementación de `merge_lora` que no hiciera absolutamente nada. Empujar los
+factores antes de guardarlos convierte la aserción `not torch.equal(...)` en una comprobación de
+verdad.
+
+La última línea es la otra mitad: el checkpoint fundido no conserva ninguna clave de LoRA. Es lo que
+garantiza que la suite abra un decoder normal y no una envoltura.
+
+```python title="tests/unit/test_nightly.py"
+def test_the_cli_dry_run_prints_the_plan(rukh_home: Path) -> None:
+    result = CliRunner().invoke(app, ["eval", "nightly", "--dry-run", "--only", "tiny,rm"])
+    assert result.exit_code == 0, result.output
+    assert "tiny-greedy" in result.output and "planned" in result.output
+    assert "rm" not in result.output.replace("tiny-greedy", "")
+```
+
+<Src file="tests/unit/test_nightly.py" tag="p6" lines="153-157" />
+
+`--only tiny,rm` pide dos cosas y solo una es medible. La última aserción comprueba que `rm` **no**
+sale, con el `replace` para que la subcadena «rm» dentro de otra palabra no dé un falso positivo. Es
+el contrato de `measure != "none"` visto desde la terminal.
+
+<Exercise n="01" title="Una etapa nueva en la tabla">
+  Supón que M7 publica `medium-v5`. Enumera qué hay que tocar para que salga en la tabla del
+  nightly, y qué pasa si te olvidas de cada cosa.
+
+  <Solution>
+    Solo una: la entrada del catálogo en `rukh.hub`, con su `target`, su `stage` y su `measure`. Si
+    falta la entrada, el modelo no se mide y el primer test del fichero no lo detecta, porque su
+    aserción es `>=`. Si está la entrada pero sin `stage`, la fila sale con el nombre del artefacto y
+    la tabla deja de decir con qué muestreo se midió. Si está con `measure: "none"`, se publica y no
+    se mide, que es exactamente lo que se quiere para un dataset y nunca para un modelo. Ese es el
+    precio de que el catálogo mande: una sola cosa que tocar, y ninguna red que avise si no la tocas.
+  </Solution>
+</Exercise>
+
+<Exercise n="02" title="El fallo que no se debe capturar">
+  El `except Exception` del bucle captura todo. Piensa en un caso en el que eso sea lo peor que puede
+  pasar, y en qué lo convertiría en un problema real y no en una molestia.
+
+  <Solution>
+    Un `KeyboardInterrupt` no entra ahí (hereda de `BaseException`, no de `Exception`), así que
+    cortar con Ctrl+C sigue funcionando. El caso malo es un error sistemático: si Stockfish no está
+    instalado, **las doce** etapas fallan una detrás de otra, cada una gastando su descarga y su carga
+    de modelo, y la tirada tarda veinte minutos en decir doce veces lo mismo. Se vuelve un problema
+    real cuando eso ocurre de noche sin nadie delante. El remedio que el fichero no tiene es una
+    parada temprana: dos fallos consecutivos con el mismo tipo de excepción podrían abortar. Está sin
+    escribir a propósito, porque hasta ahora los fallos han sido de una etapa.
+  </Solution>
+</Exercise>
+
+## Qué has aprendido
+
+Un orquestador de evaluación es, casi todo él, decisiones sobre **qué hacer cuando algo va mal**. El
+bucle en sí son veinte líneas; el resto es dónde vive la lista, cómo se resuelve una ruta que puede
+estar en dos sitios, qué se hace con un adaptador que no es un modelo, qué se escribe cuando una etapa
+falla y qué se deja intacto de lo que ya había.
+
+Tres cosas se llevan fuera del ajedrez. Que la lista de lo que se procesa se defina por el
+**propósito** —lo que el proyecto publica— y no por el tipo, para que un consumidor nuevo no pueda
+equivocarse por omisión. Que un error de un elemento se apunte y no pare el lote, con la traza
+completa en el registro. Y que el artefacto que importa no es la tabla: es el fichero que dice cómo se
+hizo la tabla.
+
+La lección siguiente construye la lista de la que este comando tira, y convierte cada fila en una card
+publicada.

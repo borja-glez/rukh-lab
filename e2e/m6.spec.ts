@@ -8,8 +8,8 @@ import { expect, test } from '@playwright/test';
  * lesson would mean the sync was skipped: this spec insists on real numbers.
  */
 const THEORY = '/curso/m6/01-evaluar/';
-const RESULTS = '/curso/m6/02-lo-que-salio/';
-const LABS = '/curso/m6/03-labs-de-cierre/';
+const RESULTS = '/curso/m6/08-lo-que-salio/';
+const LABS = '/curso/m6/09-labs-de-cierre/';
 
 test.describe('lesson M6, the table and its measured figures', () => {
   test('the three parts chain in order, and the labs part closes with the cheatsheet', async ({

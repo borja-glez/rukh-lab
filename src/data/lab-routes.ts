@@ -376,7 +376,7 @@ export const labRoutes: Record<string, LabRoute[]> = {
       gives: 'las filas de la tabla y los repos del Hub',
     },
   ],
-  'm6/03-labs-de-cierre': [
+  'm6/09-labs-de-cierre': [
     {
       lab: 'Lab 1',
       what: 'El suelo del instrumento, medido cuatro veces',

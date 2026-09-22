@@ -1,0 +1,1347 @@
+---
+title: 'Evaluar: los labs de cierre'
+description:
+  'Siete labs con sus comandos, en el orden en que se hicieron: el suelo del instrumento medido
+  cuatro veces, la tabla entera con un comando, lo que cuesta el int8 en Elo, las cards y la
+  colección regeneradas desde la tabla, la arena y los puzles en la demo, y el cierre de la fase.'
+module: m6
+order: 9
+duration: 125
+runtime: 310
+level: medio
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - evaluación
+  - nightly
+  - tabla única
+  - límite por nodos
+  - paridad
+  - cuantización
+  - model card
+  - colección
+  - arena
+  - puzles
+  - baseline
+  - reproducibilidad
+artifacts:
+  - kind: report
+    label: Tabla única de resultados
+demo: ?mode=arena
+---
+
+Lección 9 de 9 del módulo «Evaluar, exportar, publicar». Cierra el módulo y la primera fase del
+curso: los siete labs con sus comandos y sus salidas, los cuatro scripts de `labs/m6` enteros, y el
+balance de lo que la fase 1 dejó hecho y lo que no.
+
+## Labs
+
+Siete laboratorios, en el orden en que se hicieron. Ninguno entrena nada. Los dos primeros miden el
+instrumento antes de fiarse de él; el tercero reconstruye la tabla entera con un comando; el cuarto
+responde a la pregunta que M2 dejó abierta; los tres últimos ponen la tabla donde la gente la va a
+leer: en cada card, en la colección y en la demo.
+
+<Callout kind="hoy" title="Punto de partida, si te saltaste algo">
+  Este módulo mide lo que los cinco anteriores dejaron en el Hub. `uv run rukh pull --module m6`
+  trae los doce modelos a las rutas que leen las configs, más las partidas, los puzles y las
+  posiciones de la suite. Hace falta Stockfish (`scripts/get_stockfish.py`). Los comandos son los
+  que se ejecutaron y los tiempos, los de una RTX 5090 con la máquina tranquila; el mapa entero está
+  en `docs/reproducir.md`, sección M6.
+</Callout>
+
+<LabRoutes lesson="m6/09-labs-de-cierre" />
+
+### Lab 1 · El suelo del instrumento, medido cuatro veces
+
+D-107 dejó una hipótesis: la escalera no repite porque el rival juega por tiempo. La forma de
+comprobarla es medir el mismo modelo, con la misma semilla, dos veces por tiempo y dos veces con un
+presupuesto de nodos, y mirar cuánto se separan las dos tiradas de cada régimen. Antes, el
+presupuesto: a 0,1 s por jugada Stockfish explora unos 200 000 nodos en esta máquina, así que
+`elo_nodes: 200000` es el mismo rival en fuerza y otro en comportamiento. Es la diferencia entre
+un examen con tiempo fijo y uno con preguntas fijas: con una hora de reloj, cuántas preguntas
+contestas depende de si el de al lado tose; con veinte preguntas, contestas veinte tarde lo que
+tarde. El rival por nodos contesta siempre sus 200 000 preguntas.
+
+```bash
+uv run rukh eval --model checkpoints/medium-v4/best.pt --config configs/eval/ladder-time.yaml --stage ladder-time-a --no-cache
+uv run rukh eval --model checkpoints/medium-v4/best.pt --config configs/eval/ladder-time.yaml --stage ladder-time-b --no-cache
+uv run rukh eval --model checkpoints/medium-v4/best.pt --config configs/eval/ladder-nodes.yaml --stage ladder-nodes-a --no-cache
+uv run rukh eval --model checkpoints/medium-v4/best.pt --config configs/eval/ladder-nodes.yaml --stage ladder-nodes-b --no-cache
+uv run python labs/m6/ladder_floor_export.py --decision time
+```
+
+Las cuatro tiradas, con 160 partidas cada una y quince minutos de máquina parada entre ellas:
+
+| Tirada           | Límite        | Elo (IC 95 %)    |
+| ---------------- | ------------- | ---------------- |
+| `ladder-time-a`  | 0,1 s         | 1538 (1476-1599) |
+| `ladder-time-b`  | 0,1 s         | 1538 (1486-1594) |
+| `ladder-nodes-a` | 200 000 nodos | 1541 (1485-1596) |
+| `ladder-nodes-b` | 200 000 nodos | 1524 (1457-1584) |
+
+Cero Elo de separación por tiempo, 17 por nodos, y las dos muy por debajo del semiancho del
+intervalo (±55). La hipótesis de D-107 era razonable y estaba mal: el presupuesto de nodos hace
+determinista la **búsqueda**, no al rival, porque `UCI_LimitStrength` aleatoriza a propósito para
+acertar el Elo pedido. Se ve peldaño a peldaño: las dos tiradas por tiempo dan el mismo 1538
+agregado con `uci-1500` a 0,45 y 0,625, y las dos por nodos se separan igual. Lo que D-107 vio,
+1498 frente a 1558, fue una tirada con la máquina cargada o mala suerte a 1,18 σ. Con la máquina
+tranquila, el reloj repite al nivel del ruido de muestreo.
+
+La decisión (D-137) es la que la regla del plan obligaba a tomar con el número delante: los nodos
+no estrechan el suelo, así que el rival sigue por tiempo y no se recalibra la escalera ni cambian
+de escala los Elo publicados. Lo que entra en el runbook es la condición: **nada más en la máquina
+mientras corre una escalera por tiempo**. `elo_nodes` se queda en la suite para quien mida en una
+máquina compartida, y es lo que usa el lab 3, donde el jugador mismo carga la CPU. La figura con
+las cuatro tiradas está en la lección 8.
+
+Y la calibración, motor contra motor, de los ocho peldaños por reloj: cada peldaño juega
+40 partidas contra el ancla `uci-1320` con colores alternados y una apertura aleatoria por pareja, y
+el script imprime el Elo que explica el marcador al lado de la etiqueta que la escalera lleva.
+
+```bash
+uv run python labs/m6/ladder_check.py --games 40
+```
+
+```text
+anchor uci-1320 (1320) · 40 games per rung · 0.1 s per move
+rung        label   score  measured         IC 95 %   delta
+skill-0      1381   0.588      1381    1276-1488         +0
+skill-1      1467   0.762      1523    1418-1669        +56
+uci-1500     1500   0.725      1488    1381-1621        -12
+skill-2      1589   0.762      1523    1418-1658        -66
+skill-3      1678   0.938      1790    1658-2520       +112
+uci-1800     1800   0.900      1702    1561-1956        -98
+uci-2000     2000   0.950      1832    1679-2520       -168
+2126 s
+control: uci-1500 should read about +180 over the anchor; if it does not, stop here.
+```
+
+El control pasa: `uci-1500` sale a +168 sobre el ancla, donde los autores de Stockfish lo ponen a
++180. Las siete etiquetas caen dentro del intervalo de su medición, así que la escalera de D-070 se
+sostiene; y los intervalos de los tres peldaños altos son enormes (hasta 2520) porque el ancla
+pierde casi todo contra ellos: 40 partidas contra un rival que gana el 95 % no dicen dónde está,
+solo que está lejos. Es la limitación estructural de calibrar con un solo ancla, y el motivo de que
+la escalera use ocho peldaños y no dos.
+
+<Exercise n="01" title="La escalera bajo carga: ¿se mueve el tiempo o los nodos?">
+  Corre `ladder-time-a` otra vez mientras compilas algo grande en la misma máquina. ¿Cuánto se mueve
+  el Elo? ¿Y si lo haces con `ladder-nodes.yaml`? Antes de mirar, escribe cuál de los dos esperas
+  que se mueva y en qué dirección.
+
+  <Solution>
+    Por tiempo, el rival explora menos nodos cuando la CPU está ocupada y juega peor: el Elo del
+    modelo **sube** sin que el modelo cambie (D-068 midió +13 Elo por carga de CPU en P3). Por nodos,
+    el rival juega exactamente las mismas jugadas ante las mismas posiciones, y lo único que cambia es
+    cuánto tarda la tirada. Es la diferencia entre un instrumento que mide el modelo y uno que mide el
+    modelo más lo que esté haciendo la máquina.
+  </Solution>
+</Exercise>
+
+### Lab 2 · La tabla entera con un comando
+
+Hasta aquí cada módulo había medido lo suyo, el día que lo cerró, con el harness de ese día. La
+tabla única exige otra cosa: todas las etapas, la misma suite, el mismo día. `rukh eval nightly`
+recorre el catálogo de `rukh pull`, trae lo que falte, fusiona cada adaptador LoRA sobre su base,
+mide lo que no está en caché y reescribe `artifacts/web/results.json` y `docs/benchmarks.md`.
+Primero el plan, que no mide nada:
+
+```bash
+uv run rukh eval nightly --dry-run
+```
+
+```text
+stage                           measure  status     seconds  checkpoint
+tiny-greedy                     decoder  planned        0.0  checkpoints/tiny/best.pt
+small-v3-greedy                 decoder  planned        0.0  checkpoints/small-v3/best.pt
+medium-v4-greedy                decoder  planned        0.0  checkpoints/medium-v4/best.pt
+encoder-v4                      encoder  planned        0.0  checkpoints/encoder-heads-v4/step-4000.pt
+medium-elo                      decoder  planned        0.0  checkpoints/medium-elo/step-3800.pt
+medium-masters                  decoder  planned        0.0  checkpoints/medium-masters/step-3800.pt
+lora-e4                         decoder  planned        0.0  checkpoints/lora-e4
+lora-d4                         decoder  planned        0.0  checkpoints/lora-d4
+qwen3-pgn-qlora                 qwen     planned        0.0  checkpoints/qwen3-pgn-qlora
+medium-v4-dpo-onpolicy-greedy   decoder  planned        0.0  checkpoints/medium-v4-dpo-onpolicy/dpo.pt
+medium-v4-grpo-greedy           decoder  planned        0.0  checkpoints/medium-v4-grpo/grpo.pt
+karvonen-8l                     karvonen planned        0.0  checkpoints/karvonen-8l/lichess_8layers_ckpt_no_optimizer.pt
+```
+
+Doce etapas: las nueve del proyecto que juegan, el encoder, y dos baselines que no entrenó nadie
+de aquí. El Qwen3 afinado de M4 ya estaba; el de Karvonen es nuevo y merece su párrafo. Es el
+nanoGPT de ajedrez de Adam Karvonen (8 capas, 25,7 M de parámetros, entrenado sobre 16 millones de
+partidas de Lichess en PGN carácter a carácter), reimplementado aquí sin depender de su repositorio
+y puesto en **la misma escalera** que el resto: mismo `play_rungs`, mismos peldaños, misma máscara
+de rescate, mismo criterio de puzles. Se le pregunta en su formato exacto (`;1.e4 e5 2.`) y con una
+regla más estricta que la de su propio harness, que reintenta hasta cinco veces con más temperatura
+ante una jugada ilegal; aquí se pregunta una vez y se cuenta.
+
+```bash
+uv run rukh eval nightly
+```
+
+```text
+stage                           measure  status     seconds
+tiny-greedy                     decoder  measured     698.1
+small-v3-greedy                 decoder  measured     825.3
+medium-v4-greedy                decoder  measured     866.4
+encoder-v4                      encoder  measured       7.1
+medium-elo                      decoder  measured     864.8
+medium-masters                  decoder  measured     872.7
+lora-e4                         decoder  measured     849.5
+lora-d4                         decoder  measured     913.6
+qwen3-pgn-qlora                 qwen     measured    2506.2
+medium-v4-dpo-onpolicy-greedy   decoder  measured     858.4
+medium-v4-grpo-greedy           decoder  measured     843.4
+karvonen-8l                     karvonen failed         0.1  (ValueError: … holds no model_state to hash)
+seconds:    10106
+```
+
+Dos horas y cuarenta y ocho minutos, unos catorce minutos por etapa de decoder (el encoder tarda
+siete segundos porque no juega), cuarenta y dos para Qwen, y un fallo: el checkpoint de Karvonen
+guarda sus tensores bajo `model` y no bajo `model_state`, y el hash de pesos de D-135 no lo sabía.
+Una línea después, `rukh eval nightly --only karvonen-8l` lo midió en quince minutos. Las dos
+filas que no estaban en el catálogo (`small` v1 y el DPO fuera de política) se volvieron a medir a
+mano el mismo día para que ninguna fila de decoder tuviera otra fecha: 1355 (1297-1420) y 1586
+(1530-1651).
+
+Las dos filas del encoder que llevaban el nombre de su carpeta de corrida (el backlog de P3 lo
+dejó anotado) se retiran con `rukh eval drop`, y la tabla que queda es la de la lección 8.
+
+<Exercise n="02" title="Qué invalida la caché del nightly">
+  Añade `force_header: true` a `configs/eval/greedy.yaml` —la cabecera de los puzles, que no afecta
+  a las partidas— y vuelve a lanzar el nightly con `--only tiny`. ¿Cuánto tarda? ¿Y si en vez de eso
+  cambias `elo_games`? Y una tercera: ¿qué pasa si escribes `puzzles_use_header: true`, que es el
+  nombre que esa misma opción tiene **dentro de la clave de caché**?
+
+  <Solution>
+    Con la clave de caché partida por familia (D-136), tocar la cabecera de los puzles invalida solo los
+    puzles y las partidas se leen de la caché: segundos de Stockfish, no minutos. Tocar `elo_games`
+    no invalida nada, porque el número de partidas no entra en ninguna de las dos claves (es el
+    arreglo del backlog de P4 que explica la [lección 2](/curso/m6/02-la-escalera-calibrada/)). Es
+    una fecha de caducidad por producto y no por nevera: que caduque la leche no obliga a tirar el
+    arroz. Antes de M6 la clave era una sola y cualquiera de los dos cambios volvía a jugarlo todo;
+    con doce etapas, eso era una tarde.
+
+    Y la tercera es la trampa: `puzzles_use_header` **no es una clave de configuración**. Es el
+    nombre con el que la opción viaja dentro del hash de la caché, que se conservó del nombre
+    antiguo para no invalidar los intentos ya pagados. Escribirla en el YAML da un error de
+    validación de pydantic antes de tocar la GPU, porque `EvalConfig` hereda `extra="forbid"` de
+    M0.
+
+  </Solution>
+</Exercise>
+
+#### Lo que escribe una evaluación, y por qué está partido en dos
+
+Una tirada deja dos ficheros por etapa y ninguno de los dos se escribe a mano:
+`artifacts/eval/<stage>/results.json`, que es la medición completa con todas sus partidas y sus
+conteos, y `report.md`, que es la lectura para personas. De los dos sale la fila de
+`artifacts/web/results.json` que llega a la tabla de esta web.
+
+Los tres objetos que hacen eso están mostrados enteros en las lecciones de código y no se repiten
+aquí:
+
+- `SuiteResult` y su campo `weights_sha` están en [la lección 2](/curso/m6/02-la-escalera-calibrada/),
+  con el hash de los tensores al lado del hash del fichero. Un `.pt` que sube al Hub no es byte a
+  byte el que se entrenó —se le quita el estado del optimizador—, así que un hash de fichero diría
+  que son dos modelos distintos.
+- `WebRow`, que es la fila de la tabla, y `render_benchmarks`, que la escribe en
+  `docs/benchmarks.md`, están en [la lección 4](/curso/m6/04-la-tabla-cada-noche/).
+- Las cards, que se generan desde esos dos ficheros y nunca se escriben a mano, están en
+  [la lección 5](/curso/m6/05-el-hub-y-las-cards/), con la sección «In the course» que cada una
+  lleva y la guarda que comprueba que la card habla del fichero que se midió.
+
+Tres propiedades de ese diseño son las que conviene tener en la cabeza mientras se lee la salida de
+los labs.
+
+**`results.json` y `report.md` salen del mismo objeto y no uno del otro.** Es lo que impide la
+divergencia clásica: un informe que dice una cosa y una tabla que dice otra porque alguien copió un
+número a mano.
+
+**Los campos que no se midieron son `None` y no `0.0`.** Es la misma regla de M3 con el `-100`: un
+cero es un valor y entra en la media; un hueco explícito es información, y llega a la card como un
+`n/a` escrito.
+
+**El muestreo viaja con el número.** Un Elo es del **par** modelo y muestreo, así que una fila sin
+la temperatura y el `top_k` con los que se midió no se puede comparar con ninguna otra. Es la razón
+de que las filas de la tabla lleven el sufijo `-greedy`.
+
+### Lab 3 · Lo que cuesta el int8, en Elo
+
+M2 midió la paridad de las exportaciones y dejó la pregunta abierta: un int8 que elige otra jugada
+una vez de cada veinte, ¿cuánto peor juega? La paridad no lo dice; hay que jugar. `OnnxDecoder`
+pone el grafo ONNX dentro del mismo `DecoderPlayer` que usa el checkpoint, así que las tres
+precisiones pasan por la misma máscara, el mismo muestreo y el mismo rescate. ONNX Runtime juega
+en CPU, y por eso este lab quiere el rival por nodos: por tiempo, un jugador más lento cambiaría
+también el lado del motor.
+
+```bash
+uv run python labs/m6/parity_cost.py --onnx artifacts/onnx/medium-v4 --config configs/eval/ladder-nodes.yaml
+```
+
+```text
+medium-v4 · 20 games per rung · 8 rungs · 200000 nodes
+
+fp32   parity  1.000  elo 1472 (1415-1527)  160 games  816 s
+fp16   parity  0.999  elo 1535 (1484-1600)  160 games  837 s
+int8   parity  0.951  elo 1524 (1467-1576)  160 games  813 s
+```
+
+| Precisión | Paridad | Elo (IC 95 %)    |
+| --------- | ------- | ---------------- |
+| fp32      | 100 %   | 1472 (1415-1527) |
+| fp16      | 99,9 %  | 1535 (1484-1600) |
+| int8      | 95,1 %  | 1524 (1467-1576) |
+
+El int8 no tiene un coste en Elo medible con 160 partidas: 1524 (1467-1576) frente a 1535
+(1484-1600) del fp16, con los intervalos casi superpuestos. Y la fila que enseña más es la del
+fp32, que es la misma red que el checkpoint y sale 60 puntos por debajo del fp16: no hay ningún
+mecanismo por el que un grafo con paridad del 100 % juegue peor que uno del 99,9 %; es el suelo del
+instrumento otra vez, con el rival por nodos, en la misma tarde. La pregunta que M2 dejó abierta se
+responde así: el 4,9 % de jugadas distintas del int8 cuesta menos de lo que la escalera puede ver
+con este presupuesto, y para verlo haría falta un enfrentamiento directo fp16 contra int8 de varios
+miles de partidas, que es el segundo ejercicio de este lab. La figura con las tres barras de
+paridad y los tres intervalos está en la lección 8.
+
+<Exercise n="03" title="Escribe contra qué juega quien entra desde el móvil">
+  La demo sirve int8 en móvil y fp16 en escritorio. Con la tabla de arriba delante, ¿qué le dirías a
+  alguien que juega en el móvil sobre contra qué está jugando? Escribe la frase que pondrías en la
+  interfaz.
+
+  <Solution>
+    La frase honesta nombra la etapa y su Elo con intervalo, no «el mismo modelo más pequeño». Si el
+    intervalo del int8 solapa con el del fp16, la frase puede decir que no se ha medido una
+    diferencia; si no solapa, tiene que decir cuánto. Lo que no puede decir es «95 % igual», porque
+    ese número mide la exportación y no la fuerza.
+  </Solution>
+</Exercise>
+
+<Exercise n="04" title="Diseña el enfrentamiento fp16 contra int8">
+  Diseña el enfrentamiento directo fp16 contra int8 antes de jugarlo. `rukh eval match` acepta hoy
+  checkpoints o ids del Hub, no grafos ONNX: ¿qué le falta? Y con `uv run python
+  labs/m5/games_needed_match.py --edges 11,25,50` delante, ¿cuántas partidas pagarías para ver la
+  diferencia que la escalera no ha visto?
+
+  <Solution>
+    El jugador ya existe: `OnnxDecoder` entra en el mismo `DecoderPlayer` que usa `parity_cost.py`,
+    así que lo que falta es que `--a` y `--b` acepten un directorio ONNX con su precisión. Sobre el
+    número: los 11 puntos que la escalera dejó entre fp16 e int8 piden 3 832 partidas por parejas; una
+    diferencia de 25 pide 741 y una de 50, las 185 de M5, porque el coste crece con el cuadrado de lo
+    que quieres ver. La decisión es cuál de las tres te importaría de verdad, y se toma antes de
+    pagar: jugar 200 partidas y leer «no hay diferencia» es leer el ruido, que es exactamente lo que
+    la escalera ya había hecho.
+  </Solution>
+</Exercise>
+
+### Lab 4 · Las cards y la colección, regeneradas desde la tabla
+
+Una card se escribe desde `run.json` y `results.json`; cuando la tabla cambia, todas las cards del
+proyecto están desactualizadas. Republicar 460 MB de pesos para cambiar un párrafo es la
+herramienta equivocada: `rukh publish cards` prepara cada repositorio igual que lo haría su propio
+publicador, en seco, y sube **solo** el `README.md`. Y cada card lleva ahora una sección «In the
+course» con la lección que la construyó, la fila de la tabla, la demo y el comando `rukh pull` que
+la trae.
+
+```bash
+uv run rukh publish cards --dry-run
+```
+
+```text
+chorcat/rukh-tiny                  staged    artifacts/publish/chorcat/rukh-tiny/README.md
+chorcat/rukh-small                 staged    artifacts/publish/chorcat/rukh-small/README.md
+chorcat/rukh-medium                staged    artifacts/publish/chorcat/rukh-medium/README.md
+…
+chorcat/rukh-tokenizer             staged    data/publish/rukh-tokenizer/README.md
+```
+
+La primera vez que se lanzó no salió así. `rukh-tiny` falló: la evaluación registraba el SHA del
+fichero que midió y el fichero que `rukh pull` trae del Hub no es ese byte a byte, porque el
+publicador quita el optimizador y la cabeza atada. Eran los mismos pesos y la guarda no lo sabía.
+Es la misma novela en tapa dura y en bolsillo: distinto lomo, distinto peso, distinto código de
+barras, y el mismo texto de la primera línea a la última. Una guarda que compara códigos de barras
+dice que son libros distintos; la que compara el texto dice que es el mismo libro, y sigue
+distinguiéndolo de una edición con un capítulo cambiado.
+La solución es D-135: cada resultado lleva también el SHA de los tensores, y la guarda acepta un
+fichero distinto con los mismos pesos y sigue rechazando unos pesos distintos. Sin la guarda, la
+card de `tiny` habría llevado los números de otro fichero sin que nadie lo notara; con la guarda
+antigua, no se podía publicar nada desde una máquina que no fuera la que entrenó.
+
+```bash
+uv run rukh publish cards
+uv run rukh publish collection
+```
+
+La colección se monta desde el catálogo de `rukh pull`, así que lo que se puede descargar, lo que se
+puede leer y lo que está en la tabla son la misma lista de veintiún repositorios. Es idempotente:
+lanzarla dos veces no cambia nada.
+
+<Exercise n="05" title="Audita una card contra la tabla">
+  Abre la card de `chorcat/rukh-medium-dpo` y busca tres cosas: sobre qué fichero se midió, con qué
+  muestreo, y qué dice de la legalidad comparada con su base. ¿Falta alguna? ¿Sobra algún número que
+  no esté en la tabla?
+
+  <Solution>
+    Las tres están, porque la plantilla las exige: el SHA del fichero y el de los pesos, la
+    temperatura y el `top_k` de la etapa, y la fila de legalidad al lado de la de `medium-v4` con la
+    nota del peaje del alineamiento de M5. Si un número de la card no está en `results.json` o en el
+    ledger, es un bug de la plantilla, no una licencia poética: la card es la afirmación pública, y
+    todo lo que afirma tiene que poder contradecirse con lo que hay dentro.
+  </Solution>
+</Exercise>
+
+### Lab 5 · La arena: dos etapas, en tu navegador
+
+La lección de M5 enseñó que para medir una diferencia se mide la diferencia. La demo lo hace ahora
+en el navegador: dos etapas, cada una en su propio worker, juegan partidas por parejas con los
+colores espejados desde una apertura aleatoria con semilla, y el marcador se convierte en una
+diferencia de Elo con su intervalo bootstrap, con la misma aritmética que `rukh eval match`. Al lado
+imprime cuántas partidas haría falta jugar para que una diferencia de ese tamaño se separara del
+cero, para que nadie lea diez partidas como un veredicto.
+
+<DemoEmbed query="?mode=arena&stage=medium-fp16&vs=medium-dpo-fp16" />
+
+<Exercise n="06" title="Veinte partidas en la arena, contra las 800 de M5">
+  Enfrenta `medium-fp16` con `medium-dpo-fp16` durante veinte partidas. Anota la diferencia y el
+  intervalo. ¿Cuántas partidas dice la demo que harían falta? Compáralo con las 800 que jugó M5 por
+  arista y con el +57 (36-79) que publicó.
+
+  <Solution>
+    Con veinte partidas el intervalo cubre varios cientos de Elo y casi siempre incluye el cero: la
+    demo lo dice y pide del orden de 400 partidas para una diferencia de 50. Eso no es un defecto de
+    la demo, es la aritmética de M5 funcionando delante de ti: M5 jugó el doble por arista, 800, y aun
+    así el +57 lleva un intervalo de 36 a 79. Lo que la arena sí enseña con veinte partidas es
+    **cómo** juegan distinto: el DPO abre otras cosas y cambia antes de plan, y eso se ve en el
+    tablero antes de que se vea en el número.
+  </Solution>
+</Exercise>
+
+### Lab 6 · Los puzles, en vivo, contra la fila de la tabla
+
+Los 150 puzles de la demo salen del mismo `split` de test que la suite, con el prefijo real de la
+partida y los Elo de los jugadores, así que el modelo se pregunta exactamente como lo pregunta el
+harness, y el criterio es el mismo: la línea entera, no la primera jugada.
+
+```bash
+uv run python labs/m6/puzzles_export.py     # 50 por tramo, semilla 6, a artifacts/web/puzzles.json
+```
+
+<DemoEmbed query="?mode=puzzles&stage=small-fp16" />
+
+<Callout kind="hoy" title="Los mismos 150 puzles, contra tu modelo">
+  Los puzles funcionan con el modelo que esté cargado, así que sirven con el tuyo: carga tu
+  `.onnx` en «Tu propio modelo» y déjalo resolverlos. Es la comparación más barata que tienes con
+  la tabla del proyecto —minutos, sin motor, sin GPU— y la única de todo el curso que te dice algo
+  de **táctica** sin jugar una sola partida.
+
+Dos avisos para no leer de más en el resultado, los mismos que vale para cualquier fila de la
+tabla: son 50 puzles por tramo, así que el ruido de muestreo es de varios puntos; y si tu
+fichero es el int8, estás midiendo el int8, que M2 demostró que es un modelo distinto. Para
+compararte con la tabla, usa el fp32.
+
+La arena de arriba, en cambio, solo enfrenta etapas publicadas: necesita dos modelos del
+registro y el tuyo no está en él. Enfrentar el tuyo contra uno publicado es el paso que le falta
+a la demo, y es la primera cosa que pediría si este curso tuviera un backlog público.
+
+</Callout>
+
+<Exercise n="07" title="Los 150 puzles de la demo contra la fila de la tabla">
+  Deja que `small-fp16` resuelva los 150 y compara su tabla por tramos con la fila `small-v3-greedy`
+  de la tabla del proyecto. ¿Coinciden? ¿Deberían coincidir exactamente?
+
+  <Solution>
+    Se parecen y no coinciden, por tres motivos que conviene tener claros: son 50 puzles por tramo y
+    no 2 000, así que el ruido de muestreo es de varios puntos; la demo muestrea a la temperatura de
+    la interfaz y la fila `-greedy` a 0,05; y el fp16 no es el checkpoint, es una exportación con
+    paridad del 99,9 %. Que salgan a pocos puntos es la comprobación de que la demo y el harness hacen
+    la misma pregunta; que salieran iguales sería sospechoso.
+  </Solution>
+</Exercise>
+
+### Lab 7 · El README maestro y el post
+
+El cierre de la fase son dos textos. El README de `rukh` es el mapa: qué se construyó en cada
+módulo, con qué se midió y dónde está cada cosa (la tabla, el curso, la demo, la colección). El
+post es el guion del vídeo, con las tres cifras que importan y ninguna que no esté en
+`docs/benchmarks.md` o en el ledger. Los dos se escriben después de la tabla y no antes, y esa es
+la única regla.
+
+<Exercise n="08" title="Tres recomendaciones, cada una con su intervalo">
+  Escribe en tres frases qué modelo de Rukh recomendarías a alguien que quiere jugar en el móvil, a
+  alguien que quiere el mejor Elo y a alguien que quiere estudiar el repertorio de un maestro. Cada
+  frase con su etapa, su número y su intervalo.
+
+  <Solution>
+    Tres frases que valen, con los números de la tabla y del lab 3:
+
+- **Móvil:** `medium-int8`, el `medium-v4` cuantizado que sirve la demo; en la escalera por nodos
+  dio 1524 (1467-1576) frente a 1535 (1484-1600) del fp16, así que con 160 partidas no se ha
+  medido que cueste nada, y es otra etapa, no «el mismo modelo más pequeño».
+- **Mejor Elo:** `medium-v4-dpo-onpolicy-greedy`, 1632 (1567-1706), la fila más alta de la tabla;
+  y su ventaja sobre la base no es la resta de dos filas, es el +57 (36-79) del enfrentamiento
+  directo de M5.
+- **Repertorio de maestro:** `medium-masters`, 1563 (1502-1630), que no se separa de su base en
+  Elo y sí en lo que abre: entropía de la primera jugada de 1,89 bits frente a 1,77.
+
+Las tres llevan intervalo porque dos de ellas se distinguen de sus vecinas por menos de lo que el
+instrumento repite. Si te sale una frase sin intervalo, vuelve a la lección 1.
+
+  </Solution>
+</Exercise>
+
+## Los cuatro scripts de `labs/m6`
+
+Los siete labs de arriba se apoyan en cuatro scripts y un README. Ninguno de los cuatro entrena
+nada: dos miden el instrumento, uno responde la pregunta que M2 dejó abierta y uno exporta los
+puzles que la demo juega. Van enteros, porque son el código que produce las cifras de la lección 8 y
+la única forma de comprobarlas es leerlo.
+
+{/* prettier-ignore */}
+````markdown title="labs/m6/README.md"
+# M6 labs
+
+Scripts referenced by the M6 lessons (`rukh-lab`, `curso/m6/`). Run them from the repository
+root. Nothing here trains: the module measures, exports and publishes what M1-M5 left.
+
+| Script | Needs | Lesson lab |
+|---|---|---|
+| `ladder_check.py` | Stockfish | 1 · every rung of the ladder against the anchor, engine against engine |
+| `ladder_floor_export.py` | the four `ladder-*` results | 1 · the floor of the instrument: two runs on a clock, two on nodes |
+| `parity_cost.py` | the ONNX export of a model, Stockfish | 3 · what fp16 and int8 cost in Elo, on the same ladder |
+| `puzzles_export.py` | `data/puzzles/` | 6 · the 150 puzzles the demo plays live |
+
+## Starting point
+
+M6 measures everything the course published. If you skipped any module:
+
+```bash
+uv run rukh pull --module m6          # every model, the games, the puzzles and the positions of the suite
+uv run python scripts/get_stockfish.py
+```
+
+The per-module map with every command and what it took is `docs/reproducir.md` (section M6).
+````
+
+<Src file="labs/m6/README.md" tag="p6" lines="1-22" />
+
+El índice del directorio, con una tabla de qué necesita cada script y a qué lab corresponde. La
+sección «Starting point» es la que hace el módulo seguible por alguien que se saltó los cinco
+anteriores: `rukh pull --module m6` trae los doce modelos, las partidas, los puzles y las posiciones
+de la suite a las rutas que leen las configuraciones, y `get_stockfish.py` el motor.
+
+{/* prettier-ignore */}
+```markdown title="labs/m6/README.md"
+## `ladder_check.py`
+
+The rungs of the Elo ladder are hypotheses until they have played each other (D-070: four rungs
+were labelled 800-1250 by assumption and measured 1381-1678). Each rung plays the anchor
+(`uci-1320`) with mirrored colours and a seeded random opening; the script prints the rating
+that explains the score next to the label the ladder carries. `--nodes 200000` measures the
+regime M6 chose; without it, the clock of P2-P5. The control is `uci-1500`: about +180 over the
+anchor, or stop.
+
+## `ladder_floor_export.py`
+
+Collects `artifacts/eval/ladder-{time,nodes}-{a,b}/results.json` (the same model, rungs, games
+and seed, twice per regime) into `artifacts/web/ladder-floor.json` with the spread of each
+pair and the decision, for the course figure `LadderFloor`.
+
+## `parity_cost.py`
+
+Parity (M2) says how often an export picks the checkpoint's move; it cannot say what the other
+positions cost. This plays `model.onnx`, `model-fp16.onnx` and `model-int8.onnx` on the ladder
+through the same `DecoderPlayer` the checkpoint used (`rukh.infer.onnx_player.OnnxDecoder`
+stands in for the model), and writes one interval per precision next to its parity. ONNX Runtime
+runs on the CPU, so use a node budget: on a clock, a slower player changes the engine's side of
+the game too.
+
+## `puzzles_export.py`
+
+Fifty puzzles per difficulty band, drawn with a fixed seed from the test split, with the real
+game prefix and the players' ratings so the demo prompts the model exactly as the harness does.
+```
+
+<Src file="labs/m6/README.md" tag="p6" lines="24-51" />
+
+Un párrafo por script, y cada uno dice **qué pregunta responde** antes de decir qué hace. El de
+`ladder_check.py` es el más importante de los cuatro: «los peldaños de la escalera de Elo son
+hipótesis hasta que han jugado entre ellos», con el dato de D-070 al lado —cuatro peldaños
+etiquetados 800-1250 por suposición y medidos 1381-1678—. Un README de labs que se lee como la lista
+de las preguntas del módulo es un README que sirve.
+
+<Callout kind="roto" title="Los números de lab de los docstrings no cuadran">
+  La tabla del README dice que `parity_cost.py` es el lab 3 y `puzzles_export.py` el 6, y los
+  docstrings de los dos scripts dicen «Lab 2 of M6» y «Lab 5 of M6». Es un desajuste real en la
+  etiqueta `p6`: los labs se renumeraron al escribir las lecciones y los docstrings se quedaron con
+  la numeración anterior. No rompe nada y desorienta a quien abra el fichero antes de la lección; la
+  numeración buena es la de la tabla del README y la de esta página.
+</Callout>
+
+### `ladder_check.py`: calibrar la escalera contra sí misma
+
+```python title="labs/m6/ladder_check.py"
+"""Measure the ladder against itself: every rung plays the anchor, engine against engine.
+
+Lab 1 of M6, and the method of D-070 turned into a script. The four ``Skill Level`` rungs of the
+Elo ladder were once labelled 800/950/1100/1250 by assumption and measured 1381/1467/1589/1678;
+the labels of a ladder are hypotheses until the rungs have played each other. This plays each
+rung against ``uci-1320`` (the anchor, the floor of ``UCI_Elo``) with colours alternated and a
+seeded random opening per pair, and prints the rating that explains the score, with its
+interval, next to the label the ladder carries.
+
+It takes the same limit the harness takes -- a clock or a node budget -- so the ladder can be
+calibrated for the regime it is going to be used in:
+
+    uv run python labs/m6/ladder_check.py --games 40                 # 0.1 s per move, as P2-P5
+    uv run python labs/m6/ladder_check.py --games 40 --nodes 200000  # the node budget of M6
+
+The control is built in: ``uci-1500`` against ``uci-1320`` should come out near +180. If it
+does not, the procedure is biased and no other row of the table means anything.
+"""
+```
+
+<Src file="labs/m6/ladder_check.py" tag="p6" lines="1-18" />
+
+La última frase es la que convierte el script en un instrumento y no en una curiosidad: **el control
+está dentro**. `uci-1500` contra `uci-1320` tiene que salir cerca de +180, porque es lo que los
+autores de Stockfish dicen de esos dos ajustes. Si no sale, el procedimiento está sesgado y ninguna
+otra fila de la salida significa nada.
+
+Eso es un patrón que se transfiere a cualquier medición: meter en el instrumento una medida cuyo
+valor ya se conoce, y mirarla **antes** que las que no se conocen.
+
+```python title="labs/m6/ladder_check.py"
+from __future__ import annotations
+
+import argparse
+import math
+import sys
+import time
+
+import chess
+import numpy as np
+
+from rukh.eval.elo import DEFAULT_RUNGS, EloRung
+from rukh.eval.match import opening_book
+from rukh.infer.game import StockfishOpponent
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+ANCHOR = DEFAULT_RUNGS[0]
+MAX_PLIES = 300
+```
+
+<Src file="labs/m6/ladder_check.py" tag="p6" lines="20-38" />
+
+El `sys.stdout.reconfigure(encoding="utf-8")` es Windows. La consola por defecto no es UTF-8, y la
+salida de este script lleva un `·` y un `%`; sin esa línea, una `UnicodeEncodeError` mata una tirada
+de treinta y cinco minutos **al imprimir el resultado**. El `hasattr` es porque el método no existe
+en todas las versiones de Python y en algunos entornos redirigidos.
+
+`ANCHOR = DEFAULT_RUNGS[0]` toma el ancla del propio harness y no la escribe aquí: si la escalera
+cambiara de peldaño más bajo, este script calibraría contra el nuevo sin tocarse.
+
+```python title="labs/m6/ladder_check.py"
+def elo_of(score: float) -> float:
+    """The rating difference that explains a score, clipped away from 0 and 1."""
+    p = min(max(score, 1e-3), 1 - 1e-3)
+    return 400.0 * math.log10(p / (1.0 - p))
+
+
+def play(white: StockfishOpponent, black: StockfishOpponent, opening: list[str]) -> float:
+    """One game from ``opening``; the score from White's point of view."""
+    board = chess.Board()
+    for uci in opening:
+        board.push_uci(uci)
+    while not board.is_game_over(claim_draw=True) and board.ply() < MAX_PLIES:
+        mover = white if board.turn == chess.WHITE else black
+        board.push(mover.choose(board))
+    if board.is_game_over(claim_draw=True):
+        result = board.result(claim_draw=True)
+        return {"1-0": 1.0, "0-1": 0.0}.get(result, 0.5)
+    return 0.5  # out of plies: a draw, the same adjudication the harness would not accept but fair
+```
+
+<Src file="labs/m6/ladder_check.py" tag="p6" lines="41-58" />
+
+`elo_of` es la misma fórmula con el mismo recorte que la arena de la lección 7 y que el harness de
+Python. Tres implementaciones de la misma cuenta es una duplicación que aquí se acepta a
+regañadientes, y el motivo es que las tres viven en sitios que no se pueden importar entre sí: un
+script de labs, un módulo del paquete y un fichero de TypeScript. Lo que las mantiene iguales es que
+el recorte —`1e-3`— está escrito con el mismo valor en las tres.
+
+El comentario de la última línea de `play` es de los que hay que leer dos veces: una partida que se
+queda sin plies se cuenta como tablas, y el comentario dice que es «una adjudicación que el harness
+no aceptaría pero es justa». La diferencia es real: el harness pide al motor que evalúe la posición
+final y la adjudica por material, porque una partida cortada con ventaja decisiva no es unas tablas.
+Aquí no se hace porque los dos jugadores son el mismo motor a fuerzas parecidas, así que el sesgo de
+contar tablas se reparte por igual entre los dos lados.
+
+```python title="labs/m6/ladder_check.py"
+def measure(
+    rung: EloRung, games: int, seed: int, move_time: float, nodes: int | None
+) -> tuple[float, float, float, float]:
+    """Score of ``rung`` against the anchor, its Elo over the anchor and a bootstrap interval."""
+    book = opening_book(games // 2, plies=6, seed=seed)
+    scores: list[float] = []
+    with (
+        StockfishOpponent(
+            elo=rung.uci_elo or 1320, skill=rung.skill, move_time=move_time, nodes=nodes
+        ) as candidate,
+        StockfishOpponent(elo=ANCHOR.uci_elo or 1320, move_time=move_time, nodes=nodes) as anchor,
+    ):
+        for opening in book:
+            scores.append(play(candidate, anchor, opening))  # rung as White
+            scores.append(1.0 - play(anchor, candidate, opening))  # rung as Black
+    draws = np.asarray(scores)
+    rng = np.random.default_rng(seed)
+    boots = [
+        elo_of(float(rng.choice(draws, size=len(draws), replace=True).mean())) for _ in range(500)
+    ]
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    return float(draws.mean()), elo_of(float(draws.mean())), float(lo), float(hi)
+```
+
+<Src file="labs/m6/ladder_check.py" tag="p6" lines="61-82" />
+
+`opening_book(games // 2, ...)` y luego **dos** partidas por apertura, una con cada color. Es el
+mismo emparejamiento espejado de la arena y de `rukh eval match`, y aquí hace algo más: con motor
+contra motor y aperturas aleatorias, las dos partidas de una pareja son la única forma de que la
+ventaja de las blancas no se cuele en la calibración.
+
+`1.0 - play(anchor, candidate, opening)` invierte el resultado en vez de llamar a `play` con los
+argumentos al revés y otra convención. Es una línea y evita el error de signo más probable del
+fichero.
+
+El `with (A as candidate, B as anchor)` abre **dos** procesos de Stockfish a la vez y los cierra
+pase lo que pase. Dos motores en paralelo en la misma máquina es exactamente el escenario que hace
+al rival por reloj no repetir, y es la razón de que este script acepte `--nodes`: calibrar la
+escalera por nodos con dos motores compitiendo por la CPU sigue dando el mismo resultado.
+
+El bootstrap usa `np.random.default_rng(seed)` con la misma semilla que las aperturas. Es
+deliberado y no tiene consecuencias —son dos usos independientes del generador— y ahorra un
+parámetro.
+
+```python title="labs/m6/ladder_check.py"
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--games", type=int, default=40, help="Games per rung (even).")
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--move-time", type=float, default=0.1)
+    parser.add_argument("--nodes", type=int, default=None, help="Node budget instead of the clock.")
+    args = parser.parse_args()
+    if args.games % 2:
+        raise SystemExit("--games must be even: every opening is played with both colours")
+    regime = f"{args.nodes} nodes" if args.nodes else f"{args.move_time:g} s per move"
+    print(f"anchor {ANCHOR.name} ({ANCHOR.elo}) · {args.games} games per rung · {regime}\n")
+    print(f"{'rung':<10}{'label':>7}{'score':>8}{'measured':>10}{'IC 95 %':>16}{'delta':>8}")
+    started = time.perf_counter()
+    for rung in DEFAULT_RUNGS[1:]:
+        score, over, lo, hi = measure(rung, args.games, args.seed, args.move_time, args.nodes)
+        measured = ANCHOR.elo + over
+        print(
+            f"{rung.name:<10}{rung.elo:>7}{score:>8.3f}{measured:>10.0f}"
+            f"{ANCHOR.elo + lo:>8.0f}-{ANCHOR.elo + hi:<7.0f}{measured - rung.elo:>+8.0f}"
+        )
+    print(f"\n{time.perf_counter() - started:.0f} s")
+    print("control: uci-1500 should read about +180 over the anchor; if it does not, stop here.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+<Src file="labs/m6/ladder_check.py" tag="p6" lines="85-110" />
+
+`if args.games % 2: raise SystemExit(...)` con el motivo dentro del mensaje: «cada apertura se juega
+con los dos colores». Un número impar de partidas no es un error de tipo, es una petición que el
+diseño no puede cumplir, y decirlo en la primera línea de la ejecución ahorra media hora.
+
+La cabecera de la salida imprime **el régimen**: `0.1 s per move` o `200000 nodes`. Una tabla de
+calibración sin el régimen al lado es una tabla que se va a comparar con otra de otro régimen.
+
+Y la última línea, después de los segundos, repite el control. Es lo primero que se lee al volver a
+la terminal, y está al final a propósito: es donde queda el cursor.
+
+La salida de la tirada que se hizo está en el lab 1, con su lectura peldaño a peldaño.
+
+### `ladder_floor_export.py`: las cuatro tiradas, en una figura
+
+```python title="labs/m6/ladder_floor_export.py"
+"""The floor of the ladder, as a figure: four runs of the same model, two on a clock, two on nodes.
+
+D-107 found that the same configuration with the same seed gave 1498 and 1558, because the
+opponent plays on a clock and a clock is not the same twice. M6 measured it on purpose: the same
+checkpoint, the same rungs, games and seed, twice with ``elo_move_time`` and twice with
+``elo_nodes``. This collects the four ``results.json`` and writes the course figure's
+``artifacts/web/ladder-floor.json``, with the spread between the two runs of each regime and the
+regime that was chosen (D-135):
+
+    uv run python labs/m6/ladder_floor_export.py --decision nodes
+"""
+```
+
+<Src file="labs/m6/ladder_floor_export.py" tag="p6" lines="1-11" />
+
+```python title="labs/m6/ladder_floor_export.py"
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import UTC, datetime
+
+from rukh.paths import resolve
+
+RUNS = {
+    "time-a": ("ladder-time-a", "time"),
+    "time-b": ("ladder-time-b", "time"),
+    "nodes-a": ("ladder-nodes-a", "nodes"),
+    "nodes-b": ("ladder-nodes-b", "nodes"),
+}
+```
+
+<Src file="labs/m6/ladder_floor_export.py" tag="p6" lines="13-26" />
+
+El diccionario `RUNS` es el contrato entre este script y los cuatro nombres de etapa que el lab 1
+escribió con `--stage`. Es la clase de acoplamiento por cadena que da miedo, y la protección es que
+un fichero que falta **no es un error**: se imprime y se salta.
+
+```python title="labs/m6/ladder_floor_export.py"
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--decision", choices=["time", "nodes"], required=True)
+    parser.add_argument("--out", default="artifacts/web/ladder-floor.json")
+    args = parser.parse_args()
+
+    runs: list[dict[str, object]] = []
+    model = None
+    games = None
+    for name, (stage, limit) in RUNS.items():
+        path = resolve(f"artifacts/eval/{stage}/results.json")
+        if not path.is_file():
+            print(f"{name}: {path} missing, skipped")
+            continue
+        result = json.loads(path.read_text(encoding="utf-8"))
+        elo = result["elo"]
+        model = model or result.get("checkpoint")
+        games = games or elo.get("games")
+        runs.append(
+            {
+                "name": name,
+                "limit": limit,
+                "elo": round(elo["elo"]),
+                "lo": None if elo.get("ci_low") is None else round(elo["ci_low"]),
+                "hi": None if elo.get("ci_high") is None else round(elo["ci_high"]),
+                "date": result.get("date"),
+            }
+        )
+        print(f"{name:<8} {limit:<6} {runs[-1]['elo']} ({runs[-1]['lo']}-{runs[-1]['hi']})")
+```
+
+<Src file="labs/m6/ladder_floor_export.py" tag="p6" lines="29-57" />
+
+`model = model or result.get("checkpoint")` y `games = games or elo.get("games")` toman el valor de
+la primera tirada que se encuentre y no lo comprueban contra las demás. Es una simplificación con un
+riesgo real: si alguien mezclara resultados de dos modelos distintos, la figura diría el nombre del
+primero y nadie lo notaría. Lo que hace que no pase es el procedimiento —las cuatro tiradas salen de
+una sesión— y no el código.
+
+`elo.get("ci_low") is None` con un ternario en vez de un `round` directo: un resultado separado —todas
+las partidas en la misma dirección— no tiene intervalo, y `round(None)` explotaría.
+
+```python title="labs/m6/ladder_floor_export.py"
+    spread = {}
+    for limit in ("time", "nodes"):
+        pair = [r["elo"] for r in runs if r["limit"] == limit]
+        if len(pair) == 2:
+            spread[limit] = abs(int(pair[0]) - int(pair[1]))
+            print(f"spread {limit}: {spread[limit]} Elo")
+
+    out = resolve(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps(
+            {
+                "meta": {
+                    "generated": datetime.now(UTC).isoformat(timespec="seconds"),
+                    "model": model,
+                    "games": games,
+                },
+                "runs": runs,
+                "spread": spread,
+                "decision": args.decision,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(f"wrote {out}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+<Src file="labs/m6/ladder_floor_export.py" tag="p6" lines="59-89" />
+
+`spread` solo se calcula cuando hay **dos** tiradas del mismo régimen. Con una sola no hay dispersión
+que medir, y escribir un cero ahí sería publicar «repite perfectamente» sobre una medición que no se
+hizo.
+
+Y el campo `decision` del JSON es lo que la figura del curso imprime al lado de los cuatro números:
+no basta con publicar la medición, hay que publicar qué se decidió con ella. Aquí fue `time`, es
+decir, el rival se queda por reloj (D-137).
+
+<Callout kind="roto" title="El docstring cita la decisión equivocada">
+  El docstring dice «the regime that was chosen (D-135)» y su ejemplo escribe `--decision nodes`.
+  D-135 es el hash de pesos de la lección 2; la decisión del régimen es **D-137**, y lo que se
+  ejecutó fue `--decision time`. Dos erratas en el mismo párrafo, las dos inocuas para el código y
+  las dos capaces de mandar a alguien al apunte equivocado del registro de decisiones.
+</Callout>
+
+### `parity_cost.py`: lo que cuesta cada precisión, jugando
+
+```python title="labs/m6/parity_cost.py"
+"""What the export costs in Elo: fp32, fp16 and int8 of the same model on the same ladder.
+
+Lab 2 of M6. M2 measured **parity** -- in how many positions each export picks the checkpoint's
+move (fp16 99.9 %, int8 95.1 % for ``medium-v4``) -- and left the question that matters open: a
+model that plays another move once in twenty games is another player, so how much weaker is it?
+Parity cannot answer that; only playing can. This puts each ONNX file on the very ladder every
+published Elo was measured on, through the same ``DecoderPlayer`` (same masking, sampling and
+rescue), with the same rungs, games and seed, and writes one interval per precision next to the
+parity that was already known:
+
+    uv run python labs/m6/parity_cost.py --onnx artifacts/onnx/medium-v4 \
+        --config configs/eval/greedy.yaml
+
+ONNX Runtime plays on the CPU here, so the opponent's limit should be a node budget (the config's
+``elo_nodes``): on a clock, a slower player would make the engine's side of the game different,
+and the comparison would be between two Stockfishes, not between three exports.
+
+Writes ``artifacts/eval/parity-cost/<name>.json`` (one ``EloResult`` per precision) and
+``artifacts/web/parity-cost.json`` for the course figure.
+"""
+```
+
+<Src file="labs/m6/parity_cost.py" tag="p6" lines="1-20" />
+
+El segundo párrafo del docstring es la justificación del rival por nodos escrita para que no se
+olvide: ONNX Runtime juega en CPU, así que con el rival por reloj **un jugador más lento haría que el
+motor jugara distinto**, y la comparación sería entre dos Stockfishes en vez de entre tres
+exportaciones. Es el mismo razonamiento de la lección 2 aplicado a un caso concreto, y es la única
+medición del proyecto donde el presupuesto de nodos era la opción correcta.
+
+```python title="labs/m6/parity_cost.py"
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from datetime import UTC, datetime
+
+from rukh.config import load_yaml
+from rukh.eval.elo import estimate, play_rungs
+from rukh.eval.suite import EvalConfig
+from rukh.infer import DecoderPlayer
+from rukh.infer.onnx_player import OnnxDecoder
+from rukh.paths import resolve
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+PRECISIONS = {"fp32": "model.onnx", "fp16": "model-fp16.onnx", "int8": "model-int8.onnx"}
+```
+
+<Src file="labs/m6/parity_cost.py" tag="p6" lines="22-38" />
+
+`PRECISIONS` mapea el nombre al fichero, que son los tres que `rukh export --fp16 --int8` escribe en
+la carpeta. Un diccionario y no una lista porque la salida se ordena por él y porque `--only fp16
+int8` valida contra sus claves.
+
+```python title="labs/m6/parity_cost.py"
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--onnx", default="artifacts/onnx/medium-v4", help="Folder of the export.")
+    parser.add_argument("--config", default="configs/eval/greedy.yaml")
+    parser.add_argument("--games", type=int, default=None, help="Games per rung (config's).")
+    parser.add_argument("--only", nargs="*", default=list(PRECISIONS), choices=list(PRECISIONS))
+    parser.add_argument("--out", default="artifacts/eval/parity-cost")
+    parser.add_argument("--web", default="artifacts/web/parity-cost.json")
+    args = parser.parse_args()
+
+    cfg = load_yaml(resolve(args.config), EvalConfig)
+    games = args.games or cfg.elo_games
+    folder = resolve(args.onnx)
+    parity = json.loads((folder / "parity.json").read_text(encoding="utf-8"))
+    out = resolve(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    tok = UciTokenizer()
+    regime = f"{cfg.elo_nodes} nodes" if cfg.elo_nodes else f"{cfg.elo_move_time} s"
+    print(f"{folder.name} · {games} games per rung · {len(cfg.elo_rungs)} rungs · {regime}\n")
+```
+
+<Src file="labs/m6/parity_cost.py" tag="p6" lines="41-59" />
+
+`parity.json` se lee de la carpeta de la exportación y no se recalcula. Es el fichero que dejó
+`rukh export` en M2, con el porcentaje de posiciones en las que cada precisión elige la jugada del
+checkpoint. Este lab no vuelve a medir la paridad: la **pone al lado** del Elo, que es justo el
+gesto que la lección quiere enseñar.
+
+`games = args.games or cfg.elo_games` deja que la configuración decida por defecto y permite
+recortar para una prueba. Y el `regime` se imprime en la cabecera, otra vez, por lo mismo que en el
+script anterior.
+
+```python title="labs/m6/parity_cost.py"
+    variants: list[dict[str, object]] = []
+    for name in args.only:
+        path = folder / PRECISIONS[name]
+        if not path.is_file():
+            print(f"{name:<6} missing ({path.name}), skipped", file=sys.stderr)
+            continue
+        agreement = parity["precisions"].get(name, {}).get("agreement")
+        started = time.perf_counter()
+        player = DecoderPlayer(OnnxDecoder(path), tok, cfg.sampling())  # type: ignore[arg-type]
+        records = play_rungs(
+            None,
+            tok,
+            cfg.elo_rungs,
+            games,
+            cfg.sampling(),
+            move_time=cfg.elo_move_time,
+            max_plies=cfg.elo_max_plies,
+            header_elo=cfg.header_elo,
+            player=player,
+            nodes=cfg.elo_nodes,
+        )
+        result = estimate(records, samples=cfg.bootstrap, seed=cfg.seed)
+        elapsed = time.perf_counter() - started
+        (out / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "precision": name,
+                    "file": path.as_posix(),
+                    "parity": agreement,
+                    "games": games,
+                    "regime": regime,
+                    "seed": cfg.seed,
+                    "seconds": round(elapsed),
+                    "elo": result.model_dump(mode="json"),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        variants.append(
+            {
+                "name": name,
+                "parity": agreement,
+                "elo": round(result.elo),
+                "lo": None if result.ci_low is None else round(result.ci_low),
+                "hi": None if result.ci_high is None else round(result.ci_high),
+                "games": result.games,
+            }
+        )
+        low = "?" if result.ci_low is None else f"{result.ci_low:.0f}"
+        high = "?" if result.ci_high is None else f"{result.ci_high:.0f}"
+        print(
+            f"{name:<6} parity {agreement if agreement is None else f'{agreement:.3f}':>6}  "
+            f"elo {result.elo:.0f} ({low}-{high})  {result.games} games  {elapsed:.0f} s"
+        )
+```
+
+<Src file="labs/m6/parity_cost.py" tag="p6" lines="61-116" />
+
+El bucle es donde se ve que este lab no reimplementa nada: `DecoderPlayer(OnnxDecoder(path), tok,
+cfg.sampling())` y `play_rungs(None, tok, ..., player=player, nodes=cfg.elo_nodes)`. El grafo entra
+por el jugador de la lección 6, la escalera es la de la lección 2, y el `estimate` que convierte los
+resultados en un Elo con su intervalo es el de M2. Cincuenta líneas para una medición que responde
+una pregunta abierta desde hacía cuatro módulos, porque todas las piezas ya existían.
+
+Un fichero que falta se anuncia en `stderr` y se salta. Es la decisión correcta aquí: quien exportó
+solo fp16 e int8 puede correr el lab y obtener dos filas, en vez de un error sobre un fp32 que no le
+interesa.
+
+Los `json` por precisión se escriben **dentro del bucle**, no al final. Cada uno cuesta catorce
+minutos de motor: perder las tres porque la tercera falle sería el mismo error que el nightly de la
+lección 4 evita con su `except`.
+
+```python title="labs/m6/parity_cost.py"
+    web = resolve(args.web)
+    web.parent.mkdir(parents=True, exist_ok=True)
+    web.write_text(
+        json.dumps(
+            {
+                "meta": {
+                    "generated": datetime.now(UTC).isoformat(timespec="seconds"),
+                    "games": games,
+                    "regime": regime,
+                },
+                "model": folder.name,
+                "variants": variants,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(f"\nwrote {web}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+<Src file="labs/m6/parity_cost.py" tag="p6" lines="118-140" />
+
+Y el JSON para la figura se escribe al final con las variantes que salieron, más un `meta` con la
+fecha, las partidas y el régimen. Es la misma regla que el manifiesto de los datos: la figura del
+curso no puede dibujar tres barras sin decir con qué presupuesto se jugaron.
+
+La salida de las tres precisiones está en el lab 3, con la tabla y su lectura.
+
+### `puzzles_export.py`: los 150 puzles de la demo
+
+```python title="labs/m6/puzzles_export.py"
+"""Export a small, seeded set of test puzzles for the demo's live puzzle mode.
+
+Lab 5 of M6. The demo cannot read a parquet and should not download 22 MB to show fifty puzzles,
+so this writes `artifacts/web/puzzles.json`: 50 puzzles per difficulty band drawn from the
+`test` split of `chorcat/rukh-puzzles-split` with the same loader the harness uses
+(`rukh.eval.puzzles.load_puzzles`), so what the browser attempts is exactly what the table
+measured -- the real game prefix, the players' own ratings in the header, and the whole line as
+the criterion (D-053). The file is copied into `rukh-web/public/puzzles.json` by hand (it is
+versioned there: the demo must not depend on this repository being around).
+
+    uv run python labs/m6/puzzles_export.py            # 50 per band, seed 6
+    uv run python labs/m6/puzzles_export.py --per-band 20 --seed 1
+"""
+```
+
+<Src file="labs/m6/puzzles_export.py" tag="p6" lines="1-13" />
+
+Dos frases del docstring son decisiones y no descripción.
+
+«La demo no puede leer un parquet y no debería descargar 22 MB para mostrar cincuenta puzles»: por
+eso hay un JSON de 150 y no el fichero entero. Y el paréntesis final es la más importante: el fichero
+se copia a mano a `rukh-web/public/puzzles.json` y **está versionado allí**, porque la demo no puede
+depender de que este repositorio exista. Dos repositorios que se despliegan por separado no comparten
+artefactos generados; se copian, y la copia se versiona.
+
+```python title="labs/m6/puzzles_export.py"
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import UTC, datetime
+
+from rukh.eval.puzzles import load_puzzles
+from rukh.paths import resolve
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+SCHEMA = "rukh-puzzles/1"
+```
+
+<Src file="labs/m6/puzzles_export.py" tag="p6" lines="15-28" />
+
+```python title="labs/m6/puzzles_export.py"
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--puzzles", default="data/puzzles/puzzles.parquet")
+    parser.add_argument("--per-band", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=6)
+    parser.add_argument("--split", default="test")
+    parser.add_argument("--out", default="artifacts/web/puzzles.json")
+    args = parser.parse_args()
+
+    items = load_puzzles(resolve(args.puzzles), args.per_band, seed=args.seed, split=args.split)
+    without_prefix = sum(1 for item in items if not item.prefix)
+    if without_prefix:
+        raise SystemExit(
+            f"{without_prefix} puzzles carry no game prefix; the demo prompts with the real game "
+            "(D-053), so the parquet must be the `with_games` one"
+        )
+```
+
+<Src file="labs/m6/puzzles_export.py" tag="p6" lines="31-46" />
+
+`load_puzzles` es **el cargador del harness**, con los mismos argumentos: el mismo `split`, la misma
+semilla, el mismo número por tramo. Eso es lo que hace que los 150 puzles del navegador sean una
+muestra del mismo conjunto que mide la tabla y no otro parecido.
+
+Y la guarda de las cuatro líneas siguientes es la que vale el script: si algún puzle llega **sin
+prefijo de partida**, el script se niega a escribir el fichero. Un puzle sin prefijo se preguntaría
+desde la posición sola, que es la situación que la lección 3 llamó «a ciegas», y la tasa resultante
+sería un suelo y no una medición. Negarse a exportar es más útil que exportar con una advertencia,
+porque el fichero acaba en otro repositorio donde nadie va a leer la advertencia.
+
+```python title="labs/m6/puzzles_export.py"
+    bands: dict[str, list[dict[str, object]]] = {}
+    for item in items:
+        bands.setdefault(item.band, []).append(
+            {
+                "id": item.puzzle_id,
+                "fen": item.fen,
+                "moves": item.moves,
+                "rating": item.rating,
+                "prefix": item.prefix,
+                "whiteElo": item.white_elo,
+                "blackElo": item.black_elo,
+            }
+        )
+    payload = {
+        "schema": SCHEMA,
+        "source": f"chorcat/rukh-puzzles-split · split {args.split}",
+        "seed": args.seed,
+        "perBand": args.per_band,
+        "generated": datetime.now(UTC).isoformat(timespec="seconds"),
+        "bands": bands,
+    }
+    out = resolve(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n", "utf-8")
+    print(f"{out} · {sum(len(v) for v in bands.values())} puzzles · {out.stat().st_size:,} bytes")
+    for band, rows in sorted(bands.items()):
+        ratings = [row["rating"] for row in rows]
+        print(f"  {band:<10} {len(rows):>3} puzzles · rating {min(ratings)}-{max(ratings)}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+<Src file="labs/m6/puzzles_export.py" tag="p6" lines="47-78" />
+
+El `payload` lleva `schema`, `source`, `seed`, `perBand` y `generated`, que son exactamente los
+campos que `src/lib/puzzles.ts` comprueba y muestra en la lección 7. Los dos lados de la frontera
+están escritos con el mismo contrato delante.
+
+`separators=(",", ":")` quita los espacios del JSON: son 150 puzles con sus líneas de solución, y el
+fichero se sirve a cada visita de la demo. `ensure_ascii=False` deja los caracteres tal cual en vez
+de escaparlos, que con UTF-8 es más corto.
+
+Las dos últimas líneas imprimen el tamaño del fichero y el rango de dificultad de cada tramo. Es la
+comprobación de un vistazo: si un tramo sale con 3 puzles o con un rango de dificultad que no es el
+suyo, se ve antes de copiar el fichero al otro repositorio.
+
+## La lista de comprobación, sin ajedrez
+
+Todo lo anterior es de este proyecto. Esto no: es el mismo cierre escrito sin una sola palabra de
+ajedrez, para cuando midas y publiques otra cosa. Nueve puntos, en orden, y ninguno de ellos es
+opcional porque cada uno tapa un error que este módulo cometió antes de corregirlo.
+
+**Antes de medir**
+
+1. **Mide el instrumento contra sí mismo.** El mismo modelo contra el mismo modelo tiene que dar
+   empate; la misma suite repetida tiene que repetir dentro de su ruido. Lo que se mueva ahí es
+   suelo, no señal.
+2. **Escribe el suelo antes de ver el resultado.** Si dos tiradas idénticas se separan 60 puntos,
+   una mejora de 40 no existe por mucho que salga.
+
+**Al medir**
+
+3. **Una suite, todas las filas.** Misma configuración, mismo muestreo, mismo corte. Una fila
+   medida de otra forma no es comparable, aunque la columna se llame igual.
+4. **Registra el fichero exacto y el muestreo.** No «el modelo»: el checkpoint, la precisión, la
+   temperatura y la semilla. Sin eso el número no se puede volver a sacar.
+5. **Publica intervalos, no puntos.** Y compara intervalos: dos que se solapan no son una
+   diferencia, son una pregunta que aún no has pagado.
+
+**Antes de publicar**
+
+6. **Comprueba la paridad de lo que vas a servir.** Lo que corre en producción está cuantizado,
+   convertido o recompilado; mide **ese** fichero, no el que entrenaste.
+7. **Regenera la ficha desde la tabla, no a mano.** Una card escrita a mano envejece en silencio;
+   una generada envejece con un `diff`.
+8. **Escribe qué no puedes afirmar.** El proxy que usaste, contra qué se midió, y en qué se
+   parece y en qué no a lo que le importa a quien lo lea.
+9. **Deja el comando que lo reproduce todo.** Si el lector no puede sacar tu intervalo, no has
+   publicado un resultado: has publicado una cifra.
+
+## Lo que deja el módulo
+
+Tres frases, que son las del módulo y las de la fase.
+
+**Mide el instrumento antes de fiarte de él.** Cuatro escaleras del mismo modelo, dos calibraciones
+y una tabla vieja frente a una nueva dijeron lo mismo: el reloj repite al nivel del ruido de
+muestreo con la máquina parada, los nodos no compran nada, y lo que se mueve es lo que el intervalo
+dice que se puede mover. Sin esa medición, los +72 de `dpo-onpolicy` en un día habrían sido una
+noticia.
+
+**Una tabla es de un día.** Trece filas de decoder con la misma fecha, un comando que las regenera,
+y cada card diciendo sobre qué fichero y con qué muestreo se midió cada número. La que no cumple
+eso no se compara; se retira o se vuelve a medir.
+
+**Lo que no se puede decir es parte del resultado.** Un Elo contra Stockfish limitado no es un Elo
+de Lichess, una paridad no es una fuerza, un baseline medido con otro harness no es un baseline, y
+un lector reproduce el intervalo, no el número. Eso va en cada card y en el vídeo.
+
+## El balance de la fase 1
+
+Con eso termina la primera fase: un modelo de lenguaje de ajedrez construido desde el corpus hasta
+el navegador, medido, publicado y reproducible módulo a módulo. Antes de pasar a la siguiente, el
+balance en tres listas.
+
+**Qué queda hecho, y dónde está.** Siete módulos, veintiún repositorios en el Hub y tres desplegados.
+
+<div class="table-wrap">
+
+| Módulo | Qué dejó                                                                                    | Dónde                                                                   |
+| ------ | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| M0     | el repositorio instalable, Stockfish, MLflow y la CI                                        | etiqueta `p0`                                                           |
+| M1     | 5,9 M de partidas de 1800+ en UCI, el vocabulario de 2 030 tokens, puzles y etiquetas       | `rukh-games-1800`, `rukh-tokenizer`, `rukh-puzzles-split`               |
+| M2     | `tiny` (5 M), `small` (39 M) y `medium-v4` (115 M) desde cero, con exportación y paridad    | `rukh-tiny`, `rukh-small`, `rukh-medium`                                |
+| M3     | el encoder: preentrenamiento por jugada enmascarada y tres cabezas                          | `rukh-encoder-mmm`, `rukh-encoder`                                      |
+| M4     | afinado por Elo y por maestros, dos adaptadores LoRA, Qwen3 con QLoRA como baseline         | `rukh-medium-elo`, `rukh-medium-masters`, `rukh-lora-*`, `rukh-qwen3-*` |
+| M5     | reward model, DPO en y fuera de política, GRPO contra recompensa verificable                | `rukh-rm`, `rukh-medium-dpo`, `rukh-medium-grpo`, `rukh-pairs-*`        |
+| M6     | la tabla única, el suelo del instrumento, un baseline público, el coste del int8, las cards | la tabla, la colección del Hub y la demo                                |
+
+</div>
+
+**Los criterios de aceptación de este módulo: los tres, cumplidos.** «Una tabla única y reproducible
+con todas las etapas y los baselines públicos»: trece filas de decoder medidas el mismo día con un
+comando, dos baselines externos y el suelo del instrumento medido y publicado con ella. «Model cards
+en inglés para cada modelo de la colección»: veintiuna, regeneradas desde la tabla, cada una con su
+lección, su fila, su demo y su `rukh pull`. «Demo final con selector de etapa, arena y puzles en
+vivo»: cumplido y verificado en Chrome real con WebGPU.
+
+**Y los que no se cumplieron, de este módulo y de los anteriores.** Están aquí porque un balance sin
+ellos no es un balance.
+
+- **La paridad del 99,9 % que pedía el spec de M2 no se alcanzó ni con fp16** (99,80 %), y el int8
+  se quedó en 95,40 %. Lo que M6 añadió no fue alcanzarla: fue medir qué cuesta no alcanzarla, y con
+  160 partidas la respuesta es «menos de lo que la escalera puede ver».
+- **El 75 % de acierto del reward model de M5 tampoco**: 72,91 % y 74,21 % en dos corridas idénticas.
+  Con un suelo de 1,3 puntos entre corridas iguales, perseguir el criterio con más semillas habría
+  sido pescar.
+- **Maia-2 como segundo baseline condicionado por Elo** quedó en el backlog (D-138): fija `torch 2.8`
+  frente al 2.11 del proyecto y descarga sus pesos de Google Drive. Cabe como proceso hijo en su
+  propio entorno, y el diseño está escrito; el hito de cierre no lo incluyó.
+- **El bot de Lichess** del plan original, que era opcional y necesita una cuenta de bot.
+- **La imagen Open Graph por lección**, aplazada desde P0.
+- **La arena solo enfrenta etapas publicadas.** Cargas tu `.onnx` y puedes jugar contra él y
+  resolver los puzles, pero no enfrentarlo a un modelo del curso: la arena carga sus dos lados por
+  identificador del registro. Es lo primero que pediría este curso si tuviera un backlog público.
+
+**Qué viene en la fase 2.** El modelo deja de ser lo único que hay y pasa a ser **una herramienta que
+algo más usa**. Seis módulos, y los tres primeros se apoyan directamente en lo que esta fase deja:
+
+- **A1 · Embeddings y RAG**: el encoder de M3 convertido en un índice vectorial de millones de
+  posiciones, más RAG sobre libros de ajedrez de dominio público, evaluado con RAGAS.
+- **A2 · Agente con herramientas**: un entrenador que analiza una partida llamando al motor, al
+  modelo de M2 y al índice de A1, con trazas completas.
+- **A3 · Evaluación y observabilidad**: la misma disciplina de este módulo aplicada a un agente, que
+  es más difícil porque su salida es texto: preguntas doradas, jueces automáticos y regresión por
+  commit.
+- **A4 · Multiagente**, **A5 · MCP** y **A6 · Capstone**, donde las herramientas de ajedrez se
+  exponen a cualquier cliente y el entrenador comenta tu partida en vivo.
+
+Lo que se lleva de esta fase a la siguiente no son los modelos: es la costumbre de medir el
+instrumento antes de fiarse de él, y de escribir lo que no se puede afirmar al lado de lo que sí.
+
+<RepoTag tag="p6" at="final" module="M6" />
+
+La cheatsheet del módulo, con su pregunta y su respuesta corta, está justo debajo.

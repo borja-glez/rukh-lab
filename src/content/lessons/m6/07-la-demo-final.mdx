@@ -1,0 +1,1198 @@
+---
+title: 'La demo final: arena, puzles y tu propio modelo desde el disco'
+description:
+  'Una pantalla con tres modos: jugar, ver a dos etapas enfrentarse con la aritmética de M5 portada
+  línea a línea, y resolver los 150 puzles con el criterio del harness. Más una posición
+  compartible por URL y un campo que acepta el `.onnx` que acabas de exportar, sin subir un byte a
+  ninguna parte.'
+module: m6
+order: 7
+duration: 155
+level: medio
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - demo
+  - arena
+  - puzles
+  - ONNX
+  - worker
+  - privacidad
+artifacts:
+  - kind: demo
+    label: rukh.borjaglez.com
+    href: https://rukh.borjaglez.com
+demo: '?mode=arena'
+---
+
+## Qué vas a construir
+
+La demo de M5 tenía una pantalla: cargas un modelo y juegas contra él. La de este hito tiene tres
+modos sobre la misma pantalla, y añade lo que faltaba para que la demo sea de quien sigue el curso y
+no solo de quien lo escribió.
+
+**Arena**: dos etapas se cargan en dos workers y juegan por parejas con los colores espejados desde
+una apertura aleatoria con semilla. El marcador se convierte en una diferencia de Elo con su
+intervalo bootstrap, con **la misma aritmética** que `rukh eval match` de M5, y al lado se imprime
+cuántas partidas haría falta jugar para que una diferencia de ese tamaño se separara del cero.
+
+**Puzles**: los 150 que exporta `labs/m6/puzzles_export.py`, preguntados como los pregunta el harness
+—con el prefijo real de la partida y los Elo de los jugadores— y contados con su mismo criterio: la
+línea entera, no la primera jugada.
+
+**Posición compartible**: `?fen=` abre el tablero en una posición, que es lo que permite que una
+lección enlace a un puesto concreto.
+
+**Y tu propio modelo**: un campo que acepta el `artifacts/onnx/small/model-int8.onnx` que acabas de
+exportar en el lab 5 de M2, sin subirlo a ninguna parte.
+
+El código de esta lección vive en el otro repositorio, `rukh-web`, en el commit
+[`b0bf7af`](https://github.com/borja-glez/rukh-web/tree/b0bf7af). Se muestra entero lo que **decide
+algo**: la aritmética de la arena, el criterio de los puzles, la lectura del fichero local y el
+camino de los bytes hasta el worker. Las dos islas de Preact que lo dibujan —`Arena.tsx`, 460 líneas,
+y `Puzzles.tsx`, 316— van enlazadas y no pegadas, porque son estado de interfaz y maquetación: lo que
+enseñan es cómo se orquesta un bucle asíncrono en Preact, no cómo se mide un modelo, y las decisiones
+que sí importan están en los ficheros de `src/lib/` de abajo.
+
+## Tres modos en la URL
+
+{/* prettier-ignore */}
+```ts title="src/lib/query.ts"
+/** The three things the screen can do: play the model, watch two stages play, solve puzzles. */
+export type Mode = 'play' | 'arena' | 'puzzles';
+export const MODES: readonly Mode[] = ['play', 'arena', 'puzzles'];
+
+export interface Query {
+  mock: boolean;
+  stage: string;
+  /** Encoder stage the evaluation bar would load; nothing is fetched until its own consent. */
+  encoder: string;
+  color: Color;
+  mode: Mode;
+  /** A position to start from (`?fen=`), when it parses; null otherwise. */
+  fen: string | null;
+  /** The second stage of the arena (`?vs=`), when it is a known stage. */
+  vs: string | null;
+}
+```
+
+<Src file="src/lib/query.ts" repo="rukh-web" tag="b0bf7af" lines="11-26" />
+
+Todo el estado que la página puede recibir de fuera está en un objeto y sale de la cadena de consulta.
+Eso es lo que hace que un enlace sea un estado: `?mode=arena&stage=medium-fp16&vs=medium-dpo-fp16` es
+una frase completa, y es lo que una lección del curso puede pegar en un `<DemoEmbed>`.
+
+{/* prettier-ignore */}
+```ts title="src/lib/query.ts"
+export function parseQuery(
+  search: string,
+  fallback = defaultStageId(detectConditions()),
+  encoderFallback = defaultEncoderId(detectConditions()),
+): Query {
+  const params = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
+  const requested = params.get('stage') ?? fallback;
+  const stage = findStage(requested) ?? findStage(fallback);
+  const mock = params.get('mock') === '1' || stage === undefined || stage.kind === 'mock';
+  const encoder = findEncoderStage(params.get('encoder') ?? encoderFallback);
+  const mode = params.get('mode');
+  const vs = params.get('vs');
+  return {
+    mock,
+    stage: mock ? 'mock' : (stage?.id ?? fallback),
+    encoder: encoder?.id ?? encoderFallback,
+    color: params.get('color') === 'b' ? 'b' : 'w',
+    mode: mode !== null && (MODES as readonly string[]).includes(mode) ? (mode as Mode) : 'play',
+    fen: validFen(params.get('fen')),
+    vs: vs !== null && findStage(vs) ? vs : null,
+  };
+}
+
+/** `fen` when chess.js accepts it as a position, else null. */
+export function validFen(fen: string | null): string | null {
+  if (!fen) return null;
+  try {
+    return new Chess(fen).fen();
+  } catch {
+    return null;
+  }
+}
+```
+
+<Src file="src/lib/query.ts" repo="rukh-web" tag="b0bf7af" lines="44-75" />
+
+Toda la función tiene la misma forma y es la que conviene copiar: **cada parámetro se valida contra lo
+que existe y cae a un valor por defecto cuando no**. Un `?mode=cocina` abre el modo de jugar, un
+`?vs=nada` deja la arena sin segunda etapa, y un `?fen=` con basura se ignora. Nunca hay una excepción
+ni una pantalla en blanco.
+
+`validFen` valida **construyendo**: le da la cadena a `chess.js` y devuelve el FEN normalizado que
+salga, o `null` si el constructor protesta. Escribir una expresión regular para un <Term id="fen">FEN</Term> es un error clásico: el formato tiene seis campos, dos de ellos con reglas
+que dependen de la posición, y la librería que va a jugar con él ya sabe decidirlo. Y devolver `new
+Chess(fen).fen()` y no el `fen` de entrada normaliza la cadena, así que dos enlaces con la misma
+posición escrita de dos formas dan el mismo estado.
+
+`?fen=` no puede hacer daño precisamente por eso: lo que entra en el estado de la página es la salida
+de `chess.js` y no el texto del usuario.
+
+## La arena: la aritmética de M5, portada a TypeScript
+
+{/* prettier-ignore */}
+```ts title="src/lib/arena.ts"
+/**
+ * Arena: two stages play each other in the browser, and the difference is read off the games.
+ *
+ * The arithmetic is `rukh.eval.match` (M5) ported line for line: every opening is played twice
+ * with the colours swapped, the score is A's points over both games, the Elo difference is
+ * `400·log10(p / (1 - p))` and its interval comes from a bootstrap over the games. A match
+ * measures a **difference** and nothing else: there is no third party here whose mood has to be
+ * averaged (D-110), and the number is not a strength.
+ *
+ * Everything here is pure, so `tests/arena.test.ts` can pin the numbers against the Python
+ * implementation without a model in sight.
+ */
+```
+
+<Src file="src/lib/arena.ts" repo="rukh-web" tag="b0bf7af" lines="1-12" />
+
+«Portada línea a línea» es una afirmación fuerte y es la que hace que la arena sirva de algo. Si el
+navegador calculara la diferencia de Elo con otra fórmula, o remuestreara de otra forma, el número de
+la pantalla no se podría comparar con el +57 (36-79) que publicó M5, y la demo sería una animación
+bonita.
+
+«Todo aquí es puro» es la consecuencia práctica: ninguna de estas funciones toca el DOM, ni un worker,
+ni una promesa. Por eso `tests/arena.test.ts` puede fijar sus números contra los de la implementación
+de Python sin cargar un modelo.
+
+{/* prettier-ignore */}
+```ts title="src/lib/arena.ts"
+/** How many plies the random openings have; six, as `rukh eval match` does by default. */
+export const OPENING_PLIES = 6;
+/** A game that reaches this many plies without a result counts as a draw, and is marked cut. */
+export const MAX_PLIES = 300;
+
+/** A small, seeded PRNG so a run with the same seed plays the same openings. */
+export function mulberry32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** A random legal opening of `plies` moves in UCI; retried when it ends the game early. */
+export function randomOpening(random: () => number, plies = OPENING_PLIES): string[] {
+  for (;;) {
+    const chess = new Chess();
+    const moves: string[] = [];
+    for (let i = 0; i < plies; i += 1) {
+      const legal = chess.moves({ verbose: true });
+      if (legal.length === 0) break;
+      const pick = legal[Math.floor(random() * legal.length)];
+      chess.move(pick);
+      moves.push(`${pick.from}${pick.to}${pick.promotion ?? ''}`);
+    }
+    if (moves.length === plies && !chess.isGameOver()) return moves;
+  }
+}
+
+/** `pairs` openings, each to be played twice with the colours swapped. */
+export function openingBook(pairs: number, seed: number, plies = OPENING_PLIES): string[][] {
+  const random = mulberry32(seed);
+  return Array.from({ length: pairs }, () => randomOpening(random, plies));
+}
+```
+
+<Src file="src/lib/arena.ts" repo="rukh-web" tag="b0bf7af" lines="15-52" />
+
+`mulberry32` es un generador pseudoaleatorio de ocho líneas, y está aquí en vez de `Math.random`
+porque **una arena con la misma semilla juega las mismas aperturas**. Sin eso, dos ejecuciones no se
+pueden comparar ni siquiera consigo mismas, y la demo no podría enlazarse desde una lección
+prometiendo lo que se va a ver. JavaScript no trae un generador con semilla en la plataforma, así que
+o se escribe uno o se añade una dependencia por diez líneas.
+
+`randomOpening` con un bucle infinito y un `return` dentro es la forma correcta de un
+**rechazo-y-reintento**: si las seis jugadas al azar acaban la partida —mate del pastor incluido—, la
+apertura no vale como punto de partida y se sortea otra. Escribirlo con un contador de intentos sería
+más defensivo y añadiría un caso imposible que habría que tratar: la probabilidad de que seis jugadas
+aleatorias terminen la partida es pequeña, y la de que ocurra mil veces seguidas no es un escenario
+del que haya que protegerse.
+
+`openingBook` genera las `pairs` aperturas de **un solo** generador sembrado, no una por semilla. Es
+lo que hace que la apertura número cinco de una tirada con semilla 1 sea siempre la misma, y que pedir
+más parejas no cambie las anteriores.
+
+{/* prettier-ignore */}
+```ts title="src/lib/arena.ts"
+export interface ArenaGame {
+  /** Index in the schedule: game `2k` has A as White on opening `k`, game `2k+1` swaps. */
+  index: number;
+  opening: string[];
+  aWhite: boolean;
+  /** A's points: 1, 0.5 or 0. */
+  score: number;
+  plies: number;
+  /** True when the game hit `MAX_PLIES` and was scored as a draw. */
+  cut: boolean;
+}
+
+export interface ArenaSummary {
+  games: number;
+  /** A's points over all games, as a fraction. */
+  score: number;
+  wins: number;
+  draws: number;
+  losses: number;
+  cut: number;
+  /** A minus B in Elo, from the score; null until a game has been played. */
+  elo: number | null;
+  /** 95 % bootstrap interval of `elo`; null with fewer than two games. */
+  low: number | null;
+  high: number | null;
+  /** True when the interval does not contain zero. */
+  separated: boolean;
+}
+```
+
+<Src file="src/lib/arena.ts" repo="rukh-web" tag="b0bf7af" lines="54-81" />
+
+La propiedad que define el emparejamiento está en el comentario de `index`: el juego `2k` tiene a A
+con blancas en la apertura `k`, y el `2k+1` cambia los colores sobre la **misma** apertura. Eso es lo
+que saca la ventaja de las blancas de la comparación, y es la razón de que las partidas se cuenten por
+parejas.
+
+`cut` se cuenta aparte de las tablas. Una partida que llega a 300 plies sin resultado se anota como
+tablas para el marcador, y el número de esas se publica al lado, porque «tablas porque ninguno supo
+ganar» y «tablas porque se agotó el contador» no dicen lo mismo del modelo.
+
+`separated` es un booleano que la interfaz usa para decidir si puede afirmar algo. Es la regla de M5
+metida en un campo: si el intervalo contiene el cero, no hay diferencia demostrada, y la pantalla lo
+dice con palabras y no solo con un color.
+
+{/* prettier-ignore */}
+```ts title="src/lib/arena.ts"
+/** Elo difference that explains a score, clipped away from 0 and 1 as the harness does. */
+export function eloDifference(score: number): number {
+  const p = Math.min(Math.max(score, 0.001), 0.999);
+  return 400 * Math.log10(p / (1 - p));
+}
+
+/**
+ * Percentile bootstrap of the Elo difference over the games (`samples` resamples, seeded).
+ * The same estimator as `rukh.eval.match.bootstrap_interval`: resample games with replacement,
+ * recompute the score, convert.
+ */
+export function bootstrapElo(
+  scores: readonly number[],
+  samples = 500,
+  seed = 0,
+): { low: number; high: number } | null {
+  if (scores.length < 2) return null;
+  const random = mulberry32(seed);
+  const draws: number[] = [];
+  for (let s = 0; s < samples; s += 1) {
+    let total = 0;
+    for (let i = 0; i < scores.length; i += 1) {
+      total += scores[Math.floor(random() * scores.length)];
+    }
+    draws.push(eloDifference(total / scores.length));
+  }
+  draws.sort((a, b) => a - b);
+  const at = (q: number) => draws[Math.min(draws.length - 1, Math.floor(q * draws.length))];
+  return { low: at(0.025), high: at(0.975) };
+}
+```
+
+<Src file="src/lib/arena.ts" repo="rukh-web" tag="b0bf7af" lines="83-112" />
+
+El recorte de `p` a `[0,001, 0,999]` es el `eps` de este fichero, y merece pararse. La fórmula del Elo
+a partir de una proporción es `400·log10(p / (1 − p))`, y en `p = 1` eso es infinito: un jugador que
+gana todas las partidas no tiene una puntuación identificable, solo una cota inferior. Recortar
+devuelve un número grande y finito en vez de `Infinity`, que es lo que permite que la interfaz siga
+dibujando. Es **exactamente el mismo recorte** que hace el harness de Python, y por eso está aquí y no
+en la capa de presentación: si los dos recortaran distinto, los dos números no serían comparables
+aunque la fórmula fuera la misma.
+
+El <Term id="bootstrap">bootstrap</Term> es el de M5: se remuestrean las partidas con reemplazo, se
+recalcula el marcador, se convierte a Elo, y se toman los percentiles 2,5 y 97,5 de las 500
+reconversiones. Lo importante es **qué** se remuestrea: las partidas, no las jugadas. El intervalo que
+sale cubre el ruido de haber jugado esas partidas y no otras.
+
+`samples = 500` y no mil: es un bucle de 500 × n operaciones en el hilo principal del navegador, y con
+veinte partidas la diferencia entre 500 y 1000 remuestreos son decimales.
+
+{/* prettier-ignore */}
+```ts title="src/lib/arena.ts"
+export function summarize(games: readonly ArenaGame[], seed = 0): ArenaSummary {
+  const scores = games.map((game) => game.score);
+  const points = scores.reduce((sum, value) => sum + value, 0);
+  const score = games.length > 0 ? points / games.length : 0;
+  const interval = bootstrapElo(scores, 500, seed);
+  return {
+    games: games.length,
+    score,
+    wins: scores.filter((value) => value === 1).length,
+    draws: scores.filter((value) => value === 0.5).length,
+    losses: scores.filter((value) => value === 0).length,
+    cut: games.filter((game) => game.cut).length,
+    elo: games.length > 0 ? eloDifference(score) : null,
+    low: interval?.low ?? null,
+    high: interval?.high ?? null,
+    separated: interval !== null && (interval.low > 0 || interval.high < 0),
+  };
+}
+
+/** The result of a finished game from A's point of view, given who had White. */
+export function scoreFor(result: string | null, aWhite: boolean): number {
+  if (result === '1-0') return aWhite ? 1 : 0;
+  if (result === '0-1') return aWhite ? 0 : 1;
+  return 0.5;
+}
+
+/** How many games the match needs to call an edge of `elo` points at 95 % (`labs/m5`). */
+export function gamesNeeded(elo: number): number {
+  const p = 1 / (1 + 10 ** (-Math.abs(elo) / 400));
+  const z = 1.959963985;
+  return Math.ceil((z * z * p * (1 - p)) / (p - 0.5) ** 2);
+}
+```
+
+<Src file="src/lib/arena.ts" repo="rukh-web" tag="b0bf7af" lines="114-145" />
+
+`summarize` se llama después de **cada** partida, no al final, y por eso todos sus campos aguantan
+listas de cero y de un elemento. Es lo que permite que la pantalla muestre el marcador creciendo con
+su intervalo encogiéndose, que es la mejor forma de aprender de dónde sale un intervalo: se ve cómo
+unas cuantas partidas no bastan.
+
+`scoreFor` tiene un `return 0.5` como caso por defecto, que cubre las tablas **y** el `null` de una
+partida sin resultado. Eso es coherente con `cut`: una partida cortada cuenta media, y se cuenta
+aparte.
+
+Y `gamesNeeded` es la función que convierte la demo en una lección. Es la <Term id="potencia-estadistica">potencia estadística</Term> de `labs/m5/games_needed_match.py`
+traída al navegador: dado un tamaño de efecto en Elo, cuántas partidas hay que jugar para que su
+intervalo del 95 % se separe del cero. Con `(p − 0,5)²` en el denominador, el coste crece con el
+**cuadrado** de la precisión: ver una diferencia de 50 Elo pide unas 185 partidas, y ver una de 11
+pide 3 832.
+
+Enseñar ese número al lado de un marcador de veinte partidas es lo que impide leer diez partidas como
+un veredicto. Es el mismo trabajo que hace el intervalo, dicho en la unidad en la que duele: partidas
+que hay que jugar.
+
+<Callout kind="teoria" title="Una arena mide una diferencia, no una fuerza">
+  Lo que sale de aquí es «A menos B», y no se puede sumar a nada. Si A saca +57 a B y B saca +40 a
+  C, eso **no** dice que A saque +97 a C: M5 midió la{' '}
+  <Term id="no-transitividad">no transitividad</Term> y la encontró. Un{' '}
+  <Term id="enfrentamiento-directo">enfrentamiento directo</Term> es el instrumento más fino que
+  tiene el proyecto para comparar dos etapas, y a la vez el que menos se puede extrapolar. La
+  escalera de Stockfish ordena; la arena compara dos.
+</Callout>
+
+<DemoEmbed
+  query="?mode=arena&stage=medium-fp16&vs=medium-dpo-fp16"
+  title="La arena, con el alineado contra su base"
+  note="Mira dos cosas mientras juega: cuánto se mueve la diferencia de Elo entre partida y partida, y cuántas partidas dice la pantalla que harían falta."
+/>
+
+## Los puzles, con el criterio del harness
+
+{/* prettier-ignore */}
+```ts title="src/lib/puzzles.ts"
+/**
+ * Live puzzles: the harness's puzzle criterion (`rukh.eval.puzzles`), in the browser.
+ *
+ * A puzzle is attempted the way the table measured it (D-053): the model is prompted with the
+ * **real game** that led to the position, with the players' own ratings in the header, and it
+ * has to find the **whole** line, not the first move. `moves[0]` is the opponent's move that
+ * sets the puzzle (Lichess's convention), then the sides alternate; the model answers the odd
+ * indices and the opponent's replies are played from the solution.
+ *
+ * `public/puzzles.json` is written by `labs/m6/puzzles_export.py` in the ML repository from the
+ * `test` split of `chorcat/rukh-puzzles-split`, fifty per band, seeded.
+ */
+```
+
+<Src file="src/lib/puzzles.ts" repo="rukh-web" tag="b0bf7af" lines="1-12" />
+
+Tres cosas tienen que coincidir con el harness para que el porcentaje de la pantalla se pueda comparar
+con la fila de la tabla: **cómo se pregunta** (con el prefijo real y los Elo de los jugadores), **qué
+cuenta como resuelto** (la línea entera) y **de dónde salen los puzles** (el mismo `split` de test,
+nunca uno que el modelo viera entrenando).
+
+Las tres están en el docstring porque las tres son formas de que el número parezca comparable sin
+serlo. Preguntar sin prefijo da un número más bajo; contar solo la primera jugada da uno mucho más
+alto; y coger puzles del `split` de entrenamiento daría uno que no significa nada.
+
+{/* prettier-ignore */}
+```ts title="src/lib/puzzles.ts"
+export interface Puzzle {
+  id: string;
+  fen: string;
+  moves: string[];
+  rating: number;
+  prefix: string[];
+  whiteElo: number | null;
+  blackElo: number | null;
+}
+
+export interface PuzzleSet {
+  schema: string;
+  source: string;
+  seed: number;
+  perBand: number;
+  generated: string;
+  bands: Record<string, Puzzle[]>;
+}
+
+export const BANDS = ['1000-1500', '1500-2000', '2000+'] as const;
+export type Band = (typeof BANDS)[number];
+
+export const PUZZLES_URL = '/puzzles.json';
+
+export async function loadPuzzleSet(
+  url = PUZZLES_URL,
+  fetcher: typeof fetch = fetch,
+): Promise<PuzzleSet> {
+  const response = await fetcher(url);
+  if (!response.ok) throw new Error(`puzzles: ${response.status} ${response.statusText}`);
+  const data = (await response.json()) as PuzzleSet;
+  if (data.schema !== 'rukh-puzzles/1') throw new Error(`puzzles: unknown schema ${data.schema}`);
+  return data;
+}
+```
+
+<Src file="src/lib/puzzles.ts" repo="rukh-web" tag="b0bf7af" lines="16-49" />
+
+El fichero JSON lleva **su propia versión de esquema** y se comprueba al cargarlo. Es la misma idea
+del `schema` en los datos de las islas del curso: el fichero lo genera un script de otro repositorio,
+así que el día que ese script cambie de formato, la demo lo dice en vez de dibujar tableros vacíos.
+
+`source`, `seed`, `perBand` y `generated` no los usa la lógica: están ahí para que el JSON diga de
+dónde salió. Es un <Term id="manifiesto">manifiesto</Term> en miniatura, y es lo que permite que la
+pantalla pueda escribir «los 150 puzles del `split` de test, cincuenta por tramo, semilla 6».
+
+`fetcher: typeof fetch = fetch` es un parámetro que casi nunca se pasa y hace posible el test: se le
+da un `fetch` falso que devuelve un objeto de juguete y se comprueban las dos ramas de error sin red.
+
+{/* prettier-ignore */}
+```ts title="src/lib/puzzles.ts"
+/** UCI `e7e8q` as a `Move`. */
+export function uciMove(uci: string): Move {
+  return {
+    from: uci.slice(0, 2),
+    to: uci.slice(2, 4),
+    promotion: (uci.slice(4, 5) || undefined) as Move['promotion'],
+  };
+}
+
+/**
+ * The game state the puzzle starts from: the real game replayed from the initial position, so
+ * the prompt carries the prefix, and the board is the puzzle's FEN. Replaying the prefix must
+ * land on that FEN (the first four fields); when it does not, the puzzle is malformed and is
+ * skipped rather than attempted from a position the model never reached.
+ */
+export function puzzleStart(puzzle: Puzzle): GameState | null {
+  const chess = new Chess();
+  try {
+    for (const uci of puzzle.prefix) chess.move(uciMove(uci));
+  } catch {
+    return null;
+  }
+  const reached = chess.fen().split(' ').slice(0, 4).join(' ');
+  const expected = puzzle.fen.split(' ').slice(0, 4).join(' ');
+  if (reached !== expected) return null;
+  return {
+    start: INITIAL_FEN,
+    fen: chess.fen(),
+    history: chess.history(),
+    turn: chess.turn(),
+    over: chess.isGameOver(),
+    result: null,
+  };
+}
+
+/** The moves the model has to find: the odd indices of the line. */
+export function expectedMoves(puzzle: Puzzle): string[] {
+  return puzzle.moves.filter((_, index) => index % 2 === 1);
+}
+```
+
+<Src file="src/lib/puzzles.ts" repo="rukh-web" tag="b0bf7af" lines="51-89" />
+
+`puzzleStart` es la gemela de `prefix_board` de la lección 3, y hace exactamente lo mismo por el mismo
+motivo: reproduce la partida desde el principio y comprueba que llega a la posición del puzle
+comparando **los cuatro primeros campos** del FEN. Los dos contadores que quedan fuera —la regla de
+las 50 jugadas y el número de jugada— pueden diferir sin que la posición sea otra.
+
+Y cuando no coincide, se devuelve `null` y la interfaz **salta** el puzle. No lo intenta desde la
+posición sola: un puzle mal formado intentado a ciegas cuenta como un fallo del modelo cuando es un
+fallo del dato.
+
+`expectedMoves` filtrando los índices impares es la convención de Lichess hecha código: `moves[0]` es
+la jugada del rival que plantea el puzle, y a partir de ahí los lados alternan. Es el tipo de línea
+que hay que escribir con el comentario al lado, porque un `index % 2 === 1` sin explicación parece
+arbitrario y es la mitad del criterio.
+
+{/* prettier-ignore */}
+```ts title="src/lib/puzzles.ts"
+export interface PuzzleAttempt {
+  id: string;
+  band: Band;
+  rating: number;
+  solved: boolean;
+  /** Model moves that matched before the first miss. */
+  correct: number;
+  total: number;
+  /** What the model proposed at the first miss (UCI), and what the line expected. */
+  proposed: string | null;
+  expected: string | null;
+}
+
+export interface BandProgress {
+  band: Band;
+  attempted: number;
+  solved: number;
+}
+
+export function progressByBand(attempts: readonly PuzzleAttempt[]): BandProgress[] {
+  return BANDS.map((band) => {
+    const own = attempts.filter((attempt) => attempt.band === band);
+    return { band, attempted: own.length, solved: own.filter((a) => a.solved).length };
+  });
+}
+
+/** `12,3 %`-style rate, or an em dash before anything was attempted. */
+export function rate(solved: number, attempted: number): string {
+  if (attempted === 0) return '—';
+  return `${((100 * solved) / attempted).toFixed(1).replace('.', ',')} %`;
+}
+```
+
+<Src file="src/lib/puzzles.ts" repo="rukh-web" tag="b0bf7af" lines="91-121" />
+
+`correct`, `proposed` y `expected` son lo que convierte un intento fallido en algo que se puede
+mirar. El criterio es binario —la línea entera o nada—, y aun así guardar cuántas jugadas acertó antes
+de fallar y **qué** propuso en su lugar es lo que enseña la diferencia entre «no vio la combinación» y
+«la vio y se equivocó en la tercera».
+
+`rate` devuelve un guion largo cuando no se ha intentado nada, no un `0,0 %`. Es la regla del `n/a`
+del proyecto en la capa de presentación: un cero es un valor y un hueco es un hueco.
+
+El `.replace('.', ',')` es la coma decimal española, y está aquí y no en un formateador de
+internacionalización porque la demo tiene un solo idioma y `toLocaleString` arrastra más de lo que
+resuelve para un número.
+
+## Tu propio modelo, sin salir del navegador
+
+Esta es la parte del hito que cambia para quién es la demo.
+
+{/* prettier-ignore */}
+```ts title="src/lib/byo.ts"
+/**
+ * Playing against a model you trained yourself, from a file on your disk.
+ *
+ * The demo ships the models the course published, which is the wrong half of the point: somebody
+ * who has just finished lab 5 of M2 has their own `artifacts/onnx/small/model-int8.onnx` and no
+ * way to play it. This takes that file and makes a stage out of it.
+ *
+ * Nothing leaves the browser. The bytes go straight from the file picker to the worker as a
+ * transferable, so there is no upload, no `fetch`, no Cache API entry and nothing to hit the
+ * network with. That is also why the local stage is not remembered across reloads: a model the
+ * page could restore by itself is a model a link could ask it to restore.
+ *
+ * What protects the reader from a bad file is the contract in `contract.ts`, which already
+ * refuses a graph whose logits are not the tokenizer's 2030 moves wide. A `.onnx` that is not a
+ * Rukh decoder fails there, by name, before it ever picks a move. The checks here are the cheap
+ * ones that come first: shape of the name, and a ceiling on the size.
+ */
+```
+
+<Src file="src/lib/byo.ts" repo="rukh-web" tag="b0bf7af" lines="1-17" />
+
+Cuatro párrafos con cuatro decisiones, y las cuatro son de esas que se toman una vez y se agradecen
+siempre.
+
+**«La mitad equivocada del objetivo».** La demo servía los modelos que el curso publicó. Pero alguien
+que acaba de terminar el lab 5 de M2 tiene su propio `.onnx` y no tenía forma de jugar contra él, que
+es justo lo que querría hacer en ese momento. Es un diagnóstico de producto escrito en un docstring, y
+está bien que esté ahí: explica por qué existe el fichero.
+
+**Nada sale del navegador, y no por promesa sino por construcción.** No hay `fetch`, así que no hay
+ninguna política de `connect-src` que ensanchar; no hay entrada en la Cache API, así que no queda nada
+en disco; los bytes van del selector de ficheros al worker como _transferible_. Un test de extremo a
+extremo comprueba que cargar y jugar un modelo local produce **cero** peticiones de `.onnx`. Esa es la
+diferencia entre decir que algo es privado y que lo sea.
+
+**La etapa local no se recuerda al recargar, y la razón es de seguridad.** «Un modelo que la página
+pudiera restaurar por sí sola es un modelo que un enlace podría pedirle que restaure». Si el fichero
+se guardara en IndexedDB y la etapa se pudiera nombrar en la URL, un enlace preparado podría hacer que
+la página cargara el modelo de alguien sin que lo pidiera. Perder el modelo al recargar es el precio, y
+es pequeño: volver a elegir el fichero es un clic.
+
+**Lo que rechaza un fichero malo ya estaba escrito.** La comprobación del contrato de M2 rechaza un
+grafo cuyos logits no tengan las 2030 jugadas del tokenizador, así que un `.onnx` que no es un decoder
+de Rukh falla **por su nombre** antes de elegir una jugada. Lo que se añade aquí son las
+comprobaciones baratas que van delante.
+
+{/* prettier-ignore */}
+```ts title="src/lib/byo.ts"
+/** The id the local model takes in the stage selector. Never a registry id. */
+export const LOCAL_STAGE_ID = 'local';
+
+/**
+ * Biggest file the picker accepts, in bytes.
+ *
+ * The largest thing the course ever exports is a 232 MB fp32 `medium`, so 600 MB leaves room for
+ * a bigger model somebody trains on their own without letting a mis-click hand a multi-gigabyte
+ * file to `ArrayBuffer`. The failure this avoids is a tab that freezes and then dies, which
+ * reads as "the demo is broken" rather than "that file is too big".
+ */
+export const MAX_MODEL_BYTES = 600 * 1_000_000;
+
+/** Smallest file that could possibly be an ONNX graph; below this it is a mistake, not a model. */
+export const MIN_MODEL_BYTES = 1024;
+
+export interface LocalModel {
+  stage: Stage;
+  /**
+   * The picked file, not its bytes.
+   *
+   * The buffer is transferred to the worker, which detaches it on this side, so keeping a copy
+   * here would keep a dead one. A `File` is a handle to the disk: re-reading it to load the same
+   * model a second time costs a read the OS has almost certainly cached.
+   */
+  file: File;
+}
+```
+
+<Src file="src/lib/byo.ts" repo="rukh-web" tag="b0bf7af" lines="20-46" />
+
+El límite de 600 MB tiene su razonamiento escrito: lo más grande que el curso exporta son 232 MB, así
+que 600 deja margen para un modelo más grande que alguien entrene sin dejar que un clic equivocado
+entregue un fichero de varios gigas a `ArrayBuffer`. Y la última frase es la que importa: el fallo que
+evita es **una pestaña que se congela y se muere**, que el usuario lee como «la demo está rota» en vez
+de «ese fichero es demasiado grande». Un límite con un mensaje es una función; un límite sin mensaje
+es un misterio.
+
+`LocalModel` guarda **el `File` y no los bytes**, y el comentario explica las dos mitades. El búfer se
+transfiere al worker, que lo desprende de este lado, así que guardar una copia aquí sería guardar una
+copia muerta. Y un `File` es un asa al disco: volver a leerlo para cargar el mismo modelo otra vez
+cuesta una lectura que el sistema operativo casi con seguridad tiene en caché.
+
+{/* prettier-ignore */}
+```ts title="src/lib/byo.ts"
+/** `model-int8.onnx` -> `model-int8.onnx`, and a hostile name to something safe to render. */
+export function safeName(name: string): string {
+  /* Preact escapes what it renders, so this is not about injection: it is about a 300-character
+     name breaking the panel, and about control characters making the label unreadable. Written
+     as a filter rather than a character class of control codes, which is exactly what
+     `no-control-regex` exists to flag and where the rule is right to ask. */
+  const clean = [...name]
+    .filter((ch) => {
+      const code = ch.codePointAt(0) ?? 0;
+      return code > 0x1f && (code < 0x7f || code > 0x9f);
+    })
+    .join('')
+    .trim();
+  const base = clean.split(/[\\/]/).pop() ?? clean;
+  return base.length > 48 ? `${base.slice(0, 45)}…` : base || 'modelo.onnx';
+}
+```
+
+<Src file="src/lib/byo.ts" repo="rukh-web" tag="b0bf7af" lines="51-66" />
+
+El comentario empieza diciendo **de qué no se trata**, y eso es lo más útil que tiene: Preact escapa
+lo que renderiza, así que esto no es una defensa contra inyección. Es contra un nombre de 300
+caracteres que rompe la maquetación del panel y contra los caracteres de control que hacen la etiqueta
+ilegible. Saber qué problema **no** se está resolviendo evita el error contrario, que es escribir aquí
+una sanitización de HTML que no hace falta y creerse protegido por ella.
+
+`[...name]` itera por puntos de código y no por unidades UTF-16, así que un nombre con emoji no se
+parte por la mitad. El filtro deja fuera los códigos de control de los dos rangos (`0x00`–`0x1f` y
+`0x7f`–`0x9f`), y está escrito como un filtro y no como una clase de caracteres en una expresión
+regular precisamente porque la regla `no-control-regex` del linter existe para señalar eso y **tiene
+razón en preguntar**.
+
+`split(/[\\/]/).pop()` se queda con el último segmento, que quita cualquier ruta que el navegador
+pudiera haber puesto delante. Y el `|| 'modelo.onnx'` del final cubre el caso de un nombre que se
+quede vacío después de limpiarlo: la etiqueta siempre dice algo.
+
+{/* prettier-ignore */}
+```ts title="src/lib/byo.ts"
+/**
+ * The stage a local file plays as.
+ *
+ * `sizeMb` is 0 on purpose even though the file has a size: that field drives the consent step,
+ * which exists to warn before the browser spends somebody's data. A file already on the disk
+ * costs no bytes, so there is nothing to consent to.
+ */
+export function localStage(name: string, block: number): Stage {
+  return {
+    id: LOCAL_STAGE_ID,
+    label: `Tu modelo · ${safeName(name)}`,
+    kind: 'onnx',
+    sizeMb: 0,
+    block,
+  };
+}
+
+/** True for the stage that came from the reader's disk. */
+export function isLocalStage(stage: Stage | undefined): boolean {
+  return stage?.id === LOCAL_STAGE_ID;
+}
+```
+
+<Src file="src/lib/byo.ts" repo="rukh-web" tag="b0bf7af" lines="68-88" />
+
+`sizeMb: 0` a propósito aunque el fichero tenga un tamaño. Ese campo es el que dispara el paso de
+consentimiento, que existe para avisar antes de que el navegador se gaste los datos de alguien. Un
+fichero que ya está en el disco no cuesta bytes, así que no hay nada que consentir. Reutilizar un
+campo con un cero que significa «esto no aplica» es discutible; la alternativa —un campo `local:
+true` que la lógica del consentimiento tendría que consultar— duplicaría la condición en dos sitios.
+
+{/* prettier-ignore */}
+```ts title="src/lib/byo.ts"
+/**
+ * Turns a picked file into a stage plus its bytes, or into the reason it cannot be one.
+ *
+ * The context window is read out of the file when the exporter wrote it there, and falls back to
+ * the 200 every published model uses. Getting it wrong is not silent: the prompt would be cropped
+ * to the wrong length and the contract reports the block it is playing under in the panel.
+ */
+export async function readLocalModel(file: File): Promise<LocalModel | { error: LocalModelError }> {
+  if (!/\.onnx$/i.test(file.name)) {
+    return { error: 'Tiene que ser un fichero .onnx, el que deja `rukh export`.' };
+  }
+  if (file.size > MAX_MODEL_BYTES) {
+    return {
+      error: `Ese fichero ocupa ${Math.round(file.size / 1_000_000)} MB y el límite son ${Math.round(
+        MAX_MODEL_BYTES / 1_000_000,
+      )} MB.`,
+    };
+  }
+  if (file.size < MIN_MODEL_BYTES) {
+    return { error: 'Ese fichero es demasiado pequeño para ser un modelo exportado.' };
+  }
+
+  const block = readBlock(new Uint8Array(await file.arrayBuffer())) ?? DEFAULT_BLOCK;
+  return { stage: localStage(file.name, block), file };
+}
+
+/** The bytes to hand the worker, read fresh so the transfer can detach them. */
+export async function modelBytes(file: File): Promise<Uint8Array> {
+  return new Uint8Array(await file.arrayBuffer());
+}
+```
+
+<Src file="src/lib/byo.ts" repo="rukh-web" tag="b0bf7af" lines="90-119" />
+
+El tipo de retorno es `LocalModel | { error: string }` y no una excepción, y eso hace la diferencia en
+la interfaz: el panel escribe `error` en su sitio y sigue. Los tres errores están **en español y
+dicen qué hacer**: el primero nombra la orden que produce el fichero (`rukh export`), el segundo dice
+el tamaño del fichero y el límite en la misma frase.
+
+El orden de las comprobaciones es de coste creciente, como la guarda de la lección 5: extensión
+(gratis), tamaño (gratis, `file.size` es metadato), y solo al final se lee el fichero. Un test de
+extremo a extremo comprueba que un fichero de más de 600 MB se rechaza **sin leerlo**, que es la
+propiedad que evita que la pestaña muera antes de dar el mensaje.
+
+`modelBytes` existe como función aparte de `readLocalModel` por lo del búfer desprendido: la primera
+lectura sirve para sacar el `block`, y esa vista se consume; cuando llega el momento de mandarle los
+bytes al worker se vuelve a leer del `File`.
+
+{/* prettier-ignore */}
+```ts title="src/lib/byo.ts"
+/*
+ * Reading `rukh_block` out of the file.
+ *
+ * `rukh export` writes the context window into the ONNX `metadata_props`, and ORT Web does not
+ * expose them (see `contract.ts`), which is why registry stages carry `block` by hand. A file
+ * from somebody's disk has no registry entry, so the number has to come from the file.
+ *
+ * An ONNX file is a protobuf `ModelProto`. Walking its top-level fields is enough: every field is
+ * a varint tag followed by either a varint or a length-delimited block, so the graph — the big
+ * one — is skipped by advancing past its length without decoding any of it. No protobuf library,
+ * no allocation, and it stops as soon as it finds the key.
+ */
+
+/** `metadata_props` in `ModelProto`; `key` and `value` in `StringStringEntryProto`. */
+const METADATA_PROPS_FIELD = 14;
+const KEY_FIELD = 1;
+const VALUE_FIELD = 2;
+const BLOCK_KEY = 'rukh_block';
+
+interface Cursor {
+  bytes: Uint8Array;
+  at: number;
+}
+
+/** A protobuf varint, or null when it runs off the end or is implausibly long. */
+function varint(c: Cursor): number | null {
+  let result = 0;
+  let shift = 0;
+  while (c.at < c.bytes.length) {
+    const byte = c.bytes[c.at];
+    c.at += 1;
+    result += (byte & 0x7f) * 2 ** shift;
+    if ((byte & 0x80) === 0) return result;
+    shift += 7;
+    if (shift > 49) return null;
+  }
+  return null;
+}
+```
+
+<Src file="src/lib/byo.ts" repo="rukh-web" tag="b0bf7af" lines="121-158" />
+
+Aquí está la pieza más curiosa del hito: **cincuenta líneas que leen un campo de un protobuf sin una
+librería de protobuf**.
+
+El problema es concreto. `rukh export` escribe la ventana de contexto en los metadatos del `.onnx`, y
+ONNX Runtime Web **no los expone** —eso ya se sabía desde M2, y por eso las etapas del registro llevan
+su `block` escrito a mano en el catálogo de la demo. Un fichero que viene del disco de alguien no
+tiene entrada en el registro, así que el número tiene que salir del fichero.
+
+Un `.onnx` es un `ModelProto` de protobuf. Y resulta que para leer **un** campo de primer nivel no
+hace falta entender el formato entero: cada campo es una etiqueta _varint_ seguida de un valor, y el
+tipo de cable de la etiqueta dice cuántos bytes ocupa el valor. El grafo —los 232 MB— se salta
+avanzando su longitud **sin decodificar nada de él**. Ni librería, ni asignación de memoria, y para en
+cuanto encuentra la clave.
+
+La alternativa era añadir `protobufjs` al bundle de la demo: unos cientos de kilobytes para leer un
+entero.
+
+`varint` usa `* 2 ** shift` y no `<< shift`. Esa es la línea que hay que mirar dos veces: los
+operadores de desplazamiento de JavaScript trabajan sobre 32 bits con signo, así que un
+desplazamiento de 32 o más da la vuelta y produce un número equivocado en silencio. Multiplicar por
+una potencia de dos en coma flotante es exacto hasta 2⁵³, que cubre cualquier longitud de fichero
+real. Y el `shift > 49` es el corte: un varint más largo que eso no es un número plausible en este
+formato, y devolver `null` es preferible a seguir leyendo basura.
+
+Todo el lector devuelve `null` en vez de lanzar. Es la decisión de fondo: si el fichero no es lo que
+se espera, **no se sabe** el `block`, y quien llama cae al 200 por defecto. Un lector de formato
+binario que lanza excepciones ante un byte inesperado convierte un fichero raro en una pantalla roja.
+
+{/* prettier-ignore */}
+```ts title="src/lib/byo.ts"
+/** The `StringStringEntryProto` at `[at, end)`, as a key/value pair. */
+function entry(bytes: Uint8Array, at: number, end: number): { key: string; value: string } | null {
+  const c: Cursor = { bytes, at };
+  let key = '';
+  let value = '';
+  const decoder = new TextDecoder();
+  while (c.at < end) {
+    const tag = varint(c);
+    if (tag === null) return null;
+    const field = tag >>> 3;
+    const wire = tag & 7;
+    if (wire !== 2) {
+      if (varint(c) === null) return null;
+      continue;
+    }
+    const length = varint(c);
+    if (length === null || c.at + length > end) return null;
+    const text = decoder.decode(bytes.subarray(c.at, c.at + length));
+    c.at += length;
+    if (field === KEY_FIELD) key = text;
+    else if (field === VALUE_FIELD) value = text;
+  }
+  return { key, value };
+}
+```
+
+<Src file="src/lib/byo.ts" repo="rukh-web" tag="b0bf7af" lines="160-183" />
+
+`tag >>> 3` es el número de campo y `tag & 7` el tipo de cable: así se codifica una etiqueta de
+protobuf, tres bits de tipo y el resto de número. Aquí sí se puede usar `>>>` porque la etiqueta es
+pequeña por construcción.
+
+`bytes.subarray(...)` y no `slice`: `subarray` es una vista sobre los mismos bytes y no copia nada. En
+un fichero de 232 MB esa distinción no es cosmética.
+
+La comprobación `c.at + length > end` está en todas las lecturas de longitud, y es la que impide que
+un fichero manipulado haga leer fuera del bloque. `Uint8Array` no deja salirse del búfer, así que el
+peor caso sería una cadena basura; la guarda hace que sea un `null`.
+
+{/* prettier-ignore */}
+```ts title="src/lib/byo.ts"
+/** The `rukh_block` the exporter wrote, or null when the file does not carry one. */
+export function readBlock(bytes: Uint8Array): number | null {
+  const c: Cursor = { bytes, at: 0 };
+  while (c.at < bytes.length) {
+    const tag = varint(c);
+    if (tag === null) return null;
+    const field = tag >>> 3;
+    const wire = tag & 7;
+
+    if (wire === 0) {
+      if (varint(c) === null) return null;
+      continue;
+    }
+    if (wire === 5) {
+      c.at += 4;
+      continue;
+    }
+    if (wire === 1) {
+      c.at += 8;
+      continue;
+    }
+    if (wire !== 2) return null;
+
+    const length = varint(c);
+    if (length === null || c.at + length > bytes.length) return null;
+    if (field === METADATA_PROPS_FIELD) {
+      const pair = entry(bytes, c.at, c.at + length);
+      if (pair && pair.key === BLOCK_KEY) {
+        const block = Number.parseInt(pair.value, 10);
+        return Number.isInteger(block) && block > 0 && block <= 8192 ? block : null;
+      }
+    }
+    c.at += length;
+  }
+  return null;
+}
+```
+
+<Src file="src/lib/byo.ts" repo="rukh-web" tag="b0bf7af" lines="185-220" />
+
+Los cuatro tipos de cable están tratados uno por uno: `0` es un varint que se lee y se tira, `5` son
+cuatro bytes, `1` son ocho, `2` es un bloque con longitud. Cualquier otro valor no es protobuf válido
+y devuelve `null`. El bucle solo entra en `entry` cuando el campo es el 14, `metadata_props`, y para
+en cuanto encuentra la clave.
+
+El rango `block > 0 && block <= 8192` es la última guarda: un `rukh_block` con un valor absurdo se
+trata como si no estuviera, y se usa el 200 por defecto. Un `block` de mil millones haría que el
+recorte del prompt no recortara nada y la inferencia fallaría dentro del grafo con un error de forma.
+
+El comentario del constructor lo dice de la mejor forma posible: «equivocarse en esto no es
+silencioso». Si el `block` sale mal, el prompt se recorta a una longitud equivocada, y el panel
+imprime bajo qué `block` está jugando la etapa. Una decisión con un valor por defecto es tolerable
+cuando el valor elegido se puede ver.
+
+## El camino de los bytes hasta el worker
+
+{/* prettier-ignore */}
+```ts title="src/lib/worker-protocol.ts"
+  /** Absolute or same-origin URL of the `.onnx` file; ignored when `bytes` is present. */
+  url: string;
+  /**
+   * The model itself, when it came from the reader's disk instead of the network.
+   *
+   * Transferred rather than copied, so the buffer is detached on this side the moment it is
+   * sent. A local model takes this path instead of `url` on purpose: no `fetch` means no
+   * `connect-src` to widen, no Cache API entry to leave behind and nothing that could send the
+   * file anywhere. See `lib/byo.ts`.
+   */
+  bytes?: Uint8Array;
+```
+
+<Src file="src/lib/worker-protocol.ts" repo="rukh-web" tag="b0bf7af" lines="34-44" />
+
+Un campo opcional en el mensaje de inicialización, y el `url` se ignora cuando está. El protocolo del
+worker es el sitio correcto para esta decisión: es la frontera entre la página y el hilo que carga el
+modelo, y lo que cruza esa frontera es la definición de lo que el worker puede hacer.
+
+{/* prettier-ignore */}
+```ts title="src/workers/rpc.ts"
+  send<T>(
+    request: Unidentified<WorkerRequest>,
+    onProgress?: (progress: ProgressMessage) => void,
+    /**
+     * Buffers to hand over instead of copying. A 230 MB model posted by value is 230 MB cloned
+     * before the worker sees any of it; transferred, it changes owner and the sender's view is
+     * detached. Callers that transfer must not read the buffer afterwards.
+     */
+    transfer?: Transferable[],
+  ): Promise<T>;
+```
+
+<Src file="src/workers/rpc.ts" repo="rukh-web" tag="b0bf7af" lines="23-32" />
+
+`postMessage` clona por defecto: mandar un modelo de 230 MB «por valor» significa **460 MB de memoria
+a la vez** antes de que el worker vea el primer byte, en un móvil que probablemente no los tenga.
+Transferirlo cambia el dueño del búfer sin copiar nada, y la vista del emisor se queda desprendida.
+
+La última frase del comentario es el contrato que el llamador tiene que cumplir: quien transfiere no
+puede volver a leer el búfer. Es exactamente la razón de que `LocalModel` guarde el `File` y no los
+bytes.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder-client.ts"
+    async init(request, onProgress) {
+      /* A local model travels as its buffer; transferring hands it over instead of cloning it. */
+      const transfer = request.bytes ? [request.bytes.buffer] : undefined;
+      const ready = await rpc.send<ReadyMessage>(
+        { type: 'init', ...request },
+        onProgress,
+        transfer,
+      );
+```
+
+<Src file="src/workers/decoder-client.ts" repo="rukh-web" tag="b0bf7af" lines="67-74" />
+
+`request.bytes.buffer` y no `request.bytes`: lo transferible es el `ArrayBuffer` que hay debajo, no la
+vista `Uint8Array`. Es un detalle de la API que se paga con un error en tiempo de ejecución si se
+equivoca.
+
+{/* prettier-ignore */}
+```ts title="src/workers/decoder.worker.ts"
+async function loadSession(request: Extract<DecoderRequest, { type: 'init' }>) {
+  /* A local model arrives whole: it was read from disk, so there is nothing to download and no
+     progress to report. Everything after this point is identical, including the contract check
+     that decides whether these bytes are a Rukh decoder at all. */
+  const bytes =
+    request.bytes ??
+    (await fetchModel(request.url, request.sizeBytes, (loaded, total) =>
+      reply({ type: 'progress', id: request.id, loaded, total }),
+    ));
+  return createSession(bytes);
+}
+```
+
+<Src file="src/workers/decoder.worker.ts" repo="rukh-web" tag="b0bf7af" lines="64-74" />
+
+Y aquí está todo el cambio del lado del worker: **una línea de `??`**. «Todo lo que viene después es
+idéntico, incluida la comprobación del contrato que decide si estos bytes son un decoder de Rukh».
+
+Eso es lo que hace que la función de «tu propio modelo» sea barata y segura a la vez. La validación no
+se escribió para esto: existía desde M2 para rechazar una exportación corrupta descargada del Hub, y
+protege exactamente igual a un fichero que viene del disco. Un camino nuevo que se une al viejo lo
+antes posible hereda todas sus guardas; uno que las duplica hereda la mitad.
+
+<Transfer concept="La frontera donde se unen dos caminos" where="Cualquier entrada nueva a un sistema que ya valida: un fichero subido frente a uno generado, un webhook frente a una llamada interna, un caché frente al origen.">
+  Cuando hay que aceptar algo por una vía nueva, la pregunta no es qué validar, sino **en qué punto
+  del camino existente empalmar**. Cuanto antes se una, menos código nuevo y menos guardas que
+  reescribir; cuanto más tarde, más probable es que la vía nueva se salte una comprobación que nadie
+  recuerda que existía.
+
+Aquí el empalme está una línea antes de `createSession`, así que la única diferencia entre un modelo
+descargado y uno del disco es de dónde salieron los bytes. Todo lo demás —el contrato, el ancho de
+los logits, el informe del panel— es el mismo código. El equivalente en un backend es validar el
+cuerpo de una petición en el mismo sitio venga de donde venga, y no una vez por endpoint.
+
+</Transfer>
+
+## Dos detalles de interfaz que son decisiones
+
+{/* prettier-ignore */}
+```tsx title="src/islands/Board.tsx"
+  /**
+   * True in the modes where nobody moves by hand (the arena, the puzzles): input is refused
+   * without looking at whose turn it is, and the board says so with `data-locked`.
+   */
+  locked?: Signal<boolean>;
+```
+
+<Src file="src/islands/Board.tsx" repo="rukh-web" tag="b0bf7af" lines="25-29" />
+
+En la arena y en los puzles nadie mueve a mano, y hacía falta una forma de decirlo que **no fuera**
+«no es tu turno». La diferencia importa: con la lógica de turnos, arrastrar una pieza en la arena
+funcionaría la mitad de las veces. `locked` rechaza la entrada sin mirar de quién es el turno.
+
+`data-locked` en la raíz del tablero es para el E2E: la convención del proyecto es que cada estado de
+una isla se pueda comprobar desde el DOM sin depender de los datos.
+
+{/* prettier-ignore */}
+```tsx title="src/islands/MoveList.tsx"
+  // Keep the current ply visible once the list grows past its fixed height. Only the list
+  // scrolls, never the page: `scrollIntoView` walks every scrollable ancestor, and on a
+  // one-column layout that moved the document by hundreds of pixels *during* a touch, so the
+  // click the browser synthesises after `touchend` landed on whatever had slid under the finger
+  // (the mode switcher, once it existed). A page must not move because a move was played.
+  useEffect(() => {
+    const container = list.current;
+    const current = container?.querySelector<HTMLElement>('.is-current');
+    if (!container || !current) return;
+    const box = container.getBoundingClientRect();
+    const ply = current.getBoundingClientRect();
+    if (ply.top < box.top) container.scrollTop += ply.top - box.top;
+    else if (ply.bottom > box.bottom) container.scrollTop += ply.bottom - box.bottom;
+  }, [history.length]);
+```
+
+<Src file="src/islands/MoveList.tsx" repo="rukh-web" tag="b0bf7af" lines="65-78" />
+
+Este es el bloque más instructivo de la lección y no tiene nada de ajedrez.
+
+`scrollIntoView({ block: 'nearest' })` es una línea razonable que funcionó durante cuatro módulos.
+El problema apareció cuando existió el conmutador de modos: la función **recorre todos los ancestros
+desplazables**, y en la maquetación de una columna eso movía el documento cientos de píxeles
+**durante** un toque. El clic que el navegador sintetiza después del `touchend` caía sobre lo que
+hubiera resbalado bajo el dedo, que era el conmutador de modos. Tocar una jugada en el móvil cambiaba
+de modo.
+
+El arreglo son seis líneas que hacen a mano lo que la función hacía, pero solo en el contenedor:
+medir las dos cajas y mover `scrollTop` lo justo. Y la última frase del comentario es la regla
+general: **una página no se mueve porque se haya jugado una jugada**.
+
+<Callout kind="roto" title="Una API cómoda con un alcance más grande del que parece">
+  `scrollIntoView` no tiene una opción para «solo este contenedor». La lección transferible no es
+  que sea una función mala, es que una API cuyo alcance es «todos los ancestros» produce un fallo
+  que no se reproduce hasta que existe un ancestro concreto. Y el síntoma fue el peor posible: un
+  clic en un sitio que activaba otro, solo en táctil, solo con la maquetación de una columna, solo
+  después de que el conmutador de modos se añadiera cuatro módulos más tarde.
+</Callout>
+
+## Qué quedó enlazado, y por qué
+
+| Fichero                                  | Líneas | Por qué no está pegado                                                                                                                     |
+| ---------------------------------------- | -----: | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `src/islands/Arena.tsx`                  |    460 | Orquestación y maquetación: dos workers, un bucle asíncrono cancelable y la tabla del marcador. Toda la aritmética que decide está arriba. |
+| `src/islands/Puzzles.tsx`                |    316 | Igual: recorre los puzles, pinta el tablero y acumula intentos. El criterio está en `lib/puzzles.ts`.                                      |
+| `src/islands/App.tsx`                    |   +221 | El conmutador de modos y el cableado del modelo local con el panel; ningún cálculo propio.                                                 |
+| `src/islands/ModelPanel.tsx`             |    +48 | El campo de fichero y sus mensajes, que son los que devuelve `readLocalModel`.                                                             |
+| `src/styles/base.css`                    |    +83 | Estilos de los tres modos.                                                                                                                 |
+| `public/puzzles.json`                    |  9 835 | Generado por `labs/m6/puzzles_export.py`; es un dato, y el script que lo escribe está en la lección 9.                                     |
+| `e2e/arena.spec.ts` y los dos siguientes |    236 | Pruebas de navegador, que la lección 9 comenta al cerrar la verificación en Chrome real.                                                   |
+
+Todos están en [el árbol del commit](https://github.com/borja-glez/rukh-web/tree/b0bf7af). La regla
+que se ha seguido es la del runbook del curso: de la demo se muestra **lo que toca al modelo** y lo que
+decide un número; lo que dibuja, se enlaza.
+
+<Exercise n="01" title="Qué le pasa al 95 % de paridad en la arena">
+  Carga tu propio `model-int8.onnx` y enfréntalo en la arena contra... nada, porque no puedes: la
+  arena solo acepta dos etapas del registro. Con `isLocalStage` delante, di qué habría que cambiar
+  para permitirlo y qué problema de la aritmética aparecería con veinte partidas.
+
+  <Solution>
+    La arena carga sus dos etapas por identificador del registro, así que habría que dejarle recibir
+    también un `LocalModel` para uno de los dos lados y pasarle los bytes al segundo worker. Es el
+    mismo camino de `init` con `bytes` que ya existe. El problema de la aritmética no es del código:
+    con veinte partidas el intervalo cubre varios cientos de Elo, y `gamesNeeded` lo dice en la
+    pantalla. Enfrentar tu int8 contra el fp16 del curso y leer «no se ha medido una diferencia» es el
+    resultado correcto, y es el mismo que la escalera dio en el lab 3 con 160 partidas.
+  </Solution>
+</Exercise>
+
+<Exercise n="02" title="Rompe el lector de protobuf de la forma sutil">
+  Cambia `result += (byte & 0x7f) * 2 ** shift` por `result |= (byte & 0x7f) << shift`. Los tests
+  pasan. ¿Con qué fichero falla, y por qué es peor que un error?
+
+  <Solution>
+    Falla con cualquier campo cuya longitud pase de 2³¹, es decir con un grafo de más de 2 GB, y
+    también con cualquier varint de cinco bytes o más: `<<` opera sobre 32 bits con signo, así que un
+    `shift` de 28 en adelante da la vuelta y produce un entero negativo o pequeño. Lo que sale no es
+    una excepción: es una longitud equivocada, con la que el bucle avanza el cursor a un sitio
+    arbitrario y sigue leyendo etiquetas que no son etiquetas. El resultado más probable es un `null`
+    y un `block` de 200 por defecto que puede ser el correcto por casualidad, así que el error se
+    manifiesta como un prompt mal recortado en un modelo concreto. Los tests con ficheros pequeños no
+    lo ven, y ahí está la trampa.
+  </Solution>
+</Exercise>
+
+## Qué has aprendido
+
+Una demo es donde se comprueba si lo que mediste significa algo para alguien que no lo midió. Y para
+que lo signifique, lo que la pantalla calcula tiene que ser **el mismo cálculo**: la fórmula del Elo
+con el mismo recorte, el bootstrap sobre las mismas unidades, el criterio del puzle con el mismo
+prefijo. Un número del navegador que no se puede comparar con la tabla es un adorno.
+
+Las dos decisiones que se llevan fuera son de diseño, no de ajedrez. La primera: cuando una entrada
+nueva llega a un sistema que ya valida, se empalma **lo antes posible** con el camino existente, y
+entonces hereda las guardas en vez de duplicarlas —una línea de `??` en el worker. La segunda: la
+privacidad se construye quitando capacidades, no añadiendo promesas. Sin `fetch` no hay nada que
+ensanchar, sin almacenamiento no hay nada que restaurar, y un test que cuenta cero peticiones es una
+afirmación comprobable.
+
+La lección siguiente pone la tabla entera delante, con todo esto medido el mismo día.

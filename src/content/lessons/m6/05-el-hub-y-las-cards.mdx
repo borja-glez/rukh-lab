@@ -1,0 +1,1519 @@
+---
+title: 'El Hub y las cards: el catálogo, la vuelta y la afirmación pública'
+description:
+  'El catálogo que dice dónde vive cada artefacto publicado y dónde lo esperan las configuraciones,
+  el comando que lo trae de vuelta convirtiendo el formato del Hub en un checkpoint del proyecto,
+  la regeneración de las veintiuna cards desde la tabla sin republicar un solo peso, y la colección
+  que no puede separarse de lo que se puede descargar.'
+module: m6
+order: 5
+duration: 215
+level: medio
+status: vigente
+updated: '2026-09-22'
+keywords:
+  - Hugging Face Hub
+  - catálogo
+  - model card
+  - colección
+  - publicación
+  - reproducibilidad
+artifacts:
+  - kind: model
+    label: Colección Rukh en el Hub
+    href: https://huggingface.co/collections/chorcat
+  - kind: repo
+    label: borja-glez/rukh
+    href: https://github.com/borja-glez/rukh/tree/p6
+---
+
+## Qué vas a construir
+
+Cuatro ficheros nuevos y un puñado de cambios que cierran el círculo del proyecto: lo que se
+entrena se publica, lo que se publica se puede volver a bajar exactamente donde las configuraciones
+lo esperan, y lo que dice cada card se puede contradecir con lo que hay dentro.
+
+`hub.py` es el **catálogo**: la lista de todo lo que el curso publicó, con su repositorio, su ruta
+local, los módulos que empiezan desde ahí, la fila que lleva en la tabla y cómo se mide. De esa
+lista tiran cuatro cosas distintas —`rukh pull`, `rukh eval nightly`, `rukh publish cards` y
+`rukh publish collection`—, y que sea una sola lista es lo que impide que las cuatro se separen.
+
+`publish/cards.py` regenera las veintiuna cards desde lo que hay en disco y sube **solo** el
+`README.md`. `publish/collection.py` monta la colección del Hub desde el mismo catálogo.
+`publish/links.py` es lo que hace que cada card enlace a su lección, a su fila y a la demo.
+
+<Callout kind="hoy" title="El que hace falta y no se puede automatizar">
+  Todo lo de esta lección habla con Hugging Face. Para que funcione hace falta un token con permiso
+  de escritura en `huggingface-cli login`, y todos los comandos tienen `--dry-run` precisamente
+  porque la mitad de las veces lo que quieres es ver qué haría.
+</Callout>
+
+## El catálogo: una lista, cuatro consumidores
+
+```python title="src/rukh/hub.py"
+"""``rukh pull``: the published artefacts of a module, written where the configs expect them.
+
+Every model of the course is on the Hub in the Hub's own layout -- ``config.json`` plus
+``model.safetensors``, or a ``peft`` folder -- and every dataset under its own name. The
+configs and the lessons, on the other hand, read files at fixed local paths:
+``checkpoints/medium-v4/best.pt``, ``data/pairs/dpo-prompts.parquet``. This module maps one
+onto the other, so a reader who skipped a module, or a machine that never trained anything, can
+start the next module from exactly what was published, with one command:
+
+    uv run rukh pull --module m4        # everything M4 starts from
+    uv run rukh pull medium-v4 rukh-pairs-dpo
+
+The local path of a model is its **run name** (``checkpoints/<run>/<file>``), the same spelling
+``rukh.train.checkpoint.resolve_run`` accepts for a run the reader trained themselves. A pulled
+model is therefore indistinguishable, to every config, from one trained locally.
+
+Nothing here decides what is worth publishing; ``rukh publish`` does that. This is the way back.
+"""
+```
+
+<Src file="src/rukh/hub.py" tag="p6" lines="1-18" />
+
+La frase que carga con todo es la penúltima: **un modelo descargado es indistinguible, para
+cualquier configuración, de uno entrenado en local**. Eso es lo que convierte el curso en algo que
+se puede seguir por partes. Un lector que se saltó M2 entera puede empezar M4 con un comando, y la
+orden que la lección de M4 le pide escribir es exactamente la misma que escribiría si hubiera
+entrenado el modelo él.
+
+Conseguirlo tiene dos mitades. Esta, que escribe el fichero en la ruta estable; y `resolve_run`, en
+la lección siguiente, que hace que esa ruta estable también encuentre la carpeta con marca de
+tiempo que deja un entrenamiento propio.
+
+```python title="src/rukh/hub.py"
+Kind = Literal["decoder", "encoder", "reward", "adapter", "peft", "dataset"]
+OWNER = "chorcat"
+
+
+@dataclass(frozen=True)
+class Artefact:
+    """One thing ``rukh pull`` knows how to bring back, and where it lands."""
+
+    name: str
+    """What the reader types: the run or stage name of a model, the Hub name of a dataset."""
+    repo: str
+    kind: Kind
+    target: str
+    """Path under the repository root: the checkpoint file, the adapter folder or the data dir."""
+    modules: tuple[str, ...]
+    """The modules that start from this artefact when the reader skipped what produced it."""
+    note: str
+    stage: str | None = None
+    """Its row in the single results table, when it has one; ``rukh eval nightly`` measures it
+    under that name so the row it rewrites is the row the cards and the course already cite."""
+    measure: Literal["decoder", "encoder", "qwen", "karvonen", "none"] = "none"
+    """How ``nightly`` measures it: the decoder suite (adapters are merged onto their base
+    first), the encoder suite, the general-model suite, the public-baseline suite (an entry
+    ``nightly`` adds itself, since the weights are not the course's to pull or publish), or not
+    at all (datasets, the reward model, the pretraining encoder)."""
+    base: str | None = None
+    """For an adapter: the checkpoint it is merged onto before it is measured."""
+    lesson: str | None = None
+    """Path of the course lesson that builds it, for the card's "In the course" section."""
+
+    @property
+    def repo_id(self) -> str:
+        return self.repo if "/" in self.repo else f"{OWNER}/{self.repo}"
+```
+
+<Src file="src/rukh/hub.py" tag="p6" lines="33-65" />
+
+Nueve campos, y cada uno existe porque un consumidor distinto lo necesita. `target` y `kind` son de
+`pull`. `modules` es de `--module`. `stage` y `measure` y `base` son del nightly de la lección
+anterior. `lesson` es de las cards. `note` es de `--list`.
+
+Que estén todos en el mismo objeto, y no repartidos en cuatro diccionarios paralelos, es la
+decisión. Cuatro diccionarios con las mismas claves se desincronizan el día que se añade un modelo y
+se olvida uno de ellos, y el síntoma es una card sin lección o una etapa sin medir.
+
+`@dataclass(frozen=True)`: el catálogo es una constante del programa y congelarlo hace que ningún
+consumidor pueda mutar una entrada por accidente y cambiársela al siguiente.
+
+`repo_id` como propiedad y no como campo. El catálogo escribe `"rukh-tiny"` y la propiedad completa
+`"chorcat/rukh-tiny"`, salvo que ya venga con barra —que es el caso del baseline de Karvonen, cuyo
+`Artefact` vive en `nightly.py` y apunta a `adamkarvonen/chess_llms`. Es lo que permite que el
+mismo tipo describa un repositorio nuestro y uno ajeno.
+
+Una nota de lectura: la distinción entre `name` y `stage` es la misma que en el nightly. `name` es lo que se escribe en la terminal (`medium-v4`); `stage` es el
+nombre de la fila (`medium-v4-greedy`), con el sufijo del muestreo.
+
+### Las trece entradas
+
+```python title="src/rukh/hub.py"
+MODELS: tuple[Artefact, ...] = (
+    Artefact(
+        "tiny",
+        "rukh-tiny",
+        "decoder",
+        "checkpoints/tiny/best.pt",
+        ("m2", "m6", "m6"),
+        "the 5 M decoder M2 iterates on (`configs/train/tiny.yaml`)",
+        stage="tiny-greedy",
+        measure="decoder",
+        lesson="/curso/m2/02-entrenar-y-medir/",
+    ),
+    Artefact(
+        "small",
+        "rukh-small",
+        "decoder",
+        "checkpoints/small-v3/best.pt",
+        ("m2", "m6", "m6"),
+        "the 39 M course decoder, `small-v3` on the corpus with 24 months of Elite games",
+        stage="small-v3-greedy",
+        measure="decoder",
+        lesson="/curso/m2/02-entrenar-y-medir/",
+    ),
+    Artefact(
+        "medium-v4",
+        "rukh-medium",
+        "decoder",
+        "checkpoints/medium-v4/best.pt",
+        ("m4", "m5", "m6"),
+        "the 115 M decoder every M4 fine-tune and every M5 alignment run starts from",
+        stage="medium-v4-greedy",
+        measure="decoder",
+        lesson="/curso/m2/04-mas-datos-no-mas-red/",
+    ),
+    Artefact(
+        "encoder-mmm-v4",
+        "rukh-encoder-mmm",
+        "encoder",
+        "checkpoints/encoder-mmm-v4/best.pt",
+        ("m3", "m6", "m6"),
+        "the masked-move pretraining the published encoder's heads were fine-tuned on",
+        lesson="/curso/m3/03-labs-del-encoder/",
+    ),
+    Artefact(
+        "encoder-v4",
+        "rukh-encoder",
+        "encoder",
+        "checkpoints/encoder-heads-v4/step-4000.pt",
+        ("m3", "m6", "m6"),
+        "the encoder with its three heads at its last step, as published and served by the demo",
+        stage="encoder-v4",
+        measure="encoder",
+        lesson="/curso/m3/03-labs-del-encoder/",
+    ),
+```
+
+<Src file="src/rukh/hub.py" tag="p6" lines="68-121" />
+
+Cinco entradas, y ya se ven tres cosas que no son obvias.
+
+**`name` y `repo` no coinciden casi nunca.** `small` vive en `rukh-small` y su checkpoint está en
+`checkpoints/small-v3/best.pt`. Tres nombres para lo mismo, y los tres son correctos en su sitio: el
+nombre corto es el de la orden, el del repositorio es el que se anunció públicamente, y el de la
+carpeta lleva la versión porque hubo `small`, `small-v2` y `small-v3`.
+
+**`encoder-v4` apunta a `step-4000.pt` y no a `best.pt`.** Es la decisión de M3: el paso final se
+publicó en vez del mejor por validación porque la cabeza de blunder seguía mejorando cuando la
+pérdida agregada ya no. La ruta lo dice sin necesidad de explicarlo.
+
+**`encoder-mmm-v4` no tiene `stage` ni `measure`.** Es el encoder de preentrenamiento: se publica
+porque es de donde parten las cabezas, pero no tiene ninguna columna de la tabla. Un campo ausente
+es más honesto que un `measure="none"` explícito para algunas cosas y no para otras… salvo que aquí
+`measure` **sí** tiene valor por defecto `"none"`, así que ausente y explícito son lo mismo. El
+nightly lo filtra y no aparece en ninguna fila.
+
+<Callout kind="roto" title="`(\"m2\", \"m6\", \"m6\")`">
+  Mira la tupla de módulos de casi todas las entradas: `m6` está **dos veces**. No rompe nada
+  —`for_module` pregunta con `in`, que no cuenta— pero es un error real del repositorio en la
+  etiqueta `p6`, y sale de duplicar una entrada al añadir el módulo a todas las líneas. Se cuenta
+  aquí porque una lista de datos escrita a mano se revisa igual que el código, y porque el test del
+  catálogo comprueba que los **nombres** no se repiten, no que los módulos de cada entrada no lo
+  hagan.
+</Callout>
+
+```python title="src/rukh/hub.py"
+    Artefact(
+        "medium-elo",
+        "rukh-medium-elo",
+        "decoder",
+        "checkpoints/medium-elo/step-3800.pt",
+        ("m4", "m6", "m6"),
+        "`medium-v4` fine-tuned on the Elo-balanced corpus (the last step, not `best.pt`)",
+        stage="medium-elo",
+        measure="decoder",
+        lesson="/curso/m4/03-labs-de-afinado/",
+    ),
+    Artefact(
+        "medium-masters",
+        "rukh-medium-masters",
+        "decoder",
+        "checkpoints/medium-masters/step-3800.pt",
+        ("m4", "m6", "m6"),
+        "`medium-v4` fine-tuned on Elite games (the last step, not `best.pt`)",
+        stage="medium-masters",
+        measure="decoder",
+        lesson="/curso/m4/03-labs-de-afinado/",
+    ),
+    Artefact(
+        "lora-e4",
+        "rukh-lora-e4",
+        "adapter",
+        "checkpoints/lora-e4",
+        ("m4", "m6", "m6"),
+        "the 1.6 MB style adapter that opens 1. e4",
+        stage="lora-e4",
+        measure="decoder",
+        base="checkpoints/medium-v4/best.pt",
+        lesson="/curso/m4/03-labs-de-afinado/",
+    ),
+    Artefact(
+        "lora-d4",
+        "rukh-lora-d4",
+        "adapter",
+        "checkpoints/lora-d4",
+        ("m4", "m6", "m6"),
+        "the 1.6 MB style adapter that opens 1. d4",
+        stage="lora-d4",
+        measure="decoder",
+        base="checkpoints/medium-v4/best.pt",
+        lesson="/curso/m4/03-labs-de-afinado/",
+    ),
+    Artefact(
+        "qwen3-pgn-qlora",
+        "rukh-qwen3-pgn-qlora",
+        "peft",
+        "checkpoints/qwen3-pgn-qlora",
+        ("m4", "m6", "m6"),
+        "the `peft` adapter of Qwen3-0.6B over PGN text, as `trl` wrote it",
+        stage="qwen3-pgn-qlora",
+        measure="qwen",
+        lesson="/curso/m4/03-labs-de-afinado/",
+    ),
+    Artefact(
+        "rm",
+        "rukh-rm",
+        "reward",
+        "checkpoints/rm/reward.pt",
+        ("m5", "m6", "m6"),
+        "the Bradley-Terry reward model over 69 square tokens",
+        lesson="/curso/m5/03-labs-de-alineamiento/",
+    ),
+    Artefact(
+        "medium-v4-dpo-onpolicy",
+        "rukh-medium-dpo",
+        "decoder",
+        "checkpoints/medium-v4-dpo-onpolicy/dpo.pt",
+        ("m5", "m6", "m6"),
+        "`medium-v4` after DPO on its own pairs, the aligned decoder the demo serves",
+        stage="medium-v4-dpo-onpolicy-greedy",
+        measure="decoder",
+        lesson="/curso/m5/03-labs-de-alineamiento/",
+    ),
+    Artefact(
+        "medium-v4-grpo",
+        "rukh-medium-grpo",
+        "decoder",
+        "checkpoints/medium-v4-grpo/grpo.pt",
+        ("m5", "m6", "m6"),
+        "`medium-v4` after GRPO against the verifiable reward",
+        stage="medium-v4-grpo-greedy",
+        measure="decoder",
+        lesson="/curso/m5/03-labs-de-alineamiento/",
+    ),
+)
+```
+
+<Src file="src/rukh/hub.py" tag="p6" lines="122-210" />
+
+Las ocho restantes. Tres cosas para leerlas:
+
+**`kind` distingue `adapter` de `peft`.** Los dos son adaptadores <Term id="lora">LoRA</Term>, y son
+dos formatos distintos: el nuestro son dos ficheros (`adapter.safetensors` y
+`adapter_config.json`), el de `peft` es una carpeta entera con la convención de esa librería.
+`pull` los trae de forma distinta y por eso son dos tipos.
+
+**`base` solo lo tienen los dos adaptadores nuestros**, no el de Qwen3. Es coherente: el nightly
+funde los nuestros sobre `medium-v4` antes de medirlos, mientras que el de Qwen3 lo mide su propia
+suite, que carga el modelo base de Hugging Face por su cuenta.
+
+**`rm` no tiene `stage`.** El reward model juzga pares, no juega: no hay ninguna columna de la tabla
+que pueda rellenar. Publicarlo sin fila es exactamente lo correcto, y es lo que el `measure="none"`
+por defecto hace posible sin una excepción escrita en ningún sitio.
+
+```python title="src/rukh/hub.py"
+DATASET_MODULES: dict[str, tuple[str, ...]] = {
+    "rukh-games-1800": ("m1", "m2", "m3", "m4", "m5", "m6"),
+    "rukh-tokenizer": ("m2", "m3", "m4", "m5", "m6"),
+    "rukh-games-elite": ("m2", "m4"),
+    "rukh-positions-eval": ("m2", "m3", "m5", "m6"),
+    "rukh-puzzles-split": ("m2", "m3", "m4", "m5", "m6"),
+    "rukh-elo-bins": (),
+    "rukh-pairs-dpo": ("m5",),
+    "rukh-pairs-onpolicy": ("m5",),
+}
+"""Which modules start from each dataset. ``rukh-elo-bins`` is M1's 100-Elo sample of the
+1800+ corpus and nothing downstream reads it: M4 builds its own, from the club games it fetches.
+"""
+
+
+DATASET_LESSONS: dict[str, str] = {
+    "rukh-games-1800": "/curso/m1/02-labs-del-pipeline/",
+    "rukh-tokenizer": "/curso/m1/02-labs-del-pipeline/",
+    "rukh-games-elite": "/curso/m2/04-mas-datos-no-mas-red/",
+    "rukh-positions-eval": "/curso/m1/02-labs-del-pipeline/",
+    "rukh-puzzles-split": "/curso/m1/02-labs-del-pipeline/",
+    "rukh-elo-bins": "/curso/m1/02-labs-del-pipeline/",
+    "rukh-pairs-dpo": "/curso/m1/02-labs-del-pipeline/",
+    "rukh-pairs-onpolicy": "/curso/m5/03-labs-de-alineamiento/",
+}
+"""The lesson each dataset is built in."""
+
+
+def _dataset_artefact(spec: DatasetSpec) -> Artefact:
+    return Artefact(
+        spec.name,
+        spec.name,
+        "dataset",
+        spec.local_dir,
+        DATASET_MODULES.get(spec.name, ()),
+        spec.description.split(". ")[0].rstrip("."),
+        lesson=DATASET_LESSONS.get(spec.name),
+    )
+```
+
+<Src file="src/rukh/hub.py" tag="p6" lines="212-249" />
+
+Aquí sí hay dos diccionarios paralelos, y es la excepción que explica la regla de arriba. Los
+datasets ya tienen su propia descripción en `DATASETS`, el registro que M1 escribió en
+`data/publish.py`: repetirlos enteros aquí sería tener dos verdades sobre el mismo dataset. Lo que
+falta son las dos cosas que ese registro no sabe —a qué módulos sirve y en qué lección se construye—
+y viven en dos mapas por nombre que `_dataset_artefact` junta con lo demás.
+
+`rukh-elo-bins` con una tupla vacía es un dato interesante y está documentado: es el muestreo de M1
+por franjas de 100 Elo que **nadie aguas abajo lee**, porque M4 construyó el suyo. Dejarlo
+publicado con cero módulos es más honesto que borrarlo del catálogo: existe, se puede descargar, y
+ningún módulo lo necesita.
+
+`spec.description.split(". ")[0]` coge la primera frase de la descripción larga del dataset. Es una
+heurística, y es la clase de línea que falla el día que una descripción empiece por «Aprox. 5 M de
+partidas»; aquí aguanta porque las ocho descripciones están escritas y revisadas.
+
+```python title="src/rukh/hub.py"
+def catalogue() -> list[Artefact]:
+    """Every artefact ``rukh pull`` knows, models first and then the datasets."""
+    return [*MODELS, *(_dataset_artefact(spec) for spec in DATASETS.values())]
+
+
+def lookup(name: str) -> Artefact:
+    """The artefact called ``name``: a run name, a dataset name or a Hub id."""
+    for artefact in catalogue():
+        if name in (artefact.name, artefact.repo, artefact.repo_id):
+            return artefact
+    known = ", ".join(a.name for a in catalogue())
+    raise KeyError(f"nothing to pull called {name!r}; known: {known}")
+
+
+def for_module(module: str) -> list[Artefact]:
+    """What a reader who skipped everything before ``module`` needs on disk to start it."""
+    return [artefact for artefact in catalogue() if module in artefact.modules]
+```
+
+<Src file="src/rukh/hub.py" tag="p6" lines="252-268" />
+
+`lookup` acepta tres formas del mismo nombre: la corta, la del repositorio y la completa con el
+propietario. Es la misma comodidad del `--only` del nightly, por la misma razón: se escribe lo que
+se acaba de leer, y lo que se lee depende de dónde se mire.
+
+El `KeyError` incluye **la lista entera de lo conocido**. Con veintiún artefactos cabe en la
+pantalla, y un error que dice qué sí existe ahorra un `--list`.
+
+## La vuelta: del formato del Hub al del proyecto
+
+```python title="src/rukh/hub.py"
+def _download(repo_id: str, filename: str) -> Path:
+    import huggingface_hub
+
+    return Path(huggingface_hub.hf_hub_download(repo_id, filename))
+
+
+def _load_state(repo_id: str) -> dict[str, Any]:
+    """The weights of a Hub model, whichever of the two names they were published under."""
+    import torch
+
+    for name in ("model.safetensors", "pytorch_model.bin"):
+        try:
+            weights = _download(repo_id, name)
+        except Exception as exc:  # noqa: BLE001 - a missing file only means "try the next one"
+            log.debug("%s has no %s (%s)", repo_id, name, exc)
+            continue
+        if name.endswith(".safetensors"):
+            from safetensors.torch import load_file
+
+            return dict(load_file(str(weights)))
+        return dict(torch.load(weights, map_location="cpu", weights_only=True))
+    raise FileNotFoundError(f"{repo_id} holds neither model.safetensors nor pytorch_model.bin")
+```
+
+<Src file="src/rukh/hub.py" tag="p6" lines="271-292" />
+
+`safetensors` primero y `pytorch_model.bin` después, en ese orden. El primero es el formato que el
+proyecto publica y no ejecuta código al cargarse; el segundo es un `pickle` y se acepta solo porque
+un repositorio antiguo podría tenerlo. El orden es la política de seguridad escrita como una tupla.
+
+El `except Exception` de aquí es el caso menos dudoso de los tres del módulo: `hf_hub_download`
+levanta excepciones de tipos distintos según la versión de la librería y según si el fallo es un
+404, un problema de red o un fichero ausente en la caché, y lo único que este bucle quiere saber es
+«no está, prueba el siguiente». El `log.debug` deja rastro para cuando el problema sea de red y no
+de nombre.
+
+```python title="src/rukh/hub.py"
+def _model_payload(artefact: Artefact, config: dict[str, Any], state: dict[str, Any]) -> dict:
+    """Fold a Hub layout back into the checkpoint payload every loader of this project reads.
+
+    ``rukh publish`` writes the model's shape and the run's provenance into ``config.json``;
+    this puts them back under the keys ``save_checkpoint`` uses. The heads of an encoder need
+    the pooling they were trained with, which the card's config carries and ``build_heads``
+    reads from the run config.
+    """
+    from rukh.models import DecoderConfig, EncoderConfig
+
+    if artefact.kind == "reward":
+        return {
+            "model": state,
+            "encoder_config": config["encoder"],
+            "pooling": config.get("pooling"),
+            "config": {"pulled_from": artefact.repo_id},
+        }
+    shape = EncoderConfig if artefact.kind == "encoder" else DecoderConfig
+    model_cfg = {key: value for key, value in config.items() if key in shape.model_fields}
+    run_cfg: dict[str, Any] = {"pulled_from": artefact.repo_id}
+    if artefact.kind == "encoder" and config.get("pooling"):
+        run_cfg["pooling"] = config["pooling"]
+    return {
+        "step": int(config.get("step") or 0),
+        "model_state": state,
+        "opt_state": None,
+        "cfg": run_cfg,
+        "model_cfg": model_cfg,
+        "vocab_hash": config.get("vocab_hash"),
+        "data_manifest_sha": config.get("data_manifest_sha"),
+        "git_sha": config.get("git_sha"),
+        "best_val": None,
+    }
+```
+
+<Src file="src/rukh/hub.py" tag="p6" lines="295-327" />
+
+Esta es la función que hace realidad la promesa del docstring. El Hub guarda un modelo como
+«configuración más pesos»; el proyecto lo guarda como el `payload` que escribe `save_checkpoint`.
+Traducir de uno a otro es lo que permite que `load_model` abra un fichero descargado sin saber que
+lo es.
+
+**El filtro por `shape.model_fields`** es la pieza clave. El `config.json` publicado lleva la forma
+del modelo **y** la procedencia de la corrida mezcladas, porque en una card eso se lee junto. Aquí
+se separan: lo que es un campo del `DecoderConfig` va a `model_cfg`, el resto se descarta o se
+reparte. Escrito así, publicar un campo nuevo en la card no rompe la vuelta.
+
+**`opt_state: None` y `best_val: None` explícitos.** No es que se pierdan: es que **no estaban**. El
+publicador quita el optimizador a propósito, y `best_val` es una propiedad de la corrida que no
+viaja. Ponerlos a `None` en vez de omitir las claves hace que el payload tenga siempre la misma
+forma y que quien lo lea distinga «no hay» de «esta versión no lo escribía».
+
+**`cfg = {"pulled_from": repo_id}`.** El fichero resultante dice de dónde vino. Es la misma idea que
+`merged_from` en el nightly: un `.pt` de 460 MB sin procedencia dentro es un fichero anónimo dentro
+de un mes.
+
+El `pooling` del encoder es el detalle que solo se descubre al usarlo: las cabezas se construyen
+leyendo con qué agregación se entrenó el encoder, y esa clave vive en la configuración de la corrida
+y no en la del modelo. Sin esas dos líneas, un encoder descargado carga y da números distintos.
+
+```python title="src/rukh/hub.py"
+def pull(artefact: Artefact, force: bool = False) -> Path:
+    """Bring ``artefact`` to its local path and return that path.
+
+    An artefact already on disk is left alone unless ``force``: a reader's own training run,
+    sitting at the same stable path, must never be replaced silently by the published one.
+    """
+    import torch
+
+    target = paths.resolve(artefact.target)
+    if target.exists() and not force:
+        log.info("%s is already there; --force replaces it", target)
+        return target
+    if artefact.kind == "dataset":
+        import huggingface_hub
+
+        spec = DATASETS[artefact.name]
+        target.mkdir(parents=True, exist_ok=True)
+        huggingface_hub.snapshot_download(
+            artefact.repo_id,
+            repo_type=spec.repo_type,
+            local_dir=str(target),
+            allow_patterns=[*spec.patterns, "manifest.json"],
+        )
+        return target
+    if artefact.kind == "peft":
+        import huggingface_hub
+
+        target.mkdir(parents=True, exist_ok=True)
+        huggingface_hub.snapshot_download(artefact.repo_id, local_dir=str(target))
+        return target
+    if artefact.kind == "adapter":
+        target.mkdir(parents=True, exist_ok=True)
+        for name in ("adapter.safetensors", "adapter_config.json"):
+            source = _download(artefact.repo_id, name)
+            (target / name).write_bytes(source.read_bytes())
+        return target
+    config = json.loads(_download(artefact.repo_id, "config.json").read_text(encoding="utf-8"))
+    state = _load_state(artefact.repo_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    torch.save(_model_payload(artefact, config, state), tmp)
+    tmp.replace(target)
+    return target
+```
+
+<Src file="src/rukh/hub.py" tag="p6" lines="330-372" />
+
+Tres decisiones de peso.
+
+**Lo que ya está en disco no se toca.** Es la primera comprobación de la función y tiene una razón
+concreta que el docstring dice: en `checkpoints/medium-v4/best.pt` puede estar **tu** entrenamiento.
+Un `pull` que lo pisara sin avisar destruiría cuarenta minutos de GPU por escribir un comando de
+más. `--force` existe para cuando se quiere justamente eso.
+
+**Escritura atómica.** El modelo se guarda en `best.pt.tmp` y se renombra con `tmp.replace(target)`,
+que en todos los sistemas operativos es atómico dentro del mismo volumen. Si el proceso muere a
+mitad de una escritura de 460 MB, lo que queda en disco es un `.tmp` inservible y no un `best.pt`
+truncado que carga a medias y falla dentro de una hora con un error incomprensible.
+
+**`allow_patterns` en los datasets.** Un repositorio de dataset puede tener más ficheros de los que
+el proyecto usa —una vista previa, un `.gitattributes`— y `snapshot_download` sin filtro los trae
+todos. Restringirlo a los patrones que declara `DatasetSpec` más el `manifest.json` es lo que hace
+que la carpeta descargada sea exactamente la que un `rukh data` habría producido.
+
+Ese `manifest.json` añadido a mano al final de los patrones es el que permite comprobar los hashes
+de lo descargado, incluyendo el `dpo-prompts.parquet` que la lección 2 añadió. Y ese fichero entra en
+el dataset publicado por un cambio de una línea:
+
+```python title="src/rukh/data/publish.py"
+            patterns=["pairs.parquet", "dpo-prompts.parquet", "manifest.json"],
+```
+
+<Src file="src/rukh/data/publish.py" tag="p6" lines="206-206" />
+
+Sin esa línea, `rukh pull rukh-pairs-dpo` traería los pares y no los prompts, y una configuración de
+DPO de M5 fallaría al abrir un fichero que existe en el Hub y no se bajó.
+
+## El comando
+
+```python title="src/rukh/cli.py"
+@app.command("pull")
+def pull_cmd(
+    names: Annotated[
+        list[str] | None,
+        typer.Argument(help="Run names, dataset names or Hub ids (see --list)."),
+    ] = None,
+    module: Annotated[
+        str | None,
+        typer.Option("--module", help="Pull everything a module starts from, e.g. m4."),
+    ] = None,
+    list_all: Annotated[
+        bool, typer.Option("--list", help="Print the catalogue, by module, and exit.")
+    ] = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Replace what is already on disk.")
+    ] = False,
+) -> None:
+    """Bring published models and datasets to the paths the configs and the lessons read.
+
+    A pulled model lands under its run name (`checkpoints/medium-v4/best.pt`), which is the
+    spelling every config uses and the one a run you trained yourself also answers to.
+    """
+    from rukh.hub import catalogue, for_module, lookup, pull
+
+    if list_all:
+        for artefact in catalogue():
+            modules = ",".join(artefact.modules) or "-"
+            typer.echo(f"{artefact.name:<24} {modules:<15} {artefact.target}")
+            typer.echo(f"{'':<24} {artefact.repo_id:<15} {artefact.note}")
+        return
+    wanted = []
+    if module is not None:
+        wanted.extend(for_module(module))
+        if not wanted:
+            typer.echo(f"error: nothing is catalogued for module {module!r}", err=True)
+            raise typer.Exit(code=2)
+    try:
+        wanted.extend(lookup(name) for name in names or [])
+    except KeyError as exc:
+        typer.echo(f"error: {exc.args[0]}", err=True)
+        raise typer.Exit(code=2) from exc
+    if not wanted:
+        typer.echo("error: give a name, --module or --list (see rukh pull --help)", err=True)
+        raise typer.Exit(code=2)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    for chatty in ("httpx", "huggingface_hub", "urllib3"):
+        logging.getLogger(chatty).setLevel(logging.WARNING)  # one line per artefact, not per GET
+    for artefact in wanted:
+        try:
+            path = pull(artefact, force=force)
+        except (FileNotFoundError, OSError) as exc:
+            typer.echo(f"error: {artefact.name}: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        typer.echo(f"{artefact.name:<24} {artefact.repo_id:<28} -> {path}")
+```
+
+<Src file="src/rukh/cli.py" tag="p6" lines="91-144" />
+
+`rukh pull` es la **única orden del proyecto que no está en un subgrupo**: está colgada de `app`
+directamente, como `info`. La razón es que es la primera orden que escribe alguien que llega al
+curso por la mitad, y `rukh hub pull --artefact medium-v4` sería una forma innecesariamente ceremoniosa
+de decir `rukh pull medium-v4`.
+
+El bucle que baja el nivel de registro de `httpx`, `huggingface_hub` y `urllib3` a `WARNING` es una
+línea de ergonomía con un efecto grande: sin ella, bajar doce modelos imprime una línea por cada
+petición HTTP y las doce líneas que interesan se pierden. El comentario dice exactamente eso.
+
+Los tres códigos de salida están separados a propósito: `2` para un uso incorrecto —un nombre que no
+existe, un módulo vacío, ningún argumento— y `1` para un fallo de ejecución. Es la convención de
+Unix, y la diferencia importa cuando esto corre dentro de un script.
+
+Y un detalle del orden: si se pasan `--module m6` **y** nombres sueltos, se acumulan los dos. No se
+deduplica, así que un artefacto pedido dos veces se intenta bajar dos veces; la segunda es
+instantánea porque la primera lo dejó en disco y la función se planta en la primera comprobación.
+
+## Los enlaces que devuelven cada card al curso
+
+```python title="src/rukh/publish/links.py"
+"""The links every card carries back to the course: its lesson, its row in the table, the demo.
+
+A model card that does not say where its number came from is a number without a method. The
+single results table (`/proyecto/` on the course site) is where every stage is measured the same
+way, and the lesson is where it was built; both are looked up in the catalogue of ``rukh.hub`` so
+a repo id is enough and nothing is typed twice.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from rukh.hub import catalogue
+
+TABLE_PATH = "/proyecto/"
+
+LESSON_TITLES: dict[str, str] = {
+    "/curso/m1/02-labs-del-pipeline/": "M1 · Del PGN al tensor: los labs",
+    "/curso/m2/02-entrenar-y-medir/": "M2 · El decoder: entrenarlo y medirlo",
+    "/curso/m2/04-mas-datos-no-mas-red/": "M2 · Más datos, no más red: de small a medium-v4",
+    "/curso/m3/03-labs-del-encoder/": "M3 · El encoder: los labs",
+    "/curso/m4/03-labs-de-afinado/": "M4 · Fine-tuning: los labs",
+    "/curso/m5/03-labs-de-alineamiento/": "M5 · Alineamiento: los labs",
+}
+
+
+def course_links(
+    repo_id: str,
+    course_url: str = "https://lab.rukh.borjaglez.com",
+    demo_url: str = "https://rukh.borjaglez.com",
+) -> dict[str, Any]:
+    """What the card's "In the course" section needs for ``repo_id``.
+
+    ``lesson_url`` and ``stage`` are ``None`` for a repository the catalogue does not know, and
+    the section then names only the table: a card never claims a lesson it was not built in.
+    """
+    found = next((a for a in catalogue() if a.repo_id == repo_id), None)
+    lesson = found.lesson if found else None
+    from rukh.publish.model import DEMO_STAGES
+
+    name = repo_id.split("/")[-1].removeprefix("rukh-")
+    demo_stage = DEMO_STAGES.get(name)
+    return {
+        "table_url": f"{course_url}{TABLE_PATH}",
+        "lesson_url": f"{course_url}{lesson}" if lesson else None,
+        "lesson_title": LESSON_TITLES.get(lesson or "", lesson),
+        "stage": found.stage if found else None,
+        "demo_url": f"{demo_url}/?stage={demo_stage}" if demo_stage else None,
+        "reproduce": f"uv run rukh pull {found.name}" if found else None,
+    }
+```
+
+<Src file="src/rukh/publish/links.py" tag="p6" lines="1-50" />
+
+Cincuenta líneas, y la mitad son un diccionario de títulos escritos a mano. Eso es la deuda de este
+fichero y conviene verla: el repositorio de ML no puede leer el frontmatter de las lecciones del
+repositorio del curso, así que los títulos se copian. El día que una lección cambie de título, las
+cards se quedan con el viejo hasta que alguien toque este mapa.
+
+Lo que **no** se copia es lo que importa: la ruta de la lección y el nombre de la etapa salen del
+catálogo. Un repositorio que el catálogo no conoce devuelve `None` en los dos, y la sección de la
+card se queda con la tabla y nada más. Esa es la propiedad que el docstring subraya: **una card
+nunca reclama una lección en la que no se construyó**.
+
+`from rukh.publish.model import DEMO_STAGES` está dentro de la función, y aquí no es por velocidad
+de arranque: es por un ciclo. `publish/model.py` importa `course_links` arriba del todo, así que
+importar `model` desde el nivel de módulo de `links` daría un `ImportError` circular. El mismo
+problema aparece en `data/publish.py`, y allí el comentario lo dice:
+
+```python title="src/rukh/data/publish.py"
+    # Lazy: `rukh.publish.links` reads the catalogue of `rukh.hub`, which imports this module.
+    from rukh.publish.links import course_links
+```
+
+<Src file="src/rukh/data/publish.py" tag="p6" lines="355-356" />
+
+Los ciclos de importación en Python se resuelven casi siempre así, y casi siempre son la señal de que
+dos módulos se conocen demasiado. Aquí el ciclo es real y no evitable sin un tercer módulo: el
+catálogo necesita los datasets y los datasets necesitan los enlaces del catálogo.
+
+## La sección que entra en las veintiuna cards
+
+{/* prettier-ignore */}
+```markdown title="src/rukh/data/cards/_course.md.jinja"
+## In the course
+
+{% if course.lesson_url -%}
+- Built in [{{ course.lesson_title }}]({{ course.lesson_url }}), the lesson that runs every command behind this repository.
+{% endif -%}
+- Measured in the [single results table]({{ course.table_url }}){% if course.stage %} as the stage `{{ course.stage }}`{% endif %}: every stage of the course, the same suite, the same day.
+{% if course.demo_url -%}
+- Play it in the browser: [{{ course.demo_url }}]({{ course.demo_url }}).
+{% endif -%}
+{% if course.reproduce -%}
+- Bring it to the paths the configs read: `{{ course.reproduce }}`.
+{% endif %}
+```
+
+<Src file="src/rukh/data/cards/_course.md.jinja" tag="p6" lines="1-12" />
+
+Doce líneas que son el cierre del círculo: desde cualquier repositorio del Hub se llega a la lección
+que lo construyó, a la fila que lo mide, a la demo donde se juega y al comando que lo trae.
+
+El guion bajo del nombre es la convención de Jinja para una plantilla parcial: no se renderiza sola,
+se incluye. Y las cuatro secciones son condicionales porque los cuatro enlaces pueden faltar: un
+dataset no tiene demo, el reward model no tiene fila, un repositorio desconocido no tiene lección.
+La única línea incondicional es la de la tabla, porque la tabla existe siempre.
+
+Los `-%}` que cierran los bloques recortan el salto de línea siguiente. Sin ellos, cada condición
+falsa dejaría una línea en blanco y la lista de Markdown se partiría en cuatro listas de un elemento.
+
+La inclusión es la misma línea en las siete plantillas:
+
+{/* prettier-ignore */}
+```markdown title="src/rukh/data/cards/model.md.jinja"
+{% include '_course.md.jinja' %}
+```
+
+<Src file="src/rukh/data/cards/model.md.jinja" tag="p6" lines="274-274" />
+
+Y va **encima de `## License`** en todas, que es lo que comprueba el test de más abajo: los enlaces
+al curso son parte de lo que la card afirma, no una firma debajo de la licencia.
+
+## La card del encoder preentrenado
+
+El hito añadió una plantilla nueva, para el único modelo publicado que no encajaba en ninguna de las
+que había.
+
+{/* prettier-ignore */}
+````markdown title="src/rukh/data/cards/encoder-mmm.md.jinja"
+---
+license: {{ license }}
+library_name: rukh
+pipeline_tag: feature-extraction
+language:
+  - en
+datasets:
+{%- for dataset in datasets %}
+  - {{ dataset }}
+{%- endfor %}
+tags:
+  - chess
+  - rukh
+  - encoder
+  - masked-move-modeling
+---
+
+# {{ repo_id }}
+
+A bidirectional transformer written from scratch and **pretrained only**: it has no value,
+blunder or result head yet. It read games written in UCI with 15 % of the moves hidden and
+learned to put them back by looking at both sides of the hole, which is masked language
+modeling with moves for words. This is the `{{ stage }}` stage of [Rukh]({{ repository_url }}),
+a course that builds a chess language model end to end: {{ "{:,}".format(params) }} parameters
+over {{ config.get("n_layer", 8) }} layers of width {{ config.get("d_model", 384) }}, on the
+`{{ config.get("input", "moves") }}` input scheme.
+
+It exists on the Hub for one reason: it is where the encoder with heads
+([`{{ heads_repo }}`](https://huggingface.co/{{ heads_repo }})) starts from, and a reader of the
+course who skips the pretraining lab can put it where the fine-tuning configs look for it:
+
+```sh
+uv run rukh pull {{ stage }}      # -> checkpoints/{{ stage }}/best.pt
+uv run rukh train heads --config configs/train/encoder-heads-v4.yaml --mode last-n
+```
+
+Read how it was built: [{{ course_url }}]({{ course_url }})
+
+## Results
+
+The only thing a pretraining run measures is how well it fills the holes it was given.
+
+| Metric | Value |
+|---|---|
+| Masked-move loss on held-out games | {{ best_val }} |
+| Masked-move top-1 on held-out games | {{ val_top1 }} |
+| Training step of this checkpoint | {{ step }} |
+
+These are not the numbers of the model that goes into the demo: the heads are fine-tuned on
+Stockfish labels afterwards, and their F1, correlation and result accuracy live on the card of
+[`{{ heads_repo }}`](https://huggingface.co/{{ heads_repo }}).
+````
+
+<Src file="src/rukh/data/cards/encoder-mmm.md.jinja" tag="p6" lines="1-51" />
+
+El problema que resuelve está en el docstring de la función que la rellena y merece decirse antes:
+si el encoder de preentrenamiento se renderizara con la plantilla del encoder con cabezas, su card
+diría «entrenado sobre etiquetas de Stockfish» **de un modelo que nunca vio una etiqueta**, y
+publicaría huecos donde van la F1 de blunder y la correlación con el valor. Una card es una
+afirmación pública: una afirmación falsa por herencia de plantilla es exactamente el fallo que este
+fichero evita.
+
+Los tres números que sí tiene son los tres que un preentrenamiento mide: la pérdida de jugada
+enmascarada sobre partidas reservadas, su top-1, y el paso del checkpoint. Y el párrafo de debajo
+dice explícitamente que no son los números del modelo de la demo, con el enlace a la card que sí los
+tiene.
+
+«It exists on the Hub for one reason» es la frase más útil de toda la plantilla. Un repositorio
+publicado sin decir para qué sirve invita a que alguien lo descargue esperando otra cosa.
+
+{/* prettier-ignore */}
+````markdown title="src/rukh/data/cards/encoder-mmm.md.jinja"
+## Training recipe
+
+{% if recipe %}
+| Parameter | Value |
+|---|---|
+{%- for name, value in recipe %}
+| `{{ name }}` | `{{ value }}` |
+{%- endfor %}
+{% else %}
+The MLflow run for this checkpoint was not available when the card was generated; the shape of
+the model is in `config.json`.
+{% endif %}
+{% if run_id %}MLflow run: `{{ run_id }}`.{% endif %}
+
+```json
+{{ config_json }}
+```
+
+## Data
+
+Trained on {% for dataset in datasets %}[`{{ dataset }}`](https://huggingface.co/datasets/{{ dataset }}){% if not loop.last %}, {% endif %}{% endfor %},
+derived from the [Lichess open database](https://database.lichess.org) (CC0), on the same
+packed token stream the project's decoder trains on, so the two models saw the same games.
+Validation uses a held-out slice of a month the training split does not read.
+
+## Limitations
+
+- It predicts hidden moves; it does not evaluate positions. Ask it how good a position is and
+  the answer is whatever an untrained linear head returns.
+- Its masked-move accuracy is not a measure of chess strength: a move is easy to fill in when
+  the moves around it leave one legal option.
+- Fine-tuning the whole network on the labels afterwards made it *worse* than fine-tuning the
+  last two blocks; the course records that measurement, and the heads configs default to it.
+
+{% include '_course.md.jinja' %}
+
+## License
+
+Weights: Apache-2.0. Data: CC0 (Lichess). Code: MIT, at [{{ repository_url }}]({{ repository_url }}).
+````
+
+<Src file="src/rukh/data/cards/encoder-mmm.md.jinja" tag="p6" lines="53-91" />
+
+La rama `{% else %}` de la receta es la regla del proyecto sobre los huecos, aplicada a una card: si
+la corrida de MLflow no está accesible cuando se genera la card, se dice, y se apunta a dónde está la
+forma del modelo. Lo que no se hace es dejar una tabla vacía ni inventarse los hiperparámetros.
+
+Las tres limitaciones son lo que separa una card de un folleto. La tercera es una medición del
+curso: afinar la red entera fue **peor** que afinar los dos últimos bloques, y eso está escrito en la
+card del modelo que se afina desde aquí. Publicar un resultado negativo propio en la etiqueta de tu
+propio modelo es lo que hace que el resto de la etiqueta se pueda creer.
+
+<Transfer concept="La ficha generada frente a la escrita" where="Cualquier artefacto que se publica con documentación: una librería con su README de versión, un dataset con su esquema, un servicio con su contrato de API.">
+  Una ficha escrita a mano envejece en silencio; una generada envejece con un `diff`. La diferencia
+  práctica aparece el día que algo cambia: con la escrita, alguien tiene que acordarse; con la
+  generada, el cambio sale solo y lo que hay que revisar es la plantilla.
+
+El coste real no es escribir la plantilla, es decidir **de dónde sale cada dato** y qué se pone
+cuando no hay. Este proyecto lo resolvió con una regla: todo número de una card sale de
+`results.json` o del registro de la corrida, y lo que no está se escribe como `n/a`. Una plantilla
+que rellena huecos con valores plausibles produce documentación que parece mejor y vale menos.
+
+</Transfer>
+
+## Regenerar las cards sin republicar los pesos
+
+```python title="src/rukh/publish/cards.py"
+"""``rukh publish cards``: every card regenerated from what is on disk, and only the card uploaded.
+
+A card is a rendering of the run, the evaluation and the links of the day it was written. When
+the table changes -- a nightly, a corrected ladder, a new lesson URL -- the card is stale, and
+republishing 460 MB of weights to change a paragraph is the wrong tool. This stages every
+repository of the catalogue the way its own publisher does (``dry_run``: nothing leaves the
+machine) and then uploads ``README.md`` alone with ``upload_file``.
+
+It needs the checkpoints on disk, which is what ``rukh pull`` is for, and the evaluations in
+``artifacts/eval``, which is what ``rukh eval nightly`` leaves behind.
+"""
+```
+
+<Src file="src/rukh/publish/cards.py" tag="p6" lines="1-11" />
+
+La idea de todo el fichero está en «the way its own publisher does». No hay un segundo renderizador
+de cards: se llama al publicador de cada tipo **en seco**, se le deja preparar el repositorio entero
+en local, y se coge el `README.md` que dejó. Un renderizador aparte sería un segundo sitio donde
+arreglar una plantilla.
+
+```python title="src/rukh/publish/cards.py"
+ONNX_DIRS: dict[str, str] = {
+    "tiny": "artifacts/onnx/tiny",
+    "small": "artifacts/onnx/small-v3",
+    "medium-v4": "artifacts/onnx/medium-v4",
+    "encoder-v4": "artifacts/onnx/encoder-v4",
+    "medium-elo": "artifacts/onnx/medium-elo",
+    "medium-masters": "artifacts/onnx/medium-masters",
+    "medium-v4-dpo-onpolicy": "artifacts/onnx/medium-dpo",
+    "medium-v4-grpo": "artifacts/onnx/medium-grpo",
+}
+"""The ONNX export each model's card reports parity from, when it is on disk."""
+
+EFFECTS_DIR = "artifacts/publish/effects"
+
+
+class CardRefresh(BaseModel):
+    """One repository's card: where it was staged and whether it went up."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    repo_id: str
+    repo_type: str
+    card: str | None = None
+    status: str
+    """``staged`` (dry run), ``uploaded`` or ``failed``."""
+    detail: str | None = None
+```
+
+<Src file="src/rukh/publish/cards.py" tag="p6" lines="28-54" />
+
+`ONNX_DIRS` es un noveno campo del catálogo que no está en el catálogo, y es discutible que viva
+aquí. La defensa: las exportaciones son artefactos locales que no se publican por sí mismos, así que
+no son artefactos del `Artefact`; y solo este fichero las necesita. La acusación, igual de válida:
+es otro mapa por nombre que se puede desincronizar. Es una de esas decisiones que se toman en un
+sitio y se revisan en el siguiente módulo.
+
+`CardRefresh` tiene la misma forma que `NightlyRecord` de la lección anterior —un registro por
+elemento, con estado y detalle— y por la misma razón: un lote donde un elemento puede fallar sin
+llevarse a los demás.
+
+```python title="src/rukh/publish/cards.py"
+def stage_card(artefact: Artefact, cfg: ModelPublishConfig) -> Path:
+    """Render ``artefact``'s card through its own publisher, in dry-run mode; returns the card."""
+    target = resolve_run(paths.resolve(artefact.target))
+    if artefact.kind == "dataset":
+        from rukh.data.publish import PublishConfig, publish
+
+        result = publish(artefact.name, PublishConfig(owner=cfg.owner), dry_run=True)
+        return Path(result.card_path)
+    if artefact.kind == "adapter":
+        from rukh.publish.adapter import AdapterEffect, publish_adapter
+
+        effect_path = paths.resolve(EFFECTS_DIR) / f"{artefact.name}.json"
+        effect = (
+            AdapterEffect.model_validate_json(effect_path.read_text(encoding="utf-8"))
+            if effect_path.is_file()
+            else None
+        )
+        result = publish_adapter(
+            target, artefact.repo_id, f"{cfg.owner}/rukh-medium", cfg, effect=effect, dry_run=True
+        )
+        return Path(result.card_path)
+    if artefact.kind == "peft":
+        from rukh.publish.adapter import publish_qwen_adapter
+
+        result = publish_qwen_adapter(target, artefact.repo_id, cfg, dry_run=True)
+        return Path(result.card_path)
+    if artefact.kind == "reward":
+        from rukh.publish.reward import publish_reward
+
+        result = publish_reward(target, artefact.repo_id, cfg, dry_run=True)
+        return Path(result.folder) / README_NAME
+    from rukh.publish.model import publish_model
+
+    onnx = ONNX_DIRS.get(artefact.name)
+    onnx_dir = paths.resolve(onnx) if onnx and paths.resolve(onnx).is_dir() else None
+    result = publish_model(
+        target, artefact.repo_id, cfg, onnx_dir=onnx_dir, stage=artefact.stage, dry_run=True
+    )
+    return Path(result.card_path)
+```
+
+<Src file="src/rukh/publish/cards.py" tag="p6" lines="57-95" />
+
+Cinco publicadores detrás de una función. La estructura es la misma que la de las cuatro suites del
+nightly, y no es casualidad: las dos veces el problema es «cinco cosas que hacen lo mismo con firmas
+distintas», y la respuesta es una capa de adaptación en el sitio que las necesita juntas.
+
+La rama del reward model devuelve `Path(result.folder) / README_NAME` en vez de un `card_path`.
+Es una firma que se quedó atrás, y en vez de cambiarla en tres sitios —lo que habría tocado un
+publicador de M5 que ya estaba probado— se construye la ruta aquí. Es deuda visible, que es la única
+clase aceptable.
+
+`AdapterEffect` es la medición del efecto de un adaptador —cuánto cambia el repertorio— que M4 dejó
+en un JSON. Si el fichero no está, se pasa `None` y la card se genera sin esa sección. Otra vez la
+misma regla: lo que no hay no se inventa.
+
+```python title="src/rukh/publish/cards.py"
+def refresh_cards(
+    only: set[str] | None = None,
+    dry_run: bool = False,
+    cfg: ModelPublishConfig | None = None,
+    api: Any | None = None,
+) -> list[CardRefresh]:
+    """Regenerate the card of every repository (or of ``only``); upload it unless ``dry_run``."""
+    cfg = cfg or ModelPublishConfig()
+    wanted = [a for a in catalogue() if not only or a.name in only or a.repo_id in only]
+    client = None
+    outcomes: list[CardRefresh] = []
+    for artefact in wanted:
+        repo_type = (
+            "dataset"
+            if artefact.kind == "dataset" and artefact.name != "rukh-tokenizer"
+            else "model"
+        )
+        outcome = CardRefresh(
+            name=artefact.name, repo_id=artefact.repo_id, repo_type=repo_type, status="staged"
+        )
+        outcomes.append(outcome)
+        try:
+            card = stage_card(artefact, cfg)
+            outcome.card = card.as_posix()
+            if not dry_run:
+                client = client or api or _api()
+                client.upload_file(
+                    path_or_fileobj=str(card),
+                    path_in_repo=README_NAME,
+                    repo_id=artefact.repo_id,
+                    repo_type=repo_type,
+                    commit_message="docs(card): regenerated from the current table and course",
+                )
+                outcome.status = "uploaded"
+        except Exception as exc:  # noqa: BLE001 - one card failing must not stop the rest
+            log.exception("card of %s failed", artefact.name)
+            outcome.status = "failed"
+            outcome.detail = f"{type(exc).__name__}: {exc}"
+    return outcomes
+```
+
+<Src file="src/rukh/publish/cards.py" tag="p6" lines="98-136" />
+
+**`upload_file` y no `upload_folder`.** Es la línea que da nombre al comando: sube un fichero, el
+`README.md`, y nada más. Los pesos que están arriba no se tocan, el repositorio no se vuelve a
+empaquetar, y el `commit_message` deja escrito en el historial del Hub que ese commit es solo la
+card.
+
+**`client = client or api or _api()`** crea el cliente perezosamente y una sola vez. En seco no se
+crea nunca, y por eso un `--dry-run` funciona sin haber hecho `login`: si el cliente se construyera
+al principio de la función, ver qué haría el comando exigiría un token.
+
+**El parámetro `api`** es la inyección que hace testeable todo esto sin red. El test le pasa un
+objeto con un solo método y comprueba con qué argumentos se llamó.
+
+**`repo_type` con su excepción escrita.** `rukh-tokenizer` es un dataset del proyecto que vive en el
+Hub como repositorio de **modelo**, porque un tokenizador se publica así. La condición está en dos
+sitios —aquí y en `collection.py`— y las dos veces escrita igual; es la clase de duplicación pequeña
+que un día se convierte en una discrepancia.
+
+## La colección
+
+```python title="src/rukh/publish/collection.py"
+"""``rukh publish collection``: the ``Rukh`` collection on the Hub, kept equal to the catalogue.
+
+A collection is the one page that lists everything the course trained, in the order the course
+built it. It is derived from ``rukh.hub`` so it cannot drift from what ``rukh pull`` can bring
+back: adding a model to the catalogue and running this is what "publishing the collection" is.
+Idempotent on purpose -- the Hub refuses duplicates when asked (``exists_ok``), and a second run
+changes nothing.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict
+
+from rukh.hub import catalogue
+from rukh.publish.model import ModelPublishConfig, _api
+
+log = logging.getLogger(__name__)
+
+TITLE = "Rukh"
+DESCRIPTION = (
+    "A chess language model built from scratch as a course on generative and agentic AI: every "
+    "model, adapter and dataset, in course order."
+)
+"""The Hub caps a collection's description at 150 characters."""
+```
+
+<Src file="src/rukh/publish/collection.py" tag="p6" lines="1-27" />
+
+El docstring de `DESCRIPTION` es un comentario de una línea que vale un cuarto de hora: el Hub corta
+las descripciones de colección a 150 caracteres, y escribir la razón al lado del texto es lo que
+evita que alguien la alargue y vea el corte en producción.
+
+```python title="src/rukh/publish/collection.py"
+def collection_items() -> list[tuple[str, str]]:
+    """``(repo id, item type)`` for every catalogued artefact, models first, in course order."""
+    items: list[tuple[str, str]] = []
+    for artefact in catalogue():
+        item_type = (
+            "dataset"
+            if artefact.kind == "dataset" and artefact.name != "rukh-tokenizer"
+            else "model"
+        )
+        if (artefact.repo_id, item_type) not in items:
+            items.append((artefact.repo_id, item_type))
+    return items
+
+
+def sync_collection(
+    cfg: ModelPublishConfig | None = None, dry_run: bool = False, api: Any | None = None
+) -> CollectionSync:
+    """Create the collection if it does not exist and add every catalogued repository to it."""
+    cfg = cfg or ModelPublishConfig()
+    items = collection_items()
+    if dry_run:
+        return CollectionSync(slug=None, created=False, items=[r for r, _ in items], dry_run=True)
+    client = api or _api()
+    existing = next((c for c in client.list_collections(owner=cfg.owner) if c.title == TITLE), None)
+    created = existing is None
+    collection = existing or client.create_collection(
+        TITLE, namespace=cfg.owner, description=DESCRIPTION, private=False, exists_ok=True
+    )
+    for repo_id, item_type in items:
+        client.add_collection_item(collection.slug, repo_id, item_type, exists_ok=True)
+        log.info("collection %s: %s (%s)", collection.slug, repo_id, item_type)
+    return CollectionSync(
+        slug=collection.slug, created=created, items=[r for r, _ in items], dry_run=False
+    )
+```
+
+<Src file="src/rukh/publish/collection.py" tag="p6" lines="41-74" />
+
+**La deduplicación por lista y no por conjunto.** `if (repo_id, item_type) not in items` es O(n²) y
+con veintiún elementos da exactamente igual; lo que compra es que **el orden se conserva**, que es el
+orden del curso. Un `set` sería más rápido y desordenaría la colección, que es lo único que esta
+función produce.
+
+**Idempotencia por `exists_ok`, no por comprobación previa.** La alternativa sería listar lo que la
+colección ya tiene y añadir la diferencia. Sería más código, una petición más, y una condición de
+carrera si dos ejecuciones se solapan. Dejar que el servidor rechace el duplicado es más simple y más
+correcto.
+
+Lo que esta función **no** hace es quitar: un repositorio que desaparezca del catálogo se queda en la
+colección hasta que alguien lo borre a mano. Es una asimetría deliberada —borrar cosas del Hub
+automáticamente da mucho más miedo que añadirlas— y es una limitación real que conviene saber.
+
+```python title="src/rukh/cli.py"
+@publish_app.command("cards")
+def publish_cards_cmd(
+    only: Annotated[
+        str | None, typer.Option("--only", help="Comma-separated names or repo ids.")
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Stage every card locally; upload nothing.")
+    ] = False,
+) -> None:
+    """Regenerate every card from the current table and course, and upload only the card.
+
+    Each repository is staged through its own publisher (nothing leaves the machine), then
+    `README.md` alone is uploaded: changing a paragraph must not republish 460 MB of weights.
+    Needs the checkpoints on disk (`rukh pull`) and the evaluations (`rukh eval nightly`).
+    """
+    from rukh.publish.cards import refresh_cards
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    wanted = {part.strip() for part in (only or "").split(",") if part.strip()} or None
+    outcomes = refresh_cards(only=wanted, dry_run=dry_run)
+    for outcome in outcomes:
+        typer.echo(f"{outcome.repo_id:<34} {outcome.status:<9} {outcome.card or outcome.detail}")
+    if any(outcome.status == "failed" for outcome in outcomes):
+        raise typer.Exit(code=1)
+
+
+@publish_app.command("collection")
+def publish_collection_cmd(
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="List the items; touch no network.")
+    ] = False,
+) -> None:
+    """Create or update the `Rukh` collection on the Hub with every catalogued repository."""
+    from rukh.publish.collection import sync_collection
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    result = sync_collection(dry_run=dry_run)
+    typer.echo(f"collection: {result.slug or '(dry run)'}{' · created' if result.created else ''}")
+    for item in result.items:
+        typer.echo(f"  {item}")
+```
+
+<Src file="src/rukh/cli.py" tag="p6" lines="1771-1810" />
+
+`outcome.card or outcome.detail` en la misma columna: cuando la card se generó se ve dónde está, y
+cuando falló se ve por qué. Una columna que cambia de significado según el estado sería confusa en
+una tabla de datos y es exactamente lo que quieres en una salida de terminal, donde lo que se busca
+es «qué pasó con esta línea».
+
+## La guarda que costó una tarde
+
+La primera vez que se lanzó `rukh publish cards` no salió bien. `rukh-tiny` falló.
+
+La evaluación registraba el SHA del fichero que midió. El fichero que `rukh pull` trae del Hub no es
+ese byte a byte, porque el publicador le quitó el optimizador y la cabeza atada. Eran los mismos
+pesos y la guarda no lo sabía. La solución es el hash de tensores de la lección 2, y aquí está el
+otro lado.
+
+```python title="src/rukh/publish/model.py"
+    The evaluation stores ``sha256`` of the checkpoint file and, since P6, of its tensors alone
+    (``weights_sha``). A different file with the same weights -- the copy ``rukh pull`` brings
+    back, which ``rukh publish`` wrote without the optimizer -- passes on the second; a
+    ``step-*.pt`` whose weights differ from ``best.pt`` is still refused (D-135).
+    """
+    if not evaluation:
+        return
+    measured = str(evaluation.get("model_sha") or "")
+    if not measured:
+        return
+    from rukh.eval.cache import file_sha, weights_sha
+
+    actual = file_sha(Path(ckpt))
+    if measured == actual:
+        return
+    measured_weights = str(evaluation.get("weights_sha") or "")
+    if measured_weights and measured_weights == weights_sha(Path(ckpt)):
+        return
+    raise ValueError(
+        f"stage {stage!r} was measured on a different checkpoint: its results.json records "
+        f"model_sha {measured[:12]} and {Path(ckpt).as_posix()} hashes to {actual[:12]}"
+        + (f" (weights {measured_weights[:12]} vs the file's own)" if measured_weights else "")
+        + ". Evaluate this checkpoint under this stage, or publish the one that was evaluated."
+    )
+```
+
+<Src file="src/rukh/publish/model.py" tag="p6" lines="281-304" />
+
+Las cuatro salidas tempranas están en orden de coste creciente, y eso es una decisión: sin
+evaluación, se pasa; sin hash registrado, se pasa; si el hash de fichero coincide, se pasa sin
+cargar nada; y solo si no coincide se abre el `.pt` y se hashean los tensores, que cuesta segundos y
+memoria. El camino normal —publicar el fichero que se midió— no paga nada.
+
+El `measured_weights and ...` con la comprobación de que el campo existe es lo que hace que una
+evaluación antigua, de antes del campo, siga rechazándose igual que antes. No se aflojó la guarda
+retroactivamente: se le dio una segunda forma de aceptar, y solo cuando hay con qué.
+
+El mensaje de error dice las **dos** opciones que arreglan la situación: volver a evaluar este
+checkpoint bajo esta etapa, o publicar el que se evaluó. Un error que solo dice qué está mal deja al
+lector eligiendo entre acciones que no ha pensado.
+
+```python title="src/rukh/publish/model.py"
+def pretrained_encoder_card_context(
+    repo_id: str,
+    stage: str,
+    cfg: ModelPublishConfig,
+    config: dict[str, Any],
+    payload: dict[str, Any],
+    run: RunSummary | None,
+    files: list[str],
+) -> dict[str, Any]:
+    """The card of a masked-move pretraining run: what it measured, and what starts from it.
+
+    A pretraining checkpoint has no blunder F1 and no value correlation to report; rendering it
+    through the heads' card would say "trained from scratch on Stockfish labels" about a model
+    that never saw a label. What it has is the held-out masked-move loss the run selected
+    ``best.pt`` on, which the checkpoint carries, and the top-1 of the same evaluation when the
+    MLflow run is reachable.
+    """
+    metrics = run.metrics if run else {}
+    top1 = next((metrics[key] for key in ("val_top1", "val/top1") if key in metrics), None)
+    best_val = payload.get("best_val")
+```
+
+<Src file="src/rukh/publish/model.py" tag="p6" lines="869-888" />
+
+`next((metrics[key] for key in ("val_top1", "val/top1") if key in metrics), None)` prueba dos
+nombres de métrica porque las corridas de M3 usaron los dos según el mes. Es arqueología, y está
+resuelta en una línea con un valor por defecto en vez de con una migración de datos que nadie iba a
+correr.
+
+```python title="src/rukh/publish/model.py"
+    from rukh.models import PositionEncoder
+
+    if isinstance(model, PositionEncoder):
+        # Pretraining only: no heads on it, so none of the heads' numbers apply.
+        card = render_card(
+            pretrained_encoder_card_context(repo_id, name, cfg, config, payload, run, files),
+            PRETRAINED_ENCODER_CARD_TEMPLATE,
+        )
+    elif kind == "encoder":
+        card = render_card(
+            encoder_card_context(
+                repo_id, name, cfg, config, evaluation, run, files, measured_parity
+            ),
+            ENCODER_CARD_TEMPLATE,
+        )
+```
+
+<Src file="src/rukh/publish/model.py" tag="p6" lines="959-973" />
+
+El `if` sustituye a una expresión condicional anidada que antes elegía entre dos plantillas. Con tres
+opciones, la expresión habría pasado de difícil a ilegible; convertirla en un `if`/`elif`/`else`
+antes de añadir el tercer caso es el refactor mínimo correcto.
+
+La condición del primer caso es `isinstance(model, PositionEncoder)` y no `kind == "encoder"`, que es
+lo que distingue las dos cosas: un encoder **con cabezas** no es un `PositionEncoder` pelado, es un
+`MultiHead` que lo envuelve. El tipo del objeto cargado sabe la diferencia; la cadena del catálogo,
+no.
+
+## Los tests que atan lo que se publica
+
+```python title="tests/unit/test_publish_cards.py"
+def test_every_card_template_carries_the_course_section() -> None:
+    templates = [p for p in CARDS_DIR.glob("*.md.jinja") if not p.name.startswith("_")]
+    assert len(templates) >= 7
+    for template in templates:
+        text = template.read_text(encoding="utf-8")
+        assert "{% include '_course.md.jinja' %}" in text, template.name
+        # Before the licence: the links are part of the card, not an afterthought under it.
+        assert text.index("_course.md.jinja") < text.index("## Licen"), template.name
+```
+
+<Src file="tests/unit/test_publish_cards.py" tag="p6" lines="19-26" />
+
+Un test que recorre **el directorio** y no una lista escrita. Así una plantilla nueva entra en el
+test el día que se crea, sin que nadie se acuerde; y es exactamente lo que pasó con
+`encoder-mmm.md.jinja`.
+
+La segunda aserción comprueba una decisión de maquetación con un `index` sobre el texto. Es una
+forma humilde de probar y es la correcta aquí: la propiedad que importa —los enlaces van dentro de la
+card, no debajo de la licencia— no tiene otra forma de comprobarse sin renderizar las siete
+plantillas.
+
+```python title="tests/unit/test_publish_cards.py"
+def test_the_links_name_the_lesson_the_table_and_the_demo_when_they_apply() -> None:
+    medium = course_links("chorcat/rukh-medium")
+    assert (
+        medium["lesson_url"] == "https://lab.rukh.borjaglez.com/curso/m2/04-mas-datos-no-mas-red/"
+    )
+    assert medium["lesson_title"].startswith("M2")
+    assert medium["table_url"] == "https://lab.rukh.borjaglez.com/proyecto/"
+    assert medium["stage"] == "medium-v4-greedy"
+    assert medium["reproduce"] == "uv run rukh pull medium-v4"
+    pairs = course_links("chorcat/rukh-pairs-dpo")
+    assert pairs["lesson_url"].endswith("/curso/m1/02-labs-del-pipeline/")
+    assert pairs["stage"] is None and pairs["demo_url"] is None
+    # A repository the catalogue does not know gets the table and nothing it cannot back.
+    unknown = course_links("chorcat/rukh-nope", course_url="https://x", demo_url="https://d")
+    assert unknown == {
+        "table_url": "https://x/proyecto/",
+        "lesson_url": None,
+        "lesson_title": None,
+        "stage": None,
+        "demo_url": None,
+        "reproduce": None,
+    }
+```
+
+<Src file="tests/unit/test_publish_cards.py" tag="p6" lines="29-50" />
+
+El tercer caso es el que vale: un repositorio desconocido devuelve el diccionario **entero** con
+`None` en todo menos la tabla, comprobado con una igualdad completa y no con aserciones sueltas. Así
+un campo nuevo que se olvidara de tratar el caso desconocido rompería el test en vez de colarse.
+
+```python title="tests/unit/test_hub.py"
+def test_model_targets_are_run_names_the_configs_use() -> None:
+    """A pulled model must sit exactly where the shipped configs look for it."""
+    from rukh.paths import package_root
+
+    configs = (path for path in (package_root() / "configs").rglob("*.yaml") if path.name[0] != ".")
+    referenced = set()
+    for config in configs:
+        for line in config.read_text(encoding="utf-8").splitlines():
+            if "checkpoints/" in line and not line.strip().startswith("#"):
+                referenced.add(line.split("checkpoints/", 1)[1].split()[0].strip("'\""))
+    targets = {a.target.removeprefix("checkpoints/") for a in MODELS}
+    # Runs the reader always trains themselves, because they take minutes and the lesson is in
+    # running them: the 15 M masked-move encoder of M3 and the off-policy DPO arm of M5.
+    local_only = {"encoder-mmm/best.pt", "medium-v4-dpo-offpolicy/dpo.pt"}
+    # Every other checkpoint a shipped config starts from is something `rukh pull` can provide.
+    missing = referenced - targets - local_only
+    assert not missing, missing
+```
+
+<Src file="tests/unit/test_hub.py" tag="p6" lines="81-97" />
+
+Este es el mejor test del módulo y merece leerse dos veces. Lee **todas las configuraciones del
+repositorio**, saca cada ruta de `checkpoints/` que mencionan, y comprueba que el catálogo puede
+proveerlas todas menos dos, que están escritas con su razón. Es un test sobre una propiedad que nadie
+mantiene a mano: «todo lo que una configuración pide se puede descargar».
+
+La lista de excepciones es tan importante como la aserción. Las dos corridas que el lector siempre
+entrena él mismo están nombradas y justificadas —tardan minutos y la lección está en correrlas—, así
+que el día que una tercera aparezca habrá que escribir su razón aquí, que es exactamente el momento
+de pensarla.
+
+Los demás tests de los dos ficheros —que un decoder descargado carga con todos sus campos, que un
+encoder conserva su agregación, que un reward model vuelve con la forma que su entrenador escribió,
+que los adaptadores y los datasets caen en su carpeta, y que las dos órdenes funcionan en seco— van
+enlazados porque comprueban el mismo contrato una vez por tipo y la prosa de arriba ya lo explica:
+[`tests/unit/test_hub.py`](https://github.com/borja-glez/rukh/blob/p6/tests/unit/test_hub.py) y
+[`tests/unit/test_publish_cards.py`](https://github.com/borja-glez/rukh/blob/p6/tests/unit/test_publish_cards.py).
+
+<Exercise n="01" title="Publica un modelo que no se midió">
+  Intenta publicar `checkpoints/medium-v4/step-40000.pt` bajo la etapa `medium-v4-greedy`, que se
+  midió sobre `best.pt`. ¿Qué error sale y qué dos hashes se comparan? Ahora hazlo con la copia que
+  trae `rukh pull medium-v4`, que es un fichero distinto con los mismos pesos.
+
+  <Solution>
+    El primero falla: el hash de fichero no coincide y el de tensores tampoco, porque son pesos de
+    dos pasos distintos del entrenamiento. El segundo pasa por la segunda puerta: el hash de fichero
+    no coincide —el publicador quitó el optimizador— y el de tensores sí. Es exactamente la
+    distinción de D-135, y la forma de comprobar que la guarda no se aflojó es la primera mitad: un
+    `step-*.pt` sigue rechazado.
+  </Solution>
+</Exercise>
+
+<Exercise n="02" title="El catálogo como única lista">
+  Cuenta cuántos consumidores distintos recorren `catalogue()` en este hito, y qué pasaría con cada
+  uno si el baseline de Karvonen estuviera dentro de la lista en vez de en `nightly.py`.
+
+  <Solution>
+    Cuatro: `rukh pull` (por `lookup` y `for_module`), `rukh eval nightly` (por `plan`),
+    `rukh publish cards` (por `refresh_cards`) y `rukh publish collection` (por `collection_items`).
+    Con el baseline dentro: `pull` intentaría bajarlo con el formato de nuestros checkpoints y
+    fallaría; `cards` generaría una card nuestra y la **subiría al repositorio de otra persona**, que
+    es el fallo grave; `collection` lo metería en nuestra colección como si lo hubiéramos entrenado.
+    Solo el nightly lo quiere, y por eso solo el nightly lo tiene.
+  </Solution>
+</Exercise>
+
+## Qué has aprendido
+
+Publicar no es subir un fichero: es dejar escrita una afirmación que otra persona pueda contradecir,
+y montar el camino de vuelta para que pueda intentarlo.
+
+Las tres piezas que lo consiguen son las de esta lección. Una **lista única** de lo que existe, de
+la que tiran todos los consumidores, para que no puedan decir cosas distintas. Un **camino de vuelta**
+que deja cada artefacto donde las configuraciones lo esperan, escrito de forma atómica y sin pisar lo
+que ya hay. Y unas **fichas generadas** desde lo que se midió, que se regeneran solas cuando la tabla
+cambia y que suben un fichero de texto en vez de medio giga de pesos.
+
+La lección siguiente vuelve al modelo: el grafo ONNX convertido en un jugador de pleno derecho, y lo
+que la resolución de nombres de corrida cambió en el entrenamiento.
