@@ -1,0 +1,1235 @@
+---
+title: 'El reward model: una cabeza escalar sobre el encoder de M3'
+description:
+  'Los cuatro ficheros del reward model, enteros: el modelo de 73 líneas con su pérdida de
+  Bradley-Terry, el bucle de entrenamiento con su reparto por partida y su desglose por bandas, la
+  configuración que se decidió midiendo y los siete tests que fijan lo que la pérdida promete.'
+module: m5
+order: 2
+duration: 170
+runtime: 5
+level: medio
+status: vigente
+updated: 2026-09-22
+keywords:
+  - reward model
+  - Bradley-Terry
+  - par de preferencia
+  - pooling
+  - fuga de datos
+  - correlación
+artifacts:
+  - kind: model
+    label: chorcat/rukh-rm
+    href: https://huggingface.co/chorcat/rukh-rm
+---
+
+## Qué vas a construir
+
+Un modelo que lee una posición y contesta un número. No juega, no propone jugadas y no hace falta
+para nada de lo que viene después — ni <Term id="dpo">DPO</Term> ni <Term id="grpo">GRPO</Term> lo
+necesitan. Está aquí por tres razones: es la pieza que hace que PPO tenga sentido, es la única del
+módulo que **se puede medir sola** contra un listón escrito de antemano, y es el contraejemplo con
+el que se compara una recompensa verificable.
+
+Son cuatro ficheros y unas 740 líneas: el modelo (73), el bucle de entrenamiento (487), la
+configuración (35) y los tests (148). Están todos aquí enteros, tal como están en la etiqueta
+`p5`. Si copias los bloques en este orden tienes el reward model del proyecto.
+
+## El modelo: 73 líneas y dos decisiones
+
+El fichero abre con un docstring largo, y merece leerse porque las dos decisiones de diseño están
+ahí y no en el código: qué se le da de entrada y por qué la cabeza no está acotada.
+
+```python title="src/rukh/models/reward.py"
+"""A reward model: the encoder of M3 with one scalar head, trained on preferences.
+
+The scalar it produces has **no absolute meaning**. Bradley-Terry only ever sees differences --
+the loss is ``-log σ(r(better) - r(worse))`` -- so adding a constant to every score changes
+nothing, and a reward model that behaves differently when you shift it is broken in a way that
+only shows up later. There is a test for exactly that.
+
+Two design choices worth defending.
+
+**The input is the position *after* the move.** A reward over ``(position, move)`` pairs could be
+built by feeding both, but the encoder of M3 already takes a FEN and the position after a move is
+the move's consequence, which is what a reward is about. It also means the reward model can score
+a position that arrived by any route, which is what GRPO needs when it ranks eight candidate moves
+against each other.
+
+**The head is unbounded.** A ``tanh`` would keep the scale tidy and would also cap the margin
+between a good move and a catastrophic one at the same ceiling, which is the one distinction the
+model is being trained to make. The scale is kept in check by the loss itself: pushing the margin
+to infinity costs more and more for less and less.
+
+What this module is **not** for: DPO. `DPOTrainer` and `rukh.train.dpo` have an implicit reference
+and need no reward model at all. This one is here because it is the piece that makes PPO make
+sense, because it can be measured on its own (``GOAL.md`` asks for 75 % on held-out pairs), and
+because a learned reward is the thing GRPO's verifiable rewards are being compared against.
+"""
+```
+
+<Src file="src/rukh/models/reward.py" tag="p5" lines="1-25" />
+
+La primera decisión —**la entrada es la posición _después_ de la jugada**— es lo que permite
+reutilizar el <Term id="encoder">encoder</Term> de M3 sin tocarlo. Un reward sobre pares
+`(posición, jugada)` se podría construir dándole las dos cosas, pero el encoder ya toma un <Term id="fen">FEN</Term> y la posición después de una jugada _es_ la consecuencia de esa jugada,
+que es exactamente de lo que va una recompensa. El efecto secundario es el que acaba importando:
+así puede puntuar una posición a la que se llegó por cualquier camino, que es lo que GRPO necesita
+cuando ordena ocho candidatas entre sí.
+
+La segunda —**la cabeza es sin acotar**— es la que cuesta más defender. Un `tanh` dejaría la
+escala ordenada, y de paso le pondría el mismo techo al margen entre una jugada buena y una
+catastrófica, que es justo la distinción que el modelo está aprendiendo a hacer. A la escala ya la
+contiene la propia pérdida: llevar el margen al infinito cuesta cada vez más para cada vez menos.
+
+```python title="src/rukh/models/reward.py"
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+from rukh.models.encoder import PositionEncoder
+
+__all__ = ["RewardModel", "preference_accuracy", "preference_loss"]
+```
+
+<Src file="src/rukh/models/reward.py" tag="p5" lines="27-35" />
+
+Cinco imports y una lista. Lo único que dice algo es `PositionEncoder`: el reward model no es un
+modelo nuevo, es el de M3 con una capa lineal encima.
+
+```python title="src/rukh/models/reward.py"
+class RewardModel(nn.Module):
+    """``PositionEncoder`` plus a scalar head: how good is this position for whoever just moved."""
+
+    def __init__(
+        self,
+        encoder: PositionEncoder,
+        pooling: str = "mean",
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.pooling = pooling
+        self.head = nn.Linear(encoder.cfg.d_model, 1)
+
+    def forward(self, idx: Tensor, attention_mask: Tensor | None = None) -> Tensor:
+        """``(B,)`` scores. Higher is better for the side that reached this position."""
+        pooled = self.encoder.pool(idx, self.pooling, attention_mask)
+        return self.head(pooled).squeeze(-1)
+```
+
+<Src file="src/rukh/models/reward.py" tag="p5" lines="38-54" />
+
+Tres líneas de `__init__` y una de `forward`. `encoder.pool` es el método de M3 que reduce
+los 69 tokens de casilla a un vector —`mean` por defecto, que es la opción que M3 midió mejor— y
+el `squeeze(-1)` deja `(B,)` en vez de `(B, 1)`, porque lo que sale de aquí va directo a una
+resta y una dimensión sobrante se propaga hasta convertir un lote de 64 en una matriz de 64×64 sin
+que nada falle.
+
+```python title="src/rukh/models/reward.py"
+def preference_loss(chosen: Tensor, rejected: Tensor) -> Tensor:
+    """Bradley-Terry: ``-log σ(r_chosen - r_rejected)``, averaged over the batch.
+
+    Only the difference appears, which is the whole model: preferences say what is better than
+    what, never how good anything is on its own.
+    """
+    return -F.logsigmoid(chosen - rejected).mean()
+```
+
+<Src file="src/rukh/models/reward.py" tag="p5" lines="57-63" />
+
+Esta es la pérdida entera de <Term id="bradley-terry">Bradley-Terry</Term>, y es una línea. La
+probabilidad de que `chosen` le gane a `rejected` es `σ(r(chosen) − r(rejected))`, así que
+maximizar la verosimilitud es minimizar `−log σ` de la diferencia. `F.logsigmoid` en vez de
+`log(sigmoid(x))` no es cosmética: la versión ingenua satura a `-inf` en cuanto el margen es
+muy negativo, que es precisamente donde el gradiente hace falta.
+
+Y en la fórmula está la propiedad que ordena todo lo demás: **solo aparece la diferencia**. La
+escala del modelo no significa nada, y el test de más abajo lo fija.
+
+```python title="src/rukh/models/reward.py"
+def preference_accuracy(chosen: Tensor, rejected: Tensor) -> float:
+    """Share of pairs the model orders correctly. A tie counts as wrong, not as half right.
+
+    ``GOAL.md`` reads its bar on this number, and a reward model that scores two moves exactly
+    the same has expressed no preference -- rounding that up to half a point would flatter it.
+    """
+    with torch.no_grad():
+        return float((chosen > rejected).float().mean())
+```
+
+<Src file="src/rukh/models/reward.py" tag="p5" lines="66-73" />
+
+El acierto es `chosen > rejected`, no `>=`. Un empate cuenta como **fallo**. El plan del hito
+lee su listón en este número, y un modelo que puntúa dos jugadas exactamente igual no ha expresado
+ninguna preferencia: redondear eso a medio punto sería halagarlo. El `no_grad` está porque esta
+función se llama dentro del bucle de validación y no tiene por qué construir un grafo.
+
+## El bucle: de dos cadenas a dos tableros
+
+`src/rukh/train/reward.py` es el fichero largo del módulo, 487 líneas, y hace tres cosas: traduce
+los pares a posiciones, los reparte sin mentir, y mide el resultado de cuatro maneras distintas
+porque una sola engañaría.
+
+```python title="src/rukh/train/reward.py"
+"""Training the reward model on preference pairs, and measuring it on pairs it never saw.
+
+The data is the one the DPO pairs already use: a prefix of a real game, a move an engine scored
+better and a move it scored worse, at least ``min_delta_cp`` apart. What this loop adds is the
+translation from "(prefix, move)" to "the position the move leads to", which is what the encoder
+of M3 reads, and a split that does not lie.
+
+**The split goes by game, not by pair.** Two pairs from the same game are two moves a few plies
+apart in the same position, so a model that memorised one has most of the other. `game_split` is
+the same pure CRC-32 function M3 used, for the same reason: it gives the same answer in every
+process and every future run.
+
+**The metric is accuracy on held-out pairs**, which `GOAL.md` puts a bar on, plus the correlation
+between the reward and the centipawn difference it was trained from -- Spearman as well as
+Pearson, because M3 measured that a head can get the order right and the scale wrong, and the two
+numbers are the diagnosis.
+"""
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="1-17" />
+
+Las dos frases en negrita del docstring son las dos decisiones. El reparto **por partida y no por
+par** usa la misma función pura de M3, y el motivo es una <Term id="fuga-de-datos">fuga de
+datos</Term> que no se vería: dos pares de la misma partida son dos jugadas separadas por unos
+pocos plies en la misma posición, así que un modelo que memorizó uno tiene casi todo el otro. Y la <Term id="correlacion">correlación</Term> se publica en las dos variantes, Pearson y Spearman,
+porque M3 ya midió una cabeza que acertaba el orden y erraba la escala: cuando las dos discrepan,
+la discrepancia _es_ el diagnóstico.
+
+```python title="src/rukh/train/reward.py"
+from __future__ import annotations
+
+import json
+import logging
+import math
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
+
+import chess
+import numpy as np
+import torch
+import torch.nn.functional as F
+from pydantic import ConfigDict, Field
+from torch import Tensor
+
+from rukh.config import BaseConfig
+from rukh.models.config import EncoderConfig
+from rukh.models.encoder import PositionEncoder
+from rukh.models.reward import RewardModel
+from rukh.models.squares import fen_to_tokens
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Iterator, Sequence
+
+log = logging.getLogger(__name__)
+
+__all__ = [
+    "RewardBand",
+    "RewardConfig",
+    "RewardExample",
+    "RewardResult",
+    "encode_pairs",
+    "load_squares_encoder",
+    "train_reward",
+]
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="19-53" />
+
+`scipy` no aparece aquí: se importa dentro de `_correlations`, más abajo, porque es la única
+función que lo necesita y cargarlo cuesta casi un segundo en cada arranque de la CLI.
+
+```python title="src/rukh/train/reward.py"
+class RewardConfig(BaseConfig):
+    """One reward-model run: where the pairs are, what to start from, and the two knobs."""
+
+    pairs: str = "data/pairs/dpo-prompts.parquet"
+    encoder_ckpt: str | None = None
+    """The masked-move checkpoint to start from. ``None`` trains from scratch, which is the
+    honest baseline the pretraining has to beat -- the same argument as M3's heads."""
+    model: EncoderConfig | None = None
+    pooling: str = "mean"
+    out_dir: str = "checkpoints"
+    run_name: str = "rm"
+    lr: float = Field(default=1e-4, gt=0)
+    weight_decay: float = Field(default=0.01, ge=0)
+    batch_size: int = Field(default=64, ge=1)
+    epochs: int = Field(default=3, ge=1)
+    val_fraction: float = Field(default=0.1, gt=0.0, lt=0.5)
+    seed: int = 42
+    device: str | None = None
+    max_pairs: int | None = None
+    """Cap for a smoke run; ``None`` uses every usable pair."""
+    point_of_view: Literal["mover", "white"] = "white"
+    """Whose side the reward is good for.
+
+    ``mover`` asks the model for "how good is this position for whoever just moved", which is what
+    a reward *is* and which makes the sign flip every ply -- the model has to read the side to move
+    out of the FEN and invert. ``white`` asks for the value head's question instead, "how good is
+    this for White", and puts the flip in the **loss**, where it is a known constant rather than
+    something to learn.
+
+    They are the same information and they are not the same task, which is why this is a knob and
+    not a decision: M5 measured both (D-112)."""
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="56-86" />
+
+Toda la configuración de una corrida en un modelo de pydantic, y una
+sola clave con historia: `point_of_view`. Las dos opciones son la misma información y **no son la
+misma tarea**. Con `mover` el modelo tiene que leer del FEN quién acaba de mover y darle la
+vuelta al signo cada ply; con `white` contesta siempre la pregunta de las blancas y el giro vive
+en la pérdida, donde es una constante conocida en vez de algo que aprender. La sospecha era que lo
+primero costaba puntos. Se midió, cuesta unos dos, y queda como palanca documentada en vez de como
+decisión (D-112). Ese es el patrón del módulo entero: lo que se cree se mide, y si sale pequeño se
+escribe que salió pequeño.
+
+`encoder_ckpt: None` entrena desde cero, que es la línea base honesta que un preentrenamiento
+tiene que batir. En este caso no lo bate, y eso se ve en la lección 8.
+
+```python title="src/rukh/train/reward.py"
+class RewardExample(BaseConfig):
+    """One preference, already turned into the two positions the encoder reads."""
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    game_id: str
+    chosen: list[int]
+    rejected: list[int]
+    white_moved: bool
+    """Whose move the pair is about. The reward is read from that side's point of view."""
+    delta_cp: float
+    """How much better the engine said the chosen move was. Not used by the loss -- Bradley-Terry
+    only sees the order -- but it is what the correlation is measured against."""
+
+
+class RewardBand(BaseConfig):
+    """Accuracy over the pairs whose engine gap falls in one band."""
+
+    band: str
+    pairs: int
+    accuracy: float
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="89-109" />
+
+Dos modelos de datos sin ninguna decisión dentro, salvo `delta_cp`: la pérdida **no lo usa**
+—Bradley-Terry solo ve el orden— y está ahí porque es contra lo que se mide la correlación.
+Guardarlo en el ejemplo, y no recalcularlo al medir, es lo que impide que la métrica y el
+entrenamiento se separen sin que nadie lo note.
+
+```python title="src/rukh/train/reward.py"
+class RewardResult(BaseConfig):
+    """What the run produced and what it measured."""
+
+    checkpoint: str
+    pairs: int
+    train_pairs: int
+    val_pairs: int
+    accuracy: float
+    """Share of held-out pairs ordered correctly. The bar of ``GOAL.md`` is 75 %."""
+    loss: float
+    pearson: float | None = None
+    spearman: float | None = None
+    pearson_without_mates: float | None = None
+    """The same correlation over the pairs an evaluation can decide.
+
+    Both are published because on this dataset they do not share a sign (D-119): the mate pairs
+    carry the largest engine gap and the smallest learned margin, and a third of the points in that
+    corner is enough to bend the line the other way."""
+    spearman_without_mates: float | None = None
+    epochs: int = 0
+    from_scratch: bool = True
+    point_of_view: str = "white"
+    bands: list[RewardBand] = []
+    """Accuracy split by how far apart the engine scored the two moves.
+
+    The number that turns a missed bar into a diagnosis. Accuracy rises with the gap, as it
+    should -- until the mate band, where it falls off a cliff: a mate is a tactical fact and a
+    static evaluation of the resulting position cannot see it. A third of these pairs are
+    mate-scored, so the overall figure is dragged down by the very rows a reward *model* is worst
+    equipped for and a verifiable reward answers exactly."""
+    accuracy_without_mates: float | None = None
+    """Accuracy over the pairs an evaluation could decide, which is the fair read of the bar."""
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="112-143" />
+
+El resultado de una corrida lleva **siete** números de calidad y no uno. Merece la pena leer por
+qué está cada uno: `accuracy` es el titular y el que el plan pone en su criterio;
+`accuracy_without_mates` es la lectura justa de ese mismo listón, porque quita los pares que una
+evaluación estática no puede decidir; `bands` convierte un listón fallado en un diagnóstico; y
+las cuatro correlaciones van por parejas con y sin mates porque **en este conjunto no comparten
+signo** (D-119).
+
+Un `RewardResult` con un solo campo `accuracy` habría publicado la mitad de lo que se midió, y
+justamente la mitad fácil.
+
+```python title="src/rukh/train/reward.py"
+def _position_after(prefix: str, move_uci: str) -> tuple[str, bool] | None:
+    """``(fen after the move, the mover was white)``; ``None`` when the row does not replay.
+
+    A row is dropped rather than repaired. The pairs came from a different pipeline and a prefix
+    that does not replay means the row disagrees with python-chess about the game; guessing which
+    of the two is right is how a dataset quietly acquires positions nobody played.
+    """
+    board = chess.Board()
+    try:
+        for uci in prefix.split():
+            board.push_uci(uci)
+        move = chess.Move.from_uci(move_uci)
+        if move not in board.legal_moves:
+            return None
+        mover_was_white = board.turn == chess.WHITE
+        board.push(move)
+    except (ValueError, AssertionError):
+        return None
+    return board.fen(), mover_was_white
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="146-164" />
+
+Aquí es donde un par deja de ser dos cadenas y pasa a ser dos tableros. Lo que hay que mirar es el
+`return None`: una fila que no se puede reproducir **se descarta**, no se repara. Los pares
+vienen de otra tubería, y un prefijo que python-chess no acepta significa que la fila y la
+biblioteca no están de acuerdo sobre qué partida fue esa; adivinar cuál de las dos tiene razón es
+exactamente cómo un conjunto de datos adquiere en silencio posiciones que nadie jugó.
+
+El `except (ValueError, AssertionError)` es ancho a propósito: `push_uci` levanta las dos según
+por dónde falle, y las dos significan lo mismo aquí.
+
+```python title="src/rukh/train/reward.py"
+def encode_pairs(frame: Any, limit: int | None = None) -> list[RewardExample]:
+    """Turn the pair rows into the two token sequences the encoder reads."""
+    rows = frame.iter_rows(named=True) if hasattr(frame, "iter_rows") else frame
+    examples: list[RewardExample] = []
+    for row in rows:
+        prefix = row.get("prefix") or ""
+        after_chosen = _position_after(prefix, row["chosen"])
+        after_rejected = _position_after(prefix, row["rejected"])
+        if after_chosen is None or after_rejected is None:
+            continue
+        chosen_fen, white_moved = after_chosen
+        rejected_fen, _ = after_rejected
+        examples.append(
+            RewardExample(
+                game_id=str(row["game_id"]),
+                chosen=fen_to_tokens(chosen_fen),
+                rejected=fen_to_tokens(rejected_fen),
+                white_moved=white_moved,
+                delta_cp=abs(float(row["cp_rejected"]) - float(row["cp_chosen"])),
+            )
+        )
+        if limit is not None and len(examples) >= limit:
+            break
+    return examples
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="167-190" />
+
+`encode_pairs` acepta tanto un `DataFrame` de polars como una lista de diccionarios —ese
+`hasattr(frame, "iter_rows")`—, y eso no es generosidad de API: es lo que permite que el test de
+más abajo compruebe el descarte de filas con tres diccionarios escritos a mano, sin escribir un
+parquet.
+
+`delta_cp` se guarda en valor absoluto porque la orientación ya la lleva el par: `chosen` es la
+buena por construcción, así que el signo solo podría contradecir a las columnas.
+
+```python title="src/rukh/train/reward.py"
+def split_examples(
+    examples: Sequence[RewardExample], val_fraction: float, seed: int
+) -> tuple[list[RewardExample], list[RewardExample]]:
+    """Split by **game**, not by pair: two pairs of one game are almost the same pair."""
+    from rukh.data.labels import game_split
+
+    train: list[RewardExample] = []
+    val: list[RewardExample] = []
+    for example in examples:
+        side = game_split(example.game_id, val_fraction, seed)
+        (val if side == "val" else train).append(example)
+    return train, val
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="193-204" />
+
+Doce líneas, y el `import` dentro de la función. `game_split` es la misma CRC-32 pura de M3:
+da la misma respuesta en cualquier proceso y en cualquier corrida futura, así que dos ejecuciones
+del mismo comando reparten igual sin guardar nada en disco.
+
+<Callout kind="roto" title="Repartir por par es una fuga que no se ve">
+  Un reparto aleatorio por par deja pares de la misma partida a los dos lados. El acierto de
+  validación sube, la curva de entrenamiento se ve bien, y nada avisa: el modelo está contestando
+  sobre posiciones que ya vio unos plies antes. Es el mismo error que M3 cazó a tiempo, y por eso
+  este fichero no tiene su propia función de reparto.
+</Callout>
+
+```python title="src/rukh/train/reward.py"
+def batches(
+    examples: Sequence[RewardExample], size: int, shuffle: bool, seed: int
+) -> Iterator[tuple[Tensor, Tensor, Tensor, Tensor]]:
+    """``(chosen, rejected, sign, delta_cp)``, where ``sign`` is +1 when White made the move."""
+    order = list(range(len(examples)))
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(order)
+    for start in range(0, len(order), size):
+        chunk = [examples[index] for index in order[start : start + size]]
+        yield (
+            torch.tensor([example.chosen for example in chunk], dtype=torch.long),
+            torch.tensor([example.rejected for example in chunk], dtype=torch.long),
+            torch.tensor(
+                [1.0 if example.white_moved else -1.0 for example in chunk], dtype=torch.float
+            ),
+            torch.tensor([example.delta_cp for example in chunk], dtype=torch.float),
+        )
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="207-224" />
+
+Un lote es una tupla de cuatro tensores, y el tercero es el que hay que entender. `sign` vale
++1 cuando movieron las blancas y −1 cuando movieron las negras: es la constante que convierte «cómo
+de buena es esta posición para las blancas» en «para quien movió», y por eso `point_of_view`
+puede ser una palanca sin tocar el modelo.
+
+Aquí no hay relleno ni máscara, a diferencia de DPO: todas las posiciones producen exactamente los
+mismos 69 tokens de casilla, así que el lote es rectangular por construcción.
+
+```python title="src/rukh/train/reward.py"
+def margins(
+    model: RewardModel, chosen: Tensor, rejected: Tensor, sign: Tensor, point_of_view: str
+) -> Tensor:
+    """``r(chosen) - r(rejected)``, oriented so that positive means "the preferred one won".
+
+    With ``point_of_view="white"`` the model answers White's question and the flip lives here, in
+    a constant the loss knows. With ``"mover"`` the model has to work out from the board who just
+    moved and answer for them, and the sign is always +1.
+    """
+    difference = model(chosen) - model(rejected)
+    return difference * sign if point_of_view == "white" else difference
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="227-237" />
+
+Once líneas donde vive la palanca. Con `white`, el modelo contesta siempre la misma pregunta y
+el giro es una multiplicación; con `mover`, el signo es siempre +1 porque el modelo ya tiene que
+haber deducido del tablero quién movió. Un `if` de una línea para dos tareas distintas de
+aprendizaje.
+
+```python title="src/rukh/train/reward.py"
+@torch.no_grad()
+def evaluate(
+    model: RewardModel,
+    examples: Sequence[RewardExample],
+    size: int,
+    device: torch.device,
+    point_of_view: str = "white",
+) -> dict[str, float]:
+    """Accuracy, loss and the two correlations against the engine's margin."""
+    model.eval()
+    correct = total = 0
+    losses: list[float] = []
+    scored: list[float] = []
+    deltas: list[float] = []
+    for chosen, rejected, sign, delta in batches(examples, size, shuffle=False, seed=0):
+        chosen, rejected, sign = chosen.to(device), rejected.to(device), sign.to(device)
+        margin = margins(model, chosen, rejected, sign, point_of_view)
+        losses.append(float(-F.logsigmoid(margin).mean()))
+        correct += int((margin > 0).sum())
+        total += int(chosen.shape[0])
+        scored.extend(margin.tolist())
+        deltas.extend(delta.tolist())
+    model.train()
+    return {
+        "accuracy": correct / max(total, 1),
+        "loss": float(np.mean(losses)) if losses else math.nan,
+        **_correlations(scored, deltas),
+        "bands": band_accuracy(scored, deltas),
+        **_correlations(
+            [m for m, d in zip(scored, deltas, strict=True) if d < MATE_GAP],
+            [d for d in deltas if d < MATE_GAP],
+            suffix="_without_mates",
+        ),
+    }
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="240-273" />
+
+La validación devuelve un diccionario con cuatro familias de números, y la clave está en las dos
+llamadas a `_correlations`: la segunda recibe las mismas listas **filtradas por `MATE_GAP`**.
+No es un extra. En este conjunto la correlación completa sale negativa y la de los pares sin mate,
+positiva, y publicar solo la primera sería publicar que el modelo está más seguro cuanto más
+parecidas son las dos jugadas — que es lo contrario de lo que pasa.
+
+`model.eval()` al entrar y `model.train()` al salir: el decorador `@torch.no_grad()` quita el
+grafo, pero el dropout lo quita el modo, y son dos cosas distintas. Un olvido aquí mete ruido en la
+métrica y no en la pérdida, así que la curva de entrenamiento sigue pareciendo sana.
+
+```python title="src/rukh/train/reward.py"
+MATE_GAP = 2000.0
+"""Above this the pair involves a mate score, which is not a position an evaluation can read."""
+
+BANDS: tuple[tuple[float, float, str], ...] = (
+    (100, 200, "100-200"),
+    (200, 400, "200-400"),
+    (400, 800, "400-800"),
+    (800, MATE_GAP, "800-2000"),
+    (MATE_GAP, float("inf"), "mate"),
+)
+
+
+def band_accuracy(scored: Sequence[float], deltas: Sequence[float]) -> list[RewardBand]:
+    """Accuracy by how far apart the engine put the two moves, plus a mate band of its own."""
+    margin = np.asarray(scored, dtype=float)
+    gap = np.asarray(deltas, dtype=float)
+    rows: list[RewardBand] = []
+    for low, high, label in BANDS:
+        mask = (gap >= low) & (gap < high)
+        if not mask.any():
+            continue
+        rows.append(
+            RewardBand(band=label, pairs=int(mask.sum()), accuracy=float((margin[mask] > 0).mean()))
+        )
+    return rows
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="276-300" />
+
+La tabla de bandas es la pieza que convierte «no llegué al 75 %» en «sé exactamente dónde fallo».
+Las bandas son la distancia en centipeones con la que el motor separó las dos jugadas, y la de
+**mate** va aparte por un motivo que no es estético: una diferencia de ±10 000 no es una distancia
+de evaluación, es un marcador de otra escala. Meterla dentro de «800+» halagaría a la banda alta
+con pares que no son evaluaciones.
+
+`band_accuracy` omite una banda vacía en vez de emitirla con cero pares, así que la tabla de la <Term id="model-card">model card</Term> no tiene filas que no se midieron.
+
+```python title="src/rukh/train/reward.py"
+def _correlations(
+    margins: Sequence[float], deltas: Sequence[float], suffix: str = ""
+) -> dict[str, float]:
+    """Pearson and Spearman between the learned margin and the engine's centipawn gap.
+
+    Both, because M3 measured a head that got the order right and the scale wrong (D-076). When
+    they disagree, the disagreement *is* the diagnosis.
+
+    Reported twice, over all pairs and over the pairs that are not mates, because on this dataset
+    the two do not even share a **sign**: -0.128 against +0.058 (D-119). Mate pairs carry the
+    largest engine gap by construction and the smallest learned margin, so a third of the points
+    sits in the corner that bends the line. One correlation over two regimes describes neither.
+    """
+    keys = (f"pearson{suffix}", f"spearman{suffix}")
+    if len(margins) < 3:
+        return dict.fromkeys(keys, math.nan)
+    from scipy.stats import pearsonr, spearmanr
+
+    margin = np.asarray(margins, dtype=float)
+    delta = np.asarray(deltas, dtype=float)
+    if margin.std() == 0 or delta.std() == 0:
+        return dict.fromkeys(keys, math.nan)
+    return {
+        keys[0]: float(pearsonr(margin, delta).statistic),
+        keys[1]: float(spearmanr(margin, delta).statistic),
+    }
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="303-328" />
+
+Dos guardas antes de calcular nada: menos de tres puntos, o una de las dos series constante, y
+devuelve NaN en vez de una correlación. Una correlación de dos puntos es 1,0 siempre, y una sobre
+una serie sin varianza es una división por cero que `scipy` contesta con un aviso y un NaN — y
+un NaN que llega hasta un `run.json` se publica.
+
+El `import` de `scipy` vive dentro por el arranque de la CLI, y el `suffix` es lo que permite
+llamar dos veces a la misma función y que las claves no se pisen.
+
+```python title="src/rukh/train/reward.py"
+def load_squares_encoder(path: Path, map_location: str = "cpu") -> PositionEncoder:
+    """The encoder inside a checkpoint, refusing anything that does not read positions.
+
+    The guard is the whole point. A reward model is fed the 69 square tokens of
+    ``rukh.models.squares``, and an encoder trained on the ``moves`` scheme accepts those ids
+    without complaining -- they are all inside its 2 030-token vocabulary -- while meaning
+    something else entirely. Nothing crashes, nothing warns, and the run produces a plausible
+    number from a scrambled representation. It happened: the first reward model of this milestone
+    reached 72.98 % that way.
+
+    A heads checkpoint is accepted too, and is in fact the better start: its encoder was already
+    fine-tuned to answer "how good is this position", which is what a reward is.
+    """
+    from rukh.train.checkpoint import load_checkpoint, load_state
+
+    payload = load_checkpoint(path, map_location=map_location)
+    shape = EncoderConfig.model_validate(payload["model_cfg"])
+    if shape.input != "squares":
+        raise ValueError(
+            f"{path} was trained on the `{shape.input}` scheme; a reward model reads positions "
+            "and needs an encoder trained on `squares`"
+        )
+    encoder = PositionEncoder(shape)
+    state = payload["model_state"]
+    inner = {
+        key.removeprefix("encoder."): value
+        for key, value in state.items()
+        if key.startswith("encoder.")
+    }
+    load_state(encoder, inner or state)
+    return encoder
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="331-361" />
+
+Esta es la función con la historia más cara del fichero, y la guarda de tres líneas es todo el
+punto. Un reward model come los 69 tokens de casilla de `rukh.models.squares`; un encoder
+entrenado con el esquema `moves` **acepta esos identificadores sin quejarse** —caben todos en su
+vocabulario de 2 030— mientras significan otra cosa. No falla nada, no avisa nada, y la corrida
+produce un número perfectamente plausible a partir de una representación revuelta. Pasó: el primer
+reward model del hito sacó 72,98 % así.
+
+<Callout kind="roto" title="El fallo que devuelve un número creíble">
+  Los peores fallos de un proyecto de aprendizaje no son los que revientan: son los que devuelven un
+  número que cae donde lo esperabas. Aquí las dos representaciones comparten rango de enteros, así
+  que el único sitio donde se puede poner la comprobación es al cargar. La regla que deja: si dos
+  cosas incompatibles tienen el mismo tipo, el tipo no te va a salvar; escribe la guarda.
+</Callout>
+
+El `removeprefix("encoder.")` de abajo es lo que permite cargar tanto un checkpoint del encoder
+suelto como uno de las cabezas de M3, donde el encoder está anidado. Ese segundo caso es, sobre el
+papel, el mejor punto de partida: su encoder ya estaba afinado para contestar «cómo de buena es
+esta posición». La lección 8 cuenta qué pasó al medirlo.
+
+```python title="src/rukh/train/reward.py"
+def build_model(cfg: RewardConfig, device: torch.device) -> tuple[RewardModel, bool]:
+    """The reward model, from a pretrained encoder when there is one."""
+    if cfg.encoder_ckpt:
+        encoder = load_squares_encoder(Path(cfg.encoder_ckpt), map_location=str(device))
+        return RewardModel(encoder, cfg.pooling).to(device), False
+    shape = cfg.model or EncoderConfig(input="squares")
+    if shape.input != "squares":
+        raise ValueError("the reward model reads positions; `model.input` must be `squares`")
+    return RewardModel(PositionEncoder(shape), cfg.pooling).to(device), True
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="364-372" />
+
+Nueve líneas para decidir de dónde salen los pesos, y una segunda guarda con el mismo motivo que
+la anterior: si la configuración pide un `input` que no sea `squares`, se para aquí en vez de
+entrenar cuarenta minutos sobre tokens que significan otra cosa.
+
+```python title="src/rukh/train/reward.py"
+def train_reward(cfg: RewardConfig) -> RewardResult:
+    """Train the reward model and return what it measured on pairs it never saw."""
+    from datetime import UTC, datetime
+
+    import polars as pl
+
+    from rukh.train import pick_device
+
+    torch.manual_seed(cfg.seed)
+    device = torch.device(cfg.device or pick_device())
+    frame = pl.read_parquet(cfg.pairs)
+    examples = encode_pairs(frame, cfg.max_pairs)
+    if not examples:
+        raise ValueError(f"no usable pairs in {cfg.pairs}")
+    train_set, val_set = split_examples(examples, cfg.val_fraction, cfg.seed)
+    if not train_set or not val_set:
+        raise ValueError(
+            f"the split left {len(train_set)} train and {len(val_set)} val pairs; "
+            "check `val_fraction` and that the pairs carry more than one game"
+        )
+    log.info(
+        "reward model: %d pairs (%d train, %d val) over %d games",
+        len(examples),
+        len(train_set),
+        len(val_set),
+        len({example.game_id for example in examples}),
+    )
+
+    model, from_scratch = build_model(cfg, device)
+    optimiser = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    for epoch in range(cfg.epochs):
+        seen = 0
+        running = 0.0
+        for chosen, rejected, sign, _delta in batches(
+            train_set, cfg.batch_size, shuffle=True, seed=cfg.seed + epoch
+        ):
+            chosen, rejected, sign = chosen.to(device), rejected.to(device), sign.to(device)
+            loss = -F.logsigmoid(margins(model, chosen, rejected, sign, cfg.point_of_view)).mean()
+            loss.backward()
+            optimiser.step()
+            optimiser.zero_grad(set_to_none=True)
+            running += float(loss.detach()) * int(chosen.shape[0])
+            seen += int(chosen.shape[0])
+        measured = evaluate(model, val_set, cfg.batch_size, device, cfg.point_of_view)
+        log.info(
+            "epoch %d/%d  train loss %.4f  val loss %.4f  val accuracy %.4f",
+            epoch + 1,
+            cfg.epochs,
+            running / max(seen, 1),
+            measured["loss"],
+            measured["accuracy"],
+        )
+
+    final = evaluate(model, val_set, cfg.batch_size, device, cfg.point_of_view)
+    stamp = f"{datetime.now(UTC):%Y%m%d-%H%M%S}"
+    directory = Path(cfg.out_dir) / f"{cfg.run_name}-{stamp}"
+    directory.mkdir(parents=True, exist_ok=True)
+    checkpoint = directory / "reward.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "encoder_config": model.encoder.cfg.model_dump(mode="json"),
+            "pooling": cfg.pooling,
+            "config": cfg.model_dump(mode="json"),
+        },
+        checkpoint,
+    )
+    result = RewardResult(
+        checkpoint=checkpoint.as_posix(),
+        pairs=len(examples),
+        train_pairs=len(train_set),
+        val_pairs=len(val_set),
+        accuracy=final["accuracy"],
+        loss=final["loss"],
+        pearson=_clean(final["pearson"]),
+        spearman=_clean(final["spearman"]),
+        pearson_without_mates=_clean(final["pearson_without_mates"]),
+        spearman_without_mates=_clean(final["spearman_without_mates"]),
+        epochs=cfg.epochs,
+        from_scratch=from_scratch,
+        point_of_view=cfg.point_of_view,
+        bands=list(final["bands"]),
+        accuracy_without_mates=_without_mates(final["bands"]),
+    )
+    (directory / "run.json").write_text(
+        json.dumps(result.model_dump(mode="json"), indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return result
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="375-464" />
+
+El bucle en sí no tiene sorpresas, y eso es lo que se espera de un bucle: leer el parquet,
+codificar, repartir, iterar épocas, medir al final de cada una. Vale la pena mirar tres detalles.
+
+El primero es la guarda del reparto. Si el sorteo deja un lado vacío —pasa cuando los pares vienen
+todos de la misma partida, que es el caso de un fichero de prueba— se levanta un error que dice qué
+mirar, en vez de caer más tarde con un `mean of empty slice`.
+
+El segundo es que el modelo se guarda **con la configuración del encoder dentro**. Un checkpoint
+que no lleva su propia forma obliga a adivinarla al cargarlo, y adivinarla mal es el fallo de
+`load_squares_encoder` otra vez por el otro lado.
+
+El tercero es `run.json`: el resultado entero, con sus bandas y sus cuatro correlaciones, escrito
+junto al checkpoint. La lección 6 lo usa tal cual para escribir la model card, y por eso el
+publicador se niega a publicar un checkpoint que no lo tenga.
+
+```python title="src/rukh/train/reward.py"
+def _clean(value: float) -> float | None:
+    """`None` instead of NaN, so the run file reads as "not measured" and not as a number."""
+    return None if math.isnan(value) else float(value)
+
+
+def _without_mates(bands: Sequence[RewardBand]) -> float | None:
+    """Accuracy over everything but the mate band: what the model could actually have known."""
+    usable = [row for row in bands if row.band != "mate"]
+    pairs = sum(row.pairs for row in usable)
+    if not pairs:
+        return None
+    return sum(row.accuracy * row.pairs for row in usable) / pairs
+
+
+def load_reward(path: Path | str, map_location: str | None = None) -> RewardModel:
+    """Read a reward-model checkpoint back."""
+    payload = torch.load(Path(path), map_location=map_location or "cpu", weights_only=False)
+    encoder = PositionEncoder(EncoderConfig.model_validate(payload["encoder_config"]))
+    model = RewardModel(encoder, payload.get("pooling", "mean"))
+    model.load_state_dict(payload["model"])
+    return model.eval()
+```
+
+<Src file="src/rukh/train/reward.py" tag="p5" lines="467-487" />
+
+Tres funciones cortas para cerrar. `_clean` cambia NaN por `None` para que el `run.json`
+diga «no medido» y no un número; en JSON un NaN es directamente inválido, así que la alternativa no
+era fea sino ilegal. `_without_mates` recompone el acierto de las bandas que una evaluación puede
+decidir, ponderando por el número de pares de cada una. Y `load_reward` lee el checkpoint de
+vuelta, que es lo que usan el publicador y cualquiera que quiera puntuar posiciones con él.
+
+## La configuración, donde tres decisiones son medidas
+
+`configs/train/rm.yaml` son 35 líneas y diecisiete son comentario. No es verborrea: cada una
+explica una decisión que costó una corrida.
+
+{/* prettier-ignore */}
+```yaml title="configs/train/rm.yaml"
+# The reward model of M5: a position encoder with one scalar head, trained on preference pairs.
+#
+# Three things in this file were decided by measurement and not by taste (D-112).
+#
+# `encoder_ckpt: null` -- it trains from scratch. The only `squares` encoder the project has was
+# fine-tuned for value, blunder and result, and starting from it scores **62 %** against **69 %**
+# from a random initialisation at the same size. A representation optimised for one question can
+# be a worse starting point than no representation at all.
+#
+# The size is 12 x 512 and not 8 x 384 because that is what the accuracy tracks: 73 % against
+# 69 %. The first run of this milestone reached 73 % by accident, loading a `moves` encoder whose
+# embeddings meant nothing for square tokens, and matched what scratch does at the same capacity.
+# `load_squares_encoder` now refuses that mistake instead of producing a plausible number from it.
+#
+# `point_of_view: white` asks the model the value head's question and puts the sign flip in the
+# loss, where it is a constant. Asking it for the mover's point of view instead costs about two
+# points, which is small and is measured rather than assumed.
+pairs: data/pairs/dpo-prompts.parquet
+encoder_ckpt: null
+model:
+  input: squares
+  n_layer: 12
+  n_head: 8
+  d_model: 512
+  dropout: 0.1
+pooling: mean
+out_dir: checkpoints
+run_name: rm
+lr: 1.0e-4
+weight_decay: 0.01
+batch_size: 64
+epochs: 10
+val_fraction: 0.1
+seed: 42
+point_of_view: white
+```
+
+<Src file="configs/train/rm.yaml" tag="p5" lines="1-35" />
+
+La segunda y la tercera se leen enteras en la lección 8, con sus tablas. La primera merece
+quedarse aquí: partir del encoder preentrenado de M3 da unos **6,5 puntos menos** que inicializar
+al azar. El encoder aprendió a rellenar jugadas enmascaradas; aquí se le pide ordenar posiciones
+por lo buenas que son. «Preentrenado» no es una propiedad de un modelo, es una **relación** entre
+lo que aprendió y lo que le vas a pedir, y cuando esa relación no existe la inicialización al azar
+gana.
+
+<Transfer
+  concept="Preentrenado no es una propiedad, es una relación"
+  where="Cualquier vez que arranques de un checkpoint del Hub: un embedder para clasificar, un LLM instruido para extraer campos, un modelo de visión para contar objetos."
+>
+  Antes de partir de un checkpoint porque «está entrenado», pregúntate entrenado *para qué*, y mide
+  la alternativa de no partir de nada. Es una corrida, y es la única forma de saber si el
+  preentrenamiento aporta o estorba en tu tarea concreta.
+</Transfer>
+
+## La orden
+
+La CLI añade `rukh train reward`, y su trabajo es cargar el YAML, correr y **imprimir las cuatro
+cosas juntas** que el resultado obliga a publicar.
+
+```python title="src/rukh/cli.py"
+@train_app.command("reward")
+def train_reward_cmd(
+    config: Annotated[
+        Path,
+        typer.Option("--config", exists=True, dir_okay=False, help="Reward-model run YAML."),
+    ],
+    device: Annotated[str | None, typer.Option("--device", help="Where to train.")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the result as JSON only.")] = False,
+) -> None:
+    """Train the reward model on preference pairs and measure it on pairs it never saw.
+
+    The reward model is **not** what DPO uses -- DPO's reference is implicit and needs no reward
+    model at all. It is here because it is the piece that makes PPO make sense, because its
+    accuracy on held-out pairs is a bar `GOAL.md` puts a number on, and because a learned reward
+    is what GRPO's verifiable ones are compared against.
+    """
+    from rukh.config import load_yaml
+    from rukh.train.reward import RewardConfig, train_reward
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    cfg = load_yaml(config, RewardConfig)
+    if device:
+        cfg.device = device
+    try:
+        result = train_reward(cfg)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if as_json:
+        typer.echo(result.model_dump_json(indent=2))
+        return
+    typer.echo(f"checkpoint: {result.checkpoint}")
+    split = f"{result.train_pairs:,} train, {result.val_pairs:,} val"
+    typer.echo(f"pairs:      {result.pairs:,} ({split})")
+    typer.echo(f"accuracy:   {result.accuracy * 100:.2f} % on held-out pairs")
+    if result.accuracy_without_mates is not None:
+        clean = result.accuracy_without_mates * 100
+        typer.echo(f"            {clean:.2f} % over the pairs an evaluation can decide")
+    for row in result.bands:
+        typer.echo(f"  {row.band:>9} cp  {row.pairs:>5} pairs  {row.accuracy * 100:6.2f} %")
+    typer.echo(f"loss:       {result.loss:.4f}")
+    if result.pearson is not None and result.spearman is not None:
+        correlations = f"Pearson {result.pearson:+.3f}, Spearman {result.spearman:+.3f}"
+        typer.echo(f"margin vs delta cp: {correlations}")
+    if result.pearson_without_mates is not None and result.spearman_without_mates is not None:
+        # Printed beside the other one because the two do not share a sign (D-119).
+        clean_correlations = (
+            f"Pearson {result.pearson_without_mates:+.3f}, "
+            f"Spearman {result.spearman_without_mates:+.3f}"
+        )
+        typer.echo(f"        without mates: {clean_correlations}")
+    origin = "from scratch" if result.from_scratch else "from the encoder"
+    typer.echo(f"started:    {origin}")
+```
+
+<Src file="src/rukh/cli.py" tag="p5" lines="900-952" />
+
+Los `try`/`except` convierten los dos errores previsibles —no hay fichero, o el reparto dejó
+un lado vacío— en un mensaje y un código de salida, en vez de en una traza. Y el bucle sobre
+`result.bands` es lo que hace que el desglose esté delante del que lanzó el comando, no
+escondido en un JSON: si el titular no llega, la línea siguiente ya dice por qué.
+
+Salida en la máquina de referencia (RTX 5090), la corrida de la semilla 1:
+
+```text
+accuracy:   74.76 % on held-out pairs
+            77.30 % over the pairs an evaluation can decide
+    100-200 cp    556 pairs   77.52 %
+    200-400 cp    242 pairs   74.79 %
+    400-800 cp    104 pairs   80.77 %
+   800-2000 cp     10 pairs   90.00 %
+       mate cp    356 pairs   68.26 %
+margin vs delta cp: Pearson -0.128, Spearman -0.067
+        without mates: Pearson +0.058, Spearman +0.075
+```
+
+## Los tests: lo que la pérdida promete
+
+`tests/unit/test_reward_model.py` son 148 líneas y está entero aquí, porque es el fichero que
+escribe el contrato: qué promete Bradley-Terry, qué no promete, y las dos cosas que el bucle de
+datos tiene que hacer bien.
+
+```python title="tests/unit/test_reward_model.py"
+"""The reward model: what Bradley-Terry does and does not promise.
+
+A preference loss only ever sees *differences*, which has a consequence worth a test of its own:
+the scale has no meaning, and a model whose answer changes when every score shifts by a constant
+is broken in a way nothing downstream would notice.
+"""
+
+from __future__ import annotations
+
+import chess
+import pytest
+import torch
+
+from rukh.models.config import EncoderConfig
+from rukh.models.encoder import PositionEncoder
+from rukh.models.reward import RewardModel, preference_accuracy, preference_loss
+from rukh.models.squares import SQUARE_TOKENS, fen_to_tokens
+from rukh.train.reward import RewardExample, encode_pairs, split_examples
+
+pytestmark = pytest.mark.unit
+
+TOY = EncoderConfig(input="squares", n_layer=1, n_head=2, d_model=16, dropout=0.0)
+
+
+def _model() -> RewardModel:
+    torch.manual_seed(0)
+    return RewardModel(PositionEncoder(TOY))
+
+
+def test_the_loss_only_sees_the_difference():
+    """Shift every score by a constant and nothing changes: that *is* Bradley-Terry."""
+    chosen = torch.tensor([1.0, -0.5, 3.0])
+    rejected = torch.tensor([0.0, -2.0, 1.0])
+    base = preference_loss(chosen, rejected)
+    for shift in (-100.0, 0.25, 7.0):
+        assert preference_loss(chosen + shift, rejected + shift) == pytest.approx(float(base))
+
+
+def test_a_perfect_ordering_drives_the_loss_towards_zero():
+    wide = torch.tensor([20.0, 20.0])
+    low = torch.tensor([-20.0, -20.0])
+    assert float(preference_loss(wide, low)) == pytest.approx(0.0, abs=1e-6)
+    assert preference_accuracy(wide, low) == 1.0
+    # And a coin flip costs log 2 per pair, which is the loss of a model that knows nothing.
+    same = torch.zeros(4)
+    assert float(preference_loss(same, same)) == pytest.approx(0.6931, abs=1e-3)
+
+
+def test_a_tie_counts_as_wrong_rather_than_as_half_right():
+    """A model that scores two moves the same has expressed no preference."""
+    same = torch.tensor([1.0, 1.0])
+    assert preference_accuracy(same, same) == 0.0
+
+
+def test_the_model_reads_a_position_and_answers_one_number_per_row():
+    model = _model()
+    board = chess.Board()
+    board.push_uci("e2e4")
+    idx = torch.tensor([fen_to_tokens(board.fen())] * 3, dtype=torch.long)
+    assert idx.shape == (3, SQUARE_TOKENS)
+    scores = model(idx)
+    assert scores.shape == (3,)
+    # The same position scores the same, which sounds obvious and is the pooling being right.
+    assert float(scores.detach().std()) == pytest.approx(0.0, abs=1e-6)
+```
+
+<Src file="tests/unit/test_reward_model.py" tag="p5" lines="1-64" />
+
+Los tres primeros son la invariancia y sus consecuencias. El de arriba es el importante: desplazar
+todas las puntuaciones por una constante **no cambia la pérdida ni un decimal**, y esa no es una
+propiedad accidental, es Bradley-Terry. Un modelo cuya respuesta cambiara al desplazarlo estaría
+roto de una forma que nadie aguas abajo notaría.
+
+El segundo fija los dos extremos: una ordenación perfecta lleva la pérdida a cero, y una moneda al
+aire cuesta `log 2 = 0,6931` por par. Ese 0,6931 es el número contra el que se lee cualquier
+curva de pérdida de preferencias: por encima, el modelo va peor que no saber nada.
+
+El tercero fija el empate como fallo, en dos líneas, para que nadie lo «arregle» a medio punto.
+
+```python title="tests/unit/test_reward_model.py"
+def test_a_row_that_does_not_replay_is_dropped_rather_than_repaired():
+    """Guessing which of the dataset and python-chess is right is how bad positions creep in."""
+    rows = [
+        {
+            "game_id": "1",
+            "prefix": "e2e4",
+            "chosen": "e7e5",
+            "rejected": "h7h5",
+            "cp_chosen": 10,
+            "cp_rejected": 110,
+        },
+        # An illegal "chosen" for this prefix: white cannot move twice.
+        {
+            "game_id": "2",
+            "prefix": "e2e4",
+            "chosen": "d2d4",
+            "rejected": "e7e5",
+            "cp_chosen": 10,
+            "cp_rejected": 110,
+        },
+        # A prefix that is not a legal game at all.
+        {
+            "game_id": "3",
+            "prefix": "e2e9",
+            "chosen": "e7e5",
+            "rejected": "h7h5",
+            "cp_chosen": 10,
+            "cp_rejected": 110,
+        },
+    ]
+    kept = encode_pairs(rows)
+    assert [example.game_id for example in kept] == ["1"]
+    assert len(kept[0].chosen) == len(kept[0].rejected) == SQUARE_TOKENS
+    assert kept[0].delta_cp == 100
+
+
+def test_the_split_goes_by_game_so_two_pairs_of_one_game_cannot_straddle_it():
+    """Two pairs a few plies apart are almost the same pair; splitting by pair leaks."""
+    examples = [
+        RewardExample(
+            game_id=str(game),
+            chosen=[0] * 4,
+            rejected=[0] * 4,
+            white_moved=True,
+            delta_cp=100.0,
+        )
+        for game in range(200)
+        for _ in range(3)
+    ]
+    train, val = split_examples(examples, val_fraction=0.2, seed=42)
+    assert train and val
+    assert len(train) + len(val) == len(examples)
+    overlap = {e.game_id for e in train} & {e.game_id for e in val}
+    assert overlap == set(), "no game may appear on both sides of the split"
+    # Every game keeps all three of its pairs on the same side.
+    for side in (train, val):
+        counts = {}
+        for example in side:
+            counts[example.game_id] = counts.get(example.game_id, 0) + 1
+        assert set(counts.values()) == {3}
+```
+
+<Src file="tests/unit/test_reward_model.py" tag="p5" lines="67-126" />
+
+Los dos de datos. El del descarte usa tres diccionarios escritos a mano —el segundo con una jugada
+ilegal para ese prefijo, el tercero con un prefijo que no es una partida— y comprueba que solo
+sobrevive el primero. El del reparto construye 200 partidas con tres pares cada una y comprueba dos
+cosas: que ninguna partida aparece a los dos lados, y que **las tres filas de cada partida se
+quedan juntas**. Esa segunda comprobación es la que fallaría con un reparto por par, y la que
+convierte la fuga en un test rojo en vez de en un número optimista.
+
+```python title="tests/unit/test_reward_model.py"
+def test_training_one_batch_moves_the_scores_apart():
+    """The smallest end-to-end check: the loss goes down and the ordering improves."""
+    model = _model()
+    board = chess.Board()
+    board.push_uci("e2e4")
+    good = torch.tensor([fen_to_tokens(board.fen())], dtype=torch.long)
+    board.pop()
+    board.push_uci("f2f3")
+    bad = torch.tensor([fen_to_tokens(board.fen())], dtype=torch.long)
+
+    optimiser = torch.optim.AdamW(model.parameters(), lr=0.05)
+    first = float(preference_loss(model(good), model(bad)))
+    for _ in range(30):
+        loss = preference_loss(model(good), model(bad))
+        loss.backward()
+        optimiser.step()
+        optimiser.zero_grad(set_to_none=True)
+    last = float(preference_loss(model(good), model(bad)))
+    assert last < first
+    assert preference_accuracy(model(good), model(bad)) == 1.0
+```
+
+<Src file="tests/unit/test_reward_model.py" tag="p5" lines="129-148" />
+
+Y el último es el más pequeño posible de extremo a extremo: dos posiciones reales —`e4` y
+`f3`, que cualquiera ordena igual—, treinta pasos de AdamW, y la pérdida tiene que bajar y la
+ordenación tiene que salir bien. Con un modelo de juguete de una capa y `d_model=16` tarda menos
+de un segundo, y es lo que separa «el código importa» de «el código entrena».
+
+<Exercise n="01" title="Rompe la invariancia a propósito">
+  Cambia `preference_loss` por `-F.logsigmoid(chosen - rejected).mean() + 0.01 * chosen.mean()`
+  —un término que parece inocente, «que las buenas puntúen alto»— y corre los tests. ¿Cuál falla, y
+  qué le pasaría al modelo entrenado con esa pérdida?
+
+  <Solution>
+    Falla `test_the_loss_only_sees_the_difference`: con el término nuevo, desplazar las dos
+    puntuaciones por +7 cambia la pérdida en 0,07. Y el modelo entrenado así aprende dos cosas a la
+    vez, ordenar pares y subir la escala, que es exactamente lo que la cabeza sin acotar deja hacer
+    sin límite: el margen puede crecer indefinidamente sin que la ordenación mejore. El síntoma es
+    una pérdida que baja con el acierto de validación plano, que es el síntoma más difícil de
+    diagnosticar que hay.
+  </Solution>
+</Exercise>
+
+<Exercise n="02" title="¿Por qué `sign` y no un segundo modelo?">
+  `point_of_view: white` mete el giro de signo en la pérdida. ¿Por qué no entrenar dos cabezas,
+  una para cada bando, y usar la que toque?
+
+  <Solution>
+    Porque serían dos modelos con la mitad de datos cada uno aprendiendo la misma función. El
+    ajedrez es simétrico por color salvo en el enroque y el peón al paso, así que la posición
+    espejada con los colores cambiados vale lo mismo para el otro bando: una cabeza que aprende «lo
+    buena que es para las blancas» ya sabe contestar por las negras con un signo. Dividir los datos
+    para aprender dos veces la misma cosa es el error contrario al de repartir por par: allí se
+    comparte lo que no se debe, aquí se separa lo que no hace falta.
+  </Solution>
+</Exercise>
+
+## Qué has aprendido
+
+Que un reward model es un encoder con una capa lineal encima, que su pérdida cabe en una línea, y
+que la línea trae una propiedad —solo ve diferencias— que obliga a no interpretar nunca su escala.
+Que la métrica que se publica de él son cuatro números y no uno, porque el titular esconde dónde
+falla. Y que dos guardas de tres líneas —el reparto por partida y el rechazo del encoder
+equivocado— valen más que cualquier mejora de arquitectura, porque las dos tapan fallos que
+devuelven números creíbles.
+
+Lo siguiente es DPO: el mismo tipo de pares, sin reward model, entrenando la política directamente.

@@ -1,0 +1,723 @@
+---
+title: 'Publicar lo alineado: un reward model no es una política'
+description:
+  'El publicador propio del reward model y su plantilla de card, que lleva la tabla de bandas y las
+  dos correlaciones porque una exactitud sola es la mitad fácil de lo que se midió; más las tres
+  líneas que registran el dataset on-policy y la etapa nueva de la demo.'
+module: m5
+order: 6
+duration: 100
+runtime: 5
+level: medio
+status: vigente
+updated: 2026-09-22
+keywords:
+  - model card
+  - Hugging Face
+  - safetensors
+  - jinja
+  - reward model
+artifacts:
+  - kind: model
+    label: chorcat/rukh-rm
+    href: https://huggingface.co/chorcat/rukh-rm
+  - kind: dataset
+    label: chorcat/rukh-pairs-onpolicy
+    href: https://huggingface.co/datasets/chorcat/rukh-pairs-onpolicy
+---
+
+## Qué vas a construir
+
+Tres cosas que este hito tiene que publicar y que no encajaban en lo que había: un **reward model**,
+que no es una política; un **dataset** construido por el propio modelo; y una **etapa nueva** que la
+demo tiene que poder servir.
+
+La primera es la que necesita código nuevo, 174 líneas y una plantilla de 108. Las otras dos son
+tres líneas y un bloque de registro, y la lección las enseña porque el trabajo de publicar casi
+nunca es escribir un publicador: es añadir una entrada a una lista y que todo lo demás la recoja.
+
+## Por qué el reward model necesita su propio publicador
+
+`rukh publish model` prepara pesos, tres exportaciones a <Term id="onnx">ONNX</Term>, un
+vocabulario y una card cuyos números salen de `rukh eval`. Un reward model no tiene nada de eso.
+
+```python title="src/rukh/publish/reward.py"
+"""Publishing the reward model, which is not a policy and must not be published as one.
+
+`rukh publish model` stages weights, three ONNX exports, a vocabulary and a card whose numbers come
+from `rukh eval`. A reward model has none of that. It has no ONNX because nothing serves it in a
+browser; it has no Elo because it does not play; and the suite that measures every other stage of
+this project has no row it belongs in.
+
+What it does have is a number that means something narrow and precise -- how often it orders two
+moves the way an engine did -- and three caveats that have to travel with it or the number is
+misleading:
+
+* the scale is meaningless, because Bradley-Terry only ever sees differences;
+* the headline accuracy depends on the **split**, since the seed decides how many mate pairs land
+  in validation and that is the band the model is worst at;
+* the two correlations it reports do not share a sign, and the reason is that same band.
+
+So the card is written from the run's own `run.json` and leads with all three. A reward model
+published with one accuracy and no band table would be publishing the easy half of what was
+measured.
+"""
+```
+
+<Src file="src/rukh/publish/reward.py" tag="p5" lines="1-20" />
+
+Los tres puntos del docstring son el contenido entero de la decisión. No hay ONNX porque **nada lo
+sirve en un navegador**: el reward model no juega, así que la demo no tiene dónde ponerlo. No hay
+Elo porque no juega. Y la suite canónica, la que mide cada etapa del proyecto desde M2, no tiene
+ninguna fila a la que pertenezca.
+
+Lo que sí tiene es un número que significa algo estrecho y preciso —con qué frecuencia ordena dos
+jugadas como las ordenó un motor— y **tres advertencias que tienen que viajar con él** o el número
+engaña: que la escala no significa nada, que el titular depende del reparto, y que sus dos
+correlaciones no comparten signo.
+
+<Transfer
+  concept="Publicar el intervalo con el número"
+  where="Cualquier métrica que salga de tu equipo hacia otro: una exactitud en un informe, un porcentaje en una slide, un umbral en una alerta."
+>
+  El reflejo es publicar el mejor número y guardarse los matices para quien pregunte. Pero quien lee
+  el número casi nunca pregunta, y el que se lo reenvía a un tercero ya no puede. Si una cifra
+  necesita tres frases para no engañar, esas tres frases forman parte de la cifra: van en la misma
+  tabla, no en un apéndice.
+</Transfer>
+
+```python title="src/rukh/publish/reward.py"
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict
+
+from rukh.models.squares import SQUARE_TOKENS
+from rukh.paths import resolve
+from rukh.publish.model import CONFIG_NAME, README_NAME, ModelPublishConfig, _api, render_card
+
+log = logging.getLogger(__name__)
+
+__all__ = ["RewardPublishResult", "publish_reward"]
+
+REPO_TYPE = "model"
+REWARD_CARD_TEMPLATE = "reward.md.jinja"
+SAFETENSORS_NAME = "model.safetensors"
+```
+
+<Src file="src/rukh/publish/reward.py" tag="p5" lines="22-41" />
+
+Fíjate en el `import` desde `rukh.publish.model`: `CONFIG_NAME`, `README_NAME`,
+`ModelPublishConfig`, `_api` y `render_card` se reutilizan del publicador de políticas. Lo que
+cambia no es la fontanería —dónde está el repo, cómo se renderiza una plantilla, cómo se habla con
+el Hub— sino **qué se sube y qué dice**.
+
+```python title="src/rukh/publish/reward.py"
+class RewardPublishResult(BaseModel):
+    """Where the folder was staged, what went in it, and whether it was uploaded."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repo_id: str
+    folder: str
+    files: list[str]
+    uploaded: bool
+    accuracy: float
+```
+
+<Src file="src/rukh/publish/reward.py" tag="p5" lines="44-53" />
+
+```python title="src/rukh/publish/reward.py"
+def _load(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``(checkpoint payload, run result)`` for a reward run directory."""
+    import torch
+
+    checkpoint = run_dir / "reward.pt" if run_dir.is_dir() else run_dir
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    result_path = checkpoint.parent / "run.json"
+    if not result_path.is_file():
+        raise FileNotFoundError(
+            f"{result_path} is missing; the card is written from it, so the run has to have "
+            "been produced by `rukh train reward`"
+        )
+    return payload, json.loads(result_path.read_text(encoding="utf-8"))
+```
+
+<Src file="src/rukh/publish/reward.py" tag="p5" lines="56-68" />
+
+`_load` acepta tanto un directorio de corrida como el `reward.pt` directamente, y después
+**exige** el `run.json` que hay al lado. El mensaje de error dice qué hacer, no solo qué falló:
+la card se escribe desde ese fichero, así que la corrida tiene que haber salido de
+`rukh train reward`. Sin esa guarda, una card generada desde un checkpoint suelto saldría con los
+valores por defecto de la plantilla — una card de ceros que parece una card.
+
+```python title="src/rukh/publish/reward.py"
+def _seed_spread(result: dict[str, Any]) -> str:
+    """The sentence the card uses to say how little the headline deserves to be trusted.
+
+    Hard-coded from the runs M5 actually did rather than computed, because the card is about *this*
+    checkpoint while the spread is a property of the configuration. Two numbers matter and the
+    second is the one nobody expects: four seeds spread over two and a half points, **and two runs
+    of the same seed spread over 1.3** -- same split, same hyperparameters, different GPU kernels.
+    """
+    return (
+        "72.91 %, 74.21 %, 74.71 %, 74.76 % and 75.19 %. The first two are the **same seed**, "
+        "so 1.3 of those points are not the split: they are what this measurement repeats to"
+    )
+```
+
+<Src file="src/rukh/publish/reward.py" tag="p5" lines="71-82" />
+
+Doce líneas para devolver una frase fija, y el docstring defiende por qué está escrita a mano en
+vez de calculada: la card habla de **este** checkpoint, mientras que la dispersión es una propiedad
+de la configuración, que solo se conoce corriéndola cinco veces.
+
+Los dos números de la frase importan y el segundo es el que nadie espera. Cuatro semillas se
+reparten sobre dos puntos y medio, sí — pero **dos corridas de la misma semilla se separan 1,3**.
+Mismo reparto, mismos hiperparámetros, mismo modelo: kernels de GPU que no son deterministas. El
+criterio del hito está por debajo del ruido de la medición que lo comprueba, y eso tiene que estar
+en la card y no en las notas de nadie.
+
+<Callout kind="hoy" title="Un parámetro que no se usa">
+  `_seed_spread(result)` recibe el resultado de la corrida y **no lo mira**. Funciona, está
+  documentado, y aun así es el tipo de firma que engaña al leerla seis meses después: parece que la
+  frase depende de la corrida y no depende. Se apunta porque el curso muestra el fichero tal como
+  está en `p5`.
+</Callout>
+
+```python title="src/rukh/publish/reward.py"
+def publish_reward(
+    run: Path,
+    repo: str,
+    cfg: ModelPublishConfig | None = None,
+    stage: str | None = None,
+    dry_run: bool = False,
+) -> RewardPublishResult:
+    """Stage (and unless ``dry_run``, upload) a reward model as its own Hub repository."""
+    cfg = cfg or ModelPublishConfig()
+    run = Path(run)
+    payload, result = _load(run)
+    repo_id = repo if "/" in repo else f"{cfg.owner}/{repo}"
+    name = stage or repo_id.split("/")[-1].removeprefix("rukh-")
+
+    encoder_config = payload["encoder_config"]
+    state = payload["model"]
+    params = sum(int(tensor.numel()) for tensor in state.values())
+
+    folder = resolve(cfg.publish_dir) / repo_id
+    folder.mkdir(parents=True, exist_ok=True)
+
+    from safetensors.torch import save_file
+
+    save_file(
+        {key: value.detach().cpu().contiguous() for key, value in state.items()},
+        str(folder / SAFETENSORS_NAME),
+    )
+    config = {
+        "model_type": "rukh-reward",
+        "stage": name,
+        "params": params,
+        "pooling": payload.get("pooling"),
+        "encoder": encoder_config,
+        "square_tokens": SQUARE_TOKENS,
+        "objective": "bradley-terry",
+        "training": result.get("checkpoint"),
+    }
+    (folder / CONFIG_NAME).write_text(
+        json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n"
+    )
+```
+
+<Src file="src/rukh/publish/reward.py" tag="p5" lines="85-124" />
+
+La primera mitad de la publicación. Tres cosas.
+
+El nombre de la etapa se deduce del repositorio quitándole el prefijo `rukh-` cuando no se pasa
+`--stage`, así que `chorcat/rukh-rm` publica la etapa `rm` sin que haya que escribirlo.
+
+Los pesos se guardan en formato `safetensors` y no como un `.pt` de
+torch, porque un `.pt` es un _pickle_ y abrirlo ejecuta código: en el Hub eso es un problema de
+seguridad de quien descarga, no del que sube. El `detach().cpu().contiguous()` de cada tensor es
+lo que hace que el fichero se pueda leer sin torch y sin GPU.
+
+Y el `config.json` lleva `model_type: "rukh-reward"` y los 69 tokens de casilla. Es lo que
+permite que alguien que descargue el repo sepa qué tiene que darle de comer sin leer el curso.
+
+```python title="src/rukh/publish/reward.py"
+    training = payload.get("config") or {}
+    card = render_card(
+        {
+            "license": cfg.license,
+            "repo_id": repo_id,
+            "stage": name,
+            "repository_url": cfg.repository_url,
+            "course_url": cfg.course_url,
+            "datasets": [f"{cfg.owner}/rukh-pairs-dpo"],
+            "params": params,
+            "n_layer": encoder_config.get("n_layer"),
+            "d_model": encoder_config.get("d_model"),
+            "square_tokens": SQUARE_TOKENS,
+            "pairs": result["pairs"],
+            "train_pairs": result["train_pairs"],
+            "val_pairs": result["val_pairs"],
+            "accuracy": result["accuracy"],
+            "accuracy_without_mates": result.get("accuracy_without_mates"),
+            "loss": result["loss"],
+            "pearson": result.get("pearson"),
+            "pearson_without_mates": result.get("pearson_without_mates"),
+            "bands": result.get("bands") or [],
+            "epochs": result.get("epochs"),
+            "batch_size": training.get("batch_size"),
+            "lr": training.get("lr"),
+            "seed": training.get("seed"),
+            "from_scratch": result.get("from_scratch", True),
+            "seed_spread": _seed_spread(result),
+        },
+        REWARD_CARD_TEMPLATE,
+    )
+    (folder / README_NAME).write_text(card, encoding="utf-8", newline="\n")
+```
+
+<Src file="src/rukh/publish/reward.py" tag="p5" lines="126-157" />
+
+El contexto de la plantilla. Diecinueve claves, y la mitad salen del `run.json` con
+`result.get(...)` en vez de `result[...]`: una corrida antigua a la que le falte
+`accuracy_without_mates` produce una card sin esa fila en vez de un `KeyError`. Las que sí usan
+corchetes —`pairs`, `train_pairs`, `val_pairs`, `accuracy`, `loss`— son las que, si
+faltan, significan que el fichero no es lo que dice ser.
+
+```python title="src/rukh/publish/reward.py"
+    files = [SAFETENSORS_NAME, CONFIG_NAME, README_NAME]
+    uploaded = False
+    if not dry_run:
+        api = _api()
+        api.create_repo(repo_id, repo_type=REPO_TYPE, exist_ok=True)
+        api.upload_folder(repo_id=repo_id, folder_path=str(folder), repo_type=REPO_TYPE)
+        uploaded = True
+        log.info("subido %s", repo_id)
+
+    return RewardPublishResult(
+        repo_id=repo_id,
+        folder=str(folder),
+        files=files,
+        uploaded=uploaded,
+        accuracy=float(result["accuracy"]),
+    )
+```
+
+<Src file="src/rukh/publish/reward.py" tag="p5" lines="159-174" />
+
+Y el cierre. `dry_run` deja la carpeta entera preparada **sin tocar la red**, que es lo que
+permite mirar lo que se va a subir antes de subirlo. La lección 9 tiene el ejercicio de por qué eso
+importa: una vez apareció un `model.safetensors` de 25 KB donde debían estar los 152 MB del
+reward model, porque un test cuyo aislamiento no funcionaba había escrito su modelo de juguete en
+la carpeta real (D-129). Contar bytes es la comprobación más barata que existe y la única que lo
+habría pillado.
+
+## La plantilla de la card, entera
+
+`src/rukh/data/cards/reward.md.jinja` son 108 líneas de Markdown con Jinja dentro, y el orden de
+sus secciones es el argumento: primero qué significa el número, después el número.
+
+```jinja title="src/rukh/data/cards/reward.md.jinja"
+---
+license: {{ license }}
+library_name: rukh
+pipeline_tag: feature-extraction
+language:
+  - en
+datasets:
+{%- for dataset in datasets %}
+  - {{ dataset }}
+{%- endfor %}
+tags:
+  - chess
+  - rukh
+  - reward-model
+  - preference
+---
+```
+
+<Src file="src/rukh/data/cards/reward.md.jinja" tag="p5" lines="1-16" />
+
+El frontmatter de Hugging Face. `pipeline_tag: feature-extraction` es lo más parecido que hay en
+el Hub a «esto puntúa, no genera»; no existe una etiqueta para reward model, y poner
+`text-generation` haría que el widget del Hub intentara generar texto con él.
+
+```jinja title="src/rukh/data/cards/reward.md.jinja"
+# {{ repo_id }}
+
+A **reward model**: it reads a chess position and answers with one number, trained on
+{{ "{:,}".format(pairs) }} pairs of moves that a chess engine had already ranked. This is the
+`{{ stage }}` stage of [Rukh]({{ repository_url }}), a course that builds a chess language model
+end to end: {{ "{:,}".format(params) }} parameters over {{ n_layer }} layers of width
+{{ d_model }}, reading the {{ square_tokens }} square tokens of a board.
+
+Read how it was built: [{{ course_url }}]({{ course_url }})
+
+## What the number means, and what it does not
+
+The training objective is Bradley-Terry: `-log sigma(r(chosen) - r(rejected))`. Only
+**differences** appear in it, so adding a constant to every score changes nothing. The scale has
+no units and no origin, and comparing this model's `0.8` with another training run's `1.4` is
+comparing two rulers with no zero. What the model is for is **ordering two positions**, and the
+number below is how often it gets that order right.
+```
+
+<Src file="src/rukh/data/cards/reward.md.jinja" tag="p5" lines="18-34" />
+
+Y aquí está el orden que importa. La sección **«What the number means, and what it does not»** va
+antes que los resultados, no después. Comparar el 0,8 de este entrenamiento con el 1,4 de otro es
+comparar dos reglas sin origen, y quien llegue a la card desde un enlace lee las dos primeras
+pantallas y nada más.
+
+```jinja title="src/rukh/data/cards/reward.md.jinja"
+## Results
+
+Measured on {{ "{:,}".format(val_pairs) }} held-out pairs, split **by game** so that two pairs a
+few plies apart cannot straddle the split.
+
+| Metric | Value |
+|---|---|
+| Accuracy on held-out pairs | {{ "%.2f"|format(accuracy * 100) }} % |
+{%- if accuracy_without_mates %}
+| Accuracy over pairs an evaluation can decide | {{ "%.2f"|format(accuracy_without_mates * 100) }} % |
+{%- endif %}
+| Preference loss | {{ "%.4f"|format(loss) }} |
+{%- if pearson is not none %}
+| Margin vs engine gap (Pearson) | {{ "%+.3f"|format(pearson) }} |
+{%- endif %}
+{%- if pearson_without_mates is not none %}
+| Margin vs engine gap, without mates (Pearson) | {{ "%+.3f"|format(pearson_without_mates) }} |
+{%- endif %}
+```
+
+<Src file="src/rukh/data/cards/reward.md.jinja" tag="p5" lines="36-53" />
+
+La tabla de resultados, con los condicionales de Jinja para las filas que pueden faltar. Las dos
+correlaciones van **en la misma tabla**, una debajo de otra, precisamente porque no comparten
+signo: separarlas en dos secciones permitiría citar una sola.
+
+```jinja title="src/rukh/data/cards/reward.md.jinja"
+### Where it is right and where it is wrong
+
+Accuracy by how far apart the engine scored the two moves. The **mate** band is the one to read
+first: it is the largest slice after the narrowest band, and it is where the model is worst.
+
+| Engine gap | Pairs | Accuracy |
+|---|---:|---:|
+{%- for band in bands %}
+| {% if band.band == "mate" %}mate{% else %}{{ band.band }} cp{% endif %} | {{ band.pairs|int }} | {{ "%.2f"|format(band.accuracy * 100) }} % |
+{%- endfor %}
+
+Read the `Pairs` column before the `Accuracy` one. A band of a dozen pairs reports whatever those
+dozen did: across five runs of this configuration the `800-2000` band gave 90 %, 68 %, 90 %, 50 %
+and 57 %, which is the same absence of data wearing five faces.
+
+A mate is a tactical fact, and what this model reads is a static view of the position the move
+leads to: it cannot see one. That band is exactly what a **verifiable** reward answers without
+error, which is why the same milestone that trained this model also wrote one.
+
+The two correlations above do not share a sign, and that is not a typo. The mate pairs carry the
+largest engine gap by construction and the smallest learned margin, so a third of the points bends
+the line the other way. One correlation over two regimes describes neither.
+```
+
+<Src file="src/rukh/data/cards/reward.md.jinja" tag="p5" lines="55-76" />
+
+El desglose por bandas, con la instrucción de cómo leerlo escrita al lado: **primero la columna de
+pares, después la de acierto**. Una banda de una docena de pares reporta lo que hicieran esos doce,
+y en cinco corridas de esta misma configuración la banda de 800-2 000 dio 90 %, 68 %, 90 %, 50 % y
+57 % — que es la misma ausencia de dato con cinco caras.
+
+Y la última frase del bloque es la que cierra el círculo del módulo: la banda de mate es
+exactamente lo que una recompensa **verificable** contesta sin error, que es por qué el mismo hito
+que entrenó este modelo escribió también la otra.
+
+````jinja title="src/rukh/data/cards/reward.md.jinja"
+## What it is not for
+
+**DPO does not need this model.** Direct Preference Optimization has an implicit reference -- a
+frozen copy of the starting policy -- and trains on the pairs directly. A reward model is what PPO
+needs, what a learned reward is compared against, and what makes the accuracy above a number worth
+publishing at all.
+
+## Training
+
+{{ "{:,}".format(pairs) }} pairs, {{ "{:,}".format(train_pairs) }} for training and
+{{ "{:,}".format(val_pairs) }} held out, {{ epochs }} epochs, batch {{ batch_size }}, learning rate
+{{ lr }}, seed {{ seed }}.
+
+{% if from_scratch %}Trained **from a random initialisation**, and that was measured rather than
+assumed: starting from the project's pretrained position encoder scored about 6.5 points *worse*.
+That encoder learned to fill in masked moves; this task is ordering positions by how good they
+are, and what it brought did not help.{% else %}Started from a pretrained position encoder.{% endif %}
+
+The seed also decides the split, so it decides how many mate pairs land in validation -- and the
+headline number moves with that. Four seeds of this exact configuration gave
+{{ seed_spread }}. Compare two runs only if they shared a seed.
+
+## Reproducing
+
+```bash
+uv run rukh train reward --config configs/train/rm.yaml
+```
+
+## Licence
+
+{{ license }}. Trained on engine evaluations of public Lichess games.
+````
+
+<Src file="src/rukh/data/cards/reward.md.jinja" tag="p5" lines="78-108" />
+
+El resto: para qué **no** sirve —DPO no lo necesita, y decirlo en la card evita que alguien lo
+descargue creyendo que le hace falta—, los hiperparámetros, el párrafo condicional sobre el
+preentrenamiento que resta, la frase de la dispersión entre semillas y el comando para reproducirlo.
+
+<Callout kind="hoy" title="«Four seeds» y cinco números">
+  La plantilla dice `Four seeds of this exact configuration gave {{ seed_spread }}`, y `seed_spread`
+  devuelve **cinco** cifras —porque dos de ellas son la misma semilla corrida dos veces, que es
+  justamente el dato interesante—. La frase de la plantilla se quedó en la versión anterior. Es una
+  errata del repositorio, no del cálculo.
+</Callout>
+
+## Las tres líneas del dataset y de la demo
+
+Publicar el conjunto on-policy no necesita código: necesita una entrada en el registro de datasets,
+y el registro se encarga del resto —los patrones de fichero, la card, los recuentos—.
+
+```python title="src/rukh/data/publish.py"
+        DatasetSpec(
+            name="rukh-pairs-onpolicy",
+            repo_type="dataset",
+            local_dir="data/pairs-onpolicy",
+            patterns=["pairs.parquet", "manifest.json"],
+            command="onpolicy",
+            pretty_name="Rukh on-policy pairs",
+            description=(
+                "Preference pairs built from the moves the model itself proposes. The positions "
+                "are exactly those of `rukh-pairs-dpo`, so the only thing that differs between the "
+                "two datasets is where the two moves came from -- which is what makes a DPO run on "
+                "each of them a comparison. Four moves sampled per position at temperature 1.0, "
+                "scored by Stockfish at a fixed depth of 10, keeping the best and the worst when "
+                "they are at least 100 centipawns apart.\n\n"
+                "Of the 13 838 positions, 6 386 produced a pair. The rest is the interesting half: "
+                "3 743 (27 %) because the model proposed a single distinct legal move, and 3 709 "
+                "(27 %) because its best and worst candidate were less than a pawn apart. And only "
+                "2.9 % of these pairs involve a mate, against a third of the off-policy ones: a "
+                "multi-PV search finds mates the model was never going to propose, so the two "
+                "datasets are two distributions of difficulty and not two sources of one thing."
+            ),
+            columns=[
+                ("game_id", "game the position came from, for splitting without leakage"),
+                ("ply", "half-move index of the position"),
+                ("prefix", "moves played up to the position (UCI, space separated)"),
+                ("chosen", "best of the sampled moves (UCI)"),
+                ("rejected", "worst of the sampled moves (UCI)"),
+                ("cp_chosen", "score of `chosen` for the side to move (mate = +/-10000)"),
+                ("cp_rejected", "score of `rejected` for the side to move"),
+                ("phase", "`opening`, `middlegame` or `endgame`"),
+                ("white_elo", "Elo header the model was prompted with"),
+                ("black_elo", "Elo header the model was prompted with"),
+                ("candidates", "distinct legal moves the model proposed here (2 to 4)"),
+            ],
+            source="`rukh-pairs-dpo` for the positions, `chorcat/rukh-medium` for the moves",
+            source_datasets=["original"],
+            task_categories=["text-generation"],
+            tags=["dpo", "preferences", "on-policy"],
+            # `positions` counts what was *visited*, not what was written: 13 838 against 6 386
+            # rows. Summing it into the row count would double the size of the dataset on the card.
+            exclude_counts=["positions"],
+        ),
+```
+
+<Src file="src/rukh/data/publish.py" tag="p5" lines="228-269" />
+
+Cuarenta y dos líneas de las que casi todo es prosa de la card. Lo que hay que mirar son las dos
+últimas decisiones.
+
+`source_datasets=["original"]` y la descripción dicen que los pares se construyeron con las
+**posiciones** de `rukh-pairs-dpo` y las jugadas de `chorcat/rukh-medium`. Esa frase es lo que
+hace que el dataset sea reproducible por alguien que no leyó el curso.
+
+Y `exclude_counts=["positions"]` con su comentario: el manifiesto guarda `pairs` (6 386) y
+`positions` (13 838), y el generador de cards suma los recuentos para decir cuántas filas tiene
+el conjunto. Sumar las dos doblaría el tamaño anunciado. Es exactamente el tipo de error que nadie
+mira dos veces en una card generada.
+
+```python title="src/rukh/publish/model.py"
+DEMO_STAGES = {
+    "tiny": "tiny-int8",
+    "small": "small-fp16",
+    "medium": "medium-fp16",
+    "medium-dpo": "medium-dpo-fp16",
+    "medium-grpo": "medium-grpo-fp16",
+    "medium-elo": "medium-elo-fp16",
+    "medium-lora": "medium-lora-fp16",
+}
+```
+
+<Src file="src/rukh/publish/model.py" tag="p5" lines="177-185" />
+
+Y la demo. Una línea nueva —`"medium-grpo": "medium-grpo-fp16"`— en el mapa que traduce un nombre
+de repositorio del Hub al identificador de etapa que la demo entiende. El docstring que hay debajo
+(en el mismo fichero, desde M4) explica por qué existe el mapa: la card enlazaba
+`/?stage=<etapa de evaluación>`, y la demo no conoce esos nombres, así que una etapa desconocida
+caía al modelo por defecto y la card prometía una partida contra un modelo que la demo nunca
+cargaba.
+
+```text title=".gitignore"
+# The GRPO engine cache is the same kind of thing: a `(FEN, move) -> centipawns` dictionary that
+# any run rebuilds from Stockfish at a fixed depth. Megabytes of it, and reproducible by
+# definition, since the depth limit is what makes the analysis deterministic (D-118).
+/artifacts/grpo-engine-cache.json
+/artifacts/grpo-cache-*.json
+```
+
+<Src file=".gitignore" tag="p5" lines="43-47" />
+
+Y cinco líneas de `.gitignore`, porque la caché de motor de GRPO son megabytes de un diccionario
+`(FEN, jugada) → centipeones` que cualquier corrida reconstruye desde Stockfish a profundidad
+fija. Reproducible por definición, y por eso no versionado — el mismo criterio que los cachés de
+evaluación de las líneas de encima.
+
+## La orden
+
+```python title="src/rukh/cli.py"
+@publish_app.command("reward")
+def publish_reward_cmd(
+    run: Annotated[
+        Path,
+        typer.Option("--run", exists=True, help="Reward run directory or `reward.pt` checkpoint."),
+    ],
+    repo: Annotated[str, typer.Option("--repo", help="Hub repository, e.g. chorcat/rukh-rm.")],
+    stage: Annotated[str | None, typer.Option("--stage", help="Stage name for the card.")] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Stage the folder locally; touch no network.")
+    ] = False,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the result as JSON only.")] = False,
+) -> None:
+    """Publish the reward model, with the band table and both correlations on the card.
+
+    It gets its own command because it is not a policy: no ONNX, because nothing serves it in a
+    browser, and no Elo, because it does not play. What it has is an ordering accuracy, and that
+    number is only honest next to the split it was measured on.
+    """
+    from rukh.publish.reward import publish_reward
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    result = publish_reward(run, repo, stage=stage, dry_run=dry_run)
+    if as_json:
+        typer.echo(result.model_dump_json(indent=2))
+        return
+    where = "uploaded to" if result.uploaded else "staged for"
+    typer.echo(f"{where} {result.repo_id}: {', '.join(result.files)}")
+    typer.echo(f"accuracy: {result.accuracy * 100:.2f} % on held-out pairs")
+    typer.echo(f"folder:   {result.folder}")
+```
+
+<Src file="src/rukh/cli.py" tag="p5" lines="1585-1614" />
+
+Treinta y una líneas, y su docstring es la explicación corta de la lección entera: no hay ONNX
+porque nada lo sirve en un navegador, no hay Elo porque no juega, y el número que tiene solo es
+honesto al lado del reparto sobre el que se midió.
+
+Los comandos de publicación del hito, con `--dry-run` para mirar antes de subir:
+
+```bash title="Terminal"
+uv run rukh publish reward --run checkpoints/rm --repo chorcat/rukh-rm --dry-run
+uv run rukh data publish --name rukh-pairs-onpolicy --dry-run
+uv run rukh publish model --ckpt checkpoints/medium-v4-grpo/grpo.pt --repo chorcat/rukh-medium-grpo --stage medium-v4-grpo-greedy --onnx artifacts/onnx/medium-grpo --dry-run
+```
+
+El `--stage` del último tiene que ser **el mismo** con el que se corrió la evaluación canónica, o
+la card sale sin números: los busca por nombre de etapa. Y si el checkpoint no es el que se midió,
+el publicador se niega en vez de publicar los números de otro modelo.
+
+## El test que comprueba que la card no se vacía
+
+```python title="tests/unit/test_publish_reward.py"
+def test_the_card_carries_the_bands_and_both_correlations(rukh_home, tmp_path):
+    result = publish_reward(_run_dir(tmp_path), "chorcat/rukh-rm", dry_run=True)
+    assert result.uploaded is False
+    # The env var is RUKH_HOME, not RUKH_ROOT. Getting it wrong is silent -- the test passes and
+    # stages into the real `artifacts/publish/`, quietly replacing a published folder with toy
+    # weights. It happened once; this line is why it cannot happen twice.
+    assert Path(result.folder).is_relative_to(rukh_home)
+    card = (Path(result.folder) / "README.md").read_text(encoding="utf-8")
+
+    # The number, and the number that is not the same number.
+    assert "72.91 %" in card
+    assert "73.62 %" in card
+    # Both correlations, with their signs, because they do not share one.
+    assert "-0.034" in card
+    assert "+0.058" in card
+    # The band table, including the one the model is worst at.
+    assert "| mate | 484 | 71.49 % |" in card
+    # And the sentence that stops the headline being read as stable.
+    assert "75.19 %" in card, "the spread across seeds has to travel with the number"
+    assert "same seed" in card, "and so does the part of it that is not the split"
+
+
+def test_the_run_has_to_have_been_measured(rukh_home, tmp_path):
+    """A card written from a missing file would be a card of defaults."""
+    folder = _run_dir(tmp_path)
+    (folder / "run.json").unlink()
+    with pytest.raises(FileNotFoundError):
+        publish_reward(folder, "chorcat/rukh-rm", dry_run=True)
+
+
+def test_nothing_reaches_the_network_on_a_dry_run(rukh_home, tmp_path, monkeypatch):
+    def _boom():
+        raise AssertionError("a dry run must not build an API client")
+
+    monkeypatch.setattr("rukh.publish.reward._api", _boom)
+    result = publish_reward(_run_dir(tmp_path), "chorcat/rukh-rm", dry_run=True)
+    assert set(result.files) == {"model.safetensors", "config.json", "README.md"}
+```
+
+<Src file="tests/unit/test_publish_reward.py" tag="p5" lines="65-101" />
+
+Tres tests, y el primero es el que sostiene todo lo anterior. Comprueba, sobre una card generada de
+verdad, que están **los dos** números de exactitud, **las dos** correlaciones con su signo, la fila
+de la banda de mate, y las dos frases sobre la dispersión entre semillas. Una plantilla es un
+fichero de texto que cualquiera puede editar, y lo que un editor pierde primero es justo lo que
+este test fija.
+
+Y el comentario de las tres líneas del medio es una historia de un fallo real: la variable de
+entorno es `RUKH_HOME` y no `RUKH_ROOT`. Equivocarse es **silencioso** —el test pasa y prepara
+su carpeta en el `artifacts/publish/` de verdad, reemplazando una carpeta publicada con pesos de
+juguete—. Pasó una vez; ese `assert` es por lo que no puede pasar dos.
+
+El tercero prohíbe la red en una corrida en seco de la forma más directa posible: sustituye el
+constructor del cliente de la API por una función que revienta. Si el código lo llama, el test
+falla; si no, es que de verdad no tocó la red.
+
+## Lo que se enlaza en vez de pegarse
+
+<div class="table-wrap">
+
+| Fichero                                                                                                                          | Qué garantiza                                                                                                                                      | Por qué no está pegado                                                                                                                    |
+| -------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| [`tests/unit/test_publish_reward.py`](https://github.com/borja-glez/rukh/blob/p5/tests/unit/test_publish_reward.py), líneas 1-64 | el andamiaje: un reward model de juguete de una capa, un `run.json` inventado con dos bandas, y la carpeta de corrida que los tres tests comparten | es preparación, no contrato; los tres tests de arriba son lo que enseña                                                                   |
+| [`tests/unit/test_publish.py`](https://github.com/borja-glez/rukh/blob/p5/tests/unit/test_publish.py)                            | que el registro tiene exactamente siete datasets más el tokenizador, todos con licencia CC0 y manifiesto                                           | de este hito solo cambian dos líneas —el nombre del test y `"rukh-pairs-onpolicy"` en el conjunto esperado—, y el fichero entero es de M1 |
+| [`src/rukh/publish/model.py`](https://github.com/borja-glez/rukh/blob/p5/src/rukh/publish/model.py)                              | el publicador de políticas con su ONNX, su comprobación de etapa y su card                                                                         | 950 líneas que son de M2 y M4; este hito le cambia **una** línea, la de arriba                                                            |
+| [`src/rukh/data/publish.py`](https://github.com/borja-glez/rukh/blob/p5/src/rukh/data/publish.py)                                | el registro de datasets y el generador de sus cards                                                                                                | 450 líneas de M1; este hito le añade el bloque de arriba y nada más                                                                       |
+
+</div>
+
+## Qué has aprendido
+
+Que un artefacto que no encaja en el publicador que tienes casi nunca necesita un publicador
+genérico: necesita el suyo, reutilizando la fontanería y cambiando lo que se dice. Que una card es
+el sitio donde una cifra deja de tener contexto, así que las advertencias van **antes** que el
+número y en la misma tabla, no en un apéndice. Y que la mayor parte del trabajo de publicar es
+añadir una entrada a un registro y acordarse de la excepción que esa entrada necesita —aquí, no
+sumar las posiciones visitadas a las filas escritas—.
+
+Lo siguiente es el último sitio donde llegan estos modelos: el navegador de quien juega contra
+ellos.

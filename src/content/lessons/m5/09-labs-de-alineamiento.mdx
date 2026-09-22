@@ -1,0 +1,1421 @@
+---
+title: 'Alineamiento: los labs'
+description:
+  'Once labs con sus comandos y los tres scripts de `labs/m5` enteros: cuántas partidas cuesta la
+  pregunta, el control que tiene que dar 0,5000, agrupar las dos direcciones con el residuo del
+  triángulo, y la galería que rompe la recompensa de cinco maneras y mide qué rompe cada una.'
+module: m5
+order: 9
+duration: 165
+runtime: 210
+level: medio
+status: vigente
+updated: 2026-09-22
+keywords:
+  - alineamiento
+  - par de preferencia
+  - Bradley-Terry
+  - reward model
+  - DPO
+  - beta
+  - on-policy
+  - off-policy
+  - GRPO
+  - ventaja relativa
+  - línea base
+  - recompensa verificable
+  - RLVR
+  - reward hacking
+  - KL
+  - k3
+  - enfrentamiento directo
+  - potencia estadística
+  - reproducibilidad
+---
+
+Última de las nueve lecciones del módulo «Alineamiento». Viene de «cómo se mide y lo que salió» y
+cierra el módulo con los once labs y los tres scripts de `labs/m5` enteros.
+
+## Labs
+
+Once laboratorios, en el orden en que se hicieron. Los tres primeros no entrenan nada: el hito
+empezó cambiando de instrumento y comprobándolo, que es lo que permitió creerse el resto. Los tres
+últimos son los que producen lo que está en el Hub: el reward model, los dos GRPO y la evaluación
+que decide cuál se publica.
+
+<Callout kind="hoy" title="Punto de partida, si te saltaste algo">
+  Todo parte de `checkpoints/medium-v4/best.pt` (M2) y de `data/pairs/dpo-prompts.parquet` (M1, el
+  paso `pairs`). `uv run rukh pull --module m5` deja los dos, más los puzles y las partidas que usa
+  la suite y los tres modelos alineados publicados, por si solo quieres medirlos. Hace falta
+  Stockfish (`scripts/get_stockfish.py`). Los comandos son los que se ejecutaron y los tiempos, los
+  de una RTX 5090; la secuencia completa con cada salida está en `docs/runbooks/alineamiento.md`.
+</Callout>
+
+<LabRoutes lesson="m5/03-labs-de-alineamiento" />
+
+### Lab 1 · ¿Cuántas partidas cuesta la pregunta?
+
+Antes de jugar nada, el precio. Dos maneras de contestar «¿este modelo es 50 Elo mejor?», y la
+cuenta que dice cuál cuesta ocho veces menos.
+
+```bash title="Terminal"
+uv run python labs/m5/games_needed_match.py
+```
+
+El script entero son 80 líneas y no importa nada de `rukh`: es aritmética, y por eso se puede
+correr antes de tener modelos.
+
+```python title="labs/m5/games_needed_match.py"
+"""How many games a head-to-head match needs, and what a match of N games can see.
+
+Lab 1 of M5, and the first thing that runs in the milestone. `GOAL.md` asks for **+50 Elo with an
+interval** over the base, and there are two ways to measure that:
+
+* run the Stockfish ladder twice and subtract the two absolute ratings;
+* play the two models against each other and read the difference directly.
+
+They are not equally good and the difference is not a matter of taste:
+
+    uv run python labs/m5/games_needed_match.py
+
+The second one is about eight times cheaper, and it also drops a source of noise the first one
+cannot avoid -- P4 measured that two identical ladder runs of the same model give 1498 and 1558
+(D-107), because Stockfish plays on a clock and `UCI_LimitStrength` randomises on purpose. In a
+match both models play the same game, so there is no third party whose mood has to be averaged.
+
+The rule this leaves: **to measure a difference, measure the difference.**
+"""
+```
+
+<Src file="labs/m5/games_needed_match.py" tag="p5" lines="1-19" />
+
+El docstring es el argumento del módulo en diecinueve líneas. Los dos caminos, su factor de ocho, y
+la fuente de ruido que el enfrentamiento se ahorra por completo: en un enfrentamiento los dos
+modelos juegan la misma partida, así que no hay un tercero cuyo humor haya que promediar.
+
+```python title="labs/m5/games_needed_match.py"
+import argparse
+import math
+import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+Z = 1.959963985  # two-sided 95 %
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--edges", default="10,25,35,50,75,100", help="Elo edges to price, in Elo.")
+parser.add_argument("--ladder-base", type=float, default=0.45, help="Score the ladder sits at.")
+args = parser.parse_args()
+```
+
+<Src file="labs/m5/games_needed_match.py" tag="p5" lines="21-33" />
+
+El `reconfigure` de la salida estándar es fontanería de Windows: sin él, una consola con página
+de códigos heredada revienta al imprimir una tilde, y este script imprime sus tablas en castellano.
+El `errors="replace"` hace que en el peor caso se vea un interrogante en vez de una traza.
+
+`Z = 1.959963985` es el número de desviaciones típicas que deja fuera el 5 % de una campana con
+dos colas. Su cuadrado, 3,84, es la constante que aparece en todas las fórmulas de abajo — y verlo
+escrito como `Z*Z` en vez de como un 3,84 mágico es lo que hace que se pueda cambiar el nivel de
+confianza sin reescribir nada.
+
+```python title="labs/m5/games_needed_match.py"
+def score_for(elo: float) -> float:
+    """The expected score of a player ``elo`` points stronger than its opponent."""
+    return 1.0 / (1.0 + 10.0 ** (-elo / 400.0))
+
+
+def match_games(elo: float) -> int:
+    """Games of a head-to-head match needed to separate this edge from zero."""
+    p = score_for(abs(elo))
+    return math.ceil(Z * Z * p * (1 - p) / (p - 0.5) ** 2)
+
+
+def ladder_games(elo: float, base: float) -> int:
+    """Games **per side** needed to separate two ladder estimates this far apart.
+
+    The ladder measures a score against fixed rungs, so an edge in Elo has to be converted into
+    the score it moves *there*, which depends on where on the curve the model sits.
+    """
+    slope = math.log(10) / 400 * base * (1 - base)  # d(score) / d(Elo)
+    delta = abs(elo) * slope
+    spread = 2 * math.sqrt(base * (1 - base))
+    return math.ceil((Z * spread / delta) ** 2)
+```
+
+<Src file="labs/m5/games_needed_match.py" tag="p5" lines="36-56" />
+
+Las tres funciones. `score_for` convierte una ventaja en Elo a la puntuación esperada, que es la
+curva logística de siempre. `match_games` es la potencia de una proporción contra 0,5.
+
+`ladder_games` es la que merece atención, porque no es la misma cuenta. La escalera mide una
+puntuación contra escalones fijos, así que una ventaja en Elo hay que convertirla a **el trozo de
+puntuación que mueve allí**, y eso depende de dónde esté el modelo en la curva: la derivada de la
+curva logística en `base`. Un modelo que anda por el 0,45 mueve más puntuación por Elo que uno
+que anda por el 0,95, y por eso el mismo criterio cuesta distinto según contra quién lo midas.
+
+El `spread` con el factor 2 es la varianza de una **diferencia** de dos estimaciones
+independientes, que es la resta con la que abre el módulo, escrita en una línea.
+
+```python title="labs/m5/games_needed_match.py"
+print(f"{'ventaja':>9}  {'tasa h2h':>9}  {'partidas h2h':>13}  {'escalera (por lado)':>20}  ratio")
+for text in args.edges.split(","):
+    elo = float(text)
+    match, ladder = match_games(elo), ladder_games(elo, args.ladder_base)
+    print(
+        f"{elo:>+8.0f}  {score_for(elo):>9.4f}  {match:>13,}  {ladder:>20,}  "
+        f"{2 * ladder / match:>4.1f}x"
+    )
+
+print(
+    "\nY al reves: con N partidas de enfrentamiento, que ventaja se puede ver.\n"
+    f"{'partidas':>9}  {'ventaja minima':>15}"
+)
+for games in (50, 100, 200, 400, 800):
+    # p - z sqrt(p(1-p)/n) > 0.5, resuelto para p y pasado a Elo.
+    p = 0.5 + Z / (2 * math.sqrt(games)) * math.sqrt(1 + Z * Z / games) / (1 + Z * Z / games)
+    print(f"{games:>9,}  {400 * math.log10(p / (1 - p)):>14.0f} Elo")
+
+print(
+    "\nun negativo con pocas partidas no dice que no haya efecto:\n"
+    "dice que el instrumento no lo habria visto"
+)
+```
+
+<Src file="labs/m5/games_needed_match.py" tag="p5" lines="59-80" />
+
+Y la salida: la tabla de precios y, debajo, la misma cuenta **al revés**, que es como se usa de
+verdad. Con 200 partidas la diferencia más pequeña que se puede ver es de 48 Elo; con 400, de 34;
+con 50, de 95. Antes de jugar una sola partida ya sabes si tu presupuesto puede contestar tu
+pregunta.
+
+Las dos últimas líneas que imprime son la conclusión que este lab existe para dejar escrita: **un
+negativo con pocas partidas no dice que no haya efecto, dice que el instrumento no lo habría
+visto**.
+
+<Exercise n="01" title="De 50 a 20 Elo: ¿cuántas partidas más?">
+  Cambia la diferencia buscada de 50 a 20 Elo —`--edges 20`— y vuelve a correrlo. ¿Cuántas
+  partidas pide el enfrentamiento directo? ¿Y la resta de dos escaleras? ¿Es el mismo factor 8,1 o
+  cambia con la diferencia?
+
+  <Solution>
+    El factor se mantiene cerca de 8 porque las dos fórmulas escalan igual, con el cuadrado de la
+    diferencia: al bajar de 50 a 20 Elo las dos multiplican sus partidas por unas 6,3 veces
+    —`(50/20)² = 6,25`— y la razón entre ellas apenas se mueve. Lo que sí cambia, y mucho, es el
+    valor absoluto: 20 Elo son unas 1 160 partidas en un enfrentamiento, casi una vez y media las
+    800 que el hito jugó por arista. Por eso la tabla al revés es la útil: con el presupuesto que
+    tienes, ¿cuál es la diferencia más pequeña que podrías ver?
+  </Solution>
+</Exercise>
+
+### Lab 2 · El control que tiene que dar 0,5000
+
+El instrumento se estrena midiendo algo cuya respuesta ya se sabe.
+
+```bash title="Terminal"
+uv run rukh eval match --a checkpoints/medium-v4/best.pt --b checkpoints/medium-v4/best.pt --games 100
+```
+
+El código está en la lección 5, entero. Lo que importa aquí es que la primera vez esto salió
+**0,975 con 999 jugadas ilegales**, y que ese número imposible costó un minuto de máquina y
+destapó dos errores de fontanería que habrían publicado un artefacto como resultado.
+
+<Exercise n="02" title="El mismo control, con 101 partidas">
+  Corre el control. Luego corre el mismo comando con `--games 101`. ¿Qué pasa, y por qué está
+  puesto así a propósito?
+
+  <Solution>
+    Falla con un `ValueError`: «a mirrored match needs an even number of games». Cada apertura se
+    juega dos veces con los colores cambiados, así que un número impar significa que alguien jugó
+    una partida de más con un color. Podría redondearse hacia abajo en silencio y nadie se enteraría
+    — y esa es exactamente la razón de no hacerlo. Un reparto de colores torcido es un sesgo que no
+    aparece en ninguna métrica, así que el sitio donde tiene que doler es al escribir el comando.
+  </Solution>
+</Exercise>
+
+### Lab 3 · Agrupar las dos direcciones de un enfrentamiento
+
+```bash title="Terminal"
+uv run rukh eval match --a <A> --b <B> --games 400 --seed 7
+uv run rukh eval match --a <B> --b <A> --games 400 --seed 7
+uv run python labs/m5/pooled_match.py
+```
+
+Corre las dos direcciones de un par cualquiera y luego el agrupador, y compara el intervalo
+agrupado con el de cada dirección. El ejercicio de este lab —cuánto se estrecha el intervalo al
+pasar de 400 a 800 partidas, y por qué no a la mitad— está en la lección 8, junto a la tabla
+agrupada de las aristas.
+
+El agrupador son 183 líneas y hace dos cosas: junta las dos direcciones de cada par, y comprueba si
+las tres aristas de un triángulo cierran.
+
+```python title="labs/m5/pooled_match.py"
+"""Pool the two directions of a match, and show how little the verdict deserves to be trusted.
+
+Lab 2 of M5. `rukh eval match` plays A against B; playing B against A is a different sample of the
+same question, and M5 ran both for all three pairs because the first three matches all went to
+whoever was passed as A and that had to be ruled out.
+
+What came back was worth a lab of its own. For the pair `DPO on-policy` against `DPO off-policy`:
+
+* on as A: +48 Elo, interval 19 to 80 -- **separated from zero**;
+* off as A: -26 Elo for off, interval -57 to +3 -- **includes zero**.
+
+Same two models, same four hundred games, same opening book, the sides swapped. The estimate moved
+from +48 to +26 in favour of the same model, which is well inside the noise. The **verdict** flipped
+from "this is a measurement" to "this is not". A binary read off the edge of an interval is far less
+stable than the number it was read from, and the honest thing to do with two directions is to pool
+them:
+
+    uv run python labs/m5/pooled_match.py
+
+It reads the `results.json` of every match under `artifacts/eval/` and, for each unordered pair,
+reports the pooled score, the pooled Elo and its interval over all the games of both directions.
+It also prints the triangle check: whether the three edges are consistent with a single strength
+per model, which for M5's three models they are not.
+"""
+```
+
+<Src file="labs/m5/pooled_match.py" tag="p5" lines="1-24" />
+
+El docstring lleva el dato que justifica el lab. El mismo par de modelos, las mismas 400 partidas,
+las mismas aperturas, los lados intercambiados: la **estimación** se movió de +48 a +26, que es
+ruido perfectamente normal, y el **veredicto** pasó de «separado del cero» a «incluye el cero».
+
+Un binario leído del borde de un intervalo es mucho menos estable que el número del que se lee.
+Publicar solo el binario habría sido publicar una moneda al aire.
+
+```python title="labs/m5/pooled_match.py"
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import math
+import sys
+from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+Z = 1.959963985
+```
+
+<Src file="labs/m5/pooled_match.py" tag="p5" lines="26-38" />
+
+```python title="labs/m5/pooled_match.py"
+def elo(score: float) -> float:
+    """The same conversion `rukh.eval.match` uses, so the two agree by construction."""
+    if score <= 0.0:
+        return -1200.0
+    if score >= 1.0:
+        return 1200.0
+    return 400.0 * math.log10(score / (1.0 - score))
+
+
+def elo_interval(score: float, games: int, spread: float) -> tuple[float, float]:
+    """Interval in Elo, from the standard error of the mean score.
+
+    The derivative of the Elo curve at ``score`` turns an interval in score into one in Elo. Doing
+    it this way rather than bootstrapping is deliberate: the two directions are separate files with
+    separate game lists, and a closed form over the pooled mean needs no access to either.
+    """
+    if games <= 1 or not 0.0 < score < 1.0:
+        return (float("nan"), float("nan"))
+    standard_error = spread / math.sqrt(games)
+    slope = 400.0 / (math.log(10.0) * score * (1.0 - score))
+    half = Z * standard_error * slope
+    return (elo(score) - half, elo(score) + half)
+```
+
+<Src file="labs/m5/pooled_match.py" tag="p5" lines="41-62" />
+
+`elo` es **la misma conversión** que usa `rukh.eval.match`, copiada a propósito para que el lab
+no dependa de importar el paquete y para que las dos coincidan por construcción.
+
+`elo_interval` hace algo distinto del módulo de evaluación y el docstring dice por qué: allí el
+intervalo sale por bootstrap sobre la lista de partidas; aquí sale en forma cerrada, del error
+típico de la media multiplicado por la **derivada de la curva de Elo** en esa puntuación. El motivo
+es práctico: las dos direcciones son dos ficheros con dos listas de partidas distintas, y una
+fórmula sobre la media agrupada no necesita acceso a ninguna de las dos.
+
+```python title="labs/m5/pooled_match.py"
+def load(root: Path) -> list[dict]:
+    """Every match report under ``root``, with the fields this lab needs."""
+    found = []
+    for path in sorted(root.rglob("results.json")):
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if {"a", "b", "score", "played"} <= data.keys():
+            found.append(data)
+    return found
+```
+
+<Src file="labs/m5/pooled_match.py" tag="p5" lines="65-75" />
+
+La carga recorre `artifacts/eval/` buscando `results.json`, y se salta en silencio cualquier
+fichero que no tenga las cuatro claves que necesita. Eso es lo que permite lanzarlo sobre la
+carpeta entera de evaluaciones del proyecto —que tiene suites, escaleras y puzles— sin filtrar
+nada a mano.
+
+```python title="labs/m5/pooled_match.py"
+def pooled(entries: list[dict], first: str, second: str) -> dict | None:
+    """Every game between these two, oriented so the score is ``first``'s, in one summary."""
+    scores: list[float] = []
+    directions = []
+    for entry in entries:
+        if {entry["a"], entry["b"]} != {first, second}:
+            continue
+        flip = entry["a"] != first
+        games = [1.0 - game["score"] if flip else game["score"] for game in entry["played"]]
+        scores.extend(games)
+        directions.append(
+            {
+                "as": "B" if flip else "A",
+                "games": len(games),
+                "score": sum(games) / len(games),
+                "elo": entry["elo"] * (-1 if flip else 1),
+                "separated": entry["separated"],
+            }
+        )
+    if not scores:
+        return None
+    mean = sum(scores) / len(scores)
+    variance = sum((value - mean) ** 2 for value in scores) / max(len(scores) - 1, 1)
+    low, high = elo_interval(mean, len(scores), math.sqrt(variance))
+    return {
+        "first": first,
+        "second": second,
+        "games": len(scores),
+        "score": mean,
+        "elo": elo(mean),
+        "low": low,
+        "high": high,
+        "separated": low > 0 or high < 0,
+        "directions": directions,
+        "standard_error": math.sqrt(variance) / math.sqrt(len(scores)),
+        "slope": 400.0 / (math.log(10.0) * mean * (1.0 - mean)) if 0 < mean < 1 else float("nan"),
+    }
+```
+
+<Src file="labs/m5/pooled_match.py" tag="p5" lines="78-114" />
+
+El agrupado. La línea que hace el trabajo es la del `flip`: si el informe tiene los modelos al
+revés, cada puntuación se da la vuelta con `1.0 - score` antes de entrar en la lista. Así las 800
+partidas de las dos direcciones son **una sola muestra** orientada a favor del mismo modelo.
+
+Se guarda además el `standard_error` y la `slope`, que no se imprimen en esta tabla: son lo que
+necesita el triángulo de abajo para propagar el error de las tres aristas.
+
+```python title="labs/m5/pooled_match.py"
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", default="artifacts/eval", help="Where the match reports live.")
+    args = parser.parse_args()
+
+    entries = load(Path(args.root))
+    if not entries:
+        raise SystemExit(f"no match reports under {args.root}")
+    names = sorted({name for entry in entries for name in (entry["a"], entry["b"])})
+
+    print("Cada par, en las dos direcciones y agrupado.\n")
+    summaries: dict[frozenset[str], dict] = {}
+    for first, second in itertools.combinations(names, 2):
+        summary = pooled(entries, first, second)
+        if summary is None:
+            continue
+        summaries[frozenset((first, second))] = summary
+        print(f"== {first} contra {second} ==")
+        for direction in summary["directions"]:
+            mark = "separado" if direction["separated"] else "incluye el cero"
+            print(
+                f"   como {direction['as']}  {direction['games']:>4} partidas  "
+                f"{direction['score']:.4f}  {direction['elo']:+6.0f} Elo   {mark}"
+            )
+        verdict = "separado" if summary["separated"] else "incluye el cero"
+        print(
+            f"   agrupado {summary['games']:>4} partidas  {summary['score']:.4f}  "
+            f"{summary['elo']:+6.0f} Elo   IC {summary['low']:+.0f} a {summary['high']:+.0f}"
+            f"   {verdict}\n"
+        )
+```
+
+<Src file="labs/m5/pooled_match.py" tag="p5" lines="117-146" />
+
+La primera tabla: cada par, sus dos direcciones por separado y el agrupado. Ver las tres filas
+juntas es la mitad del valor del lab — la línea agrupada sola no enseñaría que las dos direcciones
+discrepaban.
+
+```python title="labs/m5/pooled_match.py"
+    if len(names) < 3:
+        return
+    print(
+        "El triángulo: si la fuerza fuera un solo número por modelo, las tres aristas cerrarían.\n"
+    )
+    for trio in itertools.combinations(names, 3):
+        edges = [summaries.get(frozenset(pair)) for pair in itertools.combinations(trio, 2)]
+        if any(edge is None for edge in edges):
+            continue
+        # Orient every edge as "later name minus earlier name" so the three add up to zero when
+        # a single strength per model explains them.
+        values, errors = [], []
+        for edge, pair in zip(edges, itertools.combinations(trio, 2), strict=True):
+            sign = 1.0 if edge["first"] == pair[0] else -1.0
+            values.append(sign * edge["elo"])
+            errors.append(edge["standard_error"] * edge["slope"])
+        # (a-b) + (b-c) - (a-c) is zero for any consistent set of strengths.
+        residual = values[0] + values[2] - values[1]
+        spread = math.sqrt(sum(error**2 for error in errors))
+        print(f"   {' / '.join(trio)}")
+        print(
+            f"   residuo {residual:+.0f} Elo, error típico {spread:.0f}  "
+            f"-> {abs(residual) / spread:.1f} sigma"
+        )
+        print(
+            "   "
+            + (
+                "consistente con un solo número por modelo."
+                if abs(residual) < 2 * spread
+                else "NO es consistente: el emparejamiento importa, no solo la fuerza."
+            )
+        )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+<Src file="labs/m5/pooled_match.py" tag="p5" lines="148-183" />
+
+Y el triángulo. La idea es de una línea: si la fuerza de un modelo fuera **un solo número**,
+entonces `(a−b) + (b−c) − (a−c)` tendría que dar cero para cualquier terna. El residuo es lo que
+no cierra, y el error típico sale de sumar en cuadratura los de las tres aristas, cada uno
+convertido de puntuación a Elo con su propia pendiente.
+
+Con los tres modelos del hito no cierra: el residuo es de unos 45 Elo a 2,6 sigmas. No es que los
+intervalos sean generosos — es que un solo número de fuerza por modelo **supone** que la fuerza es
+un orden total, y un emparejamiento no está obligado a respetarlo.
+
+<Transfer
+  concept="Comprobar la transitividad de un ranking"
+  where="Cualquier tabla de clasificación construida con comparaciones por parejas: una arena de LLMs con Elo, un test A/B contra un control común, un torneo de estrategias."
+>
+  Un ranking por parejas casi nunca se comprueba consigo mismo, y comprobarlo cuesta una resta. Si
+  las aristas no cierran, el número de la tabla está escondiendo que el emparejamiento importa: hay
+  modelos que le van bien a unos y mal a otros, y ordenarlos por una sola cifra pierde exactamente
+  eso.
+</Transfer>
+
+### Lab 4 · Mirar cuánto se mueve la recompensa con la profundidad
+
+La comprobación que no se ve mirando ordenaciones.
+
+```bash title="Terminal"
+uv run python labs/m5/reward_hacking.py --depth 10
+```
+
+`--depth` fija la profundidad con la que el motor puntúa las candidatas de las tres tablas de
+ordenación (por defecto 12). El bloque final, el de la misma jugada a cuatro profundidades, lleva
+sus 4, 6, 10 y 14 escritos en el script y no lo mueve la bandera: es la comprobación de cuánto
+depende de la bandera todo lo demás.
+
+El script son 419 líneas y es el más largo de `labs/` en todo el curso. Esta mitad es el montaje:
+las posiciones, el grupo de candidatas y el bloque de profundidades. La otra mitad —las seis
+recompensas y lo que mide de ellas— está en el lab 8.
+
+```python title="labs/m5/reward_hacking.py"
+"""The gallery: five reward designs that are wrong, and what each one actually breaks.
+
+Lab 3 of M5. A verifiable reward is written down by a person, which means it is exactly
+specifiable and therefore exactly gameable. The usual way this gets taught is a story about a boat
+in a video game spinning in circles, and the trouble with a story is that you cannot check it.
+
+So this lab does not tell you about reward hacking. It takes the reward `rukh.train.rewards`
+ships, breaks it in five ways that each look reasonable on the page, and measures all six against
+the same candidate group in the same positions.
+
+    uv run python labs/m5/reward_hacking.py
+
+**The first version of this lab asked the wrong question and the run said so.** It compared which
+move each reward crowned, and all six crowned the same move in every position -- which is obvious
+in hindsight, since every one of them is monotone in the engine's score. The top of the ranking is
+not where reward hacking lives.
+
+What it measures instead is what the optimiser actually consumes. GRPO does not see the reward: it
+sees ``(r - mean) / std`` over the group. So the three columns are
+
+* **corona** -- the move on top, kept because the negative result is part of the lesson;
+* **cabeza** -- the advantage gap between the best candidate and the second best, which is how
+  much signal is left to tell a good move from a decent one;
+* **peor** -- the share of the group's whole advantage mass absorbed by its single worst
+  candidate, which is how much of the step one blunder gets to decide.
+
+And then the inversions: pairs of candidates that the sound reward and a broken one put in the
+opposite order. An inversion is the hack in its smallest possible form -- one position, two moves,
+a reason you can read.
+
+The candidate group is built the way GRPO's actually is, illegal proposals included, because a
+gate with nothing to gate proves nothing.
+"""
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="1-33" />
+
+El docstring cuenta un fracaso y lo que salió de él, y por eso vale la pena leerlo entero.
+
+**La primera versión de este lab preguntaba lo que no era.** Comparaba qué jugada corona cada
+recompensa, esperando que las rotas coronaran otra. Las seis coronaron la misma, en las tres
+posiciones. En retrospectiva es evidente: todas son monótonas en la evaluación del motor, así que
+el máximo no se puede mover. **La cima de la ordenación no es donde vive el hackeo de recompensa.**
+
+Lo que mide en su lugar es lo que el optimizador consume de verdad, que no es la recompensa sino
+`(r − media) / desviación` sobre el grupo. De ahí las tres columnas: la **cabeza** —cuánta señal
+queda para distinguir _buena_ de _decente_—, el **peor** —qué parte de toda la masa de ventaja del
+grupo se lleva la única candidata catastrófica— y las **inversiones** de orden respecto a la
+recompensa sana.
+
+<Callout kind="mundo-real" title="Sospecha primero de la pregunta">
+  Cuando un experimento contesta «no hay efecto», la primera sospecha es la pregunta. Aquí la
+  pregunta miraba al máximo y el daño estaba en la forma de la distribución. El resultado negativo
+  se deja en la tabla —la columna `corona` sigue ahí— porque forma parte de lo que enseña.
+</Callout>
+
+```python title="labs/m5/reward_hacking.py"
+from __future__ import annotations
+
+import argparse
+import sys
+from dataclasses import dataclass
+
+import chess
+import chess.engine
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+from rukh.data.scoring import MATE_SCORE  # noqa: E402
+from rukh.engine import find_stockfish  # noqa: E402
+from rukh.train.grpo import group_advantages  # noqa: E402
+from rukh.train.rewards import (  # noqa: E402
+    RewardWeights,
+    illegal_value,
+    mate_bonus,
+    normalised_delta_cp,
+    repetition_penalty,
+)
+
+WEIGHTS = RewardWeights()
+CP_SCALE = WEIGHTS.cp_scale
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="35-59" />
+
+Los imports después del `reconfigure` y con sus `noqa: E402`, que es la forma explícita de
+decirle al linter «sé que esto va contra la regla y sé por qué»: la salida tiene que estar
+configurada antes de que nada pueda imprimir.
+
+Lo que importa aquí es **de dónde** importa: `group_advantages` sale de `rukh.train.grpo` y los
+términos de recompensa de `rukh.train.rewards`. El lab no reimplementa nada: usa las mismas
+funciones que el entrenamiento, que es lo único que hace que lo que mida signifique algo.
+
+```python title="labs/m5/reward_hacking.py"
+@dataclass(frozen=True)
+class Case:
+    """A position, the moves that led to it, and the mistake it is here to expose."""
+
+    name: str
+    about: str
+    fen: str = ""
+    moves: tuple[str, ...] = ()
+
+
+CASES = (
+    Case(
+        name="una pifia a mano",
+        about="an ordinary position with a 900-centipawn blunder available",
+        fen="r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
+    ),
+    Case(
+        name="hay mate",
+        about="a back-rank mate in one, beside moves that merely keep winning",
+        fen="6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1",
+    ),
+    Case(
+        name="ganando y repitiendo",
+        about="White is a queen up with no mate in one, and the repetition is on the board",
+        fen="6k1/5pp1/7p/8/8/8/5PPP/3Q2K1 w - - 0 1",
+        moves=("d1d2", "g8h7", "d2d1", "h7g8"),
+    ),
+)
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="62-89" />
+
+Tres posiciones, cada una elegida para que un fallo distinto tenga dónde aparecer: una con una
+pifia de 900 centipeones disponible, una con mate en uno al lado de jugadas que simplemente siguen
+ganando, y una donde las blancas van una dama arriba y **la repetición ya está en el tablero**.
+
+Esa tercera se construye con `moves` en vez de solo con un FEN, y no es un capricho: la
+repetición es una propiedad del historial, no de la posición, así que un FEN suelto no la puede
+expresar.
+
+```python title="labs/m5/reward_hacking.py"
+def illegal_candidates(board: chess.Board, count: int = 2) -> list[str]:
+    """Moves a model could plausibly propose here and that cannot be played.
+
+    Generated rather than written down, because the first version of this lab hard-coded two per
+    position and both turned out to be **legal** -- ``Ra1a7`` and ``Qd1d8`` are perfectly ordinary
+    moves. The gallery then reported inversions that were an artefact of the labelling. Asking
+    ``python-chess`` is the only way to be sure.
+
+    They start from a square that really does hold one of the mover's pieces, so they look like
+    proposals rather than noise: that is the shape of the illegal moves a decoder actually emits.
+    """
+    legal = {move.uci() for move in board.legal_moves}
+    found: list[str] = []
+    for from_square in chess.scan_forward(board.occupied_co[board.turn]):
+        for to_square in chess.SQUARES:
+            if from_square == to_square:
+                continue
+            uci = chess.square_name(from_square) + chess.square_name(to_square)
+            if uci not in legal and board.piece_at(to_square) is None:
+                found.append(uci)
+                break
+        if len(found) >= count:
+            break
+    return found[:count]
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="92-115" />
+
+Veinticuatro líneas para generar dos jugadas ilegales, y el docstring cuenta por qué no están
+escritas a mano.
+
+<Callout kind="roto" title="Las dos jugadas ilegales que eran legales">
+  La primera versión del lab escribía dos jugadas ilegales por posición, a ojo. `Ta1a7` y
+  `Dd1d8` son jugadas perfectamente ordinarias, y en esas posiciones eran **legales**. La galería
+  reportó entonces unas inversiones que eran un artefacto del etiquetado: la recompensa «sana»
+  estaba puntuando como ilegal algo que no lo era.
+
+Preguntarle a `python-chess` es la única forma de estar seguro. Y las que genera empiezan en una
+casilla que de verdad tiene una pieza del bando que mueve, para que **parezcan propuestas** en vez
+de ruido: esa es la forma de las jugadas ilegales que un decoder emite de verdad.
+
+</Callout>
+
+```python title="labs/m5/reward_hacking.py"
+def board_of(case: Case) -> chess.Board:
+    board = chess.Board(case.fen) if case.fen else chess.Board()
+    for uci in case.moves:
+        board.push_uci(uci)
+    return board
+
+
+def analyse(engine: chess.engine.SimpleEngine, board: chess.Board, depth: int) -> dict[str, int]:
+    """Centipawns for the mover, for every legal move."""
+    scores: dict[str, int] = {}
+    for move in board.legal_moves:
+        board.push(move)
+        info = engine.analyse(board, chess.engine.Limit(depth=depth))
+        scores[move.uci()] = int(info["score"].pov(not board.turn).score(mate_score=MATE_SCORE))
+        board.pop()
+    return scores
+
+
+def candidate_group(board: chess.Board, scores: dict[str, int]) -> list[tuple[str, int | None]]:
+    """A group shaped like one GRPO would draw: good, middling, awful, repeating and illegal.
+
+    Hand-picked rather than sampled, because the point is to give every failure mode somewhere to
+    go. A real group is drawn from the policy and is usually far less interesting, which is its own
+    reason these bugs survive a smoke test.
+    """
+    ranked = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
+    picked: dict[str, int | None] = {}
+    for uci, cp in (ranked[0], ranked[1], ranked[len(ranked) // 2], ranked[-1]):
+        picked[uci] = cp
+    for uci, cp in ranked:
+        if repetition_penalty(board, chess.Move.from_uci(uci)) > 0:
+            picked[uci] = cp
+            break
+    for uci in illegal_candidates(board):
+        picked.setdefault(uci, None)
+    return list(picked.items())
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="118-153" />
+
+`analyse` puntúa todas las jugadas legales de la posición, con el giro de signo de siempre. Y
+`candidate_group` construye un grupo con la forma que tendría uno de GRPO: la mejor, la segunda,
+una del medio, la peor, una que repite si la hay, y dos ilegales.
+
+Está elegido a mano y el docstring lo defiende: el objetivo es que **cada modo de fallo tenga
+dónde aparecer**. Un grupo sorteado de la política real es casi siempre mucho menos interesante, lo
+cual es a su vez la razón de que estos fallos sobrevivan a una prueba de humo.
+
+```python title="labs/m5/reward_hacking.py"
+DEPTH_CASE = Case(
+    name="rey y torre contra rey",
+    about="every move wins; only the search depth decides which ones the engine calls a mate",
+    fen="7k/8/6K1/8/8/8/8/R7 w - - 0 1",
+)
+DEPTH_MOVE = "g6f6"
+
+
+def depth_check(binary: object, depths: tuple[int, ...]) -> None:
+    """The same move, four search depths: how much of each reward is really about the position.
+
+    This is the half of mistake 3 that no ranking can show, and the answer turned out to be worse
+    than the one the lab was written to give. ``Kf6`` in a king-and-rook endgame is scored 597 at
+    depth 4 and 9997 at depth 6 -- not because the move changed, but because the engine found the
+    mate. So the reward of a fixed move moves with the analysis budget, and it moves for **every**
+    design that reads the engine's number, including the sound one.
+
+    The only term that does not move is the flat mate bonus, because it asks the board whether
+    this move is checkmate rather than asking the engine how it feels about the position. Which
+    gives the rule the lesson keeps: **pin the depth, record it in the run, and never compare two
+    runs that used different ones** -- the same conclusion P4 reached about the clock (D-107).
+    """
+    board = board_of(DEPTH_CASE)
+    move = chess.Move.from_uci(DEPTH_MOVE)
+    print("== el mismo movimiento a cuatro profundidades ==")
+    print(f"   {DEPTH_CASE.name}, {DEPTH_MOVE}")
+    print(f"   {DEPTH_CASE.about}")
+    header = "   " + f"{'recompensa':<22}" + "".join(f"{d:>9}" for d in depths) + f"{'rango':>9}"
+    print(header)
+    values: dict[str, list[float]] = {label: [] for label in REWARDS}
+    engine_says: list[int] = []
+    with chess.engine.SimpleEngine.popen_uci(str(binary)) as engine:  # type: ignore[arg-type]
+        for depth in depths:
+            scores = analyse(engine, board, depth)
+            best = max(scores.values())
+            group = candidate_group(board, scores)
+            span = float(best - min(cp for _uci, cp in group if cp is not None))
+            engine_says.append(scores[DEPTH_MOVE])
+            for label, function in REWARDS.items():
+                values[label].append(
+                    float(function(board, move, scores[DEPTH_MOVE], best, span))  # type: ignore[operator]
+                )
+    shown = "".join(f"{cp:>9}" for cp in engine_says)
+    print(f"   {'(el motor dice)':<22}{shown}")
+    for label, series in values.items():
+        spread = max(series) - min(series)
+        row = "".join(f"{value:>9.3f}" for value in series)
+        print(f"   {label:<22}{row}{spread:>9.3f}")
+    print()
+    print(
+        "   Ninguna es estable, y el rango dice cuanto: la sana se mueve 0.99, que es todo su\n"
+        "   intervalo legal; la que no tiene suelo se mueve 47.0, cuarenta y siete veces ese\n"
+        "   intervalo. La unica pieza que no se mueve es el bono de mate plano, porque le\n"
+        "   pregunta al tablero y no al motor.\n"
+    )
+    print(
+        "   Y hay una fila que se mueve sin que el motor se mueva: la reescalada sola pasa de\n"
+        "   1.000 a 0.667 entre profundidad 10 y 14 con el mismo 9998 delante. No cambio la\n"
+        "   jugada ni la posicion ni la evaluacion: cambio el grupo, que es lo unico que esa\n"
+        "   recompensa mira. De ahi la regla: fija la profundidad, escribela en el run y no\n"
+        "   compares dos runs con profundidades distintas.\n"
+    )
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="313-374" />
+
+El bloque de profundidades, que es la mitad del lab que no se ve mirando ordenaciones. La misma
+jugada —`Kf6` en un final de rey y torre contra rey—, el mismo tablero, cuatro profundidades de
+búsqueda. Lo único que cambia es que a profundidad 6 el motor encuentra el mate.
+
+Y entonces **ninguna recompensa es estable**, incluida la sana, que se mueve 0,990 — todo su
+intervalo legal. La que no tiene suelo se mueve 47,0: cuarenta y siete veces ese intervalo. Lo
+único que no se mueve es el bono de mate plano, porque le pregunta al **tablero** («¿esta jugada es
+mate?») y no al motor.
+
+Hay además una fila que se mueve **sin que el motor se mueva**: la reescalada sola pasa de 1,000 a
+0,667 entre profundidad 10 y 14 con el mismo 9 998 delante.
+
+<Callout kind="mundo-real" title="Fija y escribe la profundidad">
+  Fija la profundidad, escríbela en el run, y no compares dos corridas con profundidades distintas.
+  Es la misma conclusión que P4 sacó del reloj (D-107) llegando por otro lado: todo lo que el motor
+  te dé depende de cuánto le dejaste pensar.
+</Callout>
+
+<Exercise n="03" title="El motor dijo lo mismo y la recompensa cambió: ¿qué cambió?">
+  Fíjate en la fila «reescalada sola» del último bloque. Entre profundidad 10 y 14 el motor da el
+  mismo 9 998 y la recompensa pasa de 1,000 a 0,667. Si el motor dijo lo mismo, ¿qué cambió?
+
+  <Solution>
+    El grupo. Esa recompensa normaliza por la dispersión de las candidatas que tiene delante, y a
+    profundidad 14 el motor encuentra el mate en otra candidata más: el mínimo del grupo sube, la
+    dispersión se encoge, y la misma jugada con la misma evaluación vale otra cosa. Es la única
+    recompensa de la galería cuyo valor depende de con quién la compares, y por eso dos corridas
+    suyas no se pueden comparar ni entre sí.
+  </Solution>
+</Exercise>
+
+### Lab 5 · Construir pares con las jugadas del propio modelo
+
+```bash title="Terminal"
+uv run rukh data onpolicy --config configs/data/onpolicy.yaml --max-positions 500
+```
+
+El código está entero en la lección 3: `score_move` con su giro de signo, `sample_candidates`
+con su sorteo de más, y el bucle con sus dos motivos de descarte. Aquí solo hace falta recordar los
+dos que deciden si el experimento es justo.
+
+Los dos `continue` con contador son los dos motivos distintos por los que una posición no da par.
+Menos de dos jugadas distintas es **falta de diversidad**; una diferencia por debajo del margen es
+**falta de desacuerdo**, y no es un fallo: es el modelo diciendo que todo lo que estaba considerando
+ahí era más o menos igual de bueno. Fabricar una preferencia con eso sería enseñarle ruido, y tiene
+la misma forma que el grupo plano de GRPO.
+
+El motor va limitado por **profundidad y no por tiempo**, por lo que P4 midió: un Stockfish
+limitado por reloj hace irreproducible la medición, y un conjunto de datos es una cosa que debería
+poder reconstruirse. Y las posiciones son **las mismas** que usan los pares off-policy: mismos
+prefijos, mismo equilibrio por fase, mismas partidas. Lo único que cambia entre los dos conjuntos
+es de dónde salieron las dos jugadas, que es el motivo entero de correr los dos.
+
+<Exercise n="04" title="Los pares que no salieron, y las dos razones">
+  Mira el `manifest.json` que escribe. ¿Qué fracción de posiciones no produjo par, y por qué dos
+  razones distintas? Luego baja `temperature` a 0,3 —la temperatura a la que se leen todos los
+  números publicados del proyecto— y vuelve a correrlo. ¿Qué pasa con `skipped_all_same`?
+
+  <Solution>
+    Sobre las 13 838 posiciones completas, el 27,1 % no dio par porque el modelo propuso una sola
+    jugada distinta, y el 26,8 % porque las dos extremas estaban a menos de 100 cp. Son dos fallos
+    distintos: el primero es falta de diversidad, el segundo es falta de desacuerdo.
+
+    Con `temperature: 0.3` el primero se dispara: a esa temperatura el modelo propone su moda
+    cuatro veces de cada cuatro en la gran mayoría de las posiciones, y no hay nada que comparar. Es
+    la misma lección con la que terminó M4 desde el otro lado: el muestreo casi determinista es lo
+    que hace que los números publicados sean estables, y es exactamente lo que impide construir un
+    par.
+
+  </Solution>
+</Exercise>
+
+### Lab 6 · DPO con dos fuentes de pares, y la trampa de no igualarlas
+
+```bash title="Terminal"
+uv run rukh train dpo --config configs/train/dpo-onpolicy.yaml
+uv run rukh train dpo --config configs/train/dpo-offpolicy.yaml
+```
+
+Las dos configuraciones están en la lección 3, y la segunda no lee `data/pairs/` sino
+`data/pairs-offpolicy-matched/`: el conjunto original submuestreado a 6 386 con semilla fija, para
+que los dos brazos vean la misma cantidad de datos. El ejercicio de este lab —qué medirías si no
+los igualaras— está también allí, justo donde se toma esa decisión. Lo que no se puede igualar, y
+hay que declarar, es la mezcla: un 29 % de mates en los pares fuera de política frente a un 2,9 %
+en los del propio modelo.
+
+### Lab 7 · Ventajas de grupo a mano
+
+Sin GPU y sin motor, para ver el paso que todo el mundo reconstruye mal.
+
+```python
+import torch
+from rukh.train.grpo import group_advantages, grpo_loss
+
+# Un grupo con dispersión y uno sin ella.
+print(group_advantages([0.98, 0.74, 1.21, 0.31, 0.62, 0.05, 0.88, 0.45]))
+print(group_advantages([0.74] * 8))
+
+# La KL, en las dos direcciones.
+policy = torch.log_softmax(torch.randn(4, 8), dim=-1)
+reference = torch.log_softmax(torch.randn(4, 8), dim=-1)
+_, kl = grpo_loss(policy, reference, torch.tensor([0, 1, 2, 3]), torch.zeros(4), beta_kl=1.0)
+print(float(kl))
+```
+
+<Exercise n="05" title="Multiplica por diez las recompensas del grupo, y súmales diez">
+  Multiplica por diez todas las recompensas del primer grupo. ¿Cambian las ventajas? ¿Y si les sumas
+  diez a todas?
+
+  <Solution>
+    No cambian en ninguno de los dos casos, y por razones distintas. Sumar una constante no cambia
+    nada porque la media se mueve con ella: es la misma invariancia que tiene Bradley-Terry, vista
+    en otro sitio. Multiplicar por diez no cambia nada porque la desviación se multiplica por diez
+    también. La ventaja de grupo es invariante a traslaciones **y** a escala, lo cual es justo lo
+    que la hace utilizable sin calibrar la recompensa — y justo lo que hace que un grupo de ocho
+    pifias y un grupo de ocho jugadas excelentes produzcan ventajas del mismo tamaño.
+  </Solution>
+</Exercise>
+
+### Lab 8 · Romper la recompensa a propósito
+
+```bash title="Terminal"
+uv run python labs/m5/reward_hacking.py --depth 12
+```
+
+La otra mitad del script: las seis recompensas y lo que la galería mide de ellas. Empieza por el
+comentario que gobierna todas, porque es el arreglo del segundo error del lab.
+
+```python title="labs/m5/reward_hacking.py"
+# --- the six rewards --------------------------------------------------------------------------
+#
+# Every variant is the sound reward with **exactly one** term replaced. That constraint is what
+# makes the inversion column readable: the first version of this lab wrote each broken reward from
+# scratch, so four of them silently dropped the repetition term too and every one of them reported
+# the same inversion. A gallery whose exhibits differ in more than one way explains nothing.
+#
+# ``cp`` is ``None`` for a move that cannot be played, which is the moment each design has to say
+# what it believes. ``span`` is the group's own spread, which only the self-scaling one looks at.
+
+
+def _quality(cp: int, best: int) -> float:
+    return normalised_delta_cp(cp, best, CP_SCALE)
+
+
+def _mate(board: chess.Board, move: chess.Move) -> float:
+    return mate_bonus(board, move)
+
+
+def _repetition(board: chess.Board, move: chess.Move) -> float:
+    return repetition_penalty(board, move)
+
+
+def _assemble(quality: float, mate: float, repetition: float) -> float:
+    return WEIGHTS.quality * quality + WEIGHTS.mate * mate - WEIGHTS.repetition * repetition
+
+
+def sound(board: chess.Board, move: chess.Move, cp: int | None, best: int, span: float) -> float:
+    """What `rukh.train.rewards.reward` computes: gated, capped, flat mate, repetition paid."""
+    if cp is None:
+        return illegal_value(WEIGHTS)
+    return _assemble(_quality(cp, best), _mate(board, move), _repetition(board, move))
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="156-187" />
+
+**Cada variante es la recompensa sana con exactamente un término sustituido.** Esa restricción es
+lo que hace legible la columna de inversiones.
+
+<Callout kind="roto" title="Cinco recompensas rotas que estaban rotas dos veces">
+  La primera versión escribía cada recompensa rota por su cuenta, desde cero. Cuatro de las cinco se
+  dejaron el término de repetición por el camino sin querer. Resultado: todas reportaban la **misma**
+  inversión, y ninguna era atribuible a su propio fallo.
+
+Reescritas como «la sana con exactamente un término sustituido», cada inversión señala a lo suyo:
+la que no penaliza repetir invierte exactamente un par, y es el de la jugada que repite (D-117).
+Vale para una galería didáctica y vale para cualquier ablación: **si dos condiciones difieren en
+dos cosas, no has medido ninguna de las dos**.
+
+</Callout>
+
+Los cuatro ayudantes —`_quality`, `_mate`, `_repetition` y `_assemble`— son exactamente eso:
+las piezas que cada variante recombina cambiando una sola. Y `sound` es, línea por línea, lo que
+calcula `rukh.train.rewards.reward`.
+
+```python title="labs/m5/reward_hacking.py"
+def uncapped(board: chess.Board, move: chess.Move, cp: int | None, best: int, span: float) -> float:
+    """**Mistake 1: no floor under the quality term.** Only the quality term changes.
+
+    ``(cp - best) / cp_scale`` reads like the same thing as the clamped version and is not: it has
+    no bottom, so one catastrophic candidate sets the group's standard deviation by itself and
+    every other advantage is divided by it. Watch the ``peor`` column, not the crown.
+    """
+    if cp is None:
+        return illegal_value(WEIGHTS)
+    return _assemble((cp - best) / CP_SCALE, _mate(board, move), _repetition(board, move))
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="190-199" />
+
+**Fallo 1: sin suelo en el término de calidad.** `(cp - best) / cp_scale` se lee como lo mismo
+que la versión recortada y no lo es: no tiene fondo, así que una sola candidata catastrófica fija
+por sí sola la desviación del grupo y **todas las demás ventajas se dividen entre ella**. La
+columna que lo enseña es `peor`, no la corona.
+
+```python title="labs/m5/reward_hacking.py"
+def legality_as_a_bonus(
+    board: chess.Board, move: chess.Move, cp: int | None, best: int, span: float
+) -> float:
+    """**Mistake 2: legality is a term in the sum instead of a gate.** Only the gate changes.
+
+    ``+2 when legal`` reads as a strong preference and is in fact a *price*, which any other term
+    worth more than two can pay. An illegal move has no engine score, so this design does the
+    generous thing and treats the missing quality as no loss at all -- which is precisely how the
+    bug gets in.
+    """
+    legal = move in board.legal_moves
+    quality = _quality(cp, best) if cp is not None else 0.0
+    return (2.0 if legal else 0.0) + _assemble(
+        quality, _mate(board, move) if legal else 0.0, _repetition(board, move) if legal else 0.0
+    )
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="202-216" />
+
+**Fallo 2: la legalidad como término de la suma en vez de como puerta.** `+2 si es legal` se lee
+como una preferencia fuerte y es en realidad un **precio**, que cualquier otro término que valga
+más de dos puede pagar.
+
+Fíjate además en lo que hace con la calidad de una jugada ilegal: como no tiene evaluación del
+motor, esta versión hace lo generoso y trata la calidad ausente como «ninguna pérdida». Ahí es
+exactamente por donde entra el fallo. Quitándole el suelo al término de calidad, las dos ilegales
+salen en **+0,18**, por encima de una jugada legal que está a 355 cp del óptimo y saca −0,15.
+
+```python title="labs/m5/reward_hacking.py"
+def mate_by_engine_score(
+    board: chess.Board, move: chess.Move, cp: int | None, best: int, span: float
+) -> float:
+    """**Mistake 3: paying for the engine's mate score instead of for the mate.** Mate term only.
+
+    ``MATE_SCORE - distance`` is right there in the data and it is tempting. Two things go wrong
+    and both are visible below: the term stops being bounded, so a single mating candidate takes
+    the whole group's advantage mass; and the number it pays **depends on the search depth**,
+    because a deeper engine reports a shorter mate for the same move. A reward that changes when
+    the analysis budget changes is a reward that cannot be reproduced -- which is the same trap
+    P4 fell into with a time-limited engine (D-107), arriving from a different direction.
+    """
+    if cp is None:
+        return illegal_value(WEIGHTS)
+    mate = (abs(cp) / 1000.0) if abs(cp) >= MATE_SCORE - 100 else 0.0
+    return _assemble(_quality(cp, best), mate, _repetition(board, move))
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="219-234" />
+
+**Fallo 3: pagar por el marcador de mate del motor en vez de por el mate.**
+`MATE_SCORE − distancia` está ahí, en los datos, y es tentador. Dos cosas se rompen y las dos se
+ven en las tablas: el término deja de estar acotado, así que una sola candidata que mata se lleva
+toda la masa de ventaja del grupo; y **el número que paga depende de la profundidad de búsqueda**,
+porque un motor más profundo reporta un mate más corto para la misma jugada.
+
+```python title="labs/m5/reward_hacking.py"
+def no_repetition_penalty(
+    board: chess.Board, move: chess.Move, cp: int | None, best: int, span: float
+) -> float:
+    """**Mistake 4: rewarding the position instead of the progress.** Repetition term only.
+
+    Drop it and a winning model discovers something true: repeating costs nothing. The evaluation
+    after the repetition is the evaluation before it, so the reward is the same, and shuffling is a
+    strictly safe way to keep collecting it. Nothing in the numbers is wrong, which is what makes
+    this the most dangerous of the five.
+    """
+    if cp is None:
+        return illegal_value(WEIGHTS)
+    return _assemble(_quality(cp, best), _mate(board, move), 0.0)
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="237-249" />
+
+**Fallo 4: premiar la posición en vez del progreso.** Quita el término de repetición y un modelo
+que va ganando descubre algo cierto: repetir no cuesta nada. La evaluación después de la repetición
+es la misma que antes, así que la recompensa es la misma, y barajar es una forma estrictamente
+segura de seguir cobrándola. **Nada en los números está mal**, que es lo que la convierte en la más
+peligrosa de las cinco.
+
+```python title="labs/m5/reward_hacking.py"
+def self_scaling(
+    board: chess.Board, move: chess.Move, cp: int | None, best: int, span: float
+) -> float:
+    """**Mistake 5: a reward that rescales itself to whatever it is looking at.** Quality only.
+
+    Normalising by the spread of *this* group instead of by a fixed constant makes every group look
+    equally informative, so eight excellent moves and eight blunders produce advantages of the same
+    size and the model is told, with equal confidence, to prefer the least bad blunder. It also
+    stops the number being comparable between two runs, so nothing can tell a run it has stopped
+    improving.
+    """
+    if cp is None:
+        return illegal_value(WEIGHTS)
+    return _assemble(
+        1.0 - (best - cp) / max(span, 1.0), _mate(board, move), _repetition(board, move)
+    )
+
+
+REWARDS = {
+    "sana": sound,
+    "sin suelo": uncapped,
+    "legalidad como bonus": legality_as_a_bonus,
+    "mate por marcador": mate_by_engine_score,
+    "sin penalizar repetir": no_repetition_penalty,
+    "reescalada sola": self_scaling,
+}
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="252-277" />
+
+**Fallo 5: una recompensa que se reescala a lo que tiene delante.** Normalizar por la dispersión
+de _este_ grupo en vez de por una constante hace que todos los grupos parezcan igual de
+informativos, así que ocho jugadas excelentes y ocho pifias producen ventajas del mismo tamaño y al
+modelo se le dice, con la misma confianza, que prefiera la pifia menos mala. Y de paso el número
+deja de ser comparable entre dos corridas, así que nada puede decirle a una corrida que ha dejado
+de mejorar.
+
+```python title="labs/m5/reward_hacking.py"
+def profile(
+    board: chess.Board, group: list[tuple[str, int | None]], function: object, best: int
+) -> tuple[str, float, float, dict[str, float]]:
+    """Crowned move, head gap, worst-candidate dominance, and the advantage of each candidate."""
+    scored = [cp for _uci, cp in group if cp is not None]
+    span = float(best - min(scored)) if scored else 1.0
+    paid = {
+        uci: float(function(board, chess.Move.from_uci(uci), cp, best, span))  # type: ignore[operator]
+        for uci, cp in group
+    }
+    order = sorted(paid, key=lambda uci: paid[uci], reverse=True)
+    advantages = dict(
+        zip(paid, group_advantages([paid[uci] for uci in paid]).tolist(), strict=True)
+    )
+    mass = sum(abs(value) for value in advantages.values()) or 1.0
+    head = advantages[order[0]] - advantages[order[1]]
+    worst = min(advantages.values())
+    return order[0], head, abs(worst) / mass, advantages
+
+
+def inversions(reference: dict[str, float], other: dict[str, float]) -> list[tuple[str, str]]:
+    """Pairs the two rewards order the opposite way round. Ties on either side do not count."""
+    names = list(reference)
+    found = []
+    for index, first in enumerate(names):
+        for second in names[index + 1 :]:
+            sound_says = reference[first] - reference[second]
+            other_says = other[first] - other[second]
+            if sound_says * other_says < 0:
+                found.append((first, second) if sound_says > 0 else (second, first))
+    return found
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="280-310" />
+
+`profile` es lo que convierte una recompensa en las tres columnas de la tabla. Lo importante es
+que las ventajas se calculan con **`group_advantages` de verdad**, la misma función que usa el
+entrenamiento: la galería no simula lo que GRPO haría, se lo pregunta.
+
+`inversions` compara dos ordenaciones por parejas y solo cuenta una inversión cuando el producto
+de las dos diferencias es **estrictamente** negativo: un empate en cualquiera de los dos lados no
+cuenta, porque un empate no es una opinión contraria.
+
+```python title="labs/m5/reward_hacking.py"
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--depth", type=int, default=12, help="Engine depth per legal move.")
+    args = parser.parse_args()
+
+    binary = find_stockfish()
+    if binary is None:
+        raise SystemExit("Stockfish not found; set RUKH_STOCKFISH")
+
+    print("La galeria: el mismo grupo de candidatas, seis recompensas, lo que cada una rompe.\n")
+    with chess.engine.SimpleEngine.popen_uci(str(binary)) as engine:
+        for case in CASES:
+            board = board_of(case)
+            scores = analyse(engine, board, args.depth)
+            best = max(scores.values())
+            group = candidate_group(board, scores)
+            shown = ", ".join(f"{uci}({'ilegal' if cp is None else cp})" for uci, cp in group)
+            print(f"== {case.name} ==")
+            print(f"   {case.about}")
+            print(f"   grupo: {shown}")
+            print(f"   {'recompensa':<22} {'corona':<7} {'cabeza':>8} {'peor':>7}   inversiones")
+            reference: dict[str, float] = {}
+            for label, function in REWARDS.items():
+                crowned, head, worst, advantages = profile(board, group, function, best)
+                if not reference:
+                    reference = advantages
+                    flips = ""
+                else:
+                    pairs = inversions(reference, advantages)
+                    listed = ", ".join(f"{a}>{b}" for a, b in pairs[:3])
+                    flips = (listed + (" ..." if len(pairs) > 3 else "")) if pairs else "-"
+                print(f"   {label:<22} {crowned:<7} {head:>8.3f} {worst:>6.1%}   {flips}")
+            print()
+
+    depth_check(binary, (4, 6, 10, 14))
+    print(
+        "Lo que mide, en una linea: la corona casi nunca cambia -- todas son monotonas en la\n"
+        "evaluacion -- y el dano esta en la forma del grupo, no en su cima."
+    )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+<Src file="labs/m5/reward_hacking.py" tag="p5" lines="377-419" />
+
+Y el bucle principal, que imprime las tres posiciones y llama al bloque de profundidades.
+
+La última frase que imprime es el resumen del lab entero: **la corona casi nunca cambia —todas son
+monótonas en la evaluación— y el daño está en la forma del grupo, no en su cima.**
+
+<Exercise n="06" title="Una sexta recompensa rota: el mate a 2,0">
+  Añade una sexta recompensa rota a `REWARDS`: la sana, pero con `WEIGHTS.mate` subido de 0,25 a
+  2,0. ¿Invierte algún par? ¿Qué le pasa a la columna «cabeza» en la posición «hay mate»?
+
+  <Solution>
+    No invierte nada —el mate ya era la mejor jugada por evaluación, así que pagarlo más no cambia
+    el orden— y la cabeza se dispara, porque toda la masa de ventaja del grupo se va a la candidata
+    que mata y las demás se aplastan. Es el mismo daño que hace «sin suelo» por el otro extremo: una
+    recompensa puede romper un grupo tirando de arriba o empujando desde abajo, y en las dos el
+    síntoma es el mismo — deja de haber señal para ordenar lo que queda en medio.
+  </Solution>
+</Exercise>
+
+### Lab 9 · El reward model, y por qué su número depende de la semilla
+
+Un encoder de casillas con una cabeza escalar, entrenado con la pérdida de Bradley-Terry sobre los
+pares fuera de política. Cuatro minutos, desde cero: la lección 8 midió que partir del encoder de
+M3 **estorba** (62 % frente a 69 % a la misma talla), así que `encoder_ckpt: null`.
+
+```bash title="Terminal"
+uv run rukh train reward --config configs/train/rm.yaml
+```
+
+El bucle entero está en la lección 2. Lo que añade sobre la pérdida son dos cosas: la traducción de
+«(prefijo, jugada)» a **la posición a la que lleva la jugada**, que es lo que lee el encoder de M3,
+y un reparto que no miente — **por partida y no por par**, con la misma función pura de M3, porque
+dos pares de la misma partida son dos jugadas separadas por unos pocos plies en la misma posición.
+
+Y la razón de que este módulo publique un **desglose por bandas** en vez de un número: la banda de
+mate va separada porque una diferencia de ±10 000 no es una diferencia que una evaluación pueda
+leer, y meterla dentro de «800+» halagaría a la banda alta con pares que no son evaluaciones.
+
+Hay dos corridas de referencia y conviene saber cuál es cuál. La que está en el Hub como
+`chorcat/rukh-rm` es `rm-20260920-223655`, la repetición con la semilla 42 de la config
+publicada —74,21 % global, 75,77 % sobre los pares decidibles, 484 pares de mate en validación—, y
+es la carpeta a la que resuelve `checkpoints/rm` (D-131). La salida de abajo es la de la semilla 1
+(`checkpoints/rm-seed1-20260920-212134/`), que es la corrida cuyas bandas dibuja la figura de la
+lección 8 y de la que salen las dos correlaciones publicadas (D-119):
+
+```text
+accuracy:   74.76 % on held-out pairs
+            77.30 % over the pairs an evaluation can decide
+    100-200 cp    556 pairs   77.52 %
+    200-400 cp    242 pairs   74.79 %
+    400-800 cp    104 pairs   80.77 %
+   800-2000 cp     10 pairs   90.00 %
+       mate cp    356 pairs   68.26 %
+margin vs delta cp: Pearson -0.128, Spearman -0.067
+        without mates: Pearson +0.058, Spearman +0.075
+```
+
+<Exercise n="07" title="Tres semillas, un titular">
+  Corre la misma config con `seed: 1`, `2` y `3` (cambia también `run_name`, o las tres
+  corridas se pisarán el nombre). Anota el acierto global y el de la banda de mate de cada una.
+  ¿Cuánto se mueve el titular? ¿Qué banda lo mueve?
+
+  <Solution>
+    En la referencia, las tres semillas dieron 74,76 %, 75,19 % y 74,71 % de acierto global, con la
+    banda de mate en 68,26 %, 71,69 % y 69,57 % y con 356, 438 y 368 pares de mate en validación. La
+    semilla reparte la partición **y** entrena el modelo, así que cuántos pares de mate le tocan al
+    conjunto de validación mueve el titular, y la banda de mate —algo más de un cuarto de los pares
+    de validación, entre el 27 % y el 33 % según la semilla, y siempre la peor— es la que lo mueve.
+    Comparar dos corridas con semillas distintas no dice nada del modelo; y dos con la misma semilla
+    tampoco se repiten exactas: la config publicada, corrida dos veces sin cambiar nada, dio 72,91 %
+    y 74,21 % (D-113). Ese 1,3 es el suelo de reproducibilidad de la GPU, y cualquier diferencia que
+    publiques tiene que ser mayor que él.
+  </Solution>
+</Exercise>
+
+### Lab 10 · GRPO a dos tasas, y elegir sin restar
+
+Sin pares y sin reward model: las posiciones se leen del fichero de pares y las etiquetas se
+ignoran. Ocho candidatas por posición, la recompensa verificable con el motor a profundidad 8 y
+una caché en disco para que la segunda visita a una posición sea gratis. La corrida de referencia
+son 1 500 pasos; `grpo.yaml` deja 300 para que la primera vuelta tarde minutos.
+
+```bash title="Terminal"
+uv run rukh train grpo --config configs/train/grpo.yaml --steps 1500
+sed 's/^lr: 1.0e-6/lr: 5.0e-6/' configs/train/grpo.yaml > configs/train/grpo-fast.yaml
+uv run rukh train grpo --config configs/train/grpo-fast.yaml --steps 1500 --run-name medium-v4-grpo-fast
+uv run rukh eval match --a checkpoints/medium-v4-grpo-fast/grpo.pt --b checkpoints/medium-v4-grpo/grpo.pt --games 400 --seed 7
+uv run rukh eval match --a checkpoints/medium-v4-grpo/grpo.pt --b checkpoints/medium-v4-grpo-fast/grpo.pt --games 400 --seed 7
+uv run python labs/m5/pooled_match.py
+```
+
+La salida de `rukh train grpo` tiene dos líneas de recompensa, y la que puntúa es la segunda:
+
+```text
+reward:     +0.8657 -> +0.8937 (group best)
+            +0.8250 -> +0.8529 (engine best -- this is the score)
+flat:       0.385 -> 0.472
+illegal:    0.0000 -> 0.0000
+kl:         0.12169 against the frozen start
+```
+
+<Exercise n="08" title="Dos intervalos que se solapan: ¿cuál publicas?">
+  Las dos corridas dan estas cifras contra la base: la lenta +44 Elo (23 a 66) y la rápida +68 (46 a
+  90). Antes de mirar el agrupado de sus enfrentamientos directos: ¿cuál publicarías, y con qué
+  argumento?
+
+  <Solution>
+    Si respondiste «la rápida, por 24 puntos», acabas de restar dos mediciones contra un tercero,
+    que es exactamente lo que la lección 1 desaconseja y lo que yo hice una vez antes de darme
+    cuenta (D-126). Enfrentadas entre sí y agrupando las dos direcciones, las dos corridas empatan:
+    −0,87 Elo con intervalo de −22,2 a +20,4. Con un empate medido, el desempate no es el Elo sino
+    el coste, y ahí la lenta gana en todo: menos grupos planos (0,472 frente a 0,560), menos KL
+    contra el inicio (0,122 frente a 0,555) y menos propuestas ilegales (1,66 veces la base frente a
+    2,08). Se publica la lenta. La regla completa está en la lección 8.
+  </Solution>
+</Exercise>
+
+### Lab 11 · La suite, la exportación y el Hub
+
+Lo que cierra el módulo no es un enfrentamiento sino la fila de la tabla única, medida con la
+misma config y la misma semilla que todas las etapas anteriores, y el modelo en el Hub con esa
+fila en su card.
+
+```bash title="Terminal"
+uv run rukh eval --model checkpoints/medium-v4-dpo-onpolicy/dpo.pt --config configs/eval/greedy.yaml --stage medium-v4-dpo-onpolicy-greedy
+uv run rukh eval --model checkpoints/medium-v4-grpo/grpo.pt --config configs/eval/greedy.yaml --stage medium-v4-grpo-greedy
+uv run rukh export --ckpt checkpoints/medium-v4-dpo-onpolicy/dpo.pt --out artifacts/onnx/medium-dpo --fp16 --int8 --check-parity
+uv run rukh publish model --ckpt checkpoints/medium-v4-dpo-onpolicy/dpo.pt --repo chorcat/rukh-medium-dpo --stage medium-v4-dpo-onpolicy-greedy --onnx artifacts/onnx/medium-dpo --dry-run
+uv run rukh publish reward --run checkpoints/rm --repo chorcat/rukh-rm --dry-run
+uv run rukh data publish --name rukh-pairs-onpolicy --dry-run
+```
+
+Cada evaluación canónica tarda unos 26 minutos y una exportación unos 12; `--dry-run` deja la
+carpeta entera en `artifacts/publish/` sin tocar la red. El `--stage` del `publish` tiene que
+ser **el mismo** con el que se corrió la evaluación, o la card sale sin números; y si el checkpoint
+no es el que se midió, el publicador se niega en vez de publicar los números de otro modelo. El
+publicador del reward model está entero en la lección 6.
+
+<Exercise n="09" title="Cuánto tiene que pesar el `model.safetensors`">
+  Antes de quitar `--dry-run`, lista la carpeta preparada con `ls -la`. ¿Cuánto tiene que pesar
+  `model.safetensors` de un modelo de 115 millones de parámetros en fp32? ¿Y el del reward model?
+
+  <Solution>
+    Unos 460 MB (115 M × 4 bytes) y unos 152 MB (37,9 M × 4). La referencia encontró una vez 25 KB
+    donde debían estar los 152 MB del reward model: un test cuyo aislamiento no funcionaba había
+    escrito su modelo de juguete en la carpeta real (D-129). Contar bytes es la comprobación más
+    barata que existe, y la única que lo habría pillado. El `assert` que impide que vuelva a pasar
+    está en la lección 6.
+  </Solution>
+</Exercise>
+
+## Lo que te llevas
+
+Tres cosas, y las tres son sobre cómo medir, no sobre alineamiento. Eso no es un accidente del
+módulo: es lo que pasa cuando el instrumento y el experimento se construyen a la vez.
+
+**Para medir una diferencia, mide la diferencia.** Cada absoluto trae su ruido entero a la resta, y
+la resta acaba más ancha que las medidas que entraron. En este módulo la regla falló tres veces por
+tres caminos distintos —restando dos escaleras, restando dos enfrentamientos contra la base en un
+triángulo que no cierra, y eligiendo entre dos GRPO por lo que cada uno hizo contra un tercero— y
+las tres veces el enfrentamiento directo dio otra respuesta. Dos de las tres las cometí yo
+**después** de escribir la regla.
+
+**Antes de explicar una diferencia pequeña, mide cuánto se mueve tu montaje cuando no cambias nada.**
+La escalera repite 1498 y 1558. El reward model repite 72,91 % y 74,21 % con la misma semilla y la
+misma partición. Un veredicto de «separado del cero» se dio la vuelta al intercambiar los lados
+mientras la estimación apenas se movía. Ninguna de las tres se descubre mirando el modelo.
+
+**Y antes de publicar una métrica, describe la política que la maximizaría.** Si esa política no es
+la que quieres, la métrica no es la que quieres. Esa pregunta encontró en nuestro propio bucle un
+fallo que ninguna de las cinco recompensas rotas a propósito habría enseñado: la recompensa que GRPO
+optimiza se maximiza **dejando de ser diverso**, y la curva de tres puntos que lo demuestra tiene el
+mecanismo en la columna de al lado.
+
+El modelo, mientras tanto, mejoró: los tres métodos baten a su base con el intervalo separado del
+cero, que es la primera vez en el proyecto. Lo que cambió no fue el modelo, fue cómo se mira.
+
+Lo siguiente es M6, el cierre de la primera fase: la tabla única con todas las etapas, las model
+cards desde MLflow, y la demo final. Después empieza la fase agéntica, donde el modelo deja de ser
+lo único que hay y pasa a ser una herramienta que algo más usa.
+
+<RepoTag tag="p5" at="final" module="M5" />
+
+La cheatsheet del módulo, con su pregunta y su respuesta corta, está justo debajo.

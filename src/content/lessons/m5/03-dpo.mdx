@@ -1,0 +1,1096 @@
+---
+title: 'DPO: la referencia implícita, y de dónde salen las dos jugadas'
+description:
+  'El fichero de DPO entero —272 líneas donde una completación de un token colapsa toda la
+  maquinaria de secuencia— y el constructor de pares dentro de política, con las tres decisiones que
+  hacen que los dos brazos sean comparables y la que no se puede igualar.'
+module: m5
+order: 3
+duration: 145
+runtime: 40
+level: medio
+status: vigente
+updated: 2026-09-22
+keywords:
+  - DPO
+  - beta
+  - par de preferencia
+  - on-policy
+  - off-policy
+  - referencia
+  - nll_weight
+artifacts:
+  - kind: dataset
+    label: chorcat/rukh-pairs-onpolicy
+    href: https://huggingface.co/datasets/chorcat/rukh-pairs-onpolicy
+  - kind: model
+    label: chorcat/rukh-medium-dpo
+    href: https://huggingface.co/chorcat/rukh-medium-dpo
+---
+
+## Qué vas a construir
+
+El entrenamiento que aprende de los pares **sin reward model**, y el conjunto de datos que permite
+hacerle al método la única pregunta que importa: ¿cambia algo que los pares los haya escrito otro
+o los haya propuesto el propio modelo?
+
+Hay un detalle de historia que conviene decir antes de leer el código. `src/rukh/train/dpo.py`
+**no es nuevo de este hito**: está en el repositorio desde `p4`, donde se escribió como la última
+palanca de afinado que M4 probó, y llega a `p5` sin cambiar una línea. Lo que M5 añade a su
+alrededor es todo lo demás: la orden `rukh train dpo` de la CLI, las dos configuraciones que
+montan el experimento, y `src/rukh/data/onpolicy.py`, que construye el segundo brazo. El fichero
+llevaba un hito entero sin que nadie lo pudiera ejecutar desde la línea de órdenes, y eso también
+es un dato sobre cómo crece un proyecto.
+
+Son unas 560 líneas: DPO (272), los pares dentro de política (235), y tres configuraciones cortas.
+
+## DPO en 272 líneas, porque una jugada es un token
+
+La idea de <Term id="dpo">DPO</Term> es que no hace falta entrenar un reward model para hacer
+refuerzo sobre preferencias: el óptimo de ese refuerzo se puede escribir en función de la política
+y de una **referencia**, y entonces la política se entrena directamente sobre los pares. La
+referencia es una copia congelada de los pesos de partida, no se entrena y no se publica.
+
+```python title="src/rukh/train/dpo.py"
+"""Direct Preference Optimization on the decoder, over engine-scored move pairs.
+
+Every other lever tried so far teaches the model to *imitate*: more games, better games, a header
+saying how strong the players were. Imitation is capped by the corpus, and D-069 measured that cap
+-- conditioning on 2600 does not make the model play better, it makes it play like a 2600 losing
+to tactics. DPO changes the objective. Each example says "in this position `chosen` is at least
+``min_delta_cp`` better than `rejected`", which is information no human game contains, and the
+loss pushes probability from one to the other instead of towards the average continuation.
+
+Our completion is a single token -- one move -- so the usual sequence-level DPO collapses to the
+log-probability of two tokens at one position, which is why this file is short.
+"""
+```
+
+<Src file="src/rukh/train/dpo.py" tag="p5" lines="1-12" />
+
+La última frase del docstring es la que explica el tamaño del fichero. En un modelo de lenguaje
+normal, una completación es una secuencia: hay que sumar log-probabilidades a lo largo de muchos
+tokens, cuidar el relleno, y decidir si se normaliza por longitud. Aquí la completación es **una
+jugada**, que es un token, así que todo eso colapsa a leer dos números de la distribución en una
+sola posición. La misma simplificación aparece en GRPO dos lecciones más adelante, y es el motivo
+de que este proyecto pueda enseñar los dos algoritmos con el código delante.
+
+```python title="src/rukh/train/dpo.py"
+from __future__ import annotations
+
+import logging
+import math
+from typing import TYPE_CHECKING
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from pydantic import Field
+
+from rukh.config import BaseConfig
+from rukh.models import MoveDecoder
+from rukh.tokenize.uci_vocab import UciTokenizer, elo_token
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
+
+LOGGER = logging.getLogger(__name__)
+```
+
+<Src file="src/rukh/train/dpo.py" tag="p5" lines="14-33" />
+
+Nada que decidir aquí. `MoveDecoder` y `UciTokenizer` son los de M2, sin cambios.
+
+```python title="src/rukh/train/dpo.py"
+class DpoConfig(BaseConfig):
+    """Where the pairs and the starting weights are, and the two knobs that matter."""
+
+    pairs: str = "data/pairs/dpo-prompts.parquet"
+    checkpoint: str = ""
+    out_dir: str = "checkpoints"
+    run_name: str = "dpo"
+    beta: float = Field(default=0.1, gt=0)
+    """How hard the loss pushes. Above ~0.5 the policy leaves the reference and legality goes."""
+    lr: float = Field(default=5e-6, gt=0)
+    nll_weight: float = Field(default=0.0, ge=0)
+    """Optional anchor on the chosen move. Pure DPO can raise the margin while the model forgets
+    how to play at all; a little next-token loss keeps it honest."""
+    batch_size: int = Field(default=32, ge=1)
+    epochs: int = Field(default=1, ge=1)
+    block: int = Field(default=200, ge=8)
+    val_fraction: float = Field(default=0.1, ge=0.0, lt=0.5)
+    seed: int = 42
+    device: str | None = None
+```
+
+<Src file="src/rukh/train/dpo.py" tag="p5" lines="36-54" />
+
+Dos palancas con su comentario. `beta` es cuánto se le deja a la política alejarse de la
+referencia: por encima de 0,5 la política se va y la legalidad con ella. Y `nll_weight`, que es
+opcional y que en las dos corridas del hito vale 0,1, es la que hay que entender.
+
+DPO puro sube el **margen**, que es cuánto más prefiere la política la jugada buena de lo que la
+prefería la referencia. Un margen grande no dice que la jugada sea buena: dice que le gana a la
+otra. Nada impide que la política llegue ahí hundiendo las dos y hundiendo un poco menos la
+preferida. La pérdida de siguiente token sobre `chosen` —eso es `nll_weight`— la ancla a seguir
+sabiendo jugar mientras el margen crece.
+
+<Callout kind="roto" title="El margen sube y la ordenación baja">
+  En este hito pasó, y está medido: el brazo fuera de política triplicó el margen (+3,00) y el
+  acierto sobre pares **bajó** del 94,05 % al 92,96 %. Separar mucho a unos cuantos pares y cruzar a
+  otros por el camino es una forma perfectamente válida de subir una media. Por eso la pérdida de
+  abajo devuelve el margen y el acierto **por separado**, y el número que se mira es el segundo.
+</Callout>
+
+```python title="src/rukh/train/dpo.py"
+class PreferenceBatch:
+    """Padded prompts plus the index of the position that predicts the move."""
+
+    def __init__(
+        self, tokens: torch.Tensor, last: torch.Tensor, chosen: torch.Tensor, rejected: torch.Tensor
+    ) -> None:
+        self.tokens, self.last, self.chosen, self.rejected = tokens, last, chosen, rejected
+
+    def to(self, device: torch.device) -> PreferenceBatch:
+        return PreferenceBatch(
+            self.tokens.to(device),
+            self.last.to(device),
+            self.chosen.to(device),
+            self.rejected.to(device),
+        )
+
+    def __len__(self) -> int:
+        return int(self.tokens.shape[0])
+```
+
+<Src file="src/rukh/train/dpo.py" tag="p5" lines="57-74" />
+
+Un lote de preferencias es el prompt relleno, el índice donde acaba cada prompt, y los dos tokens
+de jugada. Ese `last` es el campo que evita el error silencioso del fichero, y la razón está en
+la función siguiente.
+
+```python title="src/rukh/train/dpo.py"
+def encode_pairs(frame: object, tok: UciTokenizer, block: int) -> list[tuple[list[int], int, int]]:
+    """``(prompt ids, chosen id, rejected id)`` for every usable row.
+
+    A row is dropped when either move is outside the fixed vocabulary (a promotion spelling the
+    enumeration does not carry) or when the prompt would not fit in ``block``: silently
+    truncating a prefix would hand the model a position that never happened.
+    """
+    rows: list[tuple[list[int], int, int]] = []
+    for prefix, chosen, rejected, white, black in zip(
+        frame["prefix"],
+        frame["chosen"],
+        frame["rejected"],  # type: ignore[index]
+        frame["white_elo"],
+        frame["black_elo"],
+        strict=True,  # type: ignore[index]
+    ):
+        chosen_id = tok.vocab.get(str(chosen))
+        rejected_id = tok.vocab.get(str(rejected))
+        if chosen_id is None or rejected_id is None or chosen_id == rejected_id:
+            continue
+        ids = [
+            tok.bos_id,
+            tok.vocab[elo_token(int(white), "w")],
+            tok.vocab[elo_token(int(black), "b")],
+        ]
+        moves = [tok.vocab.get(m) for m in str(prefix).split()]
+        if any(m is None for m in moves):
+            continue
+        ids += [int(m) for m in moves]  # type: ignore[arg-type]
+        if len(ids) > block:
+            continue
+        rows.append((ids, chosen_id, rejected_id))
+    return rows
+```
+
+<Src file="src/rukh/train/dpo.py" tag="p5" lines="77-109" />
+
+Dos motivos para descartar una fila, y los dos escritos: una jugada fuera del vocabulario fijo
+—una coronación que la enumeración no lleva— y un prompt que no cabe en `block`. El segundo
+merece la frase del docstring: **recortar un prefijo no es una opción**. Cortarle el principio a
+una partida le da al modelo una posición que en esa partida no ocurrió, con una preferencia que se
+midió sobre otra cosa. Descartar y contar es honesto; recortar es fabricar datos.
+
+`chosen_id == rejected_id` también descarta: dos jugadas iguales no son una preferencia.
+
+```python title="src/rukh/train/dpo.py"
+def batches(
+    rows: list[tuple[list[int], int, int]], size: int, pad_id: int, shuffle: bool, seed: int
+) -> Iterator[PreferenceBatch]:
+    """Pad each batch to its own longest prompt and remember where each prompt ends."""
+    order = np.arange(len(rows))
+    if shuffle:
+        np.random.default_rng(seed).shuffle(order)
+    for start in range(0, len(order), size):
+        chunk = [rows[int(i)] for i in order[start : start + size]]
+        if not chunk:
+            continue
+        width = max(len(ids) for ids, _, _ in chunk)
+        tokens = torch.full((len(chunk), width), pad_id, dtype=torch.long)
+        last = torch.empty(len(chunk), dtype=torch.long)
+        for i, (ids, _, _) in enumerate(chunk):
+            tokens[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+            last[i] = len(ids) - 1
+        yield PreferenceBatch(
+            tokens,
+            last,
+            torch.tensor([c for _, c, _ in chunk], dtype=torch.long),
+            torch.tensor([r for _, _, r in chunk], dtype=torch.long),
+        )
+```
+
+<Src file="src/rukh/train/dpo.py" tag="p5" lines="112-134" />
+
+Cada lote se rellena hasta **su propio** prompt más largo, no hasta `block`. Y `last[i]` guarda
+dónde acaba de verdad cada prompt, que es lo que la función siguiente lee.
+
+<Callout kind="roto" title="Leer en `-1` es un fallo sin síntoma">
+  La tentación es leer los logits en la última columna del tensor, `[:, -1]`, que es lo que se hace
+  cuando todas las filas miden lo mismo. Aquí no miden lo mismo: toda fila más corta que la más
+  larga del lote tendría su última columna llena de **relleno**, así que la pérdida se calcularía
+  sobre la predicción del token de padding. Y bajaría igual, porque el modelo aprende perfectamente
+  a predecir algo a partir del relleno. La curva sale sana y el modelo no ha aprendido nada de lo
+  que se le pedía.
+</Callout>
+
+```python title="src/rukh/train/dpo.py"
+def move_logprobs(model: MoveDecoder, batch: PreferenceBatch) -> torch.Tensor:
+    """Log-probabilities over the vocabulary at the position that predicts the next move."""
+    logits, _ = model(batch.tokens)
+    picked = logits[torch.arange(logits.shape[0], device=logits.device), batch.last]
+    return F.log_softmax(picked.float(), dim=-1)
+```
+
+<Src file="src/rukh/train/dpo.py" tag="p5" lines="137-141" />
+
+Cinco líneas y el `.float()` importa: el modelo puede correr en <Term id="bf16">bf16</Term>, y
+un `log_softmax` en media precisión sobre 2 030 clases pierde dígitos justo en la cola, que es
+donde viven las jugadas que el par quiere separar.
+
+```python title="src/rukh/train/dpo.py"
+def dpo_loss(
+    policy: torch.Tensor, reference: torch.Tensor, batch: PreferenceBatch, beta: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The DPO objective for a one-token completion, plus the margin and the accuracy.
+
+    ``margin`` is ``rewards/margins`` in the usual reporting: how much more the policy prefers the
+    better move than the reference did. ``accuracy`` is the share of pairs it orders correctly,
+    which is the number to watch -- a margin can grow while the ordering stays wrong.
+    """
+    index = torch.arange(policy.shape[0], device=policy.device)
+    chosen = policy[index, batch.chosen] - reference[index, batch.chosen]
+    rejected = policy[index, batch.rejected] - reference[index, batch.rejected]
+    margin = chosen - rejected
+    loss = -F.logsigmoid(beta * margin).mean()
+    accuracy = (policy[index, batch.chosen] > policy[index, batch.rejected]).float().mean()
+    return loss, margin.mean(), accuracy
+```
+
+<Src file="src/rukh/train/dpo.py" tag="p5" lines="144-159" />
+
+Esta es la pérdida entera de DPO, y cabe en seis líneas porque la completación es un token. Lee
+así: para cada par, `chosen` es cuánto ha subido la política la jugada buena **respecto a la
+referencia**, `rejected` lo mismo para la mala, y el margen es la diferencia de las dos
+diferencias. `β` escala el margen antes del `logsigmoid`: cuanto más grande, más se castiga un
+margen pequeño y más lejos se va la política.
+
+Y luego está `accuracy`, que mira la política **sola**, sin la referencia. Son dos preguntas
+distintas y hay que tenerlas separadas: el margen dice cuánto se ha movido la política respecto a
+donde estaba; el acierto dice si la ordenación que produce hoy es la correcta. Se puede mover mucho
+y ordenar peor, y eso es exactamente lo que pasó en uno de los dos brazos.
+
+```python title="src/rukh/train/dpo.py"
+def evaluate(
+    policy: MoveDecoder,
+    reference: MoveDecoder,
+    rows: list[tuple[list[int], int, int]],
+    cfg: DpoConfig,
+    device: torch.device,
+    pad_id: int,
+) -> tuple[float, float, float]:
+    """Mean loss, margin and pair accuracy over held-out pairs."""
+    policy.eval()
+    totals = [0.0, 0.0, 0.0]
+    seen = 0
+    with torch.no_grad():
+        for batch in batches(rows, cfg.batch_size, pad_id, shuffle=False, seed=cfg.seed):
+            batch = batch.to(device)
+            loss, margin, accuracy = dpo_loss(
+                move_logprobs(policy, batch), move_logprobs(reference, batch), batch, cfg.beta
+            )
+            n = len(batch)
+            totals[0] += float(loss) * n
+            totals[1] += float(margin) * n
+            totals[2] += float(accuracy) * n
+            seen += n
+    policy.train()
+    if not seen:
+        return math.nan, math.nan, math.nan
+    return totals[0] / seen, totals[1] / seen, totals[2] / seen
+```
+
+<Src file="src/rukh/train/dpo.py" tag="p5" lines="162-188" />
+
+La validación es el mismo cálculo en `no_grad` con el modelo en `eval`, ponderando por el
+tamaño de cada lote —el último lote casi nunca está lleno, y una media de medias lo contaría de
+más—. Y devuelve NaN en vez de cero cuando no hay nada que medir, porque un cero en una columna de
+pérdidas se lee como un resultado excelente.
+
+```python title="src/rukh/train/dpo.py"
+def train(cfg: DpoConfig) -> Path:
+    """Align a decoder on the preference pairs and return the checkpoint it wrote."""
+    import copy
+
+    import polars as pl
+
+    from rukh import paths
+    from rukh.train.checkpoint import load_model, save_checkpoint
+    from rukh.train.common import pick_device
+
+    torch.manual_seed(cfg.seed)
+    device = torch.device(cfg.device or pick_device())
+    tok = UciTokenizer()
+
+    policy, payload = load_model(paths.resolve(cfg.checkpoint), device)
+    policy = policy.to(device).train()
+    reference = copy.deepcopy(policy).eval()
+    for parameter in reference.parameters():
+        parameter.requires_grad_(False)
+
+    frame = pl.read_parquet(paths.resolve(cfg.pairs).as_posix())
+    rows = encode_pairs(frame, tok, cfg.block)
+    if not rows:
+        raise ValueError(f"{cfg.pairs} produced no usable pairs")
+    cut = int(len(rows) * (1 - cfg.val_fraction))
+    rng = np.random.default_rng(cfg.seed)
+    order = rng.permutation(len(rows))
+    train_rows = [rows[int(i)] for i in order[:cut]]
+    val_rows = [rows[int(i)] for i in order[cut:]]
+    LOGGER.info("dpo: %d pares de entrenamiento, %d de validación", len(train_rows), len(val_rows))
+
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=cfg.lr)
+    out_dir = paths.resolve(cfg.out_dir) / cfg.run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    before = evaluate(policy, reference, val_rows, cfg, device, tok.pad_id)
+    LOGGER.info("antes: loss %.4f · margen %.4f · aciertos %.4f", *before)
+    step = 0
+    for epoch in range(cfg.epochs):
+        for batch in batches(
+            train_rows, cfg.batch_size, tok.pad_id, shuffle=True, seed=cfg.seed + epoch
+        ):
+            batch = batch.to(device)
+            policy_logprobs = move_logprobs(policy, batch)
+            with torch.no_grad():
+                reference_logprobs = move_logprobs(reference, batch)
+            loss, margin, accuracy = dpo_loss(policy_logprobs, reference_logprobs, batch, cfg.beta)
+            if cfg.nll_weight:
+                index = torch.arange(policy_logprobs.shape[0], device=device)
+                loss = loss - cfg.nll_weight * policy_logprobs[index, batch.chosen].mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            optimizer.step()
+            step += 1
+            if step % 50 == 0:
+                LOGGER.info(
+                    "paso %d · loss %.4f · margen %.4f · aciertos %.4f",
+                    step,
+                    float(loss),
+                    float(margin),
+                    float(accuracy),
+                )
+    after = evaluate(policy, reference, val_rows, cfg, device, tok.pad_id)
+    LOGGER.info("después: loss %.4f · margen %.4f · aciertos %.4f", *after)
+
+    final = out_dir / "dpo.pt"
+    save_checkpoint(
+        final,
+        step=step,
+        model=policy,
+        optimizer=None,
+        cfg={
+            **cfg.model_dump(mode="json"),
+            "val_before": dict(zip(("loss", "margin", "accuracy"), before, strict=True)),
+            "val_after": dict(zip(("loss", "margin", "accuracy"), after, strict=True)),
+        },
+        model_cfg=payload["model_cfg"],
+        vocab_hash=payload.get("vocab_hash"),
+        data_manifest_sha=payload.get("data_manifest_sha"),
+    )
+    return final
+```
+
+<Src file="src/rukh/train/dpo.py" tag="p5" lines="191-272" />
+
+El bucle completo. Cuatro cosas que mirar.
+
+`reference = copy.deepcopy(policy).eval()` y el `requires_grad_(False)` de las tres líneas
+siguientes: la referencia se congela **dos veces**, por los gradientes y por el modo. Lo segundo es
+lo que se olvida. Una referencia que se queda en `train` sigue aplicando dropout, así que el
+mismo par daría una log-probabilidad de referencia distinta en cada época, y `β` estaría midiendo
+ruido. Es invisible en la curva.
+
+El `nll_weight` se aplica **restando** la log-probabilidad media de la jugada preferida, que es
+la pérdida de siguiente token sobre ella con el signo puesto. Está dentro de un `if` sobre el
+propio peso: con `nll_weight: 0` no se calcula, y el término no entra en el grafo.
+
+`clip_grad_norm_` a 1.0 antes de cada paso, que en una pérdida con un `logsigmoid` dentro no es
+ceremonia: un par que la política ordena muy mal produce un gradiente grande, y con `lr` de 5e-6
+un solo par así puede mover el modelo más que la época entera.
+
+Y el checkpoint guarda `val_before` y `val_after` dentro de su propia configuración. Es lo que
+permite que la lección 8 ponga las dos columnas de cada brazo en la misma tabla sin volver a medir.
+
+<Callout kind="roto" title="El reparto de DPO va por fila, no por partida">
+  Mira las cuatro líneas del `cut`: `rng.permutation(len(rows))` reparte **pares sueltos**. El
+  reward model de la lección anterior tiene una función entera, `split_examples`, para no hacer
+  exactamente esto, porque dos pares de la misma partida están a unos pocos plies y quien memorizó
+  uno tiene casi todo el otro. Aquí los dos pueden caer a los dos lados del corte.
+
+El efecto es acotado —lo que este número sostiene es una comparación entre dos brazos que usan el
+mismo reparto, no un valor absoluto— pero el acierto de validación que imprime DPO está inflado
+por una fuga que el fichero de al lado sí evita. Es el tipo de incoherencia que aparece cuando
+dos ficheros del mismo proyecto se escriben en hitos distintos.
+
+</Callout>
+
+## Los pares que salen del propio modelo
+
+Los 13 838 pares que el proyecto trae de M1 son **fuera de política**: salen de las evaluaciones
+multi-PV de Lichess, y dicen «aquí `e4` es mejor que `h4`» tanto si el modelo iba a considerar
+alguna de las dos como si no. Un par dentro de política hace una pregunta más estrecha: _de las
+jugadas que ibas a considerar aquí, ¿cuál era la mejor y cuál la peor?_
+
+```python title="src/rukh/data/onpolicy.py"
+"""Preference pairs built from the moves the **model** would actually play.
+
+The pairs the project already has are off-policy: they come from Lichess's multi-PV evaluations,
+so they say "in this position ``e4`` is better than ``h4``" regardless of whether the model was
+ever going to consider either. That is information, and it is not the information that fixes a
+particular model. A model only ever loses games to the moves it plays.
+
+An on-policy pair asks a narrower and more useful question: *of the moves you were going to
+consider here, which was best and which was worst?* Sample ``candidates`` moves from the model,
+score them with the engine, keep the best and the worst if they are far enough apart.
+
+Three decisions worth defending, because each one is a way the comparison could have been unfair.
+
+**The positions are the same ones the off-policy pairs use.** Same prefixes, same phase balance,
+same games. The only thing that changes between the two datasets is where the two moves came
+from, which is the whole point of running both.
+
+**The engine is limited by depth, not by time.** P4 measured that a time-limited Stockfish makes
+a measurement irreproducible (D-107): the same run twice gave 1498 and 1558. A depth limit gives
+the same answer on a busy machine and on an idle one, and a dataset is a thing that should be
+rebuildable.
+
+**Sampling is at temperature 1.0.** At the near-deterministic setting every published number is
+read at, a model proposes the same move four times and there is no pair to build. The candidates
+have to come from the distribution, not from its mode -- which is the same lesson M4 ended on.
+"""
+```
+
+<Src file="src/rukh/data/onpolicy.py" tag="p5" lines="1-26" />
+
+Las tres decisiones en negrita son las tres formas en que esta comparación se podía hacer injusta
+sin darse cuenta, y las tres merecen leerse como reglas de experimento y no como detalles de
+implementación.
+
+**Las posiciones son las mismas.** Mismos prefijos, mismo equilibrio por fase, mismas partidas. Lo
+único que cambia entre los dos conjuntos es de dónde salieron las dos jugadas, que es el motivo
+entero de construir el segundo.
+
+**El motor va limitado por profundidad y no por tiempo.** Un Stockfish con reloj da respuestas
+distintas en una máquina ocupada y en una libre, y un conjunto de datos es algo que debería poder
+reconstruirse. Es la misma conclusión que P4 sacó de la escalera (D-107) llegando por otro lado.
+
+**La temperatura es 1,0 y no la 0,3 a la que se leen todos los números publicados.** A la
+temperatura casi determinista el modelo propone su moda cuatro veces de cada cuatro y no hay nada
+que comparar. Es una de esas tensiones que no se resuelven: lo que hace estables los números
+publicados es exactamente lo que impide construir un par.
+
+```python title="src/rukh/data/onpolicy.py"
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+import chess
+import chess.engine
+import polars as pl
+import torch
+from pydantic import Field
+
+from rukh.config import BaseConfig
+from rukh.data.manifest import FileHash, Manifest
+from rukh.data.scoring import MATE_SCORE
+from rukh.data.uci import sha256_file
+from rukh.paths import resolve
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from rukh.models import MoveDecoder
+    from rukh.tokenize.uci_vocab import UciTokenizer
+
+log = logging.getLogger(__name__)
+
+__all__ = ["OnPolicyConfig", "build_on_policy", "score_move", "sample_candidates"]
+```
+
+<Src file="src/rukh/data/onpolicy.py" tag="p5" lines="28-51" />
+
+```python title="src/rukh/data/onpolicy.py"
+class OnPolicyConfig(BaseConfig):
+    """Where the positions come from, which model proposes, and how deep the engine looks."""
+
+    source: str = "data/pairs/dpo-prompts.parquet"
+    """The off-policy pairs. Only their **positions** are reused; their moves are not."""
+    checkpoint: str = ""
+    out: str = "data/pairs-onpolicy/pairs.parquet"
+    candidates: int = Field(default=4, ge=2)
+    """Moves sampled per position. `docs/spec/02` says four; more is more engine time per pair."""
+    temperature: float = Field(default=1.0, gt=0)
+    top_k: int | None = 20
+    depth: int = Field(default=10, ge=1)
+    """Engine depth. A depth limit is reproducible; a time limit is not (D-107)."""
+    min_delta_cp: int = Field(default=100, ge=1)
+    max_positions: int | None = None
+    seed: int = 42
+    device: str | None = None
+```
+
+<Src file="src/rukh/data/onpolicy.py" tag="p5" lines="54-70" />
+
+Cada campo con su motivo. `candidates: 4` es la palanca que fija el precio del conjunto, porque
+cada candidata cuesta un análisis de motor. `min_delta_cp: 100` es el umbral por debajo del cual
+las dos jugadas no son una preferencia sino ruido con signo. Y `depth` lleva su propio comentario
+citando la decisión que lo justifica.
+
+```python title="src/rukh/data/onpolicy.py"
+def score_move(
+    engine: chess.engine.SimpleEngine, board: chess.Board, move: chess.Move, depth: int
+) -> int:
+    """Centipawns **for the side that plays ``move``**, after playing it.
+
+    The engine is asked about the position the move leads to, where the *opponent* is to move, so
+    the score comes back from the opponent's point of view and is negated. Mates use the project's
+    own ``MATE_SCORE`` convention so these numbers can sit in the same column as the off-policy
+    ones without a footnote.
+    """
+    board.push(move)
+    try:
+        info = engine.analyse(board, chess.engine.Limit(depth=depth))
+        score = info["score"].pov(not board.turn)
+        return int(score.score(mate_score=MATE_SCORE))
+    finally:
+        board.pop()
+```
+
+<Src file="src/rukh/data/onpolicy.py" tag="p5" lines="73-89" />
+
+Diecisiete líneas donde cabe el peor error posible de este fichero, y por eso está escrito en el
+docstring. Al motor se le pregunta por la posición **a la que lleva** la jugada, donde mueve el
+rival, así que la puntuación vuelve desde el punto de vista del rival. El `pov(not board.turn)`
+es el giro. Equivocarse ahí construye un conjunto que prefiere sistemáticamente la peor candidata
+de cada grupo, y la pérdida de DPO lo aprende sin quejarse ni una vez.
+
+El `try`/`finally` con el `pop` es la otra mitad: el bucle de arriba reutiliza un solo tablero
+para todas las candidatas, así que un `push` que se quede puesto —porque el motor levantó una
+excepción, por ejemplo— envenena todo lo que venga después. Hay un test para cada una de las dos
+cosas.
+
+```python title="src/rukh/data/onpolicy.py"
+def sample_candidates(
+    model: MoveDecoder,
+    tok: UciTokenizer,
+    board: chess.Board,
+    history: list[int],
+    count: int,
+    temperature: float,
+    top_k: int | None,
+) -> list[chess.Move]:
+    """Distinct legal moves the model proposes here, sampled from its own distribution.
+
+    Illegal proposals are dropped rather than rescued: an on-policy pair is about ranking the
+    moves the model would *play*, and the demo masks illegal moves before they reach the board.
+    How often it proposes one is a different measurement, and the suite already makes it.
+    """
+    from rukh.infer.sampler import SampleConfig, model_generator, pick_move
+
+    cfg = SampleConfig(temperature=temperature, top_k=top_k, mask_illegal=False)
+    generator = model_generator(model, cfg)
+    seen: dict[str, chess.Move] = {}
+    for _ in range(count * 4):  # a few extra draws, since duplicates are the common case
+        move, _ = pick_move(model, tok, board, history, cfg, generator)
+        if move is not None and move in board.legal_moves:
+            seen.setdefault(move.uci(), move)
+        if len(seen) >= count:
+            break
+    return list(seen.values())
+```
+
+<Src file="src/rukh/data/onpolicy.py" tag="p5" lines="92-118" />
+
+El sorteo. Dos decisiones dentro.
+
+**Las propuestas ilegales se descartan, no se rescatan.** El muestreador del proyecto sabe
+enmascarar las jugadas ilegales antes de sortear, y aquí se le dice explícitamente que no lo haga
+(`mask_illegal=False`) para después tirar lo que salga mal. Suena a desperdicio y no lo es: un
+par dentro de política va de ordenar las jugadas que el modelo **jugaría**, y la demo enmascara las
+ilegales antes de que lleguen al tablero. Cuántas veces propone una es otra medida, y la suite ya
+la hace.
+
+**Se sortea cuatro veces de más.** Ese `range(count * 4)` está porque los duplicados son el caso
+común y no la excepción, incluso a temperatura 1,0. Es el mismo fenómeno que en GRPO cuenta los
+grupos planos, visto desde la generación de datos.
+
+```python title="src/rukh/data/onpolicy.py"
+def _history_for(tok: UciTokenizer, prefix: str, white_elo: int, black_elo: int) -> list[int]:
+    """The prompt the model sees: the same three header tokens the ladder uses, then the game."""
+    from rukh.infer.game import _history
+
+    ids = _history(tok, white_elo, black_elo)
+    ids.extend(tok.vocab.get(uci, tok.unk_id) for uci in prefix.split())
+    return ids
+```
+
+<Src file="src/rukh/data/onpolicy.py" tag="p5" lines="121-127" />
+
+Siete líneas que importan más de lo que parecen: el prompt se construye con la **misma** función
+que usan la escalera y la demo, importada de `infer.game`. Escribir aquí los tres tokens de
+cabecera a mano sería la forma más fácil de que dos mediciones del mismo modelo dejaran de ser
+comparables sin que nadie lo viera.
+
+```python title="src/rukh/data/onpolicy.py"
+def build_on_policy(cfg: OnPolicyConfig) -> Manifest:
+    """Sample, score and write the on-policy pairs, with a manifest that says how."""
+    from rukh.engine import find_stockfish
+    from rukh.eval.suite import resolve_model
+    from rukh.tokenize.uci_vocab import UciTokenizer
+    from rukh.train import load_model, pick_device
+
+    binary = find_stockfish()
+    if binary is None:
+        raise FileNotFoundError("Stockfish not found; set RUKH_STOCKFISH")
+    torch.manual_seed(cfg.seed)
+    where = cfg.device or pick_device()
+    tok = UciTokenizer()
+    model, _payload = load_model(resolve_model(cfg.checkpoint), map_location=where)
+    model = model.to(where).eval()
+
+    frame = pl.read_parquet(resolve(cfg.source))
+    if cfg.max_positions is not None:
+        # Shuffled first, because the source is phase-balanced *in blocks*: taking the head would
+        # buy a dataset made entirely of openings and then compare it to one that is not.
+        frame = frame.sample(n=min(cfg.max_positions, frame.height), shuffle=True, seed=cfg.seed)
+```
+
+<Src file="src/rukh/data/onpolicy.py" tag="p5" lines="130-150" />
+
+El recorte de `max_positions` lleva su comentario, y es el arreglo de un fallo que habría
+cambiado la comparación central del hito.
+
+<Callout kind="roto" title="Un `head()` no es una muestra">
+  La primera versión recortaba con `frame.head(n)`. El fichero de pares está equilibrado por fase
+  **en bloques**, así que las primeras 40 filas son un 65 % de aperturas frente al 33 % del fichero
+  entero (D-114). Si el recorte de un brazo es casi todo aperturas y el del otro no, lo que se
+  compara no son las dos fuentes de pares: es la mezcla de fases, que desde M2 se sabe que mueve
+  todo. Las cuarenta primeras entradas de la guía telefónica no son una muestra de la ciudad: son
+  cuarenta apellidos que empiezan por A.
+</Callout>
+
+```python title="src/rukh/data/onpolicy.py"
+    rows: list[dict[str, object]] = []
+    skipped_same = skipped_close = 0
+    with chess.engine.SimpleEngine.popen_uci(str(binary)) as engine:
+        for index, row in enumerate(frame.iter_rows(named=True)):
+            board = chess.Board()
+            try:
+                for uci in (row["prefix"] or "").split():
+                    board.push_uci(uci)
+            except ValueError:
+                continue
+            if board.is_game_over():
+                continue
+            history = _history_for(
+                tok, row["prefix"] or "", int(row["white_elo"]), int(row["black_elo"])
+            )
+            moves = sample_candidates(
+                model, tok, board, history, cfg.candidates, cfg.temperature, cfg.top_k
+            )
+            if len(moves) < 2:
+                skipped_same += 1
+                continue
+            scored = [(score_move(engine, board, move, cfg.depth), move) for move in moves]
+            scored.sort(key=lambda pair: pair[0], reverse=True)
+            (best_cp, best), (worst_cp, worst) = scored[0], scored[-1]
+            if best_cp - worst_cp < cfg.min_delta_cp:
+                skipped_close += 1
+                continue
+            rows.append(
+                {
+                    "game_id": str(row["game_id"]),
+                    "ply": int(row["ply"]),
+                    "prefix": row["prefix"],
+                    "chosen": best.uci(),
+                    "rejected": worst.uci(),
+                    "cp_chosen": int(best_cp),
+                    "cp_rejected": int(worst_cp),
+                    "phase": row["phase"],
+                    "white_elo": int(row["white_elo"]),
+                    "black_elo": int(row["black_elo"]),
+                    "candidates": len(moves),
+                }
+            )
+            if index and index % 250 == 0:
+                log.info(
+                    "%d positions, %d pairs (%d all-same, %d too close)",
+                    index,
+                    len(rows),
+                    skipped_same,
+                    skipped_close,
+                )
+```
+
+<Src file="src/rukh/data/onpolicy.py" tag="p5" lines="152-201" />
+
+El bucle. Los dos `continue` con contador son los dos motivos distintos por los que una posición
+no produce par, y conviene no confundirlos: menos de dos jugadas distintas es **falta de
+diversidad**; una diferencia por debajo del margen es **falta de desacuerdo**, y esto segundo no es
+un fallo. Es el modelo diciendo que todo lo que estaba considerando ahí era más o menos igual de
+bueno, y fabricar una preferencia con eso sería enseñarle ruido.
+
+Sobre las 13 838 posiciones completas, el reparto salió así: 46,1 % dio par, 27,1 % se quedó sin
+diversidad y 26,8 % sin desacuerdo. Ese 27,1 % es el mismo fenómeno que GRPO cuenta como grupos
+planos: **la confianza del propio modelo se lleva un cuarto del presupuesto de motor**, y no hay
+forma de saber cuál cuarto antes de pagarlo.
+
+```python title="src/rukh/data/onpolicy.py"
+    if not rows:
+        raise ValueError("no on-policy pair survived; loosen min_delta_cp or raise the temperature")
+    out = resolve(cfg.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    table = pl.DataFrame(rows)
+    table.write_parquet(out)
+    log.info("wrote %d on-policy pairs to %s", table.height, out)
+
+    manifest = Manifest(
+        dataset="rukh-pairs-onpolicy",
+        months=[],
+        filters={
+            "source": cfg.source,
+            "checkpoint": cfg.checkpoint,
+            "candidates": cfg.candidates,
+            "temperature": cfg.temperature,
+            "top_k": cfg.top_k,
+            "engine_depth": cfg.depth,
+            "min_delta_cp": cfg.min_delta_cp,
+            "seed": cfg.seed,
+            "skipped_all_same": skipped_same,
+            "skipped_too_close": skipped_close,
+            "note": (
+                "the moves come from the model, the positions from the off-policy pairs; "
+                "the engine is limited by depth so the dataset is rebuildable (D-107)"
+            ),
+        },
+        counts={"pairs": table.height, "positions": frame.height},
+        files=[FileHash(path=out.name, sha256=sha256_file(out), bytes=out.stat().st_size)],
+    )
+    text = manifest.model_dump_json(indent=2) + "\n"
+    (out.parent / "manifest.json").write_text(text, "utf-8")
+    return manifest
+```
+
+<Src file="src/rukh/data/onpolicy.py" tag="p5" lines="203-235" />
+
+El manifiesto es lo que convierte una carpeta con un parquet en un conjunto de datos: guarda la
+configuración entera con la que se construyó, los dos contadores de descartes, el hash del fichero
+y una nota que dice por qué el motor va por profundidad. La lección 6 lo publica tal cual.
+
+`counts` lleva `pairs` y `positions`, y eso obliga a una excepción al publicar —sumar las dos
+doblaría el tamaño del conjunto en la card— que también se ve en la lección 6.
+
+## Las tres configuraciones, y la que solo cambia una línea
+
+`configs/data/onpolicy.yaml` es la que construye el conjunto:
+
+{/* prettier-ignore */}
+```yaml title="configs/data/onpolicy.yaml"
+# Preference pairs sampled from the model itself, for the second half of M5's comparison.
+#
+# The positions are exactly the ones the off-policy pairs use, so the only thing that differs
+# between the two datasets is where the two moves came from. That is what makes the DPO runs
+# on them comparable at all.
+source: data/pairs/dpo-prompts.parquet
+checkpoint: checkpoints/medium-v4-20260919-174623/best.pt
+out: data/pairs-onpolicy/pairs.parquet
+
+# Four candidates is what `docs/spec/02` asks for. Each one costs an engine analysis, so this
+# is the knob that sets the price of the dataset.
+candidates: 4
+
+# Temperature 1.0, not the 0.3 every published number is read at: at the near-deterministic
+# setting the model proposes the same move four times and there is no pair to build.
+temperature: 1.0
+top_k: 20
+
+# Depth, not time. P4 measured that a time-limited Stockfish makes a run irreproducible
+# (D-107): the same ladder twice gave 1498 and 1558 Elo.
+depth: 10
+
+# Below a pawn apart the two moves are not a preference, they are noise with a sign.
+min_delta_cp: 100
+seed: 42
+```
+
+<Src file="configs/data/onpolicy.yaml" tag="p5" lines="1-25" />
+
+Y las dos de DPO son el experimento. Esta es la del brazo bajo prueba, entera:
+
+{/* prettier-ignore */}
+```yaml title="configs/train/dpo-onpolicy.yaml"
+# DPO on the moves the model itself proposed: on-policy, and the arm under test.
+# Everything below is identical to `dpo-offpolicy.yaml` on purpose -- if the two runs differ, it
+# has to be the pairs and nothing else. The pair counts are matched at run time by the lab script.
+pairs: data/pairs-onpolicy/pairs.parquet
+checkpoint: checkpoints/medium-v4-20260919-174623/best.pt
+out_dir: checkpoints
+run_name: medium-v4-dpo-onpolicy
+
+# beta is the distance the policy is allowed to travel from its frozen reference. 0.1 is the
+# published default and the one P5 measured at +40 Elo head-to-head against the base model.
+beta: 0.1
+lr: 5.0e-6
+
+# A little next-token loss on the chosen move. Pure DPO can raise the margin while the model
+# forgets how to play at all: the margin says "chosen beats rejected", not "chosen is good".
+nll_weight: 0.1
+
+batch_size: 32
+epochs: 1
+val_fraction: 0.1
+seed: 42
+```
+
+<Src file="configs/train/dpo-onpolicy.yaml" tag="p5" lines="1-21" />
+
+De la otra solo hay que enseñar lo que cambia, porque **es lo único que cambia**: las dieciocho
+líneas restantes son idénticas, carácter a carácter.
+
+{/* prettier-ignore */}
+```yaml title="configs/train/dpo-offpolicy.yaml"
+# DPO on the pairs Lichess's evaluations produced: off-policy, and the control arm of M5's
+# comparison. The only line that differs from `dpo-onpolicy.yaml` is `pairs`.
+pairs: data/pairs-offpolicy-matched/pairs.parquet
+```
+
+<Src file="configs/train/dpo-offpolicy.yaml" tag="p5" lines="1-3" />
+
+`data/pairs-offpolicy-matched/` no es el fichero original de 13 838 pares: es ese fichero
+submuestreado a **6 386** con semilla fija, para que los dos brazos vean exactamente la misma
+cantidad de datos.
+
+<Exercise n="01" title="¿Qué medirías si no los igualaras?">
+  El conjunto fuera de política tiene 13 838 pares y el de dentro 6 386. Si entrenas los dos tal
+  cual y el de fuera sale mejor, ¿qué has medido?
+
+  <Solution>
+    La cantidad de datos, no la fuente. Con 2,2 veces más pares, el brazo de fuera tiene 2,2 veces
+    más pasos de optimizador sobre el mismo modelo de partida, y eso solo basta para explicar una
+    diferencia. Por eso `dpo-offpolicy.yaml` apunta al conjunto submuestreado.
+
+    Hay una segunda diferencia que **no** se puede igualar y que por eso hay que declarar: los
+    pares de fuera tienen un 29 % de mates y los de dentro un 2,9 %. Eso no es un defecto de la
+    construcción, es lo que significa «dentro de política» —una evaluación multi-PV encuentra mates
+    que el modelo nunca iba a proponer— y la única salida honesta es escribirlo, no esconderlo.
+
+  </Solution>
+</Exercise>
+
+<Transfer
+  concept="Igualar todo menos la variable bajo estudio"
+  where="Comparar dos prompts de sistema, dos estrategias de troceado en un RAG, dos modelos base: si además cambia el tamaño del conjunto, el presupuesto o la temperatura, no has medido lo que creías."
+>
+  Dos conjuntos de datos solo son comparables cuando lo único que difiere entre ellos es lo que
+  estás estudiando. Y cuando algo no se puede igualar —aquí, la proporción de mates— la regla no es
+  abandonar la comparación: es declararlo en la misma tabla en la que publicas el resultado, para
+  que quien la lea sepa qué parte del efecto podría ser eso.
+</Transfer>
+
+## Las dos órdenes
+
+`rukh data onpolicy` construye el conjunto, y sus dos banderas son las dos que se quieren tocar
+sin editar un YAML: qué modelo propone y cuántas posiciones recorrer.
+
+```python title="src/rukh/cli.py"
+@data_app.command("onpolicy")
+def data_onpolicy(
+    config: Annotated[
+        Path,
+        typer.Option("--config", exists=True, dir_okay=False, help="On-policy pair run YAML."),
+    ],
+    checkpoint: Annotated[
+        str | None, typer.Option("--checkpoint", help="Override the proposing model.")
+    ] = None,
+    max_positions: Annotated[
+        int | None, typer.Option("--max-positions", help="Stop after this many positions.")
+    ] = None,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the manifest as JSON only.")
+    ] = False,
+) -> None:
+    """Build preference pairs out of the moves the model itself proposes.
+
+    The pairs the project already has are off-policy: Lichess evaluated two moves and one was
+    better, whether or not this model was ever going to play either. On-policy pairs ask the
+    narrower question that actually changes a model -- *of the moves you were going to consider
+    here, which is best and which is worst?* -- and are the second half of M5's comparison.
+    """
+    from rukh.config import load_yaml
+    from rukh.data.onpolicy import OnPolicyConfig, build_on_policy
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    cfg = load_yaml(config, OnPolicyConfig)
+    if checkpoint:
+        cfg = cfg.model_copy(update={"checkpoint": checkpoint})
+    if max_positions is not None:
+        cfg = cfg.model_copy(update={"max_positions": max_positions})
+    manifest = build_on_policy(cfg)
+    _echo_manifest(manifest, as_json, Path(cfg.out).parent)
+```
+
+<Src file="src/rukh/cli.py" tag="p5" lines="280-313" />
+
+El `model_copy(update=...)` en vez de asignar sobre la configuración es lo que mantiene la
+validación de pydantic al aplicar una bandera: un `--max-positions 0` se rechaza aquí y no
+doscientas líneas más tarde.
+
+```python title="src/rukh/cli.py"
+@train_app.command("dpo")
+def train_dpo_cmd(
+    config: Annotated[
+        Path, typer.Option("--config", exists=True, dir_okay=False, help="DPO run YAML.")
+    ],
+    pairs: Annotated[
+        str | None, typer.Option("--pairs", help="Override the preference pairs to train on.")
+    ] = None,
+    run_name: Annotated[str | None, typer.Option("--run-name", help="Name the output.")] = None,
+    device: Annotated[str | None, typer.Option("--device", help="Where to train.")] = None,
+) -> None:
+    """Align the decoder on preference pairs, with the frozen start as its own reference.
+
+    The reference is implicit: a copy of the starting weights, never trained. That is what lets
+    DPO skip the reward model entirely, and it is also what the ``beta`` knob is measured against
+    -- push too hard and the policy leaves a reference that cannot follow it.
+    """
+    from rukh.config import load_yaml
+    from rukh.train.dpo import DpoConfig, train
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    cfg = load_yaml(config, DpoConfig)
+    updates = {k: v for k, v in (("pairs", pairs), ("run_name", run_name), ("device", device)) if v}
+    if updates:
+        cfg = cfg.model_copy(update=updates)
+    typer.echo(f"wrote {train(cfg)}")
+```
+
+<Src file="src/rukh/cli.py" tag="p5" lines="819-844" />
+
+Y la de DPO, veintiséis líneas, donde lo único que hay es el mismo patrón: cargar el YAML, aplicar
+lo que venga por bandera, correr. Fíjate en el diccionario por comprensión con el filtro `if v`:
+una bandera que no se pasó no llega a `model_copy`, así que no puede pisar con `None` lo que el
+fichero decía.
+
+Los comandos del hito, en orden:
+
+```bash title="Terminal"
+uv run rukh data onpolicy --config configs/data/onpolicy.yaml
+uv run rukh train dpo --config configs/train/dpo-onpolicy.yaml
+uv run rukh train dpo --config configs/train/dpo-offpolicy.yaml
+```
+
+## Los tests que sostienen la comparación
+
+`tests/unit/test_onpolicy.py` son 131 líneas. Aquí van las tres que fijan la convención de
+puntuación, que es donde vive el fallo que no avisa; el resto —el descarte de propuestas ilegales,
+las guardas de la configuración y que el prompt sea el mismo que el de la escalera— está enlazado
+en la tabla del final de esta lección.
+
+```python title="tests/unit/test_onpolicy.py"
+def test_the_score_comes_back_for_the_side_that_played_the_move():
+    """+120 for White is +120 when White moved and -120 when Black did."""
+    engine = _FakeEngine(120)
+    board = chess.Board()
+    assert score_move(engine, board, chess.Move.from_uci("e2e4"), depth=4) == 120
+
+    board.push_uci("e2e4")
+    assert score_move(engine, board, chess.Move.from_uci("e7e5"), depth=4) == -120
+
+
+def test_scoring_a_move_leaves_the_board_exactly_as_it_found_it():
+    """The loop reuses one board for every candidate; a stray push poisons the rest."""
+    engine = _FakeEngine(0)
+    board = chess.Board()
+    board.push_uci("d2d4")
+    before = board.fen()
+    score_move(engine, board, chess.Move.from_uci("d7d5"), depth=4)
+    assert board.fen() == before
+
+
+@pytest.mark.parametrize(("moves", "expected"), [(1, MATE_SCORE - 1), (5, MATE_SCORE - 5)])
+def test_a_mate_is_scored_with_the_project_convention(moves: int, expected: int):
+    """``MATE_SCORE`` minus the distance, the same convention the off-policy column uses.
+
+    The subtraction is not decoration: it is what makes a mate in one preferable to a mate in
+    five, which is a preference a pair should be able to express.
+    """
+
+    class _Mate(_FakeEngine):
+        def analyse(self, board: chess.Board, limit: object) -> dict[str, object]:
+            return {"score": chess.engine.PovScore(chess.engine.Mate(moves), chess.WHITE)}
+
+    assert score_move(_Mate(0), chess.Board(), chess.Move.from_uci("e2e4"), depth=4) == expected
+```
+
+<Src file="tests/unit/test_onpolicy.py" tag="p5" lines="39-71" />
+
+El primero es el giro de signo: +120 para las blancas es +120 cuando movieron ellas y −120 cuando
+movió el negro. El segundo comprueba que el tablero vuelve como estaba, que es lo que el
+`try`/`finally` promete. Y el tercero, parametrizado, fija que un mate se puntúa con la
+convención del proyecto, `MATE_SCORE` menos la distancia: esa resta no es decoración, es lo que
+hace que un mate en uno sea preferible a un mate en cinco, que es una preferencia que un par
+debería poder expresar.
+
+Los tres son de milisegundos porque el motor es un objeto de nueve líneas que contesta siempre lo
+mismo. Un test que necesita a Stockfish para comprobar un signo no se ejecuta en cada guardado, y
+uno que no se ejecuta no protege nada.
+
+## Lo que se enlaza en vez de pegarse
+
+Tres ficheros de este bloque quedan enlazados, y conviene decir por qué cada uno:
+
+<div class="table-wrap">
+
+| Fichero                                                                                                                | Qué garantiza                                                                                                                                                                               | Por qué no está pegado                                                                                                                                                              |
+| ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`tests/unit/test_onpolicy.py`](https://github.com/borja-glez/rukh/blob/p5/tests/unit/test_onpolicy.py), líneas 74-131 | que una propuesta ilegal se descarta y un duplicado no cuenta como segunda candidata; que `candidates: 1` y `temperature: 0` se rechazan; y que el prompt es el mismo que el de la escalera | son tres tests de fontanería sobre decisiones que la prosa de arriba ya explica, y el módulo muestra entre un tercio y la mitad de sus líneas de test eligiendo las que más enseñan |
+| [`data/pairs-onpolicy/pairs.parquet`](https://huggingface.co/datasets/chorcat/rukh-pairs-onpolicy)                     | los 6 386 pares que salieron                                                                                                                                                                | es un artefacto generado, no código: se reconstruye con el comando de arriba o se descarga con `rukh pull`                                                                          |
+| [`docs/runbooks/alineamiento.md`](https://github.com/borja-glez/rukh/blob/p5/docs/runbooks/alineamiento.md)            | la secuencia exacta de comandos del hito, con cada salida                                                                                                                                   | es documentación del repo de ML, y lo que enseña está repartido por las lecciones 8 y 9                                                                                             |
+
+</div>
+
+## Qué has aprendido
+
+Que DPO se salta el reward model porque su referencia es implícita: una copia congelada de los
+pesos de partida, que hay que congelar dos veces —gradientes y modo— o `β` mide ruido. Que en
+este proyecto la pérdida cabe en seis líneas porque una jugada es un token, y que devuelve el
+margen y el acierto por separado a propósito, porque el primero puede subir mientras el segundo
+baja. Y que construir el segundo brazo de una comparación es sobre todo un ejercicio de igualar
+todo lo demás: las mismas posiciones, el mismo motor determinista, el mismo número de pares, y
+declarar en voz alta lo único que no se pudo igualar.
+
+Lo siguiente es el otro camino: sin pares, sin reward model, y con una recompensa que se puede
+escribir y comprobar.

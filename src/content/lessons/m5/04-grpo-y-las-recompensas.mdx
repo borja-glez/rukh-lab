@@ -1,0 +1,1850 @@
+---
+title: 'GRPO y la recompensa que un motor verifica'
+description:
+  'Las 189 líneas de la recompensa verificable con sus cuatro reglas y su test de cotas sobre
+  entradas aleatorias, y las 561 de GRPO: el grupo como línea base, el estimador k3, la caché de
+  motor, y la métrica de entrenamiento que se maximiza colapsando la política.'
+module: m5
+order: 4
+duration: 240
+runtime: 90
+level: avanzado
+status: vigente
+updated: 2026-09-22
+keywords:
+  - GRPO
+  - recompensa verificable
+  - RLVR
+  - ventaja relativa
+  - línea base
+  - grupo plano
+  - KL
+  - k3
+  - reward hacking
+artifacts:
+  - kind: model
+    label: chorcat/rukh-medium-grpo
+    href: https://huggingface.co/chorcat/rukh-medium-grpo
+---
+
+## Qué vas a construir
+
+El otro camino: **sin pares y sin reward model**. Para cada posición la política propone ocho
+jugadas, una función las puntúa, y cada una se empuja arriba o abajo según cómo le fue frente a la
+media de su propio grupo. No hay red de valor, no hay crítico, no hay nada que entrenar dos veces.
+
+Son dos ficheros y sus tests, unas 1 100 líneas. Primero la recompensa, porque GRPO no tiene
+sentido sin ella: <Term id="grpo">GRPO</Term> no necesita un reward _model_, necesita una **función**
+de recompensa, y el ajedrez es uno de los poquísimos sitios donde esa función se puede escribir y
+comprobar. Nada de lo que viene se aprende, así que nada puede equivocarse como se equivoca una
+recompensa aprendida: solo puede estar **mal diseñada**, que es otro problema y el que ordena la
+lección.
+
+## La recompensa verificable: 189 líneas y cuatro reglas
+
+El docstring del fichero son las cuatro reglas, y cada una existe porque su contraria produce un
+fallo concreto. Vale la pena leerlas antes que el código.
+
+```python title="src/rukh/train/rewards.py"
+"""Verifiable rewards for a chess move, and the reason each one is capped.
+
+GRPO does not need a reward *model*: it needs a reward *function*, and a chess move is one of the
+rare places where that function can be written down and checked. A move is legal or it is not; a
+position is worth a number Stockfish will tell you; a mate is a mate. Nothing here is learned,
+so nothing here can be wrong in the way a learned reward is wrong -- it can only be **designed**
+wrong, which is a different problem and the one this module is about.
+
+Four rules shape every function below.
+
+**Legality is a gate, not a term.** An illegal move scores zero and skips the rest. Adding a
+legality *bonus* to a weighted sum lets the model trade legality for something else, and the whole
+point of a verifiable reward is that some things are not tradeable.
+
+**Everything is capped.** A reward with no ceiling is an invitation: the optimiser will find the
+direction that grows without bound and go there, and what comes back is a model that maximises the
+number instead of playing chess. Every function here returns a value in a closed interval, and
+there is a test that says so over thousands of random inputs.
+
+**Sign and scale are fixed by hand, not by the data.** `delta_cp` is normalised by a constant the
+caller passes, not by the spread of the batch, because a reward that rescales itself makes two
+runs incomparable and hides the moment the model stops improving.
+
+**Every function is pure.** Board in, number out, no engine call inside. The engine scores are
+passed in, which is what lets the tests run in milliseconds on the CPU and what keeps the reward
+from becoming a second place where the analysis budget is decided.
+"""
+```
+
+<Src file="src/rukh/train/rewards.py" tag="p5" lines="1-27" />
+
+**La legalidad es una puerta, no un término.** Sumar un _bonus_ por ser legal a una suma ponderada
+le permite al modelo cambiar legalidad por otra cosa, y el sentido de una <Term id="recompensa-verificable">recompensa verificable</Term> es que hay cosas que no se cambian
+por nada. El carné de conducir es una puerta: sin carné no se conduce, y no hay un coche lo bastante
+bueno que compense «menos dos puntos por no tenerlo».
+
+**Todo está acotado.** Una recompensa sin techo es una invitación: el optimizador encuentra la
+dirección que crece sin límite y se va por ahí. Es el efecto cobra —el gobierno colonial de Delhi
+pagó por cada cobra muerta, sin tope, y la gente se puso a criar cobras—, y aquí el tope es
+comprobable con un test sobre cientos de entradas aleatorias.
+
+**El signo y la escala se fijan a mano.** `delta_cp` se normaliza por una constante que pasa
+quien llama, no por la dispersión del lote, porque una recompensa que se reescala sola hace
+incomparables dos corridas y esconde el momento en que el modelo deja de mejorar.
+
+**Todas las funciones son puras.** Tablero y números entran, número sale, sin llamar al motor
+dentro. Las puntuaciones vienen de fuera, que es lo que permite que los tests corran en
+milisegundos en CPU y lo que impide que la recompensa se convierta en un segundo sitio donde se
+decide el presupuesto de análisis.
+
+<Callout kind="roto" title="La primera frase del docstring ya no es verdad">
+  «An illegal move scores zero and skips the rest», dice la regla de la puerta. El código no hace
+  eso: devuelve `illegal_value(weights)`, que con los pesos por defecto es **−1,25**. El docstring
+  se quedó con la versión anterior, la del cero plano, que es justamente la que el callout de más
+  abajo cuenta que estaba mal. Es una errata del repositorio y no del diseño, pero conviene verla:
+  un docstring que describe el comportamiento de hace tres commits es tan engañoso como un
+  comentario que miente.
+</Callout>
+
+```python title="src/rukh/train/rewards.py"
+from __future__ import annotations
+
+import chess
+from pydantic import Field
+
+from rukh.config import BaseConfig
+
+__all__ = [
+    "ILLEGAL_MARGIN",
+    "RewardBreakdown",
+    "RewardWeights",
+    "illegal_value",
+    "legal_bounds",
+    "legality_gate",
+    "mate_bonus",
+    "normalised_delta_cp",
+    "reward",
+    "repetition_penalty",
+]
+```
+
+<Src file="src/rukh/train/rewards.py" tag="p5" lines="29-47" />
+
+Cuatro imports. `BaseConfig` es el modelo estricto del proyecto —rechaza claves desconocidas—,
+así que un peso mal escrito en un YAML falla al cargar y no al entrenar.
+
+```python title="src/rukh/train/rewards.py"
+ILLEGAL_MARGIN = 1.0
+"""How far below every legal move an illegal one scores. See ``illegal_value``.
+
+A flat ``0.0`` was the obvious choice and was wrong, and the gallery in `labs/m5` is what caught
+it: with the default weights a legal move that walks into a repetition scores ``-0.25``, so a
+zero for illegal moves put **illegal above legal** for exactly the moves the repetition term was
+written to discourage. A gate that the thing it gates can score better than is not a gate.
+
+The margin is a whole unit rather than an epsilon so the ordering survives any reweighting that
+keeps the other terms in their documented ranges."""
+```
+
+<Src file="src/rukh/train/rewards.py" tag="p5" lines="49-58" />
+
+Diez líneas para una constante, y el docstring es la historia del fallo que la puso ahí.
+
+<Callout kind="roto" title="La puerta que lo que controla se podía saltar">
+  `ILLEGAL` era un `0.0` plano. Con los pesos por defecto, el intervalo de una jugada **legal**
+  es `[−0,25, 1,25]`: el cero cae **dentro**. Así que una jugada que no se puede jugar puntuaba
+  `0,0` y una jugada legal que se mete en repetición puntuaba `−0,25`. A la política se le
+  estaba diciendo, con todas las letras, que proponer algo imposible es mejor que jugar algo que
+  repite — y justo en las jugadas que el término de repetición se escribió para desincentivar.
+
+Lo encontró la galería de `labs/m5` escribiendo los fallos ajenos (D-115). El arreglo es
+derivar el valor de los pesos en vez de escribirlo, y el margen es una unidad entera y no un
+epsilon para que la ordenación sobreviva a cualquier reponderación razonable.
+
+</Callout>
+
+```python title="src/rukh/train/rewards.py"
+class RewardWeights(BaseConfig):
+    """How much each verifiable rule is worth, and the constants that cap them.
+
+    The defaults are the ones `docs/spec/02` names, written down so a run can be reproduced from
+    its config alone. They are **not** tuned: tuning them against the Elo they produce would make
+    the reward a second model fitted to the evaluation, which is exactly the loop this module
+    warns about.
+    """
+
+    quality: float = Field(default=1.0, ge=0)
+    """Weight of the centipawn term: how close the move was to the best one available."""
+    mate: float = Field(default=0.25, ge=0)
+    """Weight of the mate bonus. Small on purpose -- finding mate is already the best `delta_cp`,
+    so a large bonus would pay twice for the same move."""
+    repetition: float = Field(default=0.25, ge=0)
+    """Weight of the repetition penalty, the only negative term."""
+    cp_scale: float = Field(default=200.0, gt=0)
+    """Centipawns at which the quality term reaches zero. A move 200 cp worse than the best is as
+    bad as this reward can say; beyond that the difference stops mattering, which is true of chess
+    and keeps one catastrophe from dominating a whole group."""
+```
+
+<Src file="src/rukh/train/rewards.py" tag="p5" lines="61-80" />
+
+Los pesos, con su intervalo y su motivo. `mate: 0.25` es pequeño a propósito: encontrar mate ya
+es el mejor `delta_cp` posible, así que un bono grande pagaría dos veces por la misma jugada. Y
+`cp_scale: 200` es dónde se agota el término de calidad: una jugada 200 centipeones peor que la
+mejor es lo peor que esta recompensa sabe decir, lo cual es aproximadamente cierto del ajedrez y
+además impide que una sola catástrofe domine un grupo entero.
+
+La frase que hay que leer entera es la del final del docstring: los pesos **no están ajustados**.
+Ajustarlos contra el Elo que producen convertiría la recompensa en un segundo modelo entrenado
+sobre la evaluación, que es exactamente el bucle del que este módulo avisa.
+
+```python title="src/rukh/train/rewards.py"
+class RewardBreakdown(BaseConfig):
+    """The reward and every term that went into it, because a scalar hides its own design."""
+
+    total: float
+    legal: bool
+    quality: float = 0.0
+    mate: float = 0.0
+    repetition: float = 0.0
+
+    @property
+    def terms(self) -> dict[str, float]:
+        return {"quality": self.quality, "mate": self.mate, "repetition": self.repetition}
+```
+
+<Src file="src/rukh/train/rewards.py" tag="p5" lines="83-94" />
+
+La recompensa nunca viaja sola: viaja con sus términos. Un escalar esconde su propio diseño, y
+todo lo que la lección 8 dice sobre qué parte de una subida es calidad y qué parte es otra cosa
+sale de este desglose.
+
+```python title="src/rukh/train/rewards.py"
+def legality_gate(board: chess.Board, move: chess.Move) -> bool:
+    """Whether the move can be played here at all. The gate every other term sits behind."""
+    return move in board.legal_moves
+```
+
+<Src file="src/rukh/train/rewards.py" tag="p5" lines="97-99" />
+
+```python title="src/rukh/train/rewards.py"
+def normalised_delta_cp(cp_move: float, cp_best: float, scale: float = 200.0) -> float:
+    """``1`` for the best move, ``0`` for one ``scale`` centipawns worse or more.
+
+    Both scores are from the **mover's** point of view, so the best available move is the largest.
+    Clamped at both ends: a move cannot be better than the best one, and one that is catastrophic
+    is not more informative than one that is merely losing -- letting it go to minus infinity
+    would let a single blunder decide the advantage of a whole group.
+    """
+    if scale <= 0:
+        raise ValueError("scale must be positive")
+    loss = max(0.0, float(cp_best) - float(cp_move))
+    return max(0.0, 1.0 - loss / scale)
+```
+
+<Src file="src/rukh/train/rewards.py" tag="p5" lines="102-113" />
+
+La puerta son tres líneas y el término de calidad doce. Lo que hay que leer aquí son los **dos**
+recortes, porque los dos están puestos a mano y los dos cuestan algo.
+
+Por arriba: una jugada no puede ser mejor que la mejor, así que `normalised_delta_cp(100, 50)`
+devuelve 1,0 y no 1,25. Por abajo: una jugada catastrófica no es más informativa que una
+simplemente perdedora, así que un error de 943 centipeones y uno de 355 puntúan los dos cero con
+`scale=200`.
+
+Ese segundo recorte tiene un precio honesto y medido: **se pierde resolución abajo**. En la galería
+de la lección 9, dos jugadas que están a 355 y a 943 centipeones del óptimo sacan exactamente la
+misma ventaja. Un intervalo cerrado se paga así, y conviene decir que es un cambio y no una mejora
+gratis.
+
+```python title="src/rukh/train/rewards.py"
+def mate_bonus(board: chess.Board, move: chess.Move) -> float:
+    """``1`` when the move mates, ``0`` otherwise. Deliberately binary.
+
+    Not "distance to mate": a shorter mate is not a better outcome, it is the same outcome sooner,
+    and paying for the difference teaches the model to prefer flashy mates over sure ones.
+    """
+    copy = board.copy(stack=False)
+    copy.push(move)
+    return 1.0 if copy.is_checkmate() else 0.0
+```
+
+<Src file="src/rukh/train/rewards.py" tag="p5" lines="116-124" />
+
+Binario a propósito, y la razón es de diseño de incentivos y no de cálculo. «Distancia al mate»
+está ahí, en los datos, y es tentador: un mate en uno parece mejor que un mate en cinco. No lo es
+—es el mismo resultado antes— y pagar por la diferencia le enseña al modelo a preferir mates
+vistosos antes que mates seguros.
+
+El `copy(stack=False)` es la versión barata: no hace falta el historial de la partida para
+preguntar si esto es jaque mate.
+
+```python title="src/rukh/train/rewards.py"
+def repetition_penalty(board: chess.Board, move: chess.Move) -> float:
+    """``1`` when the move walks into a repetition, ``0`` otherwise.
+
+    The one negative term, and the one that exists because of an observed failure rather than a
+    principle: a model rewarded for not losing discovers that shuffling never loses. The penalty
+    fires on a position seen before in this game, which is what `chess.Board.is_repetition(2)`
+    answers, rather than on the threefold claim -- by the time the draw is claimable the shuffling
+    has already happened and the reward arrives too late to discourage it.
+    """
+    copy = board.copy()
+    copy.push(move)
+    return 1.0 if copy.is_repetition(2) else 0.0
+```
+
+<Src file="src/rukh/train/rewards.py" tag="p5" lines="127-138" />
+
+El único término negativo, y el único que existe por una observación en vez de por un principio:
+un modelo premiado por no perder descubre que dar vueltas nunca pierde.
+
+Salta sobre `is_repetition(2)` —una posición ya vista en esta partida— y no sobre la reclamación
+de tablas por triple repetición. Cuando las tablas ya se pueden reclamar, el paseo **ya ha
+ocurrido** y la recompensa llega tarde para desincentivarlo. Aquí el `copy()` sí lleva el
+historial, porque la repetición es precisamente una pregunta sobre el historial.
+
+```python title="src/rukh/train/rewards.py"
+def reward(
+    board: chess.Board,
+    move: chess.Move,
+    cp_move: float | None = None,
+    cp_best: float | None = None,
+    weights: RewardWeights | None = None,
+) -> RewardBreakdown:
+    """The whole reward of one move, with its terms.
+
+    ``cp_move`` and ``cp_best`` come from outside -- the caller decides the analysis budget once,
+    for the whole group, instead of every reward call deciding it again. When they are missing the
+    quality term is zero and the reward falls back to what can be known without an engine, which
+    is legality, mate and repetition.
+    """
+    weights = weights or RewardWeights()
+    if not legality_gate(board, move):
+        return RewardBreakdown(total=illegal_value(weights), legal=False)
+
+    quality = 0.0
+    if cp_move is not None and cp_best is not None:
+        quality = normalised_delta_cp(cp_move, cp_best, weights.cp_scale)
+    mate = mate_bonus(board, move)
+    repetition = repetition_penalty(board, move)
+
+    total = weights.quality * quality + weights.mate * mate - weights.repetition * repetition
+    return RewardBreakdown(
+        total=total, legal=True, quality=quality, mate=mate, repetition=repetition
+    )
+```
+
+<Src file="src/rukh/train/rewards.py" tag="p5" lines="141-168" />
+
+La recompensa entera. La puerta primero y el `return` temprano; después los tres términos y la
+suma ponderada, con la repetición restando.
+
+`cp_move` y `cp_best` vienen **de fuera**, y esa es la cuarta regla en su forma práctica: quien
+llama decide el presupuesto de análisis una vez, para todo el grupo, en vez de que cada llamada lo
+decida otra vez. Cuando faltan, el término de calidad es cero y la recompensa cae a lo que se puede
+saber sin motor: legalidad, mate y repetición.
+
+```python title="src/rukh/train/rewards.py"
+def legal_bounds(weights: RewardWeights | None = None) -> tuple[float, float]:
+    """The closed interval a **legal** move falls in."""
+    weights = weights or RewardWeights()
+    return (-weights.repetition, weights.quality + weights.mate)
+
+
+def illegal_value(weights: RewardWeights | None = None) -> float:
+    """What an illegal move scores: strictly below anything a legal move can reach.
+
+    This is the number that makes legality a gate rather than a preference. It is derived from the
+    weights instead of being a constant, because a constant is a promise that quietly stops being
+    true the first time somebody raises ``repetition``.
+    """
+    return legal_bounds(weights)[0] - ILLEGAL_MARGIN
+
+
+def bounds(weights: RewardWeights | None = None) -> tuple[float, float]:
+    """The closed interval every reward falls in, which is what makes the design auditable."""
+    return (illegal_value(weights), legal_bounds(weights)[1])
+```
+
+<Src file="src/rukh/train/rewards.py" tag="p5" lines="171-189" />
+
+Y las tres funciones que hacen el diseño auditable. `legal_bounds` es el intervalo de una jugada
+legal, `illegal_value` está estrictamente por debajo de él, y `bounds` es el intervalo cerrado
+en el que cae **toda** recompensa. Que exista esta última es lo que permite escribir un test que
+compruebe la promesa en vez de confiar en ella.
+
+<Transfer
+  concept="Una métrica con cotas explícitas"
+  where="Cualquier puntuación que un sistema optimice: la relevancia de un reranker, el score de un juez LLM, una función de coste de scheduling."
+>
+  Si una función que algo va a maximizar no tiene un intervalo escrito y comprobable, no sabes qué
+  estás pidiendo. Escribe la cota como código —una función que devuelve `(mínimo, máximo)` a partir
+  de los mismos parámetros que la métrica— y pon un test que la compruebe con entradas absurdas. Una
+  constante escrita a mano en un comentario deja de ser cierta la primera vez que alguien toca un
+  peso, y no avisa.
+</Transfer>
+
+### Los tests de la recompensa, enteros
+
+150 líneas, y son el contrato: la mejor jugada saca lo máximo, una ilegal saca el suelo, y ninguna
+entrada de ningún sitio produce un número fuera del intervalo prometido.
+
+```python title="tests/unit/test_rewards.py"
+"""The reward functions, written before anything trains on them.
+
+A learned reward can be wrong in ways nobody notices. A verifiable one can only be **designed**
+wrong, and a design is testable: the best move gets the most, an illegal move gets nothing, and no
+input anywhere produces a number outside the interval the design promises.
+"""
+
+from __future__ import annotations
+
+import random
+
+import chess
+import pytest
+
+from rukh.train.rewards import (
+    RewardWeights,
+    bounds,
+    illegal_value,
+    legal_bounds,
+    legality_gate,
+    mate_bonus,
+    normalised_delta_cp,
+    repetition_penalty,
+    reward,
+)
+
+pytestmark = pytest.mark.unit
+
+
+def test_legality_is_a_gate_and_not_a_term():
+    """An illegal move scores the floor flat, with no other term able to buy it back."""
+    board = chess.Board()
+    illegal = chess.Move.from_uci("e2e5")
+    assert legality_gate(board, illegal) is False
+
+    got = reward(board, illegal, cp_move=1000, cp_best=0)
+    assert got.total == illegal_value()
+    assert got.legal is False
+    # Even with the best possible centipawn score behind it, nothing leaks through the gate.
+    assert got.terms == {"quality": 0.0, "mate": 0.0, "repetition": 0.0}
+
+
+def test_an_illegal_move_scores_below_every_legal_one():
+    """The bug the M5 gallery found: a flat zero put illegal *above* a legal repetition.
+
+    With the default weights a legal move that repeats scores -0.25, so a gate set at 0.0 was
+    telling the optimiser that proposing a move that cannot be played beats playing a legal one.
+    """
+    for weights in (
+        RewardWeights(),
+        RewardWeights(repetition=2.0),
+        RewardWeights(quality=3.0, mate=1.0, repetition=0.5),
+    ):
+        assert illegal_value(weights) < legal_bounds(weights)[0]
+        assert bounds(weights) == (illegal_value(weights), legal_bounds(weights)[1])
+```
+
+<Src file="tests/unit/test_rewards.py" tag="p5" lines="1-55" />
+
+Los dos primeros son la puerta. El primero comprueba que **nada se cuela**: con la mejor
+puntuación posible detrás, una jugada ilegal sigue sacando el suelo y sus tres términos siguen a
+cero. El segundo es el que fija el fallo de D-115 para siempre, y lo hace con **tres juegos de
+pesos distintos**, incluido uno con `repetition=2.0`. Ahí es donde una constante escrita a mano
+se habría roto en silencio.
+
+```python title="tests/unit/test_rewards.py"
+def test_the_best_move_scores_one_and_the_scale_is_where_it_runs_out():
+    assert normalised_delta_cp(50, 50) == 1.0
+    assert normalised_delta_cp(-150, 50, scale=200) == 0.0
+    assert normalised_delta_cp(-50, 50, scale=200) == pytest.approx(0.5)
+    # Better than the best is not a thing; the clamp says so instead of producing 1.2.
+    assert normalised_delta_cp(100, 50, scale=200) == 1.0
+    # And a catastrophe is not more informative than a loss: both bottom out.
+    assert normalised_delta_cp(-100_000, 50, scale=200) == 0.0
+
+
+def test_a_scale_of_zero_is_refused_rather_than_dividing():
+    with pytest.raises(ValueError, match="scale must be positive"):
+        normalised_delta_cp(0, 100, scale=0)
+
+
+def test_mate_is_binary_and_does_not_pay_for_being_quick():
+    """Fool's mate: `Qh5xf7#` ends it, and a shorter mate is the same outcome sooner."""
+    board = chess.Board()
+    for uci in ("f2f3", "e7e5", "g2g4"):
+        board.push_uci(uci)
+    mate = chess.Move.from_uci("d8h4")
+    assert mate_bonus(board, mate) == 1.0
+    assert mate_bonus(board, chess.Move.from_uci("g8f6")) == 0.0
+
+
+def test_the_repetition_penalty_fires_on_the_second_visit_not_on_the_claim():
+    """By the time a draw is claimable the shuffling already happened; the penalty is too late."""
+    board = chess.Board()
+    for uci in ("g1f3", "g8f6", "f3g1", "f6g8"):
+        board.push_uci(uci)
+    # The starting position is on the board again, so `Nf3` returns to a position already seen.
+    assert repetition_penalty(board, chess.Move.from_uci("g1f3")) == 1.0
+    assert repetition_penalty(board, chess.Move.from_uci("e2e4")) == 0.0
+
+
+def test_the_reward_carries_its_terms_because_a_scalar_hides_its_design():
+    board = chess.Board()
+    got = reward(board, chess.Move.from_uci("e2e4"), cp_move=20, cp_best=30)
+    assert got.legal is True
+    assert got.quality == pytest.approx(1.0 - 10 / 200)
+    assert got.total == pytest.approx(got.quality)
+    assert set(got.terms) == {"quality", "mate", "repetition"}
+
+
+def test_without_engine_scores_the_reward_falls_back_to_what_is_knowable():
+    """No `cp` means no quality term -- not a guessed one."""
+    board = chess.Board()
+    got = reward(board, chess.Move.from_uci("e2e4"))
+    assert got.legal is True
+    assert got.quality == 0.0
+    assert got.total == 0.0
+```
+
+<Src file="tests/unit/test_rewards.py" tag="p5" lines="58-108" />
+
+Los del término de calidad y los dos términos binarios. Fíjate en los dos recortes puestos a
+prueba con números absurdos —`normalised_delta_cp(-100_000, 50)` sigue dando 0,0— y en el mate de
+los locos como caso de prueba del bono: cuatro jugadas y `Dh4` es mate, que es la partida más
+corta que existe y por eso el ejemplo más barato.
+
+El de la repetición construye la posición inicial por el camino largo —`Cf3 Cf6 Cg1 Cg8`— para
+que `Cf3` vuelva a una posición ya vista. Sin ese rodeo no hay repetición que comprobar.
+
+```python title="tests/unit/test_rewards.py"
+def test_no_input_escapes_the_interval_the_design_promises():
+    """A reward with no ceiling is an invitation; this is the test that keeps the promise.
+
+    Random legal moves from random positions, with centipawn scores drawn far outside anything an
+    engine would return, including the mate scores the pipeline uses.
+    """
+    weights = RewardWeights()
+    low, high = bounds(weights)
+    rng = random.Random(7)
+    seen = 0
+    for _ in range(300):
+        board = chess.Board()
+        for _ in range(rng.randrange(0, 40)):
+            moves = list(board.legal_moves)
+            if not moves:
+                break
+            board.push(rng.choice(moves))
+        moves = list(board.legal_moves)
+        if not moves:
+            continue
+        move = rng.choice(moves)
+        cp_move = rng.choice([-10_000, -999, 0, 37, 10_000])
+        cp_best = rng.choice([-10_000, -12, 0, 500, 10_000])
+        total = reward(board, move, cp_move, cp_best, weights).total
+        assert low <= total <= high, (board.fen(), move.uci(), cp_move, cp_best, total)
+        seen += 1
+    assert seen > 200, "the walk should have produced plenty of legal positions"
+
+
+def test_the_bounds_move_with_the_weights_instead_of_being_a_constant():
+    weights = RewardWeights(quality=2.0, mate=0.5, repetition=1.0)
+    assert legal_bounds(weights) == (-1.0, 2.5)
+    assert bounds(weights) == (-2.0, 2.5)
+
+
+def test_the_weights_are_refused_when_they_would_break_the_design():
+    with pytest.raises(ValueError):
+        RewardWeights(quality=-1.0)
+    with pytest.raises(ValueError):
+        RewardWeights(cp_scale=0)
+```
+
+<Src file="tests/unit/test_rewards.py" tag="p5" lines="111-150" />
+
+Y el que sostiene la segunda regla. Trescientos paseos aleatorios de hasta cuarenta plies, una
+jugada legal al azar en cada uno, y **puntuaciones de centipeones muy fuera de lo que un motor
+devolvería** —incluidos los ±10 000 de la convención de mate—. Nada se sale del intervalo. El
+`assert seen > 200` del final es la guarda del propio test: sin ella, un cambio que hiciera que
+todos los paseos terminaran en posición final dejaría el test en verde sin haber comprobado nada.
+
+Los dos últimos fijan que las cotas se mueven con los pesos y que un peso imposible se rechaza al
+construirlo.
+
+## GRPO: 561 líneas donde el grupo es la línea base
+
+Ahora el algoritmo. La idea completa cabe en una fórmula:
+
+```text
+A_i = (r_i − media(r)) / (desviación(r) + ε)
+```
+
+Esa media es la <Term id="linea-base-grpo">línea base</Term>. PPO entrena una red de valor entera
+para estimarla; GRPO la saca del grupo, que ya estaba pagado.
+
+```python title="src/rukh/train/grpo.py"
+"""GRPO on the decoder: a group of candidate moves, scored by a function instead of a model.
+
+DPO needs a dataset of pairs somebody else decided. GRPO needs neither the pairs nor a reward
+model: for each position the policy proposes ``group_size`` moves, a reward *function* scores
+them, and each move is pushed up or down according to how it did **relative to its own group**.
+The group is the baseline, which is the whole trick -- no value network, no critic, nothing to
+train twice.
+
+Four things about this file that are decisions, not details.
+
+**One token, one exact gradient.** A completion here is a single move, so the usual
+sequence-level machinery collapses: the policy gradient is ``advantage * log pi(move | prompt)``
+at one position, and one forward pass gives the whole distribution. That is why ``group_size``
+candidates cost one forward pass rather than ``group_size`` of them.
+
+**The group is the baseline, so a group with no spread is worth nothing.** If all eight samples
+are the same move, every advantage is zero and the step is a no-op with the engine already paid
+for. Those groups are skipped and counted, because the count is a measurement: it says how much
+of the budget the model's own confidence is throwing away.
+
+**The engine is a cache, not a call.** Scoring every candidate at depth ``depth`` is the whole
+cost of the run, and across steps the policy proposes the same moves in the same positions over
+and over. A ``(fen, move) -> centipawns`` cache turns the second visit into a dictionary lookup;
+it is keyed by the FEN so it stays correct when the same position arrives by a different route.
+
+**KL is a term, not a clip.** The reference model is the frozen starting policy and the penalty
+is the k3 estimator, which is non-negative and low-variance. Without it a verifiable reward is an
+invitation to stop playing chess and start farming the reward -- and `labs/m5` has the gallery of
+what that looks like when the invitation is accepted.
+"""
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="1-30" />
+
+Las cuatro cosas del docstring son las cuatro decisiones del fichero.
+
+**Un token, un gradiente exacto.** Igual que en DPO, la completación es una jugada, así que el
+gradiente de política se reduce a `ventaja · log π(jugada | prompt)` en una posición. Y una sola
+pasada hacia delante da la distribución entera, así que **ocho candidatas cuestan una pasada y no
+ocho**. Esa es la razón de que un proyecto de una persona pueda hacer GRPO en una tarde.
+
+**El grupo es la línea base, así que un grupo sin dispersión no vale nada.** Si las ocho muestras
+son la misma jugada, todas las ventajas son cero y el paso es un no-op con el motor ya pagado. Esos <Term id="grupo-plano">grupos planos</Term> se saltan y **se cuentan**, porque el recuento es una
+medición: dice qué parte del presupuesto se lleva la propia confianza del modelo.
+
+**El motor es una caché, no una llamada.** Puntuar cada candidata a profundidad `depth` es el
+coste entero de la corrida, y entre pasos la política propone las mismas jugadas en las mismas
+posiciones una y otra vez.
+
+**La KL es un término, no un recorte.** El estimador es k3, que es no negativo y de varianza baja.
+
+```python title="src/rukh/train/grpo.py"
+from __future__ import annotations
+
+import json
+import logging
+import math
+from typing import TYPE_CHECKING
+
+import chess
+import chess.engine
+import numpy as np
+import torch
+import torch.nn.functional as F
+from pydantic import Field
+
+from rukh.config import BaseConfig
+from rukh.tokenize.uci_vocab import UciTokenizer, elo_token
+from rukh.train.rewards import RewardWeights, illegal_value, reward
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from pathlib import Path
+
+LOGGER = logging.getLogger(__name__)
+
+__all__ = [
+    "EngineCache",
+    "best_available",
+    "GrpoConfig",
+    "GrpoResult",
+    "group_advantages",
+    "grpo_loss",
+    "sample_group",
+    "train_grpo",
+]
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="32-65" />
+
+```python title="src/rukh/train/grpo.py"
+class GrpoConfig(BaseConfig):
+    """The prompts, the policy, the size of a group and the price of scoring one."""
+
+    prompts: str = "data/pairs/dpo-prompts.parquet"
+    """Only the ``prefix`` column is read. GRPO needs positions, not preferences -- which is the
+    point worth noticing: the same file feeds both methods and only one of them uses the labels."""
+    checkpoint: str = ""
+    out_dir: str = "checkpoints"
+    run_name: str = "grpo"
+    group_size: int = Field(default=8, ge=2)
+    """Candidates per position. The baseline is their mean, so two is the minimum that has one."""
+    temperature: float = Field(default=1.0, gt=0)
+    top_k: int | None = 20
+    """How many candidate tokens the group is drawn from, after the restriction below."""
+    restrict_to_legal: bool = True
+    """Whether the group is drawn only from moves that can be played here.
+
+    ``True`` spends the whole engine budget on moves the model could actually play, and the
+    legality gate then never fires -- which is fine, because the demo masks illegal moves before
+    they reach the board, so legality is a property the reward *guarantees* rather than one it
+    teaches.
+
+    ``False`` draws from the whole vocabulary, so an illegal proposal can land in the group and
+    score the floor. That is the only configuration in which GRPO can teach legality at all, and
+    M5 needed it: DPO doubled the illegal-proposal rate of its base (D-121), and a reward whose
+    first rule is a legality gate ought to be able to pay that back."""
+    beta_kl: float = Field(default=0.02, ge=0)
+    """Weight of the KL term against the frozen starting policy."""
+    lr: float = Field(default=1e-6, gt=0)
+    positions_per_step: int = Field(default=8, ge=1)
+    steps: int = Field(default=200, ge=1)
+    depth: int = Field(default=8, ge=1)
+    """Engine depth per candidate. Depth, not time, so a run is reproducible (D-107)."""
+    block: int = Field(default=200, ge=8)
+    weights: RewardWeights = RewardWeights()
+    cache: str | None = "artifacts/grpo-engine-cache.json"
+    """Where the ``(fen, move) -> centipawns`` cache lives between runs. ``None`` disables it."""
+    val_positions: int = Field(default=200, ge=0)
+    """Held-out positions the mean reward is measured on, before and after."""
+    seed: int = 42
+    device: str | None = None
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="68-108" />
+
+La configuración, y una clave que merece toda la atención: `restrict_to_legal`.
+
+Con `true` —el valor por defecto— el grupo se sortea **solo entre jugadas legales**, así que todo
+el presupuesto de motor se gasta en jugadas que el modelo podría jugar de verdad… y la puerta de
+legalidad **nunca se dispara**. La proporción de ilegales de la corrida sale 0,0000 exacta. No es
+un fallo: la demo enmascara las ilegales antes de que lleguen al tablero, así que la legalidad es
+una propiedad que la recompensa _garantiza_ en vez de enseñar.
+
+Con `false` el sorteo es sobre el vocabulario entero, así que una propuesta imposible puede caer
+en el grupo y sacar el suelo. Es la **única** configuración en la que GRPO puede enseñar legalidad,
+y M5 la necesitó: DPO dobló la tasa de propuestas ilegales de su base (D-121), y una recompensa
+cuya primera regla es una puerta de legalidad debería poder devolver ese peaje.
+
+```python title="src/rukh/train/grpo.py"
+class GrpoResult(BaseConfig):
+    """What the run produced, in the shape the lesson quotes it."""
+
+    checkpoint: str
+    steps: int
+    groups: int
+    """Groups that contributed a gradient."""
+    flat_groups: int
+    """Groups where every candidate scored the same, so the baseline ate the whole signal."""
+    engine_calls: int
+    cache_hits: int
+    reward_before: float
+    reward_after: float
+    """Mean reward with ``cp_best`` taken **inside the group**, which is what training optimises.
+
+    Read it as a training diagnostic and never as a score. It is maximised by a policy that
+    proposes the same move eight times out of eight: then the best candidate *is* every candidate,
+    every quality term is 1.0, and the mean is as high as it goes. A model that collapses makes
+    this number go up. ``reward_absolute_*`` is the one that cannot be gamed that way."""
+    reward_absolute_before: float = math.nan
+    reward_absolute_after: float = math.nan
+    """Mean reward with ``cp_best`` taken from the **engine's own best move** in the position.
+
+    One extra analysis per position, not per candidate, and it is the number that says whether the
+    moves got better. Collapsing the policy does not move it: if the group agrees on a mediocre
+    move, all eight are still mediocre against what was available."""
+    flat_share_before: float = math.nan
+    flat_share_after: float = math.nan
+    """Share of validation groups whose candidates were all the same move. The collapse detector."""
+    kl_after: float
+    """Mean KL over the last tenth of the run, not the last batch.
+
+    It was the last batch until a sweep reported 0.00048 and 0.126 for the same learning rate on
+    two runs that differed in nothing that mattered: one group's KL is a sample, not a level."""
+    illegal_before: float
+    illegal_after: float
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="111-146" />
+
+El resultado de una corrida, y aquí están los dos campos que el hito tuvo que separar. Léelos con
+calma porque son el hallazgo central del módulo.
+
+`reward_before`/`reward_after` es la recompensa media con `cp_best` tomado **dentro del
+grupo**, que es lo que el entrenamiento optimiza. Y su docstring dice que no se lea como una
+puntuación, porque **se maximiza proponiendo la misma jugada ocho de ocho veces**: entonces la
+mejor candidata _es_ cada candidata, las ocho sacan calidad 1,0, y la media llega a su techo. Un
+modelo que colapsa hace subir este número.
+
+`reward_absolute_*` es la misma media con `cp_best` tomado del **mejor movimiento disponible
+según el motor**: un análisis más por posición —no por candidata— que no se puede subir haciendo la
+política más determinista.
+
+Y `flat_share_*` es el detector de colapso directo: la proporción de grupos de validación cuyas
+ocho candidatas eran la misma jugada.
+
+`kl_after` lleva su propia historia en el docstring: era la KL del **último grupo** hasta que un
+barrido reportó 0,00048 y 0,126 para la misma tasa de aprendizaje en dos corridas que no se
+diferenciaban en nada relevante. Una muestra no es un nivel; ahora promedia sobre la última décima
+parte de los pasos.
+
+```python title="src/rukh/train/grpo.py"
+class EngineCache:
+    """``(fen, move) -> centipawns for the mover``, kept between steps and between runs.
+
+    Keyed by the FEN rather than by the move list, so a position reached by transposition is the
+    same key. That is not a micro-optimisation: with eight candidates per position and two hundred
+    steps, the engine is the entire cost of the run, and the policy keeps proposing the moves it
+    already likes.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path
+        self.data: dict[str, int] = {}
+        self.hits = 0
+        self.calls = 0
+        if path is not None and path.exists():
+            self.data = json.loads(path.read_text("utf-8"))
+            LOGGER.info("cache: %d analisis reutilizables en %s", len(self.data), path)
+
+    @staticmethod
+    def key(fen: str, move: chess.Move) -> str:
+        return f"{fen}|{move.uci()}"
+
+    def score(
+        self, engine: chess.engine.SimpleEngine, board: chess.Board, move: chess.Move, depth: int
+    ) -> int:
+        """Centipawns for the side that plays ``move``, from the cache when it is there."""
+        from rukh.data.onpolicy import score_move
+
+        key = self.key(board.fen(), move)
+        cached = self.data.get(key)
+        if cached is not None:
+            self.hits += 1
+            return cached
+        value = score_move(engine, board, move, depth)
+        self.data[key] = value
+        self.calls += 1
+        return value
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.data), "utf-8")
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="149-191" />
+
+La caché. Está **indexada por el FEN** y no por la lista de jugadas, así que una posición a la que
+se llega por transposición es la misma entrada. No es una microoptimización: con ocho candidatas
+por posición y cientos de pasos, el motor es el coste entero de la corrida, y la política insiste
+en proponer las jugadas que ya le gustan.
+
+El `import` de `score_move` vive dentro del método y viene del fichero de la lección anterior:
+la misma función que puntúa una candidata de un par dentro de política puntúa una candidata de un
+grupo, con la misma convención de signo. Dos convenciones distintas para lo mismo es cómo dos
+mediciones del mismo modelo dejan de ser comparables.
+
+```python title="src/rukh/train/grpo.py"
+def sample_group(
+    logits: torch.Tensor,
+    legal_ids: Sequence[int] | None,
+    size: int,
+    temperature: float,
+    top_k: int | None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """``size`` move tokens drawn from the policy at one position.
+
+    Sampling is **with replacement**: the group is meant to be a sample of what the policy would
+    actually do, and a policy that would play the same move eight times out of eight is telling
+    the loss something true about itself. De-duplicating here would quietly turn the baseline into
+    the mean of a distribution nobody is following.
+    """
+    scaled = logits.float() / temperature
+    if legal_ids is None:
+        mask = scaled
+        width = scaled.numel()
+    else:
+        mask = torch.full_like(scaled, float("-inf"))
+        index = torch.tensor(list(legal_ids), dtype=torch.long, device=scaled.device)
+        mask[index] = scaled[index]
+        width = index.numel()
+    if top_k is not None and top_k < width:
+        cut = torch.topk(mask, top_k).values[-1]
+        mask = torch.where(mask < cut, torch.full_like(mask, float("-inf")), mask)
+    probabilities = F.softmax(mask, dim=-1)
+    return torch.multinomial(probabilities, size, replacement=True, generator=generator)
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="194-222" />
+
+El sorteo del grupo, y la decisión que más gente invierte: es **con reemplazo**. Quitar duplicados
+parece gratis —ocho jugadas distintas suenan a mejor grupo— y no lo es. El grupo pretende ser una
+muestra de lo que la política haría de verdad, y una política que jugaría la misma jugada ocho de
+ocho veces le está diciendo algo cierto sobre sí misma a la pérdida. Deduplicar convertiría la
+línea base en la media de una distribución que nadie sigue.
+
+El enmascarado es el patrón de siempre: `-inf` a todo lo que no está en `legal_ids`, y después
+el recorte `top_k` sobre lo que quedó. El orden importa —primero legal, luego top-k— porque al
+revés el top-k se gastaría en tokens que después se van a descartar.
+
+```python title="src/rukh/train/grpo.py"
+def group_advantages(rewards: Sequence[float], eps: float = 1e-4) -> torch.Tensor:
+    """``(r - mean) / (std + eps)``: how each candidate did against its own group.
+
+    The normalisation by the spread is what makes a group of near-identical moves and a group with
+    a blunder in it contribute comparably. When the spread is zero the advantages are zero, which
+    is the honest answer -- the group said nothing -- and the caller drops the group rather than
+    letting ``eps`` manufacture a gradient out of floating-point dust.
+    """
+    values = torch.tensor(list(rewards), dtype=torch.float)
+    spread = float(values.std(unbiased=False))
+    if spread < eps:
+        return torch.zeros_like(values)
+    return (values - values.mean()) / (spread + eps)
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="225-237" />
+
+Trece líneas donde está el algoritmo entero. Normalizar por la dispersión es lo que hace que un
+grupo de jugadas casi iguales y uno con una barbaridad dentro aporten de forma comparable.
+
+Y cuando la dispersión es cero, las ventajas son **cero**, que es la respuesta honesta: el grupo no
+dijo nada. Fíjate en que el `eps` no se usa para dividir en ese caso — hay un `if` antes. Si se
+dejara dividir por `0 + eps`, un grupo plano produciría ventajas enormes fabricadas con polvo de
+coma flotante, y el paso siguiente las usaría.
+
+```python title="src/rukh/train/grpo.py"
+def grpo_loss(
+    policy_logprobs: torch.Tensor,
+    reference_logprobs: torch.Tensor,
+    actions: torch.Tensor,
+    advantages: torch.Tensor,
+    beta_kl: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The objective and the KL, for a one-token completion.
+
+    The KL is the k3 estimator ``exp(d) - d - 1`` with ``d = logp_ref - logp_policy``. It is
+    non-negative by construction, which matters for a term that is supposed to be a *penalty*:
+    the plain ``logp_ref - logp_policy`` difference is negative half the time and would pay the
+    model for moving away from the reference on exactly the samples it moved away on.
+    """
+    chosen_policy = policy_logprobs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+    chosen_reference = reference_logprobs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+    objective = -(advantages * chosen_policy).mean()
+    difference = chosen_reference - chosen_policy
+    kl = (torch.exp(difference) - difference - 1.0).mean()
+    return objective + beta_kl * kl, kl
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="240-259" />
+
+La pérdida: el objetivo y el castigo. `-(advantages * chosen_policy).mean()` es el gradiente de
+política en su forma más desnuda —sube lo que salió mejor que la media, baja lo que salió peor— y
+el segundo término es la KL.
+
+El estimador es **k3**: `exp(d) − d − 1` con `d = logp_ref − logp_política`. Es **no negativo
+por construcción**, y eso importa para algo que quiere ser un castigo. La diferencia de
+log-probabilidades a secas es negativa la mitad de las veces: como término de penalización, le
+pagaría al modelo precisamente en las muestras en las que se alejó. Sería un radar de velocidad que
+la mitad de las veces te multa y la otra mitad te ingresa dinero por pasarte: en promedio no
+disuade de nada.
+
+```python title="src/rukh/train/grpo.py"
+def _prompt(tok: UciTokenizer, prefix: str, white: int, black: int, block: int) -> list[int] | None:
+    """The same three header tokens every other measurement uses, then the game so far."""
+    ids = [tok.bos_id, tok.vocab[elo_token(white, "w")], tok.vocab[elo_token(black, "b")]]
+    for uci in prefix.split():
+        token = tok.vocab.get(uci)
+        if token is None:
+            return None
+        ids.append(int(token))
+    return ids if len(ids) <= block else None
+
+
+def _board_for(prefix: str) -> chess.Board | None:
+    board = chess.Board()
+    try:
+        for uci in prefix.split():
+            board.push_uci(uci)
+    except ValueError:
+        return None
+    return None if board.is_game_over() else board
+
+
+def _move_of(tok: UciTokenizer, token: int) -> chess.Move | None:
+    """The move a token spells, or ``None`` when the token is not a move at all.
+
+    The reverse table is built once per tokenizer and cached on it, because this runs eight times
+    per position and rebuilding a 2 030-entry dict each time would be the second cost of the run
+    after the engine.
+    """
+    inverse = getattr(tok, "_rukh_inverse", None)
+    if inverse is None:
+        inverse = {index: text for text, index in tok.vocab.items()}
+        tok._rukh_inverse = inverse  # type: ignore[attr-defined]
+    text = inverse.get(token)
+    if text is None or len(text) < 4:
+        return None
+    try:
+        return chess.Move.from_uci(text)
+    except ValueError:
+        return None
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="262-300" />
+
+Tres funciones de fontanería con una decisión cada una. `_prompt` usa los mismos tres tokens de
+cabecera que todas las demás mediciones, y devuelve `None` cuando el prompt no cabe en el bloque
+en vez de recortarlo, por el mismo motivo que en DPO. `_board_for` devuelve `None` si la
+partida ya terminó, porque una posición final no tiene candidatas. Y `_move_of` cachea la tabla
+inversa del tokenizador **en el propio tokenizador**, porque se llama ocho veces por posición y
+reconstruir un diccionario de 2 030 entradas cada vez sería el segundo coste de la corrida detrás
+del motor.
+
+```python title="src/rukh/train/grpo.py"
+def best_available(
+    cache: EngineCache, engine: chess.engine.SimpleEngine, board: chess.Board, cfg: GrpoConfig
+) -> float:
+    """Centipawns of the position with best play, for the side to move.
+
+    The honest reference for "how good was this move", and the one `score_candidates` deliberately
+    does **not** use while training. One analysis of the position itself, cached like the rest.
+    """
+    from rukh.data.scoring import MATE_SCORE
+
+    key = f"{board.fen()}|BEST"
+    cached = cache.data.get(key)
+    if cached is not None:
+        cache.hits += 1
+        return float(cached)
+    info = engine.analyse(board, chess.engine.Limit(depth=cfg.depth))
+    value = int(info["score"].pov(board.turn).score(mate_score=MATE_SCORE))
+    cache.data[key] = value
+    cache.calls += 1
+    return float(value)
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="303-322" />
+
+```python title="src/rukh/train/grpo.py"
+def score_candidates(
+    cache: EngineCache,
+    engine: chess.engine.SimpleEngine,
+    board: chess.Board,
+    moves: Sequence[chess.Move | None],
+    cfg: GrpoConfig,
+    best: float | None = None,
+) -> list[float]:
+    """The reward of each candidate, with ``cp_best`` taken over the candidates themselves.
+
+    The best *available* move would be the honest reference, and it costs a full multi-PV search
+    per position. The best move **in the group** costs nothing extra and asks the question GRPO
+    actually asks: of what you proposed, which was best? A model whose whole group is bad still
+    learns the ordering inside it, and the reward stays in the same closed interval either way.
+    """
+    legal = {move.uci(): move for move in moves if move is not None and move in board.legal_moves}
+    scores = {
+        uci: float(cache.score(engine, board, move, cfg.depth)) for uci, move in legal.items()
+    }
+    if best is None:
+        best = max(scores.values()) if scores else 0.0
+    floor = illegal_value(cfg.weights)
+    return [
+        floor
+        if move is None
+        else reward(
+            board,
+            move,
+            cp_move=scores.get(move.uci()),
+            cp_best=best if move.uci() in scores else None,
+            weights=cfg.weights,
+        ).total
+        for move in moves
+    ]
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="325-358" />
+
+Estas dos funciones son la pareja que el hito tuvo que separar, y el docstring de la segunda
+defiende la decisión que luego resulta ser el problema.
+
+`score_candidates` toma `cp_best` **dentro del grupo**. Es defendible: mantiene enseñable un
+grupo entero de jugadas malas, porque la ordenación interna sobrevive aunque las ocho sean flojas,
+y cuesta cero análisis extra. `best_available` hace la llamada honesta —un análisis de la
+posición, no de cada candidata— y es la que usa la métrica.
+
+<Callout kind="roto" title="La recompensa que se maximiza colapsando">
+  La única pregunta que hay que hacerle a una métrica es: **¿qué política maximizaría exactamente
+  este número?** Aquí la respuesta es «una que proponga la misma jugada ocho de ocho veces».
+  Entonces «la mejor del grupo» es cada una de ellas, las ocho sacan calidad 1,0, y la recompensa
+  media llega a su máximo. Es la clase a la que se califica por «cuánto te acercas a la mejor
+  respuesta de la clase»: en cuanto los ocho entregan la misma hoja, los ocho tienen un diez, y
+  nadie ha aprendido nada.
+
+O sea: `reward_before → reward_after` **sube cuando el modelo colapsa**. Era el número que iba
+a publicarse como «la recompensa mejoró» y mide, en parte, lo contrario.
+
+No se arregla en el entrenamiento. Usar el mejor movimiento _disponible_ ahí haría que un grupo
+entero de jugadas malas se recortara a calidad cero, quedara plano y no aportara gradiente —justo
+los grupos donde más hay que aprender— y, como la ventaja de grupo es invariante a sumar una
+constante, para el gradiente las dos referencias son casi la misma cosa. Así que se **separan**:
+el entrenamiento sigue con la referencia del grupo y la métrica usa `best_available` (D-123).
+
+La galería de `labs/m5` rompe cinco recompensas a propósito. La sexta estaba en casa.
+
+</Callout>
+
+```python title="src/rukh/train/grpo.py"
+def train_grpo(cfg: GrpoConfig) -> GrpoResult:
+    """Run GRPO and return what it measured, including the two numbers the lesson needs."""
+    import copy
+
+    import polars as pl
+
+    from rukh import paths
+    from rukh.engine import find_stockfish
+    from rukh.infer.sampler import legal_token_ids
+    from rukh.train.checkpoint import load_model, save_checkpoint
+    from rukh.train.common import pick_device
+
+    binary = find_stockfish()
+    if binary is None:
+        raise FileNotFoundError("Stockfish not found; set RUKH_STOCKFISH")
+    torch.manual_seed(cfg.seed)
+    device = torch.device(cfg.device or pick_device())
+    tok = UciTokenizer()
+
+    policy, payload = load_model(paths.resolve(cfg.checkpoint), device)
+    policy = policy.to(device).train()
+    reference = copy.deepcopy(policy).eval()
+    for parameter in reference.parameters():
+        parameter.requires_grad_(False)
+
+    frame = pl.read_parquet(paths.resolve(cfg.prompts).as_posix())
+    rng = np.random.default_rng(cfg.seed)
+    order = rng.permutation(frame.height)
+    val_index = order[: cfg.val_positions]
+    train_index = order[cfg.val_positions :]
+
+    cache = EngineCache(paths.resolve(cfg.cache) if cfg.cache else None)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=cfg.lr)
+    generator = torch.Generator(device=device).manual_seed(cfg.seed)
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="361-394" />
+
+El arranque. La referencia es una copia profunda de la política puesta en `eval` y con los
+gradientes apagados, igual que en DPO. El `val_positions` se aparta del principio de una
+permutación con semilla, así que las posiciones de validación **nunca** se entrenan, y el
+`generator` de torch con su propia semilla es lo que hace que dos corridas con la misma
+configuración sorteen los mismos grupos.
+
+```python title="src/rukh/train/grpo.py"
+    def group_at(row: dict[str, object]) -> tuple[chess.Board, list[int], torch.Tensor] | None:
+        """Prompt, board and a sampled group for one row, or ``None`` when the row is unusable."""
+        board = _board_for(str(row["prefix"] or ""))
+        ids = _prompt(
+            tok, str(row["prefix"] or ""), int(row["white_elo"]), int(row["black_elo"]), cfg.block
+        )
+        if board is None or ids is None:
+            return None
+        with torch.no_grad():
+            logits, _ = policy(torch.tensor([ids], dtype=torch.long, device=device))
+        tokens = sample_group(
+            logits[0, -1],
+            legal_token_ids(board, tok) if cfg.restrict_to_legal else None,
+            cfg.group_size,
+            cfg.temperature,
+            cfg.top_k,
+            generator,
+        )
+        return board, ids, tokens
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="396-414" />
+
+`group_at` es la única función que habla con el modelo: una pasada hacia delante en `no_grad`,
+y de la última posición salen los ocho tokens. `legal_token_ids` es del muestreador de M2, así
+que la legalidad se calcula exactamente igual aquí que al jugar.
+
+```python title="src/rukh/train/grpo.py"
+    groups = flat = 0
+    last_kl = math.nan
+    recent_kl: list[float] = []
+    tail = max(cfg.steps // 10, 1)
+    """How many of the final steps the reported KL averages over."""
+    with chess.engine.SimpleEngine.popen_uci(str(binary)) as engine:
+
+        def measure(indices: np.ndarray) -> tuple[float, float, float, float]:
+            """Mean reward two ways, the illegal share, and how many groups collapsed.
+
+            Two ways because they answer different questions and only one of them is a score. With
+            ``cp_best`` inside the group -- what training uses -- a policy that proposes one move
+            eight times scores the maximum, so the number goes up when the model collapses. With
+            ``cp_best`` from the engine's own best move it cannot be gamed that way, and the gap
+            between the two is exactly how much of the first is the collapse.
+            """
+            policy.eval()
+            relative: list[float] = []
+            absolute: list[float] = []
+            illegal = total = flat = groups_seen = 0
+            for row_index in indices:
+                drawn = group_at(frame.row(int(row_index), named=True))
+                if drawn is None:
+                    continue
+                board, _ids, tokens = drawn
+                moves = [_move_of(tok, int(token)) for token in tokens]
+                illegal += sum(1 for move in moves if move is None or move not in board.legal_moves)
+                total += len(moves)
+                groups_seen += 1
+                flat += int(len({int(token) for token in tokens}) == 1)
+                relative.extend(score_candidates(cache, engine, board, moves, cfg))
+                absolute.extend(
+                    score_candidates(
+                        cache,
+                        engine,
+                        board,
+                        moves,
+                        cfg,
+                        best=best_available(cache, engine, board, cfg),
+                    )
+                )
+            policy.train()
+            return (
+                float(np.mean(relative)) if relative else math.nan,
+                float(np.mean(absolute)) if absolute else math.nan,
+                illegal / total if total else math.nan,
+                flat / groups_seen if groups_seen else math.nan,
+            )
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="416-463" />
+
+La medición, con su docstring explicando por qué hay dos recompensas. Fíjate en lo que cuesta: por
+cada posición de validación se llama **dos veces** a `score_candidates`, una con la referencia
+del grupo y otra con la del motor. La segunda es casi gratis porque la caché ya tiene las
+candidatas; lo que se paga de nuevo es el `best_available`, un análisis por posición.
+
+Ese precio compra la única columna que no se puede maquillar colapsando, y es exactamente el
+dinero que la lección 8 necesita para decir si GRPO funcionó.
+
+```python title="src/rukh/train/grpo.py"
+        before = measure(val_index)
+        LOGGER.info(
+            "antes: recompensa grupo %.4f - absoluta %.4f - ilegales %.4f - planos %.3f", *before
+        )
+
+        for step in range(cfg.steps):
+            picks = rng.choice(train_index, size=cfg.positions_per_step, replace=False)
+            losses: list[float] = []
+            optimizer.zero_grad(set_to_none=True)
+            used = 0
+            for row_index in picks:
+                drawn = group_at(frame.row(int(row_index), named=True))
+                if drawn is None:
+                    continue
+                board, ids, tokens = drawn
+                moves = [_move_of(tok, int(token)) for token in tokens]
+                if all(move is None for move in moves):
+                    continue
+                rewards = score_candidates(cache, engine, board, moves, cfg)
+                advantages = group_advantages(rewards).to(device)
+                if float(advantages.abs().sum()) == 0.0:
+                    flat += 1
+                    continue
+                prompt = torch.tensor([ids], dtype=torch.long, device=device)
+                policy_logits, _ = policy(prompt)
+                policy_logprobs = F.log_softmax(policy_logits[0, -1].float(), dim=-1)
+                with torch.no_grad():
+                    reference_logits, _ = reference(prompt)
+                    reference_logprobs = F.log_softmax(reference_logits[0, -1].float(), dim=-1)
+                loss, kl = grpo_loss(
+                    policy_logprobs.unsqueeze(0).expand(cfg.group_size, -1),
+                    reference_logprobs.unsqueeze(0).expand(cfg.group_size, -1),
+                    tokens,
+                    advantages,
+                    cfg.beta_kl,
+                )
+                (loss / cfg.positions_per_step).backward()
+                losses.append(float(loss.detach()))
+                last_kl = float(kl.detach())
+                if step >= cfg.steps - tail:
+                    recent_kl.append(last_kl)
+                groups += 1
+                used += 1
+            if used:
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                optimizer.step()
+            if (step + 1) % 10 == 0:
+                LOGGER.info(
+                    "paso %d - loss %.4f - kl %.5f - grupos %d - planos %d - cache %d/%d",
+                    step + 1,
+                    float(np.mean(losses)) if losses else math.nan,
+                    last_kl,
+                    groups,
+                    flat,
+                    cache.hits,
+                    cache.hits + cache.calls,
+                )
+                cache.save()
+
+        if recent_kl:
+            last_kl = float(np.mean(recent_kl))
+        after = measure(val_index)
+        LOGGER.info(
+            "despues: recompensa grupo %.4f - absoluta %.4f - ilegales %.4f - planos %.3f", *after
+        )
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="465-529" />
+
+El bucle. Cuatro detalles.
+
+El `if float(advantages.abs().sum()) == 0.0` es el grupo plano saltándose: la posición ya se ha
+pagado al motor, y lo único que queda por hacer es contarla.
+
+`policy_logprobs.unsqueeze(0).expand(cfg.group_size, -1)` repite la **misma** distribución ocho
+veces, una por candidata, sin copiarla en memoria. Es la forma explícita de decir que las ocho
+candidatas salen de una sola pasada hacia delante.
+
+`(loss / cfg.positions_per_step).backward()` acumula el gradiente de las ocho posiciones del paso
+antes de un solo `optimizer.step()`, dividido para que el tamaño del paso no dependa de cuántas
+posiciones resultaron usables.
+
+Y el `if used:` de antes del paso: si las ocho posiciones del paso salieron planas o
+irreproducibles, no hay gradiente que aplicar, y llamar a `step()` con el gradiente del paso
+anterior todavía puesto movería el modelo dos veces en la misma dirección.
+
+El `cache.save()` cada diez pasos no es paranoia: la caché es lo que hace que reanudar una
+corrida interrumpida cueste minutos en vez de horas.
+
+```python title="src/rukh/train/grpo.py"
+    cache.save()
+
+    out_dir = paths.resolve(cfg.out_dir) / cfg.run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final = out_dir / "grpo.pt"
+    save_checkpoint(
+        final,
+        step=cfg.steps,
+        model=policy,
+        optimizer=None,
+        cfg={**cfg.model_dump(mode="json"), "reward_before": before[0], "reward_after": after[0]},
+        model_cfg=payload["model_cfg"],
+        vocab_hash=payload.get("vocab_hash"),
+        data_manifest_sha=payload.get("data_manifest_sha"),
+    )
+    return GrpoResult(
+        checkpoint=str(final),
+        steps=cfg.steps,
+        groups=groups,
+        flat_groups=flat,
+        engine_calls=cache.calls,
+        cache_hits=cache.hits,
+        reward_before=before[0],
+        reward_after=after[0],
+        reward_absolute_before=before[1],
+        reward_absolute_after=after[1],
+        flat_share_before=before[3],
+        flat_share_after=after[3],
+        kl_after=last_kl,
+        illegal_before=before[2],
+        illegal_after=after[2],
+    )
+```
+
+<Src file="src/rukh/train/grpo.py" tag="p5" lines="530-561" />
+
+Y el cierre: guardar el checkpoint con la configuración entera dentro —incluidas las dos
+recompensas medidas— y devolver el resultado con sus once números.
+
+<Callout kind="hoy" title="Los mensajes de log están en español">
+  `cache:`, `antes:`, `paso %d`, `despues:`. El resto del repositorio registra en inglés, y estas
+  cuatro líneas se quedaron en castellano y sin tildes. No cambia nada de lo que el código hace; se
+  apunta porque el curso muestra el fichero tal cual está en `p5` y porque una salida de log
+  mezclada es de las cosas que se arreglan cuando alguien tiene que hacer `grep` sobre ella.
+</Callout>
+
+### Los tests de GRPO, enteros
+
+185 líneas. El docstring dice qué se ha elegido probar, y el criterio es bueno: las partes donde un
+fallo produce un **número** en vez de un error.
+
+```python title="tests/unit/test_grpo.py"
+"""GRPO: the baseline, the penalty, and the two ways this loop can lie to itself.
+
+The parts worth testing here are the ones where a bug produces a *number* rather than a crash: a
+baseline that manufactures a gradient out of a group that all agreed, a KL term with the wrong
+sign that pays the model for leaving its reference, and a cache that answers for the wrong
+position.
+"""
+
+from __future__ import annotations
+
+import chess
+import pytest
+import torch
+
+from rukh.train.grpo import (
+    EngineCache,
+    GrpoConfig,
+    group_advantages,
+    grpo_loss,
+    sample_group,
+    score_candidates,
+)
+
+pytestmark = pytest.mark.unit
+
+
+def test_a_group_that_agrees_produces_no_gradient():
+    """The baseline is the group's own mean, so a flat group has nothing left to say.
+
+    Dividing by a spread of zero would hand back whatever the epsilon makes of floating-point
+    dust, and the loop would spend a step chasing it.
+    """
+    assert torch.equal(group_advantages([0.42] * 8), torch.zeros(8))
+    assert torch.equal(group_advantages([0.0, 0.0]), torch.zeros(2))
+
+
+def test_the_advantages_are_centred_and_scaled_by_the_groups_own_spread():
+    advantages = group_advantages([1.0, 0.0, 0.5, 0.5])
+    assert float(advantages.mean()) == pytest.approx(0.0, abs=1e-5)
+    assert float(advantages[0]) > 0 and float(advantages[1]) < 0
+    # A group ten times as spread out gets the same advantages: only the ordering is kept.
+    wide = group_advantages([10.0, 0.0, 5.0, 5.0])
+    assert torch.allclose(advantages, wide, atol=1e-3)
+```
+
+<Src file="tests/unit/test_grpo.py" tag="p5" lines="1-43" />
+
+Los dos primeros son la línea base. El grupo que se pone de acuerdo da ventajas exactamente cero
+—`torch.equal`, no `allclose`— y el segundo fija la invariancia que hace usable a GRPO sin
+calibrar la recompensa: un grupo diez veces más disperso produce **las mismas** ventajas.
+
+```python title="tests/unit/test_grpo.py"
+def test_the_kl_term_is_never_negative():
+    """k3 is non-negative by construction, which is the point of using it.
+
+    The naive ``logp_ref - logp_policy`` is negative on exactly the samples where the policy moved
+    away from the reference, so as a *penalty* it would pay for the behaviour it is meant to
+    discourage. The test draws both directions on purpose.
+    """
+    torch.manual_seed(0)
+    actions = torch.tensor([0, 1, 2, 3])
+    advantages = torch.zeros(4)
+    for _ in range(20):
+        policy = torch.log_softmax(torch.randn(4, 8), dim=-1)
+        reference = torch.log_softmax(torch.randn(4, 8), dim=-1)
+        _loss, kl = grpo_loss(policy, reference, actions, advantages, beta_kl=1.0)
+        assert float(kl) >= 0.0
+
+
+def test_the_kl_is_zero_when_the_policy_is_still_the_reference():
+    """The first step of any run: the penalty must cost nothing before anything has moved."""
+    logprobs = torch.log_softmax(torch.randn(4, 8), dim=-1)
+    _loss, kl = grpo_loss(
+        logprobs, logprobs.clone(), torch.tensor([0, 1, 2, 3]), torch.zeros(4), beta_kl=1.0
+    )
+    assert float(kl) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_positive_advantage_pushes_its_move_up():
+    """The smallest end-to-end check of the sign: one step of the loss raises the chosen move."""
+    torch.manual_seed(0)
+    logits = torch.zeros(1, 4, requires_grad=True)
+    actions = torch.tensor([2])
+    advantages = torch.tensor([1.0])
+    for _ in range(50):
+        logprobs = torch.log_softmax(logits, dim=-1)
+        loss, _kl = grpo_loss(logprobs, logprobs.detach(), actions, advantages, beta_kl=0.0)
+        loss.backward()
+        with torch.no_grad():
+            logits -= 0.5 * logits.grad
+        logits.grad = None
+    assert int(logits.argmax()) == 2
+
+    # And a negative advantage pushes it down, which is the same test with the sign flipped.
+    logits = torch.zeros(1, 4, requires_grad=True)
+    for _ in range(50):
+        logprobs = torch.log_softmax(logits, dim=-1)
+        loss, _kl = grpo_loss(logprobs, logprobs.detach(), actions, -advantages, beta_kl=0.0)
+        loss.backward()
+        with torch.no_grad():
+            logits -= 0.5 * logits.grad
+        logits.grad = None
+    assert int(logits.argmin()) == 2
+```
+
+<Src file="tests/unit/test_grpo.py" tag="p5" lines="46-96" />
+
+Los tres de la pérdida. El de la KL la dispara veinte veces con distribuciones aleatorias, que es
+la forma de acertar las dos direcciones sin escribirlas: con `logp_ref − logp_política` a secas,
+la mitad de esas veinte darían negativo. El siguiente comprueba el caso del primer paso de
+cualquier corrida —política igual a referencia, castigo cero— y el tercero es el signo, de extremo
+a extremo: cincuenta pasos de descenso a mano y el token con ventaja positiva tiene que acabar
+arriba, el de ventaja negativa abajo.
+
+```python title="tests/unit/test_grpo.py"
+def test_sampling_only_ever_draws_from_the_moves_it_was_given():
+    """Everything outside ``legal_ids`` is masked to minus infinity, however large its logit."""
+    logits = torch.zeros(10)
+    logits[7] = 50.0  # the model is very sure about a move that is not on the list
+    drawn = sample_group(logits, [1, 2, 3], size=64, temperature=1.0, top_k=None)
+    assert set(int(token) for token in drawn) <= {1, 2, 3}
+
+
+def test_sampling_keeps_duplicates_because_the_group_is_a_sample_of_the_policy():
+    """A policy that would play one move eight times out of eight is saying something true."""
+    logits = torch.zeros(10)
+    logits[2] = 30.0
+    drawn = sample_group(logits, [1, 2, 3], size=8, temperature=1.0, top_k=None)
+    assert drawn.shape == (8,)
+    assert set(int(token) for token in drawn) == {2}
+
+
+class _CountingEngine:
+    """An engine that refuses to be called twice for the same thing."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def analyse(self, board: chess.Board, limit: object) -> dict[str, object]:
+        self.seen.append(board.fen())
+        return {"score": chess.engine.PovScore(chess.engine.Cp(33), chess.WHITE)}
+
+
+def test_the_cache_answers_the_second_time_without_the_engine():
+    cache = EngineCache(None)
+    engine = _CountingEngine()
+    board = chess.Board()
+    move = chess.Move.from_uci("e2e4")
+    first = cache.score(engine, board, move, depth=4)
+    second = cache.score(engine, board, move, depth=4)
+    assert first == second == 33
+    assert len(engine.seen) == 1
+    assert (cache.calls, cache.hits) == (1, 1)
+
+
+def test_the_cache_is_keyed_by_the_position_not_by_the_move_list():
+    """Two move orders reaching the same position are one cache entry, which is why it pays."""
+    direct = chess.Board()
+    direct.push_uci("g1f3")
+    direct.push_uci("g8f6")
+    transposed = chess.Board()
+    transposed.push_uci("g1f3")
+    transposed.push_uci("g8f6")
+    move = chess.Move.from_uci("d2d4")
+    assert EngineCache.key(direct.fen(), move) == EngineCache.key(transposed.fen(), move)
+
+
+def test_the_config_refuses_a_group_that_cannot_have_a_baseline():
+    with pytest.raises(ValueError):
+        GrpoConfig(group_size=1)
+    with pytest.raises(ValueError):
+        GrpoConfig(beta_kl=-0.1)
+```
+
+<Src file="tests/unit/test_grpo.py" tag="p5" lines="99-155" />
+
+Los del muestreo y la caché. El del enmascarado pone un logit de 50 en un token que **no** está en
+la lista y comprueba que no sale ni una vez en 64 sorteos. El de los duplicados hace lo contrario:
+ocho sorteos y los ocho son el mismo token, que es lo que el diseño promete. Y los dos de la caché
+fijan que la segunda llamada no toca el motor y que la clave es la posición.
+
+```python title="tests/unit/test_grpo.py"
+def test_a_collapsed_group_scores_the_maximum_against_its_own_best():
+    """The flaw that makes the training reward useless as a score, pinned so it stays documented.
+
+    ``score_candidates`` takes ``cp_best`` over the candidates themselves, which is what keeps a
+    group of bad moves teachable -- the ordering inside it survives. The price is that a policy
+    proposing one move eight times gets quality 1.0 on all eight, which is the highest the reward
+    goes. So the training number is maximised by collapsing, and only the version that takes
+    ``cp_best`` from the engine can be read as a score.
+    """
+
+    class _Fixed:
+        """An engine that says every move leaves the position at -50 for the mover."""
+
+        def analyse(self, board: chess.Board, limit: object) -> dict[str, object]:
+            return {"score": chess.engine.PovScore(chess.engine.Cp(50), chess.WHITE)}
+
+    cache = EngineCache(None)
+    board = chess.Board()
+    move = chess.Move.from_uci("a2a3")  # a legal move, and not a good one
+    collapsed = [move] * 8
+
+    relative = score_candidates(cache, _Fixed(), board, collapsed, GrpoConfig())
+    assert relative == [pytest.approx(1.0)] * 8, "the group is its own best, so every one is best"
+
+    # Against a genuinely better reference the same eight moves score the floor of the quality
+    # term, which is what a mediocre move deserves and what the published number has to use.
+    absolute = score_candidates(cache, _Fixed(), board, collapsed, GrpoConfig(), best=400.0)
+    assert absolute == [pytest.approx(0.0)] * 8
+```
+
+<Src file="tests/unit/test_grpo.py" tag="p5" lines="158-185" />
+
+Y el último es el más interesante del fichero, porque **fija un fallo conocido en vez de un
+comportamiento deseado**. Un grupo colapsado —la misma jugada ocho veces— saca 1,0 en las ocho
+contra su propio mejor, y 0,0 contra una referencia genuinamente mejor. El test no arregla nada:
+deja escrito, con un motor falso de cuatro líneas, por qué la métrica de entrenamiento no se puede
+leer como una puntuación.
+
+<Transfer
+  concept="Un test que documenta un defecto conocido"
+  where="Cualquier decisión de diseño con un precio: un caché que puede servir datos rancios, un reintento que puede duplicar un efecto, un umbral elegido a ojo."
+>
+  Cuando una decisión tiene un precio y se decide pagarlo, el precio se escribe como test. Así no se
+  puede «arreglar» por accidente, el siguiente que lo lea entiende que es deliberado, y el día que
+  alguien encuentre una alternativa mejor el test le dice exactamente qué tiene que mejorar.
+</Transfer>
+
+## Las dos configuraciones
+
+`configs/train/grpo.yaml` es la corrida publicada, y sus comentarios llevan las mediciones que
+fijaron cada valor.
+
+{/* prettier-ignore */}
+```yaml title="configs/train/grpo.yaml"
+# GRPO against a verifiable reward. No preference pairs and no reward model: only the positions
+# are read out of the pairs file, and the labels in it are ignored.
+prompts: data/pairs/dpo-prompts.parquet
+checkpoint: checkpoints/medium-v4-20260919-174623/best.pt
+out_dir: checkpoints
+run_name: medium-v4-grpo
+
+# Eight candidates per position, which is what makes the group's mean a usable baseline. Their
+# spread is the entire learning signal, so this is the knob that decides how much of the engine
+# budget turns into a gradient and how much is spent on groups that all agree.
+group_size: 8
+
+# Temperature 1.0, and the measurement that says this is not a free lever. Raising it buys
+# diversity -- 38 % of groups are flat at 1.0, 26 % at 1.3, 19 % at 1.6 -- and charges for it in
+# engine calls, so the price per *useful* group barely moves: 0.184, 0.186 and 0.174 groups per
+# analysis. With the cost flat, the tie-break is on-policy-ness, and 1.0 is closest to how the
+# model is read.
+temperature: 1.0
+top_k: 20
+
+# Only moves that can be played here. The legality gate then never fires, which is fine: the demo
+# masks illegal moves before they reach the board. Set it to false to let the gate teach --
+# `grpo-legality.yaml` is the run that does.
+restrict_to_legal: true
+
+# The KL term against the frozen start. The reward is verifiable, which means it is exactly
+# specifiable and therefore exactly gameable: this is what stops the policy from walking off to
+# whatever corner of move-space scores best.
+beta_kl: 0.02
+
+lr: 1.0e-6
+positions_per_step: 8
+steps: 300
+
+# Depth 8 per candidate, and a persistent cache so the second visit to a position is free.
+# The engine is the whole cost of this run; the model is almost an afterthought.
+depth: 8
+cache: artifacts/grpo-engine-cache.json
+
+val_positions: 200
+
+# The reward's weights, written down so the run can be rebuilt from its config alone.
+weights:
+  quality: 1.0
+  mate: 0.25
+  repetition: 0.25
+  cp_scale: 200.0
+
+seed: 42
+```
+
+<Src file="configs/train/grpo.yaml" tag="p5" lines="1-49" />
+
+El comentario de la temperatura es el que más enseña, porque documenta una palanca que **no lo
+es**. Subirla compra dispersión —38 % de grupos planos a 1,0, 26 % a 1,3, 19 % a 1,6— y cobra
+exactamente lo que da en llamadas al motor, así que el precio por grupo **útil** casi no se mueve:
+0,184, 0,186 y 0,174 grupos por análisis. Con el coste plano, el desempate es cuál se parece más a
+cómo se lee el modelo, y esa es 1,0.
+
+La segunda configuración es la que le pide a GRPO que devuelva el peaje que DPO se gastó:
+
+{/* prettier-ignore */}
+```yaml title="configs/train/grpo-legality.yaml"
+# GRPO asked to pay back the legality that DPO spent.
+#
+# D-121 measured the toll: aligning with DPO doubled the base model's illegal-proposal rate, from
+# 1.3-1.5 % to 2.9-3.8 % for the off-policy arm. This run starts from that model and draws its
+# candidate groups from the **whole vocabulary** instead of from the legal moves, so an illegal
+# proposal can land in a group and score the floor -- which is the only configuration in which a
+# legality gate can teach anything at all.
+#
+# The number to watch is not the reward. It is `illegal` before and after, with the KL small.
+prompts: data/pairs/dpo-prompts.parquet
+checkpoint: checkpoints/medium-v4-dpo-offpolicy/dpo.pt
+out_dir: checkpoints
+run_name: medium-v4-dpo-offpolicy-grpo-legality
+
+group_size: 8
+temperature: 1.0
+top_k: 20
+restrict_to_legal: false
+
+beta_kl: 0.02
+lr: 1.0e-6
+positions_per_step: 8
+steps: 1500
+depth: 8
+cache: artifacts/grpo-engine-cache.json
+val_positions: 400
+
+weights:
+  quality: 1.0
+  mate: 0.25
+  repetition: 0.25
+  cp_scale: 200.0
+
+seed: 42
+```
+
+<Src file="configs/train/grpo-legality.yaml" tag="p5" lines="1-34" />
+
+Va entera y no por diferencia porque cambian cuatro cosas a la vez y las cuatro están relacionadas:
+parte del modelo **ya alineado** con DPO en vez de la base, sortea del vocabulario entero,
+cuadruplica los pasos y dobla las posiciones de validación. Y la última línea de su cabecera es la
+que hay que leer: **el número que se mira no es la recompensa**, es `illegal` antes y después con
+la KL pequeña.
+
+## La orden
+
+`rukh train grpo` imprime once números, y el orden en el que los imprime es el argumento entero
+del módulo.
+
+```python title="src/rukh/cli.py"
+@train_app.command("grpo")
+def train_grpo_cmd(
+    config: Annotated[
+        Path, typer.Option("--config", exists=True, dir_okay=False, help="GRPO run YAML.")
+    ],
+    steps: Annotated[
+        int | None, typer.Option("--steps", help="Override the number of steps.")
+    ] = None,
+    run_name: Annotated[str | None, typer.Option("--run-name", help="Name the output.")] = None,
+    device: Annotated[str | None, typer.Option("--device", help="Where to train.")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the result as JSON only.")] = False,
+) -> None:
+    """Align the decoder against a reward *function*, using the group as its own baseline.
+
+    No pairs and no reward model: the policy proposes a group of moves, a verifiable reward scores
+    them, and each is pushed up or down relative to its group's mean. What to watch is not the
+    reward going up -- it always can -- but whether it went up *and* the KL stayed small.
+    """
+    from rukh.config import load_yaml
+    from rukh.train.grpo import GrpoConfig, train_grpo
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    cfg = load_yaml(config, GrpoConfig)
+    updates: dict[str, object] = {}
+    if steps is not None:
+        updates["steps"] = steps
+    if run_name:
+        updates["run_name"] = run_name
+    if device:
+        updates["device"] = device
+    if updates:
+        cfg = cfg.model_copy(update=updates)
+    result = train_grpo(cfg)
+    if as_json:
+        typer.echo(result.model_dump_json(indent=2))
+        return
+    typer.echo(f"checkpoint: {result.checkpoint}")
+    typer.echo(
+        f"reward:     {result.reward_before:+.4f} -> {result.reward_after:+.4f} (group best)"
+    )
+    typer.echo(
+        f"            {result.reward_absolute_before:+.4f} -> "
+        f"{result.reward_absolute_after:+.4f} (engine best -- this is the score)"
+    )
+    typer.echo(f"flat:       {result.flat_share_before:.3f} -> {result.flat_share_after:.3f}")
+    typer.echo(f"illegal:    {result.illegal_before:.4f} -> {result.illegal_after:.4f}")
+    typer.echo(f"kl:         {result.kl_after:.5f} against the frozen start")
+    spent = result.engine_calls + result.cache_hits
+    share = result.cache_hits / spent if spent else 0.0
+    typer.echo(f"groups:     {result.groups:,} useful, {result.flat_groups:,} flat")
+    typer.echo(f"engine:     {result.engine_calls:,} analyses, {share * 100:.1f} % from cache")
+```
+
+<Src file="src/rukh/cli.py" tag="p5" lines="847-897" />
+
+Las dos líneas de recompensa van seguidas y la segunda lleva escrito `-- this is the score` en la
+propia salida. No es humor: un mes después de la corrida, quien lea el terminal pegado en un
+informe necesita saber cuál de los dos números significa algo.
+
+Y después van juntos, en la misma pantalla, los tres que hay que leer a la vez: recompensa, grupos
+planos, ilegales y KL. Una recompensa verificable **siempre** puede subir —está escrita, y lo que
+está escrito se puede optimizar—; lo que dice si subió jugando mejor o cultivando el número es que
+suba **y** el colapso no crezca **y** la KL se quede pequeña.
+
+Salida en la máquina de referencia (RTX 5090), la corrida publicada de 1 500 pasos:
+
+```text
+reward:     +0.8657 -> +0.8937 (group best)
+            +0.8250 -> +0.8529 (engine best -- this is the score)
+flat:       0.385 -> 0.472
+illegal:    0.0000 -> 0.0000
+kl:         0.12169 against the frozen start
+```
+
+<Exercise n="01" title="¿Por qué el paso de un grupo plano no cuesta nada y aun así hay que contarlo?">
+  Un grupo plano se salta antes de la pasada hacia delante de la política. ¿Qué se ha gastado ya
+  cuando se descubre que es plano, y por qué el recuento es una métrica y no un detalle de log?
+
+  <Solution>
+    Cuando se descubre, ya se han pagado **las ocho puntuaciones de motor** de las candidatas: el
+    grupo se sortea, se puntúa, y solo entonces se calculan las ventajas y se ve que son cero. Lo
+    único que se ahorra es la pasada hacia atrás, que en este modelo es lo barato.
+
+    Y es una métrica porque mide algo que no se puede saber por adelantado: qué fracción del
+    presupuesto de motor se lleva la propia confianza del modelo. Empieza en el 38 % a temperatura
+    1,0 y **crece con el entrenamiento**, que es el mecanismo de la sobreoptimización que la lección
+    8 mide con una curva de tres puntos.
+
+  </Solution>
+</Exercise>
+
+<Exercise n="02" title="El grupo plano y el par que no salió">
+  En la lección anterior, un 27,1 % de las posiciones no produjo par on-policy porque el modelo
+  propuso una sola jugada distinta. ¿Qué relación tiene con `flat_groups`?
+
+  <Solution>
+    Son el mismo fenómeno medido en dos sitios. En los dos casos el modelo propone varias veces y
+    sale siempre lo mismo, el motor ya está pagado, y no hay nada que aprender de ahí. La diferencia
+    es qué se hace con el dato: en la construcción de pares es un descarte que aparece en el
+    manifiesto; en GRPO es un contador que se publica en el resultado y que, además, **sube durante
+    la corrida** — o sea, el mismo número que en los datos es una propiedad estática del modelo, en
+    el entrenamiento es un síntoma dinámico de que la política se está cerrando.
+  </Solution>
+</Exercise>
+
+## Qué has aprendido
+
+Que una recompensa verificable no se equivoca como una aprendida: solo puede estar mal diseñada, y
+por eso lleva cuatro reglas y un test de cotas sobre entradas absurdas. Que GRPO cambia la red de
+valor de PPO por la media del propio grupo, y que el precio de esa ganga es que un grupo de acuerdo
+no enseña nada y aun así ya se ha pagado. Que la KL tiene que ser no negativa o deja de ser un
+castigo. Y, sobre todo, la pregunta que encontró en este bucle un fallo que ninguna de las cinco
+recompensas rotas a propósito habría enseñado: **describe la política que maximizaría tu métrica**;
+si esa política no es la que quieres, la métrica no es la que quieres.
+
+Lo siguiente es el instrumento con el que se decide si algo de esto sirvió: dos modelos jugando
+entre sí.

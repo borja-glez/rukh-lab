@@ -1,0 +1,232 @@
+---
+title: 'Los modelos alineados en la demo'
+description:
+  'Diecinueve líneas de TypeScript en el registro de etapas de la demo: la etapa de GRPO, el DPO
+  que ahora apunta al brazo dentro de política, y la razón de que servir un modelo alineado no
+  cambie absolutamente nada del resto del navegador.'
+module: m5
+order: 7
+duration: 45
+level: base
+status: vigente
+updated: 2026-09-22
+keywords:
+  - demo
+  - ONNX
+  - registro de etapas
+  - WebGPU
+artifacts:
+  - kind: demo
+    label: rukh.borjaglez.com
+    href: https://rukh.borjaglez.com
+demo: ?stage=medium-grpo-fp16
+---
+
+## Qué vas a construir
+
+Nada, y esa es la lección. El hito entrena tres modelos nuevos, publica dos de ellos en el Hub, y
+lo que hace falta en `rukh-web` para que alguien pueda jugar contra ellos desde el navegador son
+**diecinueve líneas**: una entrada en el mapa de tamaños, una entrada en la lista de etapas, y una
+línea en el test que fija esa lista.
+
+El commit de la demo para este hito es
+[`a34c8b9`](https://github.com/borja-glez/rukh-web/commit/a34c8b9), y toca exactamente dos
+ficheros. El tokenizador, el worker de ONNX, el tablero, la máquina de estados de la partida y el
+enmascarado de jugadas ilegales **no cambian ni una línea**, porque un modelo alineado es el mismo
+decoder de M2 con otros pesos: mismo vocabulario de 2 030 tokens, mismo contexto de 200, misma
+forma de entrada y salida. Eso es lo que hace que alinear sea barato de servir y lo que justifica
+que el registro sea la única frontera.
+
+## El registro de etapas
+
+La demo tiene un fichero donde vive todo lo que sabe de cada modelo que ofrece:
+`src/lib/registry.ts`. M0 lo enseñó entero al construir el tablero; aquí solo se mira lo que este
+hito le añade.
+
+Primero el mapa de tamaños, que es el que se lee antes de descargar nada:
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+/**
+ * Download sizes in MB, **measured** on the published files rather than estimated. They drive
+ * the consent copy, which is the last thing a reader sees before the browser fetches tens of
+ * megabytes, so an estimate that drifts from the file is a promise the page does not keep. Read
+ * them back with `python -c "import os; print(os.path.getsize(...))"` whenever a stage is
+ * re-exported: `small` and the encoder both changed size when their weights did.
+ *
+ * Every number here was re-read from the staged `onnx` folders on 2026-09-20 and every
+ * one of them was wrong -- by 6 to 10 MB, always low, because they had been carried over from the
+ * plan's estimates and never corrected. The consent step had been under-promising every download
+ * since P2.
+ */
+export const STAGE_SIZE_MB = {
+  'tiny-int8': 8,
+  'small-fp16': 79,
+  'small-int8': 43,
+  'medium-fp16': 231,
+  'medium-int8': 122,
+  'medium-dpo-fp16': 231,
+  'medium-grpo-fp16': 231,
+  'medium-elo-fp16': 231,
+  'medium-elo-int8': 122,
+  // The swappable export is 438 KB bigger than the ordinary one -- the cost of a graph that takes
+  // its LoRA factors as inputs is 0.19 % of the file, which is the whole argument for doing it.
+  'medium-lora-fp16': 232,
+  'medium-lora-int8': 122,
+} as const;
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="a34c8b9" lines="42-68" />
+
+`'medium-grpo-fp16': 231` es la línea nueva. El resto ya estaba, y el docstring de encima merece
+leerse aunque no sea de este hito: los tamaños están **medidos** sobre los ficheros publicados, no
+estimados, porque son lo que la demo le promete a alguien justo antes de bajarse cientos de
+megabytes por su conexión.
+
+La última frase es una confesión que vale por un runbook entero: el día que se releyeron todos, los
+**doce** estaban mal —entre 6 y 10 MB por debajo, siempre por debajo—, porque venían de las
+estimaciones del plan y nadie los había corregido. La demo llevaba prometiendo descargas más
+pequeñas de las reales desde M2.
+
+<Transfer
+  concept="Un número que promete algo se mide, no se estima"
+  where="Cualquier cifra que aparezca en una interfaz antes de una acción irreversible: el tamaño de un adjunto, el coste estimado de una consulta, el tiempo restante de un proceso."
+>
+  Una estimación que se copia de un documento de diseño a una interfaz deja de ser una estimación y
+  pasa a ser una promesa, y nadie vuelve a comprobarla porque parece un dato. La regla barata es
+  leerla del artefacto real en el momento de publicarlo, y si eso no se puede automatizar, poner la
+  fecha de la última vez que se leyó al lado.
+</Transfer>
+
+{/* prettier-ignore */}
+```ts title="src/lib/registry.ts"
+  // `medium` after DPO on preference pairs the model proposed itself. +57 Elo over the base in a
+  // head-to-head of 800 games (M5), and it beats the off-policy arm by +37 when the two play each
+  // other -- which is the only direct comparison between the two candidates, and the reason this
+  // is the one served.
+  {
+    id: 'medium-dpo-fp16',
+    label: 'Rukh medium + DPO (fp16)',
+    kind: 'onnx',
+    repo: 'chorcat/rukh-medium-dpo',
+    file: 'onnx/model-fp16.onnx',
+    sizeMb: STAGE_SIZE_MB['medium-dpo-fp16'],
+    block: DEFAULT_BLOCK,
+  },
+  // `medium` after GRPO against a verifiable reward: +43 Elo over the base, and the aligned model
+  // that damages legality least -- 1.66 times its base's illegal-proposal rate against the 2.0-2.6
+  // of the two DPO arms.
+  {
+    id: 'medium-grpo-fp16',
+    label: 'Rukh medium + GRPO (fp16)',
+    kind: 'onnx',
+    repo: 'chorcat/rukh-medium-grpo',
+    file: 'onnx/model-fp16.onnx',
+    sizeMb: STAGE_SIZE_MB['medium-grpo-fp16'],
+    block: DEFAULT_BLOCK,
+  },
+```
+
+<Src file="src/lib/registry.ts" repo="rukh-web" tag="a34c8b9" lines="205-229" />
+
+Y las dos entradas de la lista de etapas. La segunda es nueva; la primera ya existía y lo que
+cambia de ella son **sus cuatro líneas de comentario**.
+
+Eso último no es cosmética. Hasta este hito, `medium-dpo-fp16` apuntaba a un DPO entrenado sobre
+el fichero completo de pares fuera de política. Ahora apunta al brazo entrenado con los pares que
+**el propio modelo propuso**, y el comentario dice exactamente por qué es ese y no el otro: +57 Elo
+sobre la base en 800 partidas, y +37 sobre el brazo de fuera cuando los dos juegan entre sí — que
+es la única comparación directa entre los dos candidatos.
+
+Un comentario que cita la medición que decidió es lo que impide que dentro de seis meses alguien
+cambie el `repo` de esa entrada porque «el otro parecía mejor».
+
+<Callout kind="hoy" title="+43 aquí, +44 en todas partes">
+  El comentario de la etapa de GRPO dice «+43 Elo over the base», y la medición agrupada sobre 800
+  partidas que publican el módulo, la model card y el propio mensaje del commit es **+44** (IC 23 a
+  66). También dice «2.0-2.6» para la tasa de ilegales de los dos brazos de DPO, donde las tablas
+  del hito dan 1,7-2,0 para el de dentro y 2,0-2,9 para el de fuera. Son discrepancias de un punto
+  en un comentario, no en el código, pero conviene verlas: un comentario con cifras envejece igual
+  que una estimación copiada.
+</Callout>
+
+Las dos entradas comparten `kind: 'onnx'`, `file: 'onnx/model-fp16.onnx'` y
+`block: DEFAULT_BLOCK`. Ese último campo es el que explica por qué no hace falta tocar nada más:
+la demo aprende el contexto del modelo del registro y no del fichero, porque ONNX Runtime Web no
+expone los metadatos que el exportador escribe dentro. Un modelo alineado tiene el mismo contexto
+que su base, así que la constante vale para los dos.
+
+## El test que fija la lista
+
+{/* prettier-ignore */}
+```ts title="tests/registry.test.ts"
+describe('stage registry', () => {
+  it('keeps the mock first and every other stage an ONNX one', () => {
+    expect(STAGES.map((stage) => stage.id)).toEqual([
+      'mock',
+      'tiny-int8',
+      'small-fp16',
+      'small-int8',
+      'medium-fp16',
+      'medium-int8',
+      'medium-dpo-fp16',
+      'medium-grpo-fp16',
+      'medium-elo-fp16',
+      'medium-elo-int8',
+      'medium-lora-fp16',
+      'medium-lora-int8',
+    ]);
+    expect(STAGES[0].kind).toBe('mock');
+    expect(STAGES.slice(1).every((stage) => stage.kind === 'onnx')).toBe(true);
+  });
+```
+
+<Src file="tests/registry.test.ts" repo="rukh-web" tag="a34c8b9" lines="31-49" />
+
+Una línea nueva —`'medium-grpo-fp16'`— dentro de una comparación de **igualdad**, no de
+pertenencia. `toEqual` sobre el array entero significa que añadir una etapa, quitarla o cambiarla
+de sitio rompe el test, y eso es deliberado: el orden de esta lista es el orden del selector que ve
+quien abre la demo, y una etapa que aparece en medio sin que nadie lo decida es un cambio de
+interfaz disfrazado de refactor.
+
+Las dos líneas de abajo son las que impiden que alguien meta una etapa sin modelo: la primera tiene
+que ser el `mock` —lo que `?mock=1` sirve, y lo único que no descarga nada— y todas las demás
+tienen que ser ONNX.
+
+## Lo que no cambió, y por qué es la noticia
+
+Merece la pena enumerarlo, porque la lista corta es el resultado del trabajo de los cinco módulos
+anteriores:
+
+<div class="table-wrap">
+
+| Pieza de la demo                     | Por qué no se toca                                                                                                                       |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| El tokenizador (`src/lib/chess-lm/`) | el vocabulario de 2 030 tokens se fijó en M1 y ningún alineamiento lo cambia: DPO y GRPO mueven probabilidad entre los mismos tokens     |
+| El worker de ONNX                    | la forma de entrada y salida del grafo es la del decoder de M2; un modelo alineado exporta idéntico                                      |
+| El enmascarado de jugadas ilegales   | sigue siendo necesario —y más que antes, porque alinear **dobla** la tasa de propuestas ilegales— pero el código que lo hace es el mismo |
+| El tablero y la máquina de partida   | no saben qué modelo hay detrás, y ese fue el diseño de M0                                                                                |
+| El selector de Elo                   | solo lo contestan las etapas de M4, que son las únicas entrenadas con cabeceras por debajo de 1800                                       |
+
+</div>
+
+La fila del enmascarado es la que conviene subrayar. La lección 8 mide que los modelos alineados
+proponen entre 1,7 y 2,9 veces más jugadas ilegales que su base. En la demo eso **no se nota**,
+porque el sorteo enmascarado las descarta antes de que lleguen al tablero. El peaje existe, está
+medido y el jugador no lo ve — que es exactamente la razón de que haya que medirlo en otro sitio.
+
+<DemoEmbed
+  query="?stage=medium-grpo-fp16"
+  title="Jugar contra el modelo alineado con GRPO"
+  note="231 MB la primera vez; después queda en la caché del navegador. Compáralo con ?stage=medium-fp16, que es su base."
+/>
+
+## Qué has aprendido
+
+Que la frontera entre el repositorio de ML y el de la demo es una lista, y que si esa lista está
+bien hecha un modelo nuevo cuesta tres líneas. Que los números que una interfaz enseña antes de una
+descarga son promesas y se miden en vez de estimarse. Y que un comentario al lado de una entrada de
+configuración, citando la medición que la decidió, vale más que el mismo dato en un documento que
+nadie va a abrir.
+
+Lo siguiente es lo que salió: los números del hito, con sus intervalos y sus tres criterios.
