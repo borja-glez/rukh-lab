@@ -2,30 +2,41 @@
 import { getCollection } from 'astro:content';
 import Base from '../../layouts/Base.astro';
 import SectionHead from '../../components/SectionHead.astro';
+import { courseTime, formatHours, moduleTime } from '../../lib/hours';
 
 const modules = (await getCollection('modules')).sort((a, b) => a.data.order - b.data.order);
 const lessons = (await getCollection('lessons')).sort((a, b) => a.data.order - b.data.order);
 const lessonsOf = (moduleId: string) => lessons.filter((l) => l.data.module === moduleId);
+const timeOf = (m: (typeof modules)[number]) => moduleTime(m, lessons);
+const phase1 = modules.filter((m) => m.data.phase === 1);
+const phase2 = modules.filter((m) => m.data.phase === 2);
+const t1 = courseTime(phase1, lessons);
+const t2 = courseTime(phase2, lessons);
 const phases = [
   {
     n: '01',
     id: 'fase-1',
     label: 'Fase 1',
     title: 'Un modelo de lenguaje de ajedrez desde cero',
-    kind: 'siete módulos · cinco semanas · ≈ 44 h',
-    modules: modules.filter((m) => m.data.phase === 1),
+    kind: `siete módulos · cinco semanas · ≈ ${formatHours(t1.work)} de trabajo + ${formatHours(t1.run)} de GPU y red`,
+    modules: phase1,
   },
   {
     n: '02',
     id: 'fase-2',
     label: 'Fase 2',
     title: 'IA agéntica: el entrenador',
-    kind: 'seis módulos · cuatro semanas · ≈ 30 h',
-    modules: modules.filter((m) => m.data.phase === 2),
+    kind: `seis módulos · cuatro semanas · ≈ ${formatHours(t2.work)} estimadas`,
+    modules: phase2,
   },
 ];
+/*
+ * Only the two unfinished states get a chip. A module that is published is the normal case, and
+ * labelling the normal case says nothing: the reader learns what is missing, not what is there.
+ * `live` stays in the map because the status still drives the styling elsewhere.
+ */
 const statusLabel = { live: 'vigente', draft: 'borrador', planned: 'previsto' } as const;
-const totalHours = modules.reduce((acc, m) => acc + m.data.hours, 0);
+const total = courseTime(modules, lessons);
 ---
 
 <Base
@@ -36,13 +47,21 @@ const totalHours = modules.reduce((acc, m) => acc + m.data.hours, 0);
   <main id="main" class="page container">
     <section class="section intro">
       <p class="label label--accent">
-        // curso · {modules.length} módulos · ≈ {totalHours} h
+        // curso · {modules.length} módulos · ≈ {formatHours(total.work)} de trabajo
       </p>
       <h1 class="section__title section__title--narrow">Dos fases, un artefacto.</h1>
       <p class="body section__lead pretty">
         Cada módulo cierra con algo que funciona y se mide con la misma tabla: legalidad, exactitud,
         puzles y Elo frente a Stockfish. Las lecciones se publican hito a hito; el módulo 0 ya está
         disponible.
+      </p>
+      <p class="caption intro__clocks pretty">
+        Las dos cifras de cada módulo son dos relojes distintos. <strong>Trabajo</strong> es el
+        tiempo contigo delante: leer, escribir el código y hacer los ejercicios.{' '}
+        <strong>GPU y red</strong> es el reloj de pared sin ti: entrenamientos, descargas y partidas
+        contra el motor en la máquina de referencia (RTX 5090). Casi todo ese segundo reloj se puede
+        saltar descargando el artefacto ya hecho con <code>rukh pull</code>; cada lección de labs
+        dice cuál.
       </p>
     </section>
 
@@ -55,22 +74,22 @@ const totalHours = modules.reduce((acc, m) => acc + m.data.hours, 0);
         <ol class="card-grid modules">
           {phase.modules.map((m) => {
             const ls = lessonsOf(m.id);
+            const time = timeOf(m);
             return (
               <li class="module" id={m.id}>
                 <div class="module__head">
                   <span class="mono module__id">{m.id.toUpperCase()}</span>
-                  <span class="module__hours mono">{m.data.hours} h</span>
-                  <span
-                    class:list={[
-                      'chip',
-                      {
-                        'chip--live': m.data.status === 'live',
-                        'chip--draft': m.data.status === 'draft',
-                      },
-                    ]}
-                  >
-                    {statusLabel[m.data.status]}
+                  <span class="module__hours mono">
+                    {formatHours(time.work)}
+                    {time.run > 0 && (
+                      <span class="module__run"> + {formatHours(time.run)} de GPU</span>
+                    )}
                   </span>
+                  {m.data.status !== 'live' && (
+                    <span class:list={['chip', { 'chip--draft': m.data.status === 'draft' }]}>
+                      {statusLabel[m.data.status]}
+                    </span>
+                  )}
                   {ls.length > 0 && (
                     <span
                       class="chip module__progress"
@@ -130,7 +149,10 @@ const totalHours = modules.reduce((acc, m) => acc + m.data.hours, 0);
                               {String(l.data.order).padStart(2, '0')}
                             </span>
                             <span class="lessons__title">{l.data.title}</span>
-                            <span class="caption lessons__meta">{l.data.duration} min</span>
+                            <span class="caption lessons__meta">
+                              {l.data.duration} min
+                              {l.data.runtime ? ` + ${l.data.runtime} de GPU` : ''}
+                            </span>
                           </a>
                         </li>
                       ))}
@@ -202,6 +224,23 @@ const totalHours = modules.reduce((acc, m) => acc + m.data.hours, 0);
   .module__hours {
     font-size: 12px;
     color: var(--muted);
+  }
+
+  .module__run {
+    color: var(--muted);
+  }
+
+  .intro__clocks {
+    max-width: 62ch;
+    margin-top: 14px;
+    padding-left: 14px;
+    border-left: 1px solid var(--line);
+    color: var(--muted);
+  }
+
+  .intro__clocks strong {
+    color: var(--ink);
+    font-weight: 600;
   }
 
   .module__progress {

@@ -5,6 +5,7 @@
  */
 import Callout from './Callout.astro';
 import Exercise from './Exercise.astro';
+import LabRoutes from './LabRoutes.astro';
 import Solution from './Solution.astro';
 import Term from './Term.astro';
 import Transfer from './Transfer.astro';
@@ -23,6 +24,7 @@ import ValueBar from '../../islands/ValueBar';
 export {
   Callout,
   Exercise,
+  LabRoutes,
   Solution,
   Term,
   Transfer,
@@ -42,6 +44,7 @@ export {
 export const components = {
   Callout,
   Exercise,
+  LabRoutes,
   Solution,
   Term,
   Transfer,

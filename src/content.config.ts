@@ -23,7 +23,12 @@ const modules = defineCollection({
   schema: z.object({
     title: z.string(),
     phase: z.union([z.literal(1), z.literal(2)]),
-    hours: z.number().positive(),
+    /**
+     * Planned estimate, in hours, and only for modules with no published lesson. A module
+     * that has lessons derives its time from them (`src/lib/hours.ts`); writing it twice is
+     * how the two numbers drifted apart.
+     */
+    hours: z.number().positive().optional(),
     status: z.enum(['draft', 'live', 'planned']),
     summary: z.string(),
     outcomes: z.array(z.string()).min(1),
@@ -39,8 +44,14 @@ const lessons = defineCollection({
     description: z.string(),
     module: z.string().regex(/^(m[0-6]|a[1-6])$/),
     order: z.number().int().nonnegative(),
-    /** Estimated reading and lab time, in minutes. */
+    /** Time at the keyboard: reading, writing code, doing the exercises, in minutes. */
     duration: z.number().int().positive(),
+    /**
+     * Wall clock with nobody in front of it: GPU training, downloads, engine matches, in
+     * minutes, on the reference machine. Taken from `rukh/docs/reproducir.md` and the
+     * runbooks. Omitted by lessons whose labs run in seconds.
+     */
+    runtime: z.number().int().nonnegative().optional(),
     level: z.enum(['base', 'medio', 'avanzado']),
     status: z.enum(['borrador', 'vigente']),
     updated: z.coerce.date(),
