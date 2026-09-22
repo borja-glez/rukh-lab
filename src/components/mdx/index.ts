@@ -17,6 +17,7 @@ import ResultsTable from './ResultsTable.astro';
 import DemoEmbed from './DemoEmbed.astro';
 import TokenizerStats from './TokenizerStats.astro';
 import RepoTag from './RepoTag.astro';
+import Src from './Src.astro';
 import AttentionMap from '../../islands/AttentionMap';
 import TrainingReplay from '../../islands/TrainingReplay';
 import ValueBar from '../../islands/ValueBar';
@@ -36,6 +37,7 @@ export {
   DemoEmbed,
   TokenizerStats,
   RepoTag,
+  Src,
   AttentionMap,
   TrainingReplay,
   ValueBar,
@@ -56,6 +58,7 @@ export const components = {
   DemoEmbed,
   TokenizerStats,
   RepoTag,
+  Src,
 };
 
 /*

@@ -91,6 +91,7 @@ Qué se ha hecho, cómo se mide (columnas de la tabla única que cambian) y qué
 | `ModelBadge`   | Insignia a una model/dataset card del Hub                               | `repo` (`chorcat/rukh-small`), `kind?: model \| dataset`, `label?`          |
 | `ResultsTable` | La tabla única desde `src/data/results.json`                            | `lang?`, `emptyText?`                                                       |
 | `DemoEmbed`    | Tarjeta con enlace a la demo (iframe opcional con `embed`)              | `query`, `title`, `note?`, `embed?`                                         |
+| `Src`          | Citación bajo un bloque de código: fichero, etiqueta y líneas en GitHub | `file`, `tag?`, `lines?`, `repo?`, `note?` — ver `docs/runbooks/codigo-en-lecciones.md` |
 
 ## Islas (componentes Preact)
 
@@ -139,6 +140,10 @@ Convenciones de una isla nueva:
 El popover de `Term` existe solo en dispositivos con `(hover: hover)` (ratón o trackpad, al pasar por
 encima o al enfocar con teclado); en pantallas táctiles el término es un enlace normal al glosario,
 así que la definición nunca debe ser imprescindible para seguir el párrafo.
+
+Todo bloque que dice ser un fichero de un repo es ese fichero, literal, en la etiqueta del módulo,
+y lleva un `<Src>` debajo que lo cita y lo hace verificable (`pnpm verify:code`). La regla completa
+está en `docs/runbooks/codigo-en-lecciones.md` y no es negociable: es la que se rompió en la fase 1.
 
 Los bloques de código usan expressive-code: ` ```bash title="Terminal" ` pone la barra de título;
 ` ```text ` para salidas. Los temas claro/oscuro siguen el tema del sitio.

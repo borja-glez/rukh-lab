@@ -18,6 +18,7 @@ const REQUIRED = [
   'ModelBadge',
   'ResultsTable',
   'DemoEmbed',
+  'Src',
 ] as const;
 
 describe('MDX component registry', () => {
