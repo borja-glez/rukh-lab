@@ -2,8 +2,8 @@
 title: 'La receta de entrenamiento'
 description:
   'AdamW, warmup y coseno, clipping y bf16, con el bucle entero de `rukh train` delante: el
-  planificador de seis líneas, los grupos de decaimiento, la acumulación de gradiente ponderada por
-  tokens, los checkpoints con procedencia y las dos configuraciones del repositorio.'
+  planificador que fija la tasa de cada paso, los grupos de decaimiento, la acumulación de gradiente
+  ponderada por tokens, los checkpoints con procedencia y las dos configuraciones del repositorio.'
 module: m2
 order: 3
 duration: 205
@@ -31,7 +31,7 @@ artifacts:
 
 ## Qué vas a construir
 
-`uv run rukh train --config configs/train/small.yaml`, y los 608 líneas de `src/rukh/train/` que hay
+`uv run rukh train --config configs/train/small.yaml`, y el código de `src/rukh/train/` que hay
 detrás. Al terminar tendrás `tiny` entrenado en **189 segundos** y `small` en **42 minutos**, con
 sus veinte checkpoints, sus curvas en MLflow y la propiedad de la que depende todo lo demás: si el
 proceso se corta, `--resume` continúa donde estaba en vez de empezar otra vez.
@@ -106,7 +106,7 @@ cifra, la larga es la que sirve. En la RTX 5090 (sm_120) bf16 es nativo, así qu
 gratis. Los pesos maestros siguen en fp32 y el optimizador acumula en fp32; bf16 es solo la
 precisión de las operaciones dentro del `autocast`.
 
-## `schedule.py`: veintiocho líneas, y las tres primeras deciden la ejecución
+## `schedule.py`: la tasa de aprendizaje de cada paso
 
 Empezamos por el fichero más pequeño del módulo, que es además el que separa una ejecución que
 converge de una que se queda plana veinte mil pasos.
@@ -234,8 +234,8 @@ entrenaría con 6e-4 sin decir nada.
 
 ## `loop.py`: el bucle
 
-Trescientas sesenta y tres líneas, y la mitad son la contabilidad que hace que una ejecución sea
-reproducible seis meses después. Empezamos por la cabecera, que es un resumen de las decisiones.
+Buena parte del fichero es la contabilidad que hace que una ejecución sea reproducible seis meses
+después. Empezamos por la cabecera, que es un resumen de las decisiones.
 
 ```python title="src/rukh/train/loop.py"
 """The training loop: AdamW with a cosine schedule, bf16, checkpoints and MLflow logging.
@@ -382,7 +382,7 @@ def param_groups(model: nn.Module, weight_decay: float) -> list[dict[str, Any]]:
 `pick_device` mira primero `RUKH_DEVICE`, y esa variable de entorno es lo que permite a los tests
 forzar CPU en una máquina con GPU sin tocar ninguna configuración.
 
-`param_groups` son las seis líneas del decaimiento de pesos, y la regla es literalmente «tensores de
+`param_groups` reparte el decaimiento de pesos, y la regla es literalmente «tensores de
 dos dimensiones o más». Un `LayerNorm` tiene una ganancia por canal inicializada a 1; empujarla hacia
 cero es apagar el canal, no regularizarlo. Un sesgo tiene una dimensión y desplaza, no escala. Son
 unos pocos miles de parámetros de los 39 millones, y meterlos en el grupo equivocado degrada el
@@ -397,7 +397,7 @@ def forever(loader: DataLoader[Batch]) -> Iterator[Batch]:
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="110-113" />
 
-Cuatro líneas que convierten un `DataLoader` finito en un flujo infinito. El bucle cuenta pasos, no
+`forever` convierte un `DataLoader` finito en un flujo infinito. El bucle cuenta pasos, no
 épocas, así que necesita que los lotes no se acaben; `yield from` reinicia el cargador —y con él su
 barajado— cada vez que se agota. En la tirada de `small` eso ocurre 4,3 veces, y esa cifra es la que
 la última lección del módulo convierte en un diagnóstico.
@@ -685,7 +685,7 @@ hash del vocabulario, el SHA del manifiesto de datos, el dispositivo y el númer
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="296-317" />
 
-El corazón. Veintidós líneas, y tres detalles que se equivocan con facilidad:
+El corazón, con tres detalles que se equivocan con facilidad:
 
 - **`(loss / cfg.grad_accum).backward()`.** Es lo que hace que los cuatro gradientes acumulados
   equivalgan a una media y no a una suma. Sin esa división, el tamaño del paso dependería de cuántos
@@ -1049,7 +1049,7 @@ __all__ = [
 
 <Src file="src/rukh/train/__init__.py" tag="p2" lines="1-45" />
 
-Cuarenta y cinco líneas de reexportes, la tercera lista de este tipo del módulo. `rukh.train` es lo
+Reexportes: la tercera lista de este tipo del módulo. `rukh.train` es lo
 que importan el harness de evaluación (`load_model`, `pick_device`), el exportador (`load_model`), el
 publicador (`load_model`, `TIED_HEAD`) y los labs. Ninguno de ellos sabe que hay tres ficheros
 detrás.
@@ -1301,7 +1301,7 @@ log_every: 10
 
 <Src file="configs/train/small.yaml" tag="p2" lines="1-27" />
 
-El modelo del curso. Veintisiete líneas, y ninguna clave es decorativa: `BaseConfig` rechaza las que
+El modelo del curso. Ninguna clave es decorativa: `BaseConfig` rechaza las que
 no reconoce, así que lo que está aquí es exactamente lo que `TrainConfig` sabe leer. Los números son
 los de la receta de arriba; el resto son decisiones de operación: `eval_every: 500` (cuarenta
 evaluaciones en la ejecución), `ckpt_every: 1000` (veinte checkpoints, que son los que recorre la isla

@@ -18,6 +18,10 @@ final.
   `<Callout kind="ejecuta">` dice qué órdenes lanzar y qué mirar en la salida (ver abajo).
 - Nada de secciones sobre el propio curso: inventarios de lo que se enlaza en vez de pegarse, la CI,
   el README, los ficheros generados. Ver `docs/runbooks/codigo-en-lecciones.md`.
+- **Los títulos dicen qué hace o qué decide el código**, no cuántas líneas tiene ni un gancho
+  ("veintiocho líneas que salvan noches de GPU"). Tampoco se abre un párrafo contando líneas: un
+  número se queda solo si informa (un diff, una proporción que es el argumento) y está comprobado
+  contra la etiqueta.
 - Cada término técnico que aparece por primera vez enlaza al glosario con `<Term id="…">`. Si no
   existe, se añade a `src/content/glossary/terms.json` (id en kebab-case, definición con el proyecto
   delante, módulo donde se aprende, alias).
