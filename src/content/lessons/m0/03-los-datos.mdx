@@ -21,10 +21,13 @@ artifacts:
     href: https://github.com/borja-glez/rukh/tree/p0
 ---
 
+import M0FetchPlan from '../../../components/figures/M0FetchPlan.astro';
+
 ## Qué vas a construir
 
-El recorte de datos con el que se entrena todo el curso, y —más importante— la prueba de qué entró
-en él. El centro es una consulta SQL que se puede leer **antes** de descargar nada.
+La biblioteca del club: el recorte de datos con el que se entrena todo el curso y, lo que importa
+más, la prueba de qué entró en él. El centro es una consulta SQL que se puede leer **antes** de
+descargar nada.
 
 Lichess publica todo lo que se juega en su servidor. Los volcados mensuales, las copias en Hugging
 Face (`Lichess/standard-chess-games`, más de 6 700 millones de partidas), los seis millones de puzles
@@ -74,9 +77,9 @@ dos lados, y la validación mediría "¿reconoces a este jugador?" en vez de "¿
 <Callout kind="hoy" title="Así se hace hoy: filtrar en remoto, materializar poco">
   Hace unos años el flujo era descargar el `.pgn.zst` de 30 GB, descomprimirlo y filtrar con
   scripts. Hoy, con datos en parquet particionado y motores como <Term id="duckdb">DuckDB</Term> o
-  Polars que hablan `hf://`, el filtro viaja al fichero y solo baja lo que pasa (
+  Polars que hablan `hf://`, el filtro viaja al fichero y solo baja lo que pasa. Eso es el
   <Term id="predicate-pushdown">predicate pushdown</Term>: pedirle al almacén que te mande solo las
-  cajas rojas, en vez de traer el camión entero a tu garaje y separarlas allí). La misma consulta
+  cajas rojas, en vez de traer el camión entero a tu garaje y separarlas allí. La misma consulta
   sirve para explorar (`LIMIT 1000`) y para producir el recorte completo.
 </Callout>
 
@@ -134,11 +137,11 @@ class Manifest(BaseModel):
 
 <Src file="src/rukh/data/manifest.py" tag="p0" lines="1-33" />
 
-Los tres campos del medio hacen el trabajo, y son la diferencia entre un dataset y un dataset del que
-se puede responder.
+Los tres campos del medio hacen el trabajo, y son la diferencia entre tener un dataset y poder
+responder por él.
 
 `filters` son los parámetros con los que el paso **corrió de verdad**, no los que dice el README.
-`counts` es cuántas filas salieron por mes, que es lo que convierte "descartamos las partidas cortas"
+`counts` es cuántas filas salieron por mes, que es lo que convierte «descartamos el bullet»
 en algo comprobable en vez de afirmado. Y `files` es un sha256 por salida, que es lo que convierte
 "el mismo dataset" en una afirmación que un test puede tumbar.
 
@@ -152,7 +155,33 @@ no tener manifiesto, porque miente con autoridad.
 `datetime.now(UTC)` y no `datetime.now()`. Una fecha sin zona horaria en un fichero que se va a
 comparar entre máquinas es una fecha que no se puede comparar.
 
+Un manifiesto es la ficha de catálogo de la biblioteca: no es el libro, pero dice de dónde vino,
+cuándo entró y cuántas páginas tiene, y con ella puedes comprobar que el ejemplar de la estantería
+es el que dice ser.
+
+<Transfer
+  concept="Procedencia de datos"
+  where="El índice de un RAG, un dataset de fine-tuning, un conjunto de evaluación: todo lo que alimenta a un modelo."
+>
+  Cualquier conjunto de datos que alimente un modelo necesita su manifiesto: qué fuente, qué filtros
+  se aplicaron de verdad, cuántas filas quedaron y un hash de lo que salió. En un RAG es lo que te
+  deja responder «¿esta respuesta salió de la versión del manual de marzo o de la de junio?». En una
+  evaluación, lo que te deja demostrar que las preguntas del test no estaban en los datos de
+  entrenamiento. Sin él, la pregunta «¿qué datos vio este modelo?» se responde de memoria.
+</Transfer>
+
 ## `fetch.py`: la consulta, el plan y la descarga
+
+Antes del código, el recorrido completo. La orden valida la configuración, construye un plan con la
+consulta dentro y, si es un ensayo, se para ahí. Si no, ejecuta ese mismo plan mes a mes y escribe
+el manifiesto lo último.
+
+<Figure
+  n="01"
+  caption="El camino de rukh data fetch. El ensayo y la descarga comparten todo hasta el primer efecto: el --dry-run es el mismo camino, cortado antes de tocar la red."
+>
+  <M0FetchPlan />
+</Figure>
 
 ```python title="src/rukh/data/fetch.py"
 """Fetch a filtered slice of ``Lichess/standard-chess-games`` with DuckDB over ``hf://``.
@@ -181,16 +210,13 @@ MONTH_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
 
 <Src file="src/rukh/data/fetch.py" tag="p0" lines="1-22" />
 
-El docstring es el sitio donde vive la decisión más importante del fichero, y merece leerse como
-prosa y no como comentario: **`min_plies` no se aplica aquí**. Contar medias jugadas
+En el docstring vive la decisión más importante del fichero: **`min_plies` no se aplica aquí**. Contar medias jugadas
 (<Term id="ply">plies</Term>) desde el `movetext` en SQL es poco fiable, porque el texto trae
 comentarios (`%clk`, `%eval`) que hay que quitar y una notación <Term id="san">SAN</Term> que hay que
 parsear. Se aplicará en M1, con `python-chess`, después de convertir a <Term id="uci">UCI</Term>. Y
-—esta es la parte que importa— el manifiesto lo dirá: el filtro se guarda como
-`min_plies_deferred`, no como `min_plies`, para que nadie lea el manifiesto y crea que ya se aplicó.
-
-Un filtro que se documenta como aplicado y no lo está es exactamente la clase de error que un
-manifiesto existe para no cometer.
+el manifiesto lo dirá: el filtro se guarda como `min_plies_deferred`, no como `min_plies`, para que
+nadie lo lea y crea que ya se aplicó. Un filtro documentado como aplicado que no lo está es justo el
+error que un manifiesto existe para evitar.
 
 `MONTH_RE` valida `YYYY-MM` con los meses reales: `(0[1-9]|1[0-2])` rechaza `2025-13` y `2025-00`,
 que un `\d{2}` aceptaría.
@@ -225,13 +251,13 @@ class FetchConfig(BaseConfig):
 Hereda de `BaseConfig`, así que una clave que no esté aquí es un error. Y cada campo lleva su
 restricción: `ge=0` en los tres umbrales, `min_length=1` en las dos listas, `ge=1` en `limit`.
 
-Esas restricciones parecen defensivas y son pedagógicas: dicen qué valores tienen sentido.
+Esas restricciones, además de defender, documentan qué valores tienen sentido.
 `min_length=1` en `terminations` porque una lista vacía produciría `Termination IN ()`, que es SQL
 inválido. `ge=1` en `limit` porque `LIMIT 0` no devuelve nada y casi siempre es una errata, no una
 intención. `Field(default=[...])` con una lista mutable como valor por defecto es seguro en pydantic
 —copia el valor por instancia— y sería un error clásico en una `dataclass`.
 
-El `field_validator` de `months` valida cada mes con la expresión regular. Nótese que la regex
+El `field_validator` de `months` valida cada mes con la expresión regular. La misma regex se usa
 **también** se usa después para partir el mes en año y mes; validar y parsear con el mismo patrón
 evita que se separen.
 
@@ -256,11 +282,14 @@ class FetchPlan(BaseModel):
 
 <Src file="src/rukh/data/fetch.py" tag="p0" lines="45-60" />
 
-La existencia de este modelo es la decisión de diseño del fichero: **el plan es un objeto, no un
-efecto secundario**. `run(cfg, dry_run=True)` devuelve exactamente el mismo `FetchPlan` que
-`run(cfg, dry_run=False)` va a ejecutar, así que lo que imprime el ensayo no puede diferir de lo que
-hace la descarga. Un `--dry-run` que construye su propia descripción es un `--dry-run` que
-eventualmente miente.
+La decisión de diseño del fichero está en que este modelo exista: **el plan es un objeto, no un
+efecto secundario**. `run(cfg, dry_run=True)` devuelve el mismo `FetchPlan` que
+`run(cfg, dry_run=False)` va a ejecutar, así que lo que imprime la <Term id="ejecucion-en-seco">ejecución en seco</Term>
+no puede diferir de lo que hace la descarga. Un `--dry-run` que construye su propia descripción
+acaba mintiendo el día que alguien cambia una y no la otra.
+
+Es la misma idea que un agente que te enseña su plan antes de actuar: lo que apruebas tiene que ser,
+objeto por objeto, lo que luego se ejecuta, no un resumen redactado aparte.
 
 El detalle de las rutas relativas en POSIX está explicado en el docstring y vale para todo el
 proyecto: el manifiesto y el plan se publican, y una ruta absoluta de Windows dentro de un fichero
@@ -290,7 +319,7 @@ def _sql_string(value: str) -> str:
 `_source` construye la URL `hf://`, que es el protocolo con el que DuckDB lee parquet remoto del Hub
 sin descargarlo entero. La ruta refleja el particionado del dataset: `data/year=2025/month=01/`.
 
-`_sql_string` duplica las comillas simples. Es higiene: los valores que se interpolan
+`_sql_string` duplica las comillas simples, por higiene: los valores que se interpolan
 en la SQL vienen de una configuración, no de un usuario anónimo, pero un nombre de dataset con un
 apóstrofo rompería la consulta de una forma que cuesta diagnosticar. Y el hábito de no interpolar
 cadenas en SQL sin escaparlas conviene tenerlo también donde no hay atacante.
@@ -333,8 +362,8 @@ def build_query(cfg: FetchConfig) -> str:
 
 <Src file="src/rukh/data/fetch.py" tag="p0" lines="77-105" />
 
-El constructor de la consulta, y los dos detalles del docstring son de los que cuestan una tarde
-cuando no se conocen.
+El constructor de la consulta. Los dos detalles del docstring cuestan una tarde cuando no se
+conocen.
 
 **`TRY_CAST` y no `CAST`.** Las partidas por correspondencia llegan con `TimeControl = '-'`. Un
 `CAST('-' AS INTEGER)` **aborta la consulta entera**: seis mil millones de filas y una que no se
@@ -346,8 +375,7 @@ diferencia entre un filtro y un fallo.
 ruta y, si no se lo impides, los inyecta como columnas `year` y `month`. La consulta ya añade su
 propia columna `month` con el alias (`'2025-01' AS month`), así que habría dos columnas con el mismo
 nombre: DuckDB renombra una a `month_1` y el resultado tiene un `month` que es `01` y un `month_1` que
-es `2025-01`, o al revés según la versión. Hay un test que comprueba exactamente eso, y está más
-abajo.
+es `2025-01`, o al revés según la versión. Un test de más abajo lo comprueba.
 
 La columna `month` se añade a mano en el `SELECT` porque el `split` del curso es por mes, y después de
 unir los dos meses con `UNION ALL` hace falta saber de cuál viene cada partida.
@@ -392,8 +420,8 @@ def plan(cfg: FetchConfig) -> FetchPlan:
 
 <Src file="src/rukh/data/fetch.py" tag="p0" lines="111-127" />
 
-La salida reproduce el particionado del origen: `year=2025/month=01/games.parquet`. No es estética.
-Un directorio con ese formato lo lee DuckDB (y pandas, y polars) como una tabla particionada, así que
+La salida reproduce el particionado del origen: `year=2025/month=01/games.parquet`. Y no por
+estética: un directorio con ese formato lo lee DuckDB (y pandas, y polars) como una tabla particionada, así que
 M1 puede consultar los dos meses juntos o uno solo con la misma expresión.
 
 El `relative_to(out_dir).as_posix()` es lo que mantiene la promesa del `FetchPlan`: nada de rutas
@@ -472,10 +500,10 @@ def run(cfg: FetchConfig, dry_run: bool = False) -> FetchPlan:
 
 <Src file="src/rukh/data/fetch.py" tag="p0" lines="136-186" />
 
-La función que descarga, y seis decisiones dentro.
+La función que descarga lleva seis decisiones dentro.
 
-**`if dry_run: return fetch_plan`** en la tercera línea. El ensayo no es un camino alternativo: es el
-mismo camino, cortado antes del primer efecto. Por eso no puede divergir.
+**`if dry_run: return fetch_plan`** en la tercera línea. El ensayo es el mismo camino, cortado antes
+del primer efecto, y por eso no puede divergir.
 
 **Un `COPY` por mes**, no uno con la consulta entera. La consulta completa tiene el `UNION ALL` de
 todos los meses, y si se ejecutara de una vez el `limit` se aplicaría al total en vez de por mes, y
@@ -493,9 +521,9 @@ cuenta las filas que hay **en disco**, así que un `COPY` que escribiera mal dar
 incoherente en vez de pasar inadvertido.
 
 **El `try/finally` alrededor de la conexión.** Una excepción a mitad de un mes (la red se cae, el
-disco se llena) cierra la conexión igual. Lo que **no** hay es limpieza de ficheros a medias: si
-falla, quedan los meses ya escritos y **no** queda manifiesto. Eso es deliberado y es la propiedad
-útil: el manifiesto se escribe al final, así que su presencia significa "esto terminó". Un directorio
+disco se llena) cierra la conexión igual. Lo que no hay es limpieza de ficheros a medias: si falla,
+quedan los meses ya escritos y **no** queda manifiesto. Es deliberado: el manifiesto se escribe al
+final, así que su presencia significa «esto terminó». Un directorio
 con parquet y sin `manifest.json` es una descarga interrumpida, y se ve de un vistazo.
 
 **`exclude={"dataset", "months", "out_dir", "min_plies"}`** al volcar los filtros. Los tres primeros
@@ -535,8 +563,8 @@ outputs:
 manifest: manifest.json
 ```
 
-Los cuatro filtros están ahí, legibles, antes de que nada se descargue. Eso es lo que hace que la
-tabla de arriba sea una afirmación comprobable y no una descripción.
+Los cuatro filtros están ahí, legibles, antes de que nada se descargue: la tabla de arriba deja de
+ser una descripción y pasa a ser algo que puedes comprobar.
 
 <Exercise n="01" title="Lee el plan antes de descargar">
   Ejecuta el `--dry-run` y localiza en la SQL los cuatro filtros. Después copia el YAML, cambia
@@ -597,9 +625,8 @@ Seis filas, y cada una está ahí para caer por un filtro distinto: la primera p
 bullet, la tercera tiene un jugador por debajo de 1800, la cuarta está abandonada, la quinta es una
 variante y la sexta es la de correspondencia con `TimeControl = '-'` que reventaría un `CAST`.
 
-Ese es el patrón que merece copiarse: **un dato de prueba por rama del filtro**, con el comentario
-que dice cuántas filas deben quedar. Con seis filas se cubre lo que con seis millones no se cubriría
-mejor.
+El patrón que merece copiarse es **un dato de prueba por rama del filtro**, con el comentario que
+dice cuántas filas deben quedar. Seis filas elegidas cubren más que seis millones al azar.
 
 ```python title="tests/unit/test_fetch.py"
 
@@ -637,7 +664,7 @@ misma estructura de carpetas** que el dataset remoto (`year=2025/month=01/`) y s
 una función que devuelve esa ruta. A partir de ahí, `run()` ejecuta su SQL de verdad, con DuckDB de
 verdad, sobre parquet de verdad: lo único falso es de dónde sale el fichero.
 
-Que la estructura de carpetas sea la real no es un detalle: es lo que permite que el test detecte el
+Que la estructura de carpetas sea la real es lo que permite que el test detecte el
 problema del `hive_partitioning`, que solo aparece cuando la ruta tiene el formato `clave=valor`.
 
 ```python title="tests/unit/test_fetch.py"
@@ -690,14 +717,13 @@ def test_fetch_config_rejects_out_of_range_values(overrides: dict[str, object]) 
 <Src file="tests/unit/test_fetch.py" tag="p0" lines="58-101" />
 
 El primero fija los valores por defecto **como contrato**: cambiar `min_elo` a 1600 sin querer rompe
-un test en vez de cambiar en silencio lo que el modelo aprende. Es la clase de test que parece
-tautológico y no lo es, porque los valores por defecto de una configuración de datos son decisiones
-publicadas.
+un test en vez de cambiar en silencio lo que el modelo aprende. Parece tautológico, pero los valores
+por defecto de una configuración de datos son decisiones publicadas.
 
 `test_fetch_config_rejects_unknown_key` usa `min_rating` a propósito: es la errata plausible de
 `min_elo`, la que alguien escribiría de verdad.
 
-Los dos `parametrize` merecen fijarse en el argumento `ids`: sin él, el informe de pytest dice
+En los dos `parametrize`, fíjate en el argumento `ids`: sin él, el informe de pytest dice
 `test_fetch_config_rejects_out_of_range_values[overrides3]`; con él dice `[negative-elo]`. Cuando el
 test falle dentro de seis meses, esa palabra es la diferencia entre saber qué se rompió y tener que
 contar posiciones en una lista.
@@ -764,8 +790,6 @@ def test_shipped_config_loads(repo_root: Path) -> None:
 
 <Src file="tests/unit/test_fetch.py" tag="p0" lines="122-145" />
 
-Tres tests cortos y los tres valen su sitio.
-
 `assert fetch_plan.query == build_query(_cfg())` es la promesa del `FetchPlan` convertida en aserción:
 la consulta del plan **es** la del constructor, no una copia.
 
@@ -773,8 +797,8 @@ la consulta del plan **es** la del constructor, no una copia.
 igual al plan, y que el directorio no existe. La segunda es la importante y la que casi nadie
 escribe.
 
-`test_shipped_config_loads` valida el YAML que va en el repositorio. Es el test que evita el ridículo
-de publicar una configuración de ejemplo que no carga, y cuesta tres líneas.
+`test_shipped_config_loads` valida el YAML que va en el repositorio: tres líneas que evitan publicar
+una configuración de ejemplo que no carga.
 
 ```python title="tests/unit/test_fetch.py"
 
@@ -807,10 +831,10 @@ def test_cli_data_fetch_dry_run_json(rukh_home: Path, repo_root: Path) -> None:
 
 <Src file="tests/unit/test_fetch.py" tag="p0" lines="146-171" />
 
-Los dos tests de la CLI: el humano y el JSON. Nótese el `"  year=2025/month=01/games.parquet"` con
+Los dos tests de la CLI: el humano y el JSON. Fíjate en el `"  year=2025/month=01/games.parquet"` con
 **dos espacios delante** en el primero: comprueba la sangría con la que la CLI imprime la lista de
-salidas. Es el nivel de detalle que hace que la salida pegada en esta lección siga siendo cierta
-dentro de un año.
+salidas. Ese nivel de detalle es el que mantiene cierta la salida pegada en esta lección dentro de
+un año.
 
 ```python title="tests/unit/test_fetch.py"
 
@@ -864,17 +888,16 @@ promete.
 
 **Que `hive_partitioning = false` hace su trabajo**: `columns.count("month") == 1`,
 `"month_1" not in columns`, `"year" not in columns`. Tres aserciones para un argumento de una
-función, y son las que impiden que alguien lo borre por parecer superfluo. Sin ellas, el error sería
+función, y son las que impiden que alguien lo borre por parecerle superfluo. Sin ellas, el error sería
 un dataset con una columna `month` que vale `01` en vez de `2025-01`, y el _split_ por mes de M1
 fallaría por un motivo que no se parece a su causa.
 
 **Que el manifiesto no miente**: `min_plies_deferred` está y `min_plies` no. La promesa del docstring,
 comprobada.
 
-El último test es mi favorito del fichero, y su nombre es la razón: `drops_correspondence_games_
-instead_of_aborting`. Con `min_elo=0` pasan las dos partidas de blitz y **la de correspondencia no
-revienta la consulta**: `TRY_CAST` la convierte en `NULL` y el filtro la descarta. Ese test es la
-única cosa que impide que alguien cambie `TRY_CAST` por `CAST` porque "queda más limpio", y descubra
+El último test se explica con su nombre: `drops_correspondence_games_instead_of_aborting`. Con `min_elo=0` pasan las dos partidas de blitz y **la de correspondencia no
+revienta la consulta**: `TRY_CAST` la convierte en `NULL` y el filtro la descarta. Ese test es lo
+único que impide que alguien cambie `TRY_CAST` por `CAST` porque "queda más limpio", y descubra
 el problema seis mil millones de filas después.
 
 ```python title="tests/unit/test_manifest.py"
@@ -986,13 +1009,9 @@ paralelo. Van sin firmar, así que Hugging Face les aplica el límite más bajo.
 intenta tres veces. Cuando llega el `429`, el `COPY` falla después de minutos de trabajo y no deja
 nada de lo que reanudar: no hay manifiesto, y al relanzar se empieza de cero.
 
-**Por qué el código de `p0` sigue así.** El curso cita `rukh` tal como estaba el día en que se
-cerró cada hito, y cuando se cerró `p0` esta lectura en remoto funcionaba: el corpus del proyecto
-se descargó con ella. Los `429` empezaron el 2026-09-20, cuando M4 tuvo que bajar meses nuevos, y
-la corrección vive en `p4`. Cambiar `p0` ahora sería reescribir la historia: el bloque de arriba ya
-no coincidiría con su tag, y M4 no tendría nada que corregir. Así que el código de la lección se
-queda como estaba, y lo que se añade es este parche. Lo cuenta
-[M4 · Los tokens de Elo y el corpus que faltaba](/curso/m4/02-tokens-de-elo/).
+El código de la lección es el del tag `p0`, de cuando esta lectura en remoto todavía funcionaba
+sin tropiezos (el corpus del proyecto se descargó así). Hasta que llegue el arreglo de fondo, en
+[M4](/curso/m4/02-tokens-de-elo/), te basta un parche de pocas líneas.
 
 **El parche.** En `run`, justo después de `con = duckdb.connect()` y antes del `try:`, añade:
 
@@ -1012,28 +1031,22 @@ queda como estaba, y lo que se añade es este parche. Lo cuenta
         con.execute("CREATE OR REPLACE SECRET hf (TYPE huggingface, TOKEN ?)", [token])
 ```
 
-Hace tres cosas. Deja tres hilos, que es lo que usó el proyecto en M4 después de que ocho
+Hace tres cosas. Deja tres hilos, que es lo que acabó usando el proyecto después de que ocho
 provocaran tres `429` seguidos. Sube a ocho los reintentos, con espera creciente, porque un `429`
 es un «espera», no un «no». Y firma las peticiones con tu token de Hugging Face, lo que sube el
 límite. La firma necesita que hayas iniciado sesión con `hf auth login`; sin token, el parche
 sigue ayudando, pero las peticiones salen anónimas. Después relanza la misma orden.
 
-Reduce mucho los `429`, pero no los elimina. La solución de fondo llega en M4: bajar cada shard
-entero con `huggingface_hub`, que reanuda y espera bien, y filtrarlo en local. Tu copia deja de
-ser idéntica a `p0` en estas líneas, y está bien que así sea: en M1 el `run` cambia
-`duckdb.connect()` por `connect(cfg.duckdb)` y el parche se va con ese cambio. Para entonces los
-datos ya están en disco.
+Reduce mucho los `429`, pero no los elimina. La solución de fondo es bajar cada shard entero con
+`huggingface_hub`, que reanuda y espera bien, y filtrarlo en local. Tu copia deja de ser idéntica a
+`p0` en estas líneas, y no pasa nada: en M1 el `run` cambia `duckdb.connect()` por
+`connect(cfg.duckdb)` y el parche se va con ese cambio.
 
-</Callout>
+Lo que enseña este error vale para cualquier API que consumas, también la de un LLM: un `429`
+significa «más despacio», así que se responde con menos peticiones en paralelo, reintentos con
+espera creciente y peticiones autenticadas. Y un trabajo largo tiene que poder reanudarse desde el
+último trozo terminado, no empezar de cero.
 
-<Callout kind="roto" title="Lo que este código todavía no tiene">
-  `FetchConfig` no tiene `max_elo`, y en M4 hará falta. Al entrenar el modelo condicionado por Elo
-  se descubrió que `min_elo: 1800` aplicado a los dos jugadores dejaba **doce tokens de Elo sin un
-  solo gradiente**: no había ninguna partida por debajo de 1800 en el corpus, así que los tokens que
-  representan esos tramos nunca aparecían. La solución fue traer también la mitad baja del eje con
-  un `max_elo`, y de paso una propiedad que un test puede comprobar sin tocar la red: `low.max_elo +
-  1 == high.min_elo`, es decir, que las dos mitades embaldosen el rango sin solaparse ni dejar
-  hueco. Aquí no está porque aquí no estaba: el `fetch.py` de M4 tiene 350 líneas y M4 las enseña.
 </Callout>
 
 ## Qué has aprendido
