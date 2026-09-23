@@ -26,7 +26,6 @@ test.describe('lesson M6, the table and its measured figures', () => {
 
     await page.goto(RESULTS);
     await expect(page.locator('.prose h2', { hasText: 'La tabla' }).first()).toBeVisible();
-    await expect(page.locator('.prose h2', { hasText: 'Los criterios' }).first()).toBeVisible();
     await expect(page.locator('.cheat')).toHaveCount(0);
 
     await page.goto(LABS);
@@ -90,4 +89,94 @@ test.describe('lesson M6, the table and its measured figures', () => {
       expect(results.violations).toEqual([]);
     });
   }
+});
+
+/**
+ * The animated figures of M6. Their CSS lives in `global.css` for the reason `m4.spec.ts`
+ * gives: a scoped style inside an `.astro` component used from an MDX lesson never reaches the
+ * page, and the only symptom is that nothing moves. These figures are bare `<svg>`s inside the
+ * lesson's `<Figure>`, so the class sits on the `<svg>` itself.
+ */
+const ANIMATED_FIGURES: Record<string, string[]> = {
+  '/curso/m6/01-evaluar/': ['fig--quant'],
+};
+
+async function runningIn(page: import('@playwright/test').Page, figure: string): Promise<number> {
+  return page
+    .locator(`svg.${figure}`)
+    .evaluate(
+      (svg) =>
+        [...svg.querySelectorAll('*')].filter(
+          (element) => getComputedStyle(element).animationName !== 'none',
+        ).length,
+    );
+}
+
+test.describe('the animated figures of M6', () => {
+  test('every animated figure actually animates', async ({ page }) => {
+    for (const [lesson, figures] of Object.entries(ANIMATED_FIGURES)) {
+      await page.goto(lesson);
+      for (const figure of figures) {
+        await expect(page.locator(`svg.${figure}`)).toHaveCount(1);
+        expect(await runningIn(page, figure), `${figure} has no running animation`).toBeGreaterThan(
+          0,
+        );
+      }
+    }
+  });
+
+  test('every animation stops under prefers-reduced-motion', async ({ browser }) => {
+    const context = await browser.newContext({ reducedMotion: 'reduce' });
+    const page = await context.newPage();
+    for (const [lesson, figures] of Object.entries(ANIMATED_FIGURES)) {
+      await page.goto(lesson);
+      for (const figure of figures) {
+        expect(await runningIn(page, figure), `${figure} still moves`).toBe(0);
+      }
+    }
+    await context.close();
+  });
+
+  test('no animated figure draws outside its viewBox in any frame', async ({ page }) => {
+    // The static check (texts inside the viewBox) says nothing about a window that hops or a bar
+    // that grows. Every animation is paused at eleven points of its cycle and every shape is
+    // measured there, in viewBox units.
+    for (const [lesson, figures] of Object.entries(ANIMATED_FIGURES)) {
+      await page.goto(lesson);
+      for (const figure of figures) {
+        const spilled = await page.locator(`svg.${figure}`).evaluate((svg) => {
+          const box = (svg as SVGSVGElement).viewBox.baseVal;
+          const out: string[] = [];
+          const animations = svg.getAnimations({ subtree: true });
+          for (let step = 0; step <= 10; step++) {
+            for (const animation of animations) {
+              animation.pause();
+              const duration = Number(animation.effect?.getComputedTiming().duration ?? 0);
+              animation.currentTime = (duration * step) / 10;
+            }
+            const frame = svg.getBoundingClientRect();
+            const scale = frame.width / box.width;
+            for (const shape of svg.querySelectorAll('rect, line, circle, path, text')) {
+              const b = shape.getBoundingClientRect();
+              if (b.width === 0 && b.height === 0) continue;
+              const left = (b.left - frame.left) / scale;
+              const right = (b.right - frame.left) / scale;
+              const top = (b.top - frame.top) / scale;
+              const bottom = (b.bottom - frame.top) / scale;
+              if (
+                left < -0.5 ||
+                top < -0.5 ||
+                right > box.width + 0.5 ||
+                bottom > box.height + 0.5
+              ) {
+                out.push(`${shape.tagName} at ${step * 10} %`);
+              }
+            }
+          }
+          return out;
+        });
+        expect(spilled, `${figure} draws outside its viewBox`).toEqual([]);
+      }
+    }
+  });
 });

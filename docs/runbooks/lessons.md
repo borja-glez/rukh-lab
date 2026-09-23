@@ -30,6 +30,17 @@ final.
 - Las visualizaciones (islas Preact) leen JSON de `src/data/`, que llega con `pnpm sync:data` desde
   `rukh/artifacts/web/`. Reservar la altura de la isla en CSS para evitar CLS.
 - Anchura de prosa 72ch; tablas anchas dentro de `<div class="table-wrap">`.
+- **Un error que enseña por lección, como mucho.** La caja `roto` (se muestra como «Error que
+  enseña») es para un modo de fallo real y transferible. Nada de fe de erratas («aquí decía…»),
+  números de decisión que el lector no necesita ni avisos de lo que se romperá dos módulos después:
+  el tropiezo se cuenta donde ocurre, una vez.
+- **Una analogía cuando el concepto la pide**, al final de la explicación técnica y no en su lugar
+  (el modelo: el libro de consulta de la biblioteca del dataloader en M1). El hilo de todo el curso
+  es Rukh como aprendiz; su mapa (`src/components/Recorrido.astro`, textos en
+  `src/data/recorrido.ts`) sale solo al principio y al final de cada módulo, así que la lección no
+  repite el itinerario en prosa.
+- **Fuera del ajedrez.** Si lo que se enseña sirve igual en un LLM de texto, un RAG o un agente,
+  se dice (una frase, o un `<Transfer>` si lo merece).
 
 ## Las cajas «Ejecútalo»
 
@@ -112,7 +123,7 @@ Qué se ha hecho, cómo se mide (columnas de la tabla única que cambian) y qué
 
 | Componente     | Uso                                                                     | Props                                                                       |
 | -------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `Callout`      | Aparte con etiqueta                                                     | `kind`: `teoria` · `mundo-real` · `entrevista` · `hoy` · `roto` · `ejecuta`; `title?` |
+| `Callout`      | Aparte con etiqueta                                                     | `kind`: `teoria` · `mundo-real` · `entrevista` · `hoy` · `roto` (error que enseña) · `ejecuta` · `guia` (punto de partida, cómo seguir la lección); `title?` |
 | `Exercise`     | Ejercicio enmarcado                                                     | `title`, `n?`                                                               |
 | `Solution`     | Desplegable con la solución (dentro de `Exercise`)                      | `label?`                                                                    |
 | `Term`         | Término enlazado al glosario; popover solo con `(hover: hover)`, en táctil es un enlace | `id` (de `terms.json`)                                                      |

@@ -1,16 +1,16 @@
 ---
 title: 'Exportar el encoder: dos salidas, tres precisiones y una model card'
 description:
-  'El encoder en ONNX con `value` y `blunder`, los dos bugs del exportador que hubo que arreglar,
+  'El encoder en ONNX con `value` y `blunder`, los tres problemas de formato que hubo que arreglar,
   la paridad medida sobre la decisión de error, los embeddings de posición con su sidecar, y la
   publicación en el Hub con la plantilla de la model card del encoder.'
 module: m3
 order: 9
-duration: 230
+duration: 210
 runtime: 5
 level: avanzado
 status: vigente
-updated: 2026-09-22
+updated: 2026-09-23
 keywords:
   - ONNX
   - cuantización
@@ -31,9 +31,10 @@ evaluación».
 
 Lo que hace falta para que el encoder salga del repositorio: el grafo <Term id="onnx">ONNX</Term> con dos salidas, su cuantización a fp16 e int8, la comprobación de <Term id="paridad">paridad</Term> sobre la decisión que de verdad importa, los embeddings de posición que la fase 2 usará como índice, y la publicación en el Hub con su propia plantilla de <Term id="model-card">model card</Term>.
 
-Casi todo es código de M2 al que se le añade un camino paralelo. Lo interesante no son las líneas
-nuevas sino **los dos bugs del exportador que hubo que encontrar para que el encoder llegara a
-int8**, y los dos son del tipo que no aparece en ningún manual.
+Casi todo es código de M2 con un camino paralelo. Lo interesante son tres problemas de formato:
+una dimensión que el exportador fija sin avisar, unas anotaciones que hacen fallar la cuantización y
+un tipo mal declarado tras pasar a fp16. Ninguno da un error claro, y te los puedes encontrar al
+exportar cualquier modelo propio.
 
 ## El envoltorio: dos salidas y ninguna más
 
@@ -46,9 +47,6 @@ the verification, the metadata, the sidecar — is the same code: the decoder's 
 ```
 
 <Src file="src/rukh/export/onnx.py" tag="p3" lines="14-18" />
-
-El párrafo que el módulo añade al docstring del exportador, y es el plan de la lección: un
-envoltorio distinto y el resto igual.
 
 ```python title="src/rukh/export/onnx.py"
 MODEL_NAME = "model.onnx"
@@ -66,9 +64,8 @@ METADATA_PREFIX = "rukh_"
 
 <Src file="src/rukh/export/onnx.py" tag="p3" lines="46-56" />
 
-Los nombres de las salidas como constantes, no como cadenas sueltas. Es lo que permite que la
-comprobación de paridad busque `value` y `blunder` **por nombre** en el grafo exportado, que es lo
-que impide un bug que la lección explica más abajo.
+Los nombres de las salidas son constantes para que la comprobación de paridad busque `value` y
+`blunder` por nombre en el grafo exportado (más abajo se ve por qué importa).
 
 ```python title="src/rukh/export/onnx.py"
 class EncoderHeads(nn.Module):
@@ -91,24 +88,18 @@ class EncoderHeads(nn.Module):
 
 <Src file="src/rukh/export/onnx.py" tag="p3" lines="71-86" />
 
-Tres decisiones, y las tres son sobre **qué cruza la frontera al navegador**.
+Las tres decisiones son sobre **qué cruza la frontera al navegador**:
 
-**Se deja fuera la cabeza de resultado.** No porque sobre en el modelo, sino porque la demo no la
-dibuja y cada tensor que el grafo devuelve es un tensor que el trabajador tiene que copiar y pasar al
-hilo principal. Exportar lo que no se usa es pagar ancho de banda por nada.
+- La cabeza de resultado se queda fuera: la demo no la dibuja, y cada tensor devuelto es uno que el
+  trabajador tiene que copiar al hilo principal.
+- El pooling se hace una vez y las dos cabezas leen el mismo vector. Aquí paga la separación entre
+  `forward` y `from_pooled` de la lección 4: sin ella habría dos pasadas por las ocho capas.
+- `blunder` sale como probabilidad. El sigmoide va dentro del grafo y la página solo compara contra
+  0,5: una implementación menos en TypeScript con la que discrepar.
 
-**El pooling se hace una vez** (`pooled = self.model.pooled(idx)`) y las dos cabezas leen el mismo
-vector. Aquí es donde paga la separación entre `forward` y `from_pooled` de la lección 4: sin ella
-habría dos pasadas por ocho capas de Transformer dentro del grafo.
-
-**`blunder` sale como probabilidad y no como logit.** El sigmoide entra en el grafo ONNX, así que la
-página compara contra 0,5 y no tiene que llevar su propia implementación de una sigmoide en
-TypeScript. Es una operación que cuesta nanosegundos en la GPU del navegador y ahorra una
-oportunidad de discrepar entre dos implementaciones.
-
-`EncoderHeads` no llama a `forward` del `MultiHead` sino a sus piezas. Es lo que permite ese
-reordenado, y es exactamente lo que hace `LastStepLogits` con el decoder: un envoltorio de
-exportación describe **lo que el consumidor necesita**, no lo que el modelo sabe hacer.
+Como `LastStepLogits` con el decoder, `EncoderHeads` llama a las piezas del `MultiHead` y no a su
+`forward`: un envoltorio de exportación describe lo que el consumidor necesita, igual que una API
+expone solo los campos que el cliente usa.
 
 ## El escritor de grafos, compartido
 
@@ -160,20 +151,11 @@ def _write_graph(
 
 <Src file="src/rukh/export/onnx.py" tag="p3" lines="167-209" />
 
-El mismo refactor de la lección 2 aplicado al exportador: lo que los dos grafos hacen igual —el
-intento con el exportador moderno, la caída al antiguo, el arreglo de la consola de Windows, la
-declaración de los ejes— se saca a una función.
-
-Fíjate en que los dos caminos usan **claves distintas para lo mismo**: `dynamic_shapes` en el
-exportador moderno y `dynamic_axes` en el antiguo. No son sinónimos: el primero describe las
-dimensiones del **grafo capturado** por `torch.export`, el segundo anota los nombres de los ejes en el
-fichero. Que una función tenga las dos es lo que hace que el resto del código no tenga que saber cuál
-corrió.
-
-Y el `except Exception` con su `noqa`: cualquier fallo del exportador moderno cae al antiguo con un
-aviso que viaja en el resultado, porque un fichero exportado por el camino viejo es peor pero sirve,
-y no tener fichero no sirve de nada. Lo que **no** se hace es esconder cuál corrió: el
-`ExportResult` lo dice y la paridad se lee sabiéndolo.
+Es el refactor de la lección 2 aplicado al exportador: lo que los dos grafos hacen igual (intentar
+el exportador moderno, caer al antiguo, el arreglo de la consola de Windows, declarar los ejes) va a
+una sola función. Los dos caminos usan claves distintas para lo mismo, `dynamic_shapes` en el
+moderno y `dynamic_axes` en el antiguo. Cualquier fallo del moderno cae al antiguo con un aviso,
+porque un fichero peor sirve; lo que no se esconde es cuál corrió, y el `ExportResult` lo dice.
 
 ## El exportador del encoder: dos filas de ejemplo, y ninguna de relleno
 
@@ -209,27 +191,19 @@ def export_encoder_onnx(
 
 <Src file="src/rukh/export/onnx.py" tag="p3" lines="276-302" />
 
-Ese comentario es el primero de los dos bugs del módulo, y es uno que cuesta media tarde encontrar.
-
-`torch.export` **especializa** una dimensión cuyo ejemplo vale 1. Se llama la especialización 0/1: el
-capturador razona que una dimensión de tamaño 1 se comporta distinto de una de tamaño _n_ —se difunde,
-se puede colapsar— y en vez de tratarla como simbólica, la fija. El resultado es un grafo que dice
-tener un eje de lote dinámico y que revienta dentro de un `reshape` la primera vez que se le pasan dos
-filas. En la demo eso es un error en el trabajador la primera vez que hay que evaluar dos posiciones.
-
-La solución es **trazar con dos filas**. Un grafo trazado a dos mantiene el eje simbólico y sigue
-aceptando un lote de una, así que no se pierde nada.
-
-El segundo detalle del comentario es más específico de este modelo: `torch.zeros` como ejemplo daría
-una fila entera de `<pad>`, y el encoder de la lección 3 **rechaza** eso con un `ValueError` a
-propósito. `torch.ones` son tokens reales y el trazado pasa.
+Ese comentario es el primero de los tres problemas. `torch.export` **especializa** una dimensión
+cuyo ejemplo vale 1 (la especialización 0/1): como una dimensión de tamaño 1 se comporta distinto
+—se difunde, se puede colapsar—, el capturador la fija en vez de tratarla como simbólica. Sale un
+grafo que dice tener un lote dinámico y revienta en un `reshape` la primera vez que recibe dos
+filas. Trazar con dos filas deja el eje simbólico, y el grafo sigue aceptando una. El ejemplo es
+`torch.ones` y no `torch.zeros` porque una fila entera de `<pad>` es justo lo que el encoder de la
+lección 3 rechaza.
 
 <Callout kind="roto" title="La especialización 0/1 de `torch.export`">
-  El síntoma es un fichero ONNX que se exporta sin un solo aviso, pasa la comprobación de paridad
-  —que se hace fila a fila, con lotes de una— y falla en el navegador la primera vez que llega un
-  lote de dos. La comprobación que lo caza es correr el fichero exportado con **más de una** fila, y
-  la regla general: **traza con un ejemplo cuyas dimensiones dinámicas valgan al menos dos**. Vale
-  para cualquier eje que quieras dinámico, no solo el del lote.
+  El fichero se exporta sin un aviso, pasa la paridad —que va fila a fila, con lotes de una— y falla
+  en el navegador con el primer lote de dos. Vale para cualquier modelo que exportes: **traza con un
+  ejemplo cuyas dimensiones dinámicas valgan al menos dos**, y prueba el fichero con más de una
+  fila.
 </Callout>
 
 ```python title="src/rukh/export/onnx.py"
@@ -287,29 +261,16 @@ propósito. `torch.ones` son tokens reales y el trazado pasa.
 
 <Src file="src/rukh/export/onnx.py" tag="p3" lines="332-348" />
 
-`seq_len=seq_len, block=seq_len`: los dos campos valen lo mismo porque en un encoder no hay
-diferencia entre «la longitud con la que se trazó» y «lo que el modelo admite». En el decoder sí la
-hay —se traza con 200 y el bloque son 200, pero el grafo acepta menos—, y el resultado conserva los
-dos campos para que un consumidor no tenga que saber de qué tipo de modelo vino el fichero.
+En un encoder la longitud trazada y la admitida coinciden (`seq_len=seq_len, block=seq_len`); el
+resultado conserva los dos campos para que el consumidor no tenga que saber de qué modelo vino.
+`bytes` se lee después de escribir los metadatos, así que es el tamaño que se sube.
 
-`bytes=path.stat().st_size` se lee **después** de escribir los metadatos y de borrar las
-anotaciones, así que el tamaño que se publica es el del fichero que se sube.
+El eje de secuencia solo es dinámico en el esquema de jugadas; en casillas siempre son 69 tokens y
+`works` es `None`. Cuando lo es, `verify_dynamic_seq` ejecuta el fichero a dos longitudes, porque el
+exportador antiguo acepta la petición de un eje dinámico y luego fija la longitud trazada.
 
-`dynamic_seq = cfg.input == "moves"` unas líneas arriba, y aquí su consecuencia: el eje de secuencia
-solo se declara dinámico y **se verifica corriendo el fichero** cuando el esquema es de jugadas. En
-casillas siempre son 69 tokens, así que no hay nada que hacer dinámico y `works` es `None`.
-
-Esa distinción no es cosmética. Un eje que se declara dinámico y no lo es se convierte en un error en
-el navegador la primera vez que llega una secuencia de otro tamaño, y el exportador antiguo tiene la
-costumbre de cocer la longitud trazada mientras acepta la petición de un eje dinámico. De ahí el
-`verify_dynamic_seq`, que **ejecuta el fichero** a dos longitudes distintas en vez de creerse la
-declaración. `dynamic_seq_verified` distingue en el resultado «lo comprobé» de «no había nada que
-comprobar».
-
-Los metadatos son el otro detalle que merece la pena copiar: el fichero `.onnx` lleva dentro
-`rukh_kind=encoder`, `rukh_heads=value,blunder`, `rukh_blunder=probability` y el esquema de entrada.
-Un `.onnx` suelto, sin su repositorio, sigue sabiendo decir **qué es, qué devuelve y en qué escala**.
-Sin eso, un fichero en una carpeta de descargas es una caja negra.
+Los metadatos (`rukh_kind=encoder`, `rukh_heads=value,blunder`, `rukh_blunder=probability`, el
+esquema) hacen que un `.onnx` suelto sepa decir **qué es, qué devuelve y en qué escala**.
 
 ```python title="src/rukh/export/onnx.py"
 def clear_value_info(path: Path) -> int:
@@ -335,6 +296,13 @@ def clear_value_info(path: Path) -> int:
 
 <Src file="src/rukh/export/onnx.py" tag="p3" lines="410-428" />
 
+El segundo problema. Un grafo ONNX puede llevar una anotación de forma opcional para cada tensor
+intermedio (`value_info`). El exportador moderno las escribe todas, y algunas guardan la forma del
+ejemplo —dos filas de 69— en vez de la del grafo dinámico. `onnxruntime` ni las mira, pero
+`quantize_dynamic` reinfiere formas en modo estricto antes de cuantizar y rechaza el fichero si no
+coinciden. El int8 muere con un mensaje sobre formas que no menciona la cuantización. Como son
+opcionales, se borran.
+
 ```python title="src/rukh/export/onnx.py"
 def _load_heads(ckpt: Path) -> MultiHead:
     from rukh.train import load_heads
@@ -347,21 +315,6 @@ def _load_heads(ckpt: Path) -> MultiHead:
 
 El gemelo del `_load` del decoder, con el `import` dentro por la razón de siempre: `rukh.train`
 arrastra `mlflow`.
-
-El segundo bug, y es de los que enseñan cómo funciona un formato.
-
-Un grafo ONNX puede llevar, opcionalmente, una **anotación de forma para cada tensor intermedio**
-(`value_info`). El exportador moderno las escribe todas, y algunas son la forma del ejemplo trazado
-—dos filas de 69— en vez de la del grafo dinámico. Nada las ejecuta: `onnxruntime` corre el fichero
-sin mirarlas.
-
-`quantize_dynamic`, en cambio, vuelve a inferir formas en modo estricto **antes** de cuantizar, y se
-niega a trabajar con un fichero cuyas anotaciones no coinciden con lo que él deduce. El síntoma es que
-la construcción int8 del encoder muere en una anotación, no en un peso, con un mensaje sobre formas
-que no menciona la cuantización.
-
-Como la especificación dice que son opcionales, la solución es borrarlas. Diecinueve líneas para un
-fallo que, sin este docstring, alguien volvería a encontrar desde cero.
 
 ## El bug de fp16, que es un tipo mal declarado
 
@@ -397,6 +350,13 @@ def _align_cast_outputs(model: object) -> int:
 
 <Src file="src/rukh/export/quantize.py" tag="p3" lines="84-110" />
 
+El tercer problema viene de un `Cast` que el decoder no tiene: en `pool` (lección 3),
+`mask.unsqueeze(-1).to(hidden.dtype)` convierte la máscara booleana al tipo de los estados ocultos.
+`convert_float_to_float16` cambia a float16 el tipo **declarado** de la salida de ese nodo, pero no
+su atributo `to`, que sigue diciendo float32, y `onnxruntime` se niega a cargar el fichero. El
+docstring pega el mensaje de error tal cual, una costumbre que merece copiarse: buscar ese texto
+lleva a esta función.
+
 ```python title="src/rukh/export/quantize.py"
     repaired = _align_cast_outputs(converted)
     if repaired:
@@ -415,9 +375,8 @@ def _align_cast_outputs(model: object) -> int:
 
 <Src file="src/rukh/export/quantize.py" tag="p3" lines="69-81" />
 
-El arreglo se aplica **siempre**, con los dos caminos de conversión, y se registra cuántos nodos tocó.
-Que sea un `log.info` con el número y no un silencio es lo que permite darse cuenta de que un modelo
-nuevo trae un `Cast` donde antes no había ninguno.
+El arreglo se aplica siempre y registra cuántos nodos tocó: así se nota cuando un modelo nuevo trae
+un `Cast` donde antes no había.
 
 ```python title="src/rukh/export/quantize.py"
 def quantize_int8(path: Path, out: Path | None = None) -> QuantizeResult:
@@ -444,27 +403,7 @@ def quantize_int8(path: Path, out: Path | None = None) -> QuantizeResult:
 
 <Src file="src/rukh/export/quantize.py" tag="p3" lines="152-171" />
 
-La cuantización a int8 no cambia en M3: es `quantize_dynamic` sobre los pesos de `MatMul` y `Gemm`, la
-misma de M2. Lo que cambió para que funcionara con el encoder está antes, en el `clear_value_info` del
-exportador: `quantize_dynamic` vuelve a inferir formas en modo estricto y se negaba por una anotación.
-
-El tercer arreglo, y el que enseña de dónde vienen estos problemas: **el encoder tiene una operación
-que el decoder no tiene**, y esa operación es un `Cast`.
-
-Vuelve a `pool` de la lección 3: `weights = mask.unsqueeze(-1).to(hidden.dtype)` convierte la máscara
-booleana al tipo de los estados ocultos. Eso es un `Cast` en el grafo, y el decoder no tiene ninguno
-porque nunca convierte nada. Cuando `convert_float_to_float16` retipa el grafo, cambia el tipo
-**declarado** de la salida de ese `Cast` a float16 y **no toca el atributo `to` del propio nodo**, que
-sigue diciendo float32. `onnxruntime` compara las dos cosas y se niega a cargar el fichero.
-
-El mensaje que da está en el docstring, palabra por palabra, y eso es una decisión de documentación
-que merece copiarse: **pega el error literal que el usuario va a ver**. Es lo que hace que una
-búsqueda por ese texto llegue a esta función.
-
-La última frase es la precaución que hace correcto el arreglo: solo se miran los valores
-**intermedios** (`graph.value_info`), no las entradas ni las salidas del grafo, porque esas conservan
-los tipos que `keep_io_types` le prometió a quien llama. Retipar una salida rompería el contrato con
-el navegador.
+La cuantización a int8 es la de M2; lo que el encoder necesitaba ya lo hizo `clear_value_info`.
 
 ## La paridad del encoder: la decisión, no el número
 
@@ -492,15 +431,10 @@ class EncoderParityResult(BaseModel):
 
 <Src file="src/rukh/export/parity.py" tag="p3" lines="62-73" />
 
-La paridad del decoder mide **coincidencia de la jugada elegida** y la desviación máxima de los
-logits. La del encoder mide **coincidencia de la decisión de error** y la desviación máxima del valor.
-No es la misma medida traducida: es la misma pregunta —«¿el fichero que va al navegador hace lo mismo
-que el checkpoint?»— respondida sobre lo que cada modelo decide.
-
-La distinción entre `agreement` y `max_abs_value_delta` es la que hace útil el par. La primera es
-categórica —¿se enciende la alerta en las mismas posiciones?— y la segunda es continua —¿cuánto se
-mueve la barra?—. Un int8 que cambie el valor 0,024 es invisible en la barra y no cambia ninguna
-decisión; un int8 que cambie el 5 % de las decisiones sería inaceptable aunque el valor apenas se
+La paridad del decoder mide si coincide la jugada elegida; la del encoder, si coincide **la
+decisión de error** y cuánto se desvía el valor como máximo. Es la misma pregunta («¿el fichero hace
+lo mismo que el checkpoint?») sobre lo que cada modelo decide. Un int8 que mueva el valor 0,024 no
+se ve en la barra; uno que cambie el 5 % de las alertas sería inaceptable aunque el valor apenas se
 moviera.
 
 ```python title="src/rukh/export/parity.py"
@@ -542,22 +476,11 @@ def label_positions(
 
 <Src file="src/rukh/export/parity.py" tag="p3" lines="146-179" />
 
-«An encoder parity check has no honest fallback»: aquí está la diferencia con el decoder, y es
-interesante. La paridad del decoder, si no encuentra las partidas de validación, cae a un paseo
-aleatorio legal con un aviso, porque un paseo aleatorio sigue siendo una secuencia de jugadas legales
-sobre la que comparar dos implementaciones.
-
-Para el encoder eso no vale. Un tablero aleatorio no es una posición que la demo vaya a evaluar
-nunca, y comparar dos implementaciones sobre posiciones imposibles mediría **una propiedad de un
-régimen que no existe**. Así que no hay respaldo: la lista sale vacía y quien llama informa de que no
-se pudo medir.
-
-Es una decisión que va contra el instinto de «mejor un número que ninguno», y es la correcta. Un
-número medido sobre lo que no importa es peor que un hueco, porque el hueco se ve.
-
-El comentario del esquema es la tercera vez que aparece la misma regla en el módulo —también está en
-`encoder_items` de la lección 7 y en `LabelledPositions`—: **el esquema lo dice el modelo, no una
-constante**.
+Sin partidas de validación, la paridad del decoder cae a paseos aleatorios legales con un aviso,
+porque siguen siendo secuencias de jugadas legales. Un tablero aleatorio, en cambio, no es una
+posición que la demo vaya a evaluar nunca, así que el encoder no tiene respaldo: la lista sale vacía
+y quien llama informa de que no se pudo medir. Un número medido sobre lo que no importa es peor que
+un hueco, porque el hueco se ve. (El esquema lo dice el modelo, como en la lección 7.)
 
 ```python title="src/rukh/export/parity.py"
 def encoder_parity_positions(
@@ -580,9 +503,7 @@ def encoder_parity_positions(
 
 <Src file="src/rukh/export/parity.py" tag="p3" lines="182-197" />
 
-El aviso dice **la orden que hay que ejecutar** para que deje de faltar, igual que el de la curva
-ausente de la lección 7. Y «`model` … is never run» en el docstring es una aclaración que ahorra una
-duda razonable: el modelo se pasa solo para preguntarle su esquema.
+El aviso dice la orden que hay que ejecutar para que deje de faltar.
 
 ```python title="src/rukh/export/parity.py"
 def encoder_parity(
@@ -643,21 +564,11 @@ def encoder_parity(
 
 <Src file="src/rukh/export/parity.py" tag="p3" lines="200-253" />
 
-El comentario del medio es el detalle que más fácil habría sido no escribir. Las salidas del grafo
-se leen **por su nombre**, preguntándole a la sesión de `onnxruntime` (`session.get_outputs()`), y
-no emparejando la lista de resultados con `ENCODER_OUTPUTS` por posición.
-
-La diferencia importa por un escenario concreto: si el exportador intercambiara alguna vez el orden
-de las dos cabezas, un emparejamiento por posición seguiría comparando tan contento **el valor contra
-la probabilidad de error** y llamando a eso coincidencia. El número que sale de ahí no parecería
-roto: parecería malo, y alguien lo achacaría a la cuantización.
-
-La comprobación de `missing` cierra el otro lado: si el grafo no trae una de las dos salidas, falla
-con el nombre que falta y la lista de las que hay, en vez de con un `KeyError`.
-
-`float(np.asarray(array).reshape(-1)[0])` aplana antes de tomar el primer elemento porque la forma de
-una salida escalar depende de la versión del exportador: puede venir como `(1,)` o como `(1, 1)`.
-Aplanar hace que el código no dependa de eso.
+Las salidas se leen **por su nombre**, preguntándole a la sesión, y no por posición. Si el
+exportador intercambiara las dos cabezas, emparejar por posición compararía el valor con la
+probabilidad de error; el número saldría malo pero no absurdo, y alguien culparía a la
+cuantización. Si falta una salida, `missing` dice cuál. El `reshape(-1)[0]` aplana porque un escalar
+puede llegar como `(1,)` o `(1, 1)` según la versión del exportador.
 
 ## El paquete de exportación
 
@@ -686,10 +597,8 @@ class ExportBundle(BaseModel):
 
 <Src file="src/rukh/export/__init__.py" tag="p3" lines="59-78" />
 
-Dos diccionarios de paridad, `parity` y `heads_parity`, en vez de uno con una unión dentro. Es la
-misma decisión que las dos filas de la tabla de resultados de la lección 7: **dos cosas que miden
-fenómenos distintos van en dos campos**, y el que no aplica queda vacío. Un consumidor sabe cuál
-mirar por el `kind` del `ExportResult`.
+Dos diccionarios de paridad, `parity` y `heads_parity`, en vez de uno con una unión dentro: la misma
+decisión que las dos filas de la tabla de resultados de la lección 7.
 
 ```python title="src/rukh/export/__init__.py"
 def _quantize(bundle: ExportBundle, fp16: bool, int8: bool) -> dict[str, str]:
@@ -713,13 +622,9 @@ def _quantize(bundle: ExportBundle, fp16: bool, int8: bool) -> dict[str, str]:
 
 <Src file="src/rukh/export/__init__.py" tag="p3" lines="81-97" />
 
-El comentario es el fallo que evita, y es de los que solo se descubren en producción: **ningún
-convertidor promete conservar los metadatos de su entrada**. La demo carga el fp16 o el int8, nunca el
-fp32, así que si los `rukh_*` se quedaran solo en el original, el fichero que el navegador descarga no
-sabría decir su longitud de contexto ni qué devuelve.
-
-Que esta función devuelva **el diccionario de ficheros a comprobar** es lo que hace que los dos
-caminos —decoder y encoder— compartan también la lista de lo que hay que verificar.
+El comentario recoge un fallo de los que solo aparecen en producción: ningún convertidor promete
+conservar los metadatos de su entrada. La demo carga el fp16 o el int8, nunca el fp32, así que sin
+copiar los `rukh_*` el fichero que descarga el navegador no sabría decir qué es.
 
 ```python title="src/rukh/export/__init__.py"
 def export_all(
@@ -753,10 +658,9 @@ def export_all(
 
 <Src file="src/rukh/export/__init__.py" tag="p3" lines="100-126" />
 
-`kind: str = "decoder"` con el decoder como valor por defecto: la orden que M2 documentó sigue
-haciendo lo mismo sin pasar nada. Y la bifurcación es un retorno temprano a una función privada, no
-un `if` que envuelve medio fichero. Es legible y, más importante, hace imposible que una rama coja
-por accidente una variable de la otra.
+Con `kind="decoder"` por defecto, la orden de M2 sigue haciendo lo mismo. La bifurcación es un
+retorno temprano a una función privada, así que una rama no puede coger por accidente una variable
+de la otra.
 
 ```python title="src/rukh/export/__init__.py"
 def _export_encoder(
@@ -789,6 +693,10 @@ def _export_encoder(
 ```
 
 <Src file="src/rukh/export/__init__.py" tag="p3" lines="145-171" />
+
+Exportar, cuantizar, comprobar: la estructura del decoder. Sin posiciones, `heads_parity` se queda
+vacío y el aviso ya está puesto. `seq_len` falta en la firma a propósito: la longitud la decide el
+esquema del checkpoint.
 
 ```python title="src/rukh/export/__init__.py"
 __all__ = [
@@ -838,17 +746,9 @@ __all__ = [
 
 <Src file="src/rukh/export/__init__.py" tag="p3" lines="174-216" />
 
-La superficie pública del paquete de exportación después del módulo. Lo único que se lee de ella es
-la simetría: para cada cosa del decoder hay una del encoder —`export_onnx` y `export_encoder_onnx`,
-`parity` y `encoder_parity`, `ParityResult` y `EncoderParityResult`— más `embed_positions`, que no
-tiene pareja porque el decoder no produce embeddings.
-
-Es el camino del encoder entero, y la estructura es idéntica a la del decoder: exportar, cuantizar,
-comprobar. El `if items:` es la consecuencia de no tener respaldo: sin posiciones, `heads_parity` se
-queda vacío y el aviso ya está puesto.
-
-`seq_len` no está en la firma, y eso es deliberado: la longitud la decide el esquema del checkpoint, no
-quien llama. `--seq-len` en la orden no pinta nada al exportar un encoder.
+La superficie pública es simétrica (`export_onnx` y `export_encoder_onnx`, `parity` y
+`encoder_parity`), más `embed_positions`, que no tiene pareja porque el decoder no produce
+embeddings.
 
 ## Los embeddings de posición
 
@@ -897,16 +797,14 @@ class EmbedResult(BaseModel):
 
 <Src file="src/rukh/export/embed.py" tag="p3" lines="1-40" />
 
-El segundo párrafo del docstring es la regla que hay que llevarse de este fichero: **el índice viaja
-con los datos o los datos no existen**.
+Lo que hay que llevarse es el segundo párrafo del docstring: **el índice viaja con los datos**. Una
+matriz de flotantes sin saber qué fila es qué posición no sirve, y un `.npy` no tiene dónde decirlo.
+Por eso cada tirada escribe dos ficheros: la matriz y un parquet de acompañamiento (sidecar) con
+`row` y `fen4` en el mismo orden. Es una caja de fotos con el nombre escrito detrás de cada una.
 
-Una matriz de flotantes sin saber qué fila es qué posición no sirve para nada, y un `.npy` no tiene
-sitio donde decirlo —es una cabecera con la forma y el tipo, y nada más—. Así que cada tirada escribe
-**dos** ficheros: la matriz y un parquet de acompañamiento con `row` y `fen4` en el mismo orden. Es
-una caja de zapatos llena de fotos con los nombres escritos detrás en vez de sin nada.
-
-Que la clave sea el FEN de cuatro campos y no un identificador propio es lo que hace que el sidecar
-se una directamente a las tablas de P1: es la misma clave.
+Cualquier índice vectorial de un RAG guarda lo mismo: cada vector con el identificador del fragmento
+del que salió. Aquí la clave es el FEN de cuatro campos de las tablas de P1, así que el sidecar se
+une a ellas directamente.
 
 ```python title="src/rukh/export/embed.py"
 def fen4(fen: str) -> str:
@@ -927,10 +825,8 @@ def _encoder(ckpt: Path, device: str | None = None):  # type: ignore[no-untyped-
 
 <Src file="src/rukh/export/embed.py" tag="p3" lines="43-56" />
 
-`_encoder` acepta **las dos formas** de checkpoint de encoder que existen: el del preentrenamiento,
-que es un `PositionEncoder` suelto, y el del afinado, que es un `MultiHead` con el encoder dentro. Los
-embeddings solo necesitan el tronco, así que los dos valen. Es la utilidad de `load_any` de la
-lección 6: un sitio que decide qué hay en un fichero.
+`_encoder` acepta el checkpoint del preentrenamiento (un `PositionEncoder`) y el del afinado (un
+`MultiHead`): los embeddings solo necesitan el tronco, y `load_any` (lección 6) distingue los dos.
 
 ```python title="src/rukh/export/embed.py"
 def embed_positions(
@@ -967,13 +863,10 @@ def embed_positions(
 
 <Src file="src/rukh/export/embed.py" tag="p3" lines="59-88" />
 
-Las tres validaciones de la entrada, y las tres traen en el mensaje **lo que hay** además de lo que
-falta: las columnas encontradas, el esquema del checkpoint. Un error que dice «falta la columna fen»
-manda a mirar el fichero; uno que dice «falta `fen`, hay `fen4`, `game_id`, `ply`» lo resuelve solo.
-
-La tercera es la que explica una cosa del lab de la lección 11: los embeddings necesitan el checkpoint
-de **casillas** y no el de jugadas. El script tokeniza un FEN, así que con un encoder de jugadas
-estaría metiendo ids de otro vocabulario. Se rechaza en vez de reinterpretarse.
+Los errores dicen lo que hay además de lo que falta: «falta `fen`, hay `fen4`, `game_id`, `ply`» se
+resuelve solo. La tercera validación explica un detalle del lab de la lección 11: los embeddings
+necesitan el checkpoint de casillas, porque se tokeniza un FEN y un encoder de jugadas recibiría ids
+de otro vocabulario.
 
 ```python title="src/rukh/export/embed.py"
     vectors: list[np.ndarray] = []
@@ -1010,18 +903,10 @@ estaría metiendo ids de otro vocabulario. Se rechaza en vez de reinterpretarse.
 
 <Src file="src/rukh/export/embed.py" tag="p3" lines="89-118" />
 
-`target.with_suffix(".parquet")` es lo que garantiza que el sidecar se llame igual que la matriz y
-viva a su lado. Dos ficheros que comparten nombre y difieren en la extensión son dos ficheros que
-nadie separa por accidente al copiarlos.
-
-`float32` explícito al guardar: el pooling puede salir en `bfloat16` bajo autocast, y una matriz de
-medio millón de vectores en un tipo que numpy no lee bien es una matriz inútil. Y `float32` y no
-`float64` porque duplicar el tamaño de un índice de 488 159 × 384 por precisión que nadie va a usar
-son 750 MB en vez de 375.
-
-`range(len(fens))` como columna `row` parece redundante —es el índice de la fila— y no lo es: hace el
-sidecar **autosuficiente**. Alguien que lo lea con una herramienta que reordene filas sigue sabiendo a
-qué fila de la matriz corresponde cada FEN.
+El sidecar se llama igual que la matriz y vive a su lado, así que no se separan por accidente.
+`float32` explícito porque el pooling puede salir en `bfloat16`, y no `float64` porque un índice de
+488 159 × 384 ocuparía 750 MB en vez de 375 por una precisión que nadie usa. La columna `row`, que
+parece redundante, mantiene el sidecar válido aunque una herramienta reordene sus filas.
 
 ## Las órdenes
 
@@ -1049,10 +934,8 @@ qué fila de la matriz corresponde cada FEN.
 
 <Src file="src/rukh/cli.py" tag="p3" lines="762-772" />
 
-La orden de M2 gana una opción y nada más. El `--kind` se valida a mano con código 2 —uso incorrecto—
-antes de tocar el disco.
-
-Y llega a `export_all` como `kind=kind`, una línea nueva en una llamada que por lo demás es la de M2:
+La orden de M2 gana `--kind`, validado a mano con código 2 (uso incorrecto) antes de tocar el disco,
+y que llega a `export_all` como una línea nueva:
 
 ```python title="src/rukh/cli.py"
     try:
@@ -1113,19 +996,13 @@ Y llega a `export_all` como `kind=kind`, una línea nueva en una llamada que por
 
 <Src file="src/rukh/cli.py" tag="p3" lines="792-821" />
 
-Los dos bucles de paridad, uno por familia, y solo uno de los dos tiene entradas en cada ejecución.
-La línea del encoder dice explícitamente «of the blunder decisions», que es lo que hace que el 1,0000
-que imprime no se confunda con «los números son idénticos».
+Hay un bucle de paridad por familia y en cada ejecución solo uno tiene entradas. La línea del
+encoder dice «of the blunder decisions» para que el 1,0000 no se lea como «números idénticos».
+`{checked}` distingue un eje dinámico comprobado de uno solo declarado; en casillas imprime
+`not verified` porque no había nada que comprobar.
 
-`{checked}` en la línea de las formas es lo que distingue «el eje es dinámico y lo he comprobado
-corriendo el fichero» de «lo he declarado». En un esquema de casillas imprime `not verified`, y es
-correcto: no había nada que comprobar.
-
-Los embeddings son una orden nueva que no es de entrenar, ni de evaluar, ni de exportar, así que
-estrenan grupo: `rukh encoder`, el tercer `Typer` que M3 añade al principio de `cli.py`, debajo de
-`eval_app`. A diferencia de los otros dos no lleva `invoke_without_command`, sino
-`no_args_is_help=True` como `data_app`: sin subcomando no tiene nada que hacer, y lo útil es enseñar
-la ayuda.
+Los embeddings no son de entrenar, evaluar ni exportar, así que estrenan grupo: `rukh encoder`, con
+`no_args_is_help=True` como `data_app`, porque sin subcomando lo útil es enseñar la ayuda.
 
 ```python title="src/rukh/cli.py"
 encoder_app = typer.Typer(help="Encoder utilities: position embeddings.", no_args_is_help=True)
@@ -1134,9 +1011,9 @@ app.add_typer(encoder_app, name="encoder")
 
 <Src file="src/rukh/cli.py" tag="p3" lines="40-41" />
 
-La firma de `rukh encoder embed`. Las tres rutas son obligatorias, y el parquet y el checkpoint
-además tienen que existir: lo comprueba Typer (`exists=True`) antes de cargar nada. `--positions`
-pide una columna `fen`, que tienen tanto la tabla de posiciones de P1 como la de evaluaciones:
+En `rukh encoder embed`, Typer comprueba que el parquet y el checkpoint existen (`exists=True`)
+antes de cargar nada. `--positions` pide una columna `fen`, que tienen la tabla de posiciones de P1
+y la de evaluaciones:
 
 ```python title="src/rukh/cli.py"
 @encoder_app.command("embed")
@@ -1170,8 +1047,6 @@ def encoder_embed_cmd(
 
 <Src file="src/rukh/cli.py" tag="p3" lines="824-850" />
 
-El cuerpo es una llamada a `embed_positions` y el resumen:
-
 ```python title="src/rukh/cli.py"
     """Write mean-pooled position embeddings plus the `fen4` sidecar that names their rows."""
     from rukh.export import embed_positions
@@ -1193,14 +1068,13 @@ El cuerpo es una llamada a `embed_positions` y el resumen:
 
 <Src file="src/rukh/cli.py" tag="p3" lines="851-866" />
 
-La salida menciona el sidecar y sus columnas. Es una línea que existe para que nadie se lleve solo el
-`.npy`.
+La salida menciona el sidecar y sus columnas, para que nadie se lleve solo el `.npy`.
 
 <Callout kind="ejecuta" title="El exportador, para las dos familias">
-  El escritor de grafos es ahora compartido, así que lo primero es comprobar que el decoder sigue
-  exportándose igual; lo segundo, exportar un encoder de verdad. La segunda orden necesita un
-  checkpoint de las cabezas (el de la tirada corta de la lección 6 basta para probar el camino; el
-  que se publica sale del lab 3) y, para la paridad, `data/evals/positions-eval.parquet`.
+  Primero comprueba que el decoder sigue exportándose igual con el escritor compartido; después
+  exporta un encoder. La segunda orden necesita un checkpoint de las cabezas (el de la tirada corta
+  de la lección 6 basta; el que se publica sale del lab 3) y, para la paridad,
+  `data/evals/positions-eval.parquet`.
 
 ```sh
 uv run pytest -m unit -q tests/unit/test_export.py
@@ -1247,9 +1121,8 @@ ENCODER_HEADS = ("value", "blunder", "result")
 
 <Src file="src/rukh/publish/model.py" tag="p3" lines="47-59" />
 
-Los dos diccionarios `ARCHITECTURES` y `MODEL_TYPES` son lo que el Hub lee del `config.json` para
-saber qué es un repositorio. Tenerlos como tablas indexadas por `kind` en vez de como dos ramas de un
-`if` es lo que hace que añadir un tercer tipo de modelo sea una entrada más.
+`ARCHITECTURES` y `MODEL_TYPES` son lo que el Hub lee del `config.json`; como tablas indexadas por
+`kind`, un tercer tipo de modelo sería una entrada más.
 
 ```python title="src/rukh/publish/model.py"
 def tied_names(model: Any) -> list[str]:
@@ -1282,28 +1155,22 @@ def publish_state(model: Any) -> dict[str, Any]:
 
 <Src file="src/rukh/publish/model.py" tag="p3" lines="172-197" />
 
-**`data_ptr()`**. Esa es la línea que decide si la cabeza está atada. En M2, «¿está atada la
-cabeza?» se respondía leyendo `model.cfg.tie_embeddings`, un booleano de la configuración. Aquí no
-basta: el atado del encoder es **condicional** (solo en el esquema de jugadas, lección 3) y vive un
-nivel más abajo cuando el encoder está dentro de un `MultiHead`.
+En M2 bastaba leer `model.cfg.tie_embeddings` para saber si la cabeza estaba atada. En el encoder el
+atado solo existe en el esquema de jugadas y vive un nivel más abajo, dentro del `MultiHead`, así
+que se pregunta a los tensores: dos nombres están atados si apuntan a la misma memoria, y
+**`data_ptr()`** es esa dirección. Hay que detectarlo porque `safetensors` se niega a serializar un
+alias y porque contar los dos nombres inflaría los parámetros en una tabla de embeddings entera. El
+nombre atado se quita y el cargador lo vuelve a atar con `TIED_HEADS` (lección 6).
 
-La respuesta fiable es preguntarle a los tensores: dos nombres están atados si apuntan a **la misma
-memoria**, y `Tensor.data_ptr()` es la dirección. No hay configuración que pueda mentir sobre eso.
-
-Y por qué hay que detectarlo: `safetensors` **se niega** a serializar un alias —guarda tensores, no
-referencias— y contar los dos nombres inflaría el recuento de parámetros en una tabla de embeddings
-entera. El nombre atado se quita del fichero y el cargador lo vuelve a atar, que es lo que
-`load_state` de la lección 6 acepta gracias a `TIED_HEADS`.
-
-<Transfer concept="Preguntarle al objeto en vez de a su configuración" where="Cualquier serialización de un modelo con pesos compartidos: PEFT, embeddings atados, capas reutilizadas.">
-  La regla: **cuando una propiedad del objeto se puede observar, observarla es más fiable que
-  consultar la bandera que se supone que la produjo.** Una configuración describe la intención en el
-  momento de construir; el objeto describe lo que hay.
-
-Aparece igual en cualquier modelo con pesos compartidos —adaptadores que reutilizan una proyección,
-una capa que se aplica dos veces— y el síntoma de equivocarse es siempre el mismo: un fichero que se
-escribe mal o un recuento de parámetros que no cuadra con la suma de las formas.
-
+<Transfer
+  concept="Preguntarle al objeto en vez de a su configuración"
+  where="Cualquier serialización de un modelo con pesos compartidos: PEFT, embeddings atados, capas reutilizadas."
+>
+  Cuando una propiedad del objeto se puede observar, observarla es más fiable que consultar la
+  bandera que se supone que la produjo: la configuración describe la intención al construir, el
+  objeto describe lo que hay. Con adaptadores que reutilizan una proyección o capas que se aplican
+  dos veces, equivocarse da siempre el mismo síntoma: un fichero mal escrito o un recuento de
+  parámetros que no cuadra con la suma de las formas.
 </Transfer>
 
 ```python title="src/rukh/publish/model.py"
@@ -1345,13 +1212,9 @@ def write_config(
 
 <Src file="src/rukh/publish/model.py" tag="p3" lines="221-254" />
 
-El `**({...} if encoder else {})` añade tres claves solo cuando hace falta, en vez de escribir `null`
-en el config de un decoder. Es la misma política que las dos filas de la tabla de resultados: una
-clave ausente y una clave nula no dicen lo mismo.
-
-`**model_cfg` al final es lo que hace que la forma del modelo —capas, dimensiones, esquema— acabe en
-el `config.json` sin enumerarla. Y que vaya **al final** significa que la configuración del modelo
-gana si hay una colisión de nombres, que es lo correcto: es el dato primario.
+Las tres claves del encoder solo aparecen cuando hacen falta, en vez de un `null` en el config del
+decoder: una clave ausente y una nula no dicen lo mismo. `**model_cfg` va al final, así que la forma
+del modelo entra sin enumerarla y gana en una colisión de nombres, porque es el dato primario.
 
 ```python title="src/rukh/publish/model.py"
 def _pooling(payload: dict[str, Any]) -> str:
@@ -1372,10 +1235,9 @@ def _pretrained_from(payload: dict[str, Any]) -> str | None:
 
 <Src file="src/rukh/publish/model.py" tag="p3" lines="261-274" />
 
-`_pretrained_from` existe **para que la model card no mienta**. La línea de casillas se entrena desde
-pesos aleatorios, y una plantilla que dijera «preentrenado con masked move modeling» sin condición
-publicaría una afirmación falsa en la mitad de los casos. Este dato es lo que la plantilla usa para
-elegir la frase.
+`_pretrained_from` existe para que la model card no mienta: la línea de casillas se entrena desde
+pesos aleatorios, y decir «preentrenado con masked move modeling» sin condición sería falso en la
+mitad de los casos.
 
 ```python title="src/rukh/publish/model.py"
 def write_vocab(folder: Path, kind: str, scheme: str) -> str:
@@ -1408,16 +1270,9 @@ def write_vocab(folder: Path, kind: str, scheme: str) -> str:
 
 <Src file="src/rukh/publish/model.py" tag="p3" lines="277-302" />
 
-«Without them the 69 integers of an input mean nothing»: el vocabulario de casillas es tan parte del
-modelo publicado como los pesos. Un `.safetensors` sin la enumeración es una función de enteros a
-números que nadie puede alimentar.
-
-Y el `vocab_hash()` viaja dentro del JSON, así que quien descargue el repositorio puede comprobar que
-su copia del código produce la misma enumeración. Es la misma identidad que el test de la lección 4,
-publicada.
-
-`ensure_ascii=True` por el mismo motivo que en el hash: que el fichero sea byte a byte el mismo en
-cualquier máquina.
+El vocabulario es tan parte del modelo como los pesos, igual que el tokenizador de cualquier modelo
+de lenguaje del Hub. Con el `vocab_hash()` dentro, quien lo descargue puede comprobar que su copia
+del código produce la misma enumeración.
 
 ```python title="src/rukh/publish/model.py"
 def encoder_card_context(
@@ -1469,17 +1324,9 @@ def encoder_card_context(
 
 <Src file="src/rukh/publish/model.py" tag="p3" lines="410-454" />
 
-La tabla de la model card se construye **leyendo el `results.json` que escribió la suite**, no a mano.
-Eso es la propiedad que el docstring del módulo anuncia: «los números de la card son los números que
-se midieron».
-
-Y la lista de filas es una decisión editorial repetida: el F1 ajustado, la precisión, la
-exhaustividad, **el F1 fijo**, las dos métricas sin umbral, **la tasa base**, el F1 del baseline
-y el margen. La card publica el número malo y la referencia junto al bueno, igual que el informe.
-
-El `from rukh.eval.encoder import base_rate_caveat, sentence` de la primera línea es lo que hace que
-la advertencia de la tasa base sea **la misma frase** en el informe y en la card. Un texto compartido
-no puede ablandarse en un sitio y no en el otro.
+La tabla se construye leyendo el `results.json` de la suite, no a mano, y como el informe pone el
+número malo y la referencia junto al bueno. Importar `base_rate_caveat` hace que la advertencia de
+la tasa base sea la misma frase en el informe y en la card.
 
 ```python title="src/rukh/publish/model.py"
     curve = [
@@ -1529,23 +1376,10 @@ no puede ablandarse en un sitio y no en el otro.
 
 <Src file="src/rukh/publish/model.py" tag="p3" lines="460-492" />
 
-El contexto entero de la plantilla, y todo lo que no es una métrica sale de `config` o de la ejecución de
-MLflow. Tres detalles:
-
-`"scheme": config.get("tokenizer", "squares")` reutiliza el campo `tokenizer` del `config.json`, que
-para un encoder de casillas vale `"squares"`. Es la variable que decide cuál de los dos párrafos de
-«Input and output» escribe la plantilla.
-
-`"recipe": sorted((run.params if run else {}).items())` ordena la receta por nombre de parámetro, así
-que la tabla de la card sale igual en dos ejecuciones. Y `if run else {}` es lo que permite que la card
-se genere aunque MLflow no tenga la ejecución: la plantilla imprime entonces la frase que lo dice.
-
-`"has_onnx"` se calcula de la lista de ficheros y no de un argumento, así que la card no puede
-prometer unos ficheros ONNX que no se copiaron.
-
-La curva por etiquetas llega a la model card desde el checkpoint, pasando por la suite. Es el viaje
-completo de la lección 6: se escribe dentro del `.pt`, `rukh eval encoder` la lee, la mete en el
-`results.json`, y de ahí sale a la tabla «How many labels it takes» del Hub.
+Lo que no es métrica sale de `config` o de MLflow. `"recipe"` se ordena para que la card salga
+igual en dos ejecuciones, y `"has_onnx"` se calcula de los ficheros copiados, así que la card no
+puede prometer uno que no está. La curva por etiquetas completa aquí su viaje: del `.pt`
+(lección 6) al `results.json` de `rukh eval encoder`, y de ahí a la tabla «How many labels it takes».
 
 ```python title="src/rukh/publish/model.py"
         "blunder_caveat": sentence(base_rate_caveat(measured.get("blunder_base_rate"))),
@@ -1560,9 +1394,8 @@ completo de la lección 6: se escribe dentro del `.pt`, `rukh eval encoder` la l
 
 <Src file="src/rukh/publish/model.py" tag="p3" lines="479-486" />
 
-Las notas de la suite pasan **enteras** a la model card. Las siete u ocho frases que dicen dónde se
-eligió el umbral, que el baseline no tuvo ninguno, que la exactitud no significa nada con esta tasa
-base y que los dos detectores no ven lo mismo, publicadas en el Hub al lado de las cifras.
+Las notas de la suite pasan enteras a la card (dónde se eligió el umbral, que la exactitud no
+significa nada con esta tasa base…), al lado de las cifras.
 
 ```python title="src/rukh/publish/model.py"
 def render_card(context: dict[str, Any], template: str = CARD_TEMPLATE) -> str:
@@ -1599,14 +1432,10 @@ def publish_model(
 
 <Src file="src/rukh/publish/model.py" tag="p3" lines="506-521" />
 
-`removeprefix("rukh-")` es lo que hace que el repositorio `chorcat/rukh-encoder` produzca la etapa
-`encoder`, que es el nombre con el que la suite escribió su informe. Las dos convenciones se cruzan
-aquí y en un solo sitio.
-
-`StrictUndefined` es la línea que importa. Con el comportamiento por defecto de Jinja, una variable
-que la plantilla usa y el contexto no trae se renderiza como **cadena vacía**, así que una model card
-publicada tendría una tabla con un hueco en vez de un error. Con `StrictUndefined`, la plantilla falla
-al renderizar. Es el mismo `extra="forbid"` de M0 en el otro sentido: fallar al usar lo que no existe.
+`removeprefix("rukh-")` convierte `chorcat/rukh-encoder` en la etapa `encoder`, el nombre del
+informe de la suite. En `render_card` la línea que importa es `StrictUndefined`: por defecto Jinja
+pinta como cadena vacía una variable que falta, y la card publicada tendría un hueco en vez de un
+error. Es el `extra="forbid"` de M0 aplicado a plantillas.
 
 ```python title="src/rukh/publish/model.py"
     model, payload, kind = load_any(ckpt)
@@ -1665,22 +1494,14 @@ al renderizar. Es el mismo `extra="forbid"` de M0 en el otro sentido: fallar al 
 
 <Src file="src/rukh/publish/model.py" tag="p3" lines="550-571" />
 
-`dry_run` corta **después** de escribirlo todo y antes de tocar la red, así que
-`rukh publish model --dry-run` deja la carpeta completa para revisarla. Es la única forma razonable de
-mirar una model card antes de publicarla.
-
-`tied_embeddings=bool(tied_names(model))` cierra el círculo del `data_ptr()`: el resultado publica si
-la cabeza estaba atada, y lo publica **observado**, no copiado de la configuración.
-
-`hasattr(model, "num_params")` es la única fealdad del bloque y tiene una razón: `MultiHead` no tiene
-ese método —lo tiene el `PositionEncoder` de dentro— y sumar los `numel()` da lo mismo en su caso,
-porque un `MultiHead` no tiene tabla de posiciones que descontar. La alternativa sería añadir
-`num_params` a `MultiHead`, que es probablemente mejor; que no se hizo está aquí a la vista.
+`dry_run` corta después de escribirlo todo y antes de tocar la red: la carpeta queda completa para
+revisar la card. `tied_embeddings` se publica observado, no copiado de la configuración. El
+`hasattr(model, "num_params")` está porque `MultiHead` no tiene ese método (añadírselo sería más
+limpio).
 
 ## La plantilla de la model card
 
-La plantilla es el documento que la gente va a leer en el Hub, y las decisiones están en sus
-condicionales.
+La plantilla es lo que la gente va a leer en el Hub, y las decisiones están en sus condicionales.
 
 {/* prettier-ignore */}
 ````jinja title="src/rukh/data/cards/encoder.md.jinja"
@@ -1866,60 +1687,40 @@ Generated with `rukh` {{ rukh_version }}.
 
 <Src file="src/rukh/data/cards/encoder.md.jinja" tag="p3" lines="1-178" />
 
-Cinco cosas de esta plantilla son decisiones y no redacción.
+Lo que en esta plantilla es decisión y no redacción:
 
-**`pipeline_tag: feature-extraction`** en la cabecera. Es lo que el Hub usa para clasificar el
-repositorio, y es el tag correcto: este modelo no genera texto, produce una representación. El
-decoder lleva otra.
-
-**Cada condicional evita una afirmación falsa.** `{% if pretrained_from %}` decide entre «preentrenado
-con masked move modeling» y «entrenado desde cero, sin etapa de preentrenamiento»; `{% if
-evaluated_on %}` decide entre las cifras y «todavía sin evaluar, ejecuta esto»; `{% if scheme ==
-"squares" %}` describe los 69 tokens o la línea de jugadas con su asterisco. Una plantilla sin esos
-condicionales sería una plantilla que publica la mitad de las cartas con una frase inventada.
-
-**La sección del baseline está en la card, no solo en el informe.** Quien llegue al Hub buscando
-un detector de errores lee, antes de las cifras, contra qué se midieron y qué no ve la referencia —con
-la partida de Fischer como ejemplo—. Es la información que hace que un F1 del 18 % se entienda en vez
-de descartarse.
-
-**Las limitaciones son cinco y las cinco son concretas.** «No tiene búsqueda», «la etiqueta de error
-es un umbral sobre una puntuación de Stockfish, no un juicio humano», «`result` es la cabeza más
-ruidosa porque todas las posiciones de una partida llevan la misma etiqueta». Ninguna es del tipo «el
-modelo puede producir resultados inesperados».
-
-**Y el `config.json` entero va dentro de la card**, en un bloque de código. Con eso, la forma del
-modelo, la versión del código, el SHA de git y el hash del vocabulario están en la página que la gente
-lee, no solo en un fichero al lado.
+- `pipeline_tag: feature-extraction`, el tag con el que el Hub clasifica los modelos de embeddings de
+  texto: este modelo no genera, produce una representación.
+- Cada condicional evita una afirmación falsa: preentrenado o desde cero, cifras o «todavía sin
+  evaluar», 69 casillas o línea de jugadas con su asterisco.
+- El baseline va antes de las cifras, con la partida de Fischer como ejemplo de lo que no ve. Es lo
+  que hace que un F1 del 18 % se entienda en vez de descartarse.
+- Las limitaciones son concretas («no tiene búsqueda»), nada de «puede producir resultados
+  inesperados».
+- El `config.json` entero va dentro, con la versión del código, el SHA de git y el hash del
+  vocabulario.
 
 <Callout kind="mundo-real" title="Una model card generada, no escrita">
-  Las cifras de esta card salen del `results.json` de la suite y la receta sale de la ejecución de
-  MLflow. No hay ninguna que alguien haya copiado a mano, y por eso no hay ninguna que se pueda
-  quedar desfasada después de una tirada nueva. La parte escrita a mano es la que **no** son números:
-  las limitaciones, la explicación del baseline y la descripción de la entrada.
-
-Es la división correcta y se puede copiar tal cual: **los números se generan, el contexto se
-escribe.** Una card con números escritos a mano es una card que miente en cuanto alguien vuelve a
-entrenar.
-
+  Las cifras salen del `results.json` de la suite y la receta, de MLflow; ninguna se copió a mano,
+  así que ninguna se desfasa tras una tirada nueva. A mano va lo que no son números: limitaciones,
+  baseline y descripción de la entrada. Es la división que conviene copiar en cualquier model card:
+  **los números se generan, el contexto se escribe**.
 </Callout>
 
 ## Los tests de la exportación
 
-`tests/unit/test_export_encoder.py` monta un encoder de juguete, lo exporta, lo cuantiza y corre el
-fichero con `onnxruntime`. Lo que garantiza: que el grafo exportado tiene **exactamente** las salidas
-`value` y `blunder` y que sus metadatos dicen `rukh_kind=encoder`; que el fichero corre con **dos**
-filas y con una, que es la comprobación de la especialización 0/1; que el esquema de casillas no
-declara eje de secuencia dinámico y el de jugadas sí, verificado corriéndolo; que `encoder_parity`
-detecta un desacuerdo inventado y lo cuenta en `mismatches`; que la paridad se salta con un aviso
-cuando no hay etiquetas, en vez de medirse sobre un tablero aleatorio; y que `publish_model` de un
-checkpoint de encoder escribe la card del encoder, el vocabulario de casillas y un `config.json` con
-`architectures: ["PositionEncoder"]`.
+`tests/unit/test_export_encoder.py` exporta, cuantiza y ejecuta un encoder de juguete. Comprueba que:
+
+- el grafo tiene solo las salidas `value` y `blunder`, y los metadatos dicen `rukh_kind=encoder`;
+- el fichero corre con dos filas y con una (la especialización 0/1);
+- el eje de secuencia es dinámico en jugadas y no en casillas, verificado ejecutándolo;
+- `encoder_parity` detecta un desacuerdo inventado, y sin etiquetas la paridad se salta con aviso;
+- `publish_model` escribe la card del encoder, el vocabulario de casillas y
+  `architectures: ["PositionEncoder"]`.
 
 <Callout kind="ejecuta" title="La exportación y la publicación, sin red">
-  Con `publish/model.py` y la plantilla en su sitio, pasa los tests del encoder junto con los de la
-  publicación de M2, y después prepara la carpeta del Hub sin subir nada. La tercera orden necesita el
-  checkpoint y la carpeta ONNX de la caja anterior.
+  Pasa los tests del encoder junto con los de la publicación de M2 y prepara la carpeta del Hub sin
+  subir nada. La segunda orden usa el checkpoint y la carpeta ONNX de la caja anterior.
 
 ```sh
 uv run pytest -m unit -q tests/unit/test_export_encoder.py tests/unit/test_publish_model.py
@@ -1942,18 +1743,14 @@ cifras, y si no, la sección de resultados dice «Not evaluated yet» en vez de 
   correctas, y di qué tendría que existir para que el encoder pudiera tener un respaldo honesto.
 
 <Solution>
-  Lo que la paridad mide es si **dos implementaciones de la misma función** —PyTorch y el grafo
-  ONNX— coinciden. Eso es una propiedad de las dos implementaciones sobre un conjunto de entradas, y
-  un paseo aleatorio legal sigue siendo una entrada del mismo tipo que el decoder verá: una secuencia
-  de jugadas legales. La medida es peor —esas posiciones no son las que la demo alcanza— y por eso va
-  con aviso, pero no es engañosa.
+  La paridad mide si dos implementaciones de la misma función, PyTorch y el grafo ONNX, coinciden
+  sobre unas entradas. Un paseo aleatorio legal sigue siendo una entrada del tipo que el decoder verá,
+  una secuencia de jugadas legales: la medida es peor, y por eso va con aviso, pero no engaña.
 
-Para el encoder la entrada es una posición **con su etiqueta implícita**: la decisión de error se
-umbraliza en 0,5, y en una posición aleatoria la probabilidad que sale de la cabeza es la de un
-régimen que el modelo no vio en el entrenamiento. Es perfectamente posible que todas las
-probabilidades de posiciones absurdas caigan pegadas al cero, en cuyo caso **las dos
-implementaciones coincidirían siempre** y la paridad saldría 1,0000 sin haber comprobado nada. Un
-número que no puede fallar no es una medida.
+En el encoder lo que se compara es una decisión umbralizada en 0,5, y en una posición absurda la
+cabeza trabaja en un régimen que no vio al entrenar. Si todas esas probabilidades cayeran pegadas al
+cero, **las dos implementaciones coincidirían siempre** y la paridad daría 1,0000 sin haber
+comprobado nada. Un número que no puede fallar no es una medida.
 
 Un respaldo honesto tendría que ser un conjunto de posiciones plausibles y fijas, independiente de
 la tabla de etiquetas: por ejemplo unas mil posiciones muestreadas de partidas reales y guardadas en
@@ -1964,22 +1761,18 @@ la tabla de etiquetas: por ejemplo unas mil posiciones muestreadas de partidas r
 
 ## Qué has aprendido
 
-Que exportar un modelo nuevo por un camino que ya existía es sobre todo escribir un envoltorio que
-describe **lo que el consumidor necesita** —dos salidas, el sigmoide dentro, la cabeza que nadie
-dibuja fuera— y que los problemas de verdad están en los detalles del formato: una dimensión de
-ejemplo que vale 1 y se especializa, unas anotaciones de forma opcionales que hacen fallar la
-cuantización, y un `Cast` cuyo tipo declarado y cuyo atributo dejan de coincidir.
+Exportar un modelo por un camino que ya existía es sobre todo escribir un envoltorio con lo que el
+consumidor necesita: dos salidas, el sigmoide dentro, la cabeza que nadie dibuja fuera. Los
+problemas de verdad estaban en el formato: una dimensión de ejemplo que vale 1 y se especializa,
+anotaciones opcionales que tumban la cuantización y un `Cast` cuyo tipo declarado y cuyo atributo
+dejan de coincidir. Y te llevas dos costumbres para cualquier modelo: el índice viaja con los datos,
+y una propiedad que se puede observar (como el atado de una cabeza) se observa en vez de leerla de
+la configuración.
 
-Y dos reglas que se transfieren: **el índice viaja con los datos o los datos no existen**, y
-**pregúntale al objeto, no a su configuración** —el atado de una cabeza se comprueba con `data_ptr()`,
-no con un booleano—.
-
-**Cómo se mide**: `uv run rukh export --ckpt <checkpoint> --kind encoder --out artifacts/onnx/encoder
+Cómo se mide: `uv run rukh export --ckpt <checkpoint> --kind encoder --out artifacts/onnx/encoder
 --fp16 --int8 --check-parity` escribe los tres ficheros e imprime la coincidencia de las decisiones
 de error en las tres precisiones. `uv run rukh publish model --ckpt <checkpoint> --repo rukh-encoder
 --dry-run` deja la carpeta lista con su card, su `config.json` y su vocabulario sin tocar la red. Las
 cifras reales —60,7 / 30,6 / 18,3 MB y el 100 % de coincidencia— están en la lección 11.
 
-Lo siguiente es el otro lado de la frontera: qué hace la demo con ese fichero de 30 MB, cómo se pide
-el consentimiento antes de descargarlo y por qué la barra y el tablero viven en dos trabajadores
-distintos.
+Lo siguiente es el otro lado de la frontera: qué hace la demo con ese fichero de 30 MB.

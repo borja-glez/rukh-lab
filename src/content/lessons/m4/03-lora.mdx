@@ -6,11 +6,11 @@ description: 'models/lora.py entero: la tabla de objetivos sobre una proyección
   configuraciones de los adaptadores de estilo.'
 module: m4
 order: 3
-duration: 165
+duration: 120
 runtime: 15
 level: avanzado
 status: vigente
-updated: '2026-09-22'
+updated: '2026-09-23'
 keywords:
   - LoRA
   - rango
@@ -30,15 +30,14 @@ faltaba» y sigue en «Estilo y texto PGN».
 
 ## Qué vas a construir
 
-`src/rukh/models/lora.py` entero —428 líneas— y los catorce tests que lo definen. Es el fichero más
-largo del módulo y el único que implementa una técnica publicada en vez de una decisión del
-proyecto, así que cada parte tiene una afirmación del método detrás y un test que la comprueba.
+`src/rukh/models/lora.py` entero y los catorce tests que lo definen. Es el único fichero del módulo
+que implementa una técnica publicada, así que detrás de cada parte hay una afirmación del método y un
+test que la comprueba.
 
-Al terminar tendrás: un envoltorio que congela un `nn.Linear` y le suma una corrección de rango
-bajo por cada rodaja de salida; una función que decide qué se entrena y —más importante— qué no; dos
-maneras de fundir la corrección, una que muta y otra que no, y la razón de que hagan falta las dos;
-y un formato de adaptador que sabe viajar de tres maneras distintas, porque PyTorch, safetensors y
-un grafo ONNX quieren tres formas distintas de los mismos números.
+Al terminar tendrás un envoltorio que congela un `nn.Linear` y le suma una corrección de rango bajo
+por cada rodaja de salida, dos maneras de fundir esa corrección (una que muta y otra que no) y un
+formato de adaptador con tres formas, porque PyTorch, safetensors y un grafo ONNX quieren los mismos
+números colocados de tres maneras.
 
 ## El docstring, que es el diseño
 
@@ -71,19 +70,10 @@ module they adapt, and ``merge_lora`` folds the correction back into ``W`` and p
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="1-24" />
 
-Los dos detalles que el docstring nombra son los que separan esta implementación de la que sale en
-cualquier tutorial, y los dos vienen de cómo está escrito **este** decoder.
-
-El primero: la atención usa una proyección `qkv` **fusionada**. No hay un módulo `q_proj` que
-envolver; hay una sola `nn.Linear` de 768 × 2304 que produce consulta, clave y valor pegadas.
-Adaptar «consulta y valor» significa adaptar dos rangos contiguos de salida de esa matriz, y cada
-uno recibe su propia `A` y su propia `B`. Compartir una `A` entre los dos sería más barato y no
-sería <Term id="lora">LoRA</Term>: el punto del método es que cada matriz adaptada tenga su propio
-subespacio de <Term id="rango">rango</Term> `r`.
-
-El segundo: envolver **renombra**. `blocks.0.attn.qkv.weight` pasa a ser
-`blocks.0.attn.qkv.base.weight`, que ningún checkpoint del proyecto conoce. Por eso los envoltorios
-no son nunca lo que se guarda, y por eso hay dos funciones de fundido en vez de una.
+Los dos detalles del docstring separan esta implementación de la de cualquier tutorial. El primero:
+no hay un módulo `q_proj` que envolver, sino una `qkv` **fusionada**, y cada rango adaptado recibe su
+propia `A` y su propia `B`. Compartir una `A` sería más barato y no sería <Term id="lora">LoRA</Term>: cada matriz adaptada tiene que tener su propio subespacio de <Term id="rango">rango</Term> `r`. El segundo: envolver **renombra** los parámetros, así que los
+envoltorios nunca son lo que se guarda.
 
 ```python title="src/rukh/models/lora.py"
 from __future__ import annotations
@@ -124,13 +114,9 @@ ADAPTER_CONFIG = "adapter_config.json"
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="26-59" />
 
-`__all__` con trece nombres es la superficie pública del módulo, y merece mirarse antes de leer el
-resto: hay un envoltorio, una configuración, tres funciones para aplicar y recorrer, dos para
-fundir, dos para guardar y cargar, y tres para el camino del grafo (`AdapterLayout`,
-`adapter_layout`, `stack_adapter`). Ese último grupo existe por la demo y es de lo que va la lección 6.
-
-`ADAPTER_FILE` y `ADAPTER_CONFIG` son constantes y no cadenas sueltas porque los escribe el bucle de
-entrenamiento y los lee el publicador, que están en paquetes distintos.
+`__all__` es la superficie pública: un envoltorio, una configuración, funciones para aplicar,
+recorrer, fundir, guardar y cargar, y tres para el camino del grafo (`AdapterLayout`,
+`adapter_layout`, `stack_adapter`), que existen por la demo y se usan en la lección 6.
 
 ## La tabla de objetivos
 
@@ -152,13 +138,10 @@ TARGETS: dict[str, tuple[str, int, int]] = {
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="61-73" />
 
-El comentario es lo que hace legible la tabla. Los nombres de la izquierda son los que espera quien
-ha leído los artículos de LoRA —«adaptamos Wq y Wv»—, y la tupla de la derecha traduce ese nombre a
-**dónde vive esa matriz en este decoder** y **qué rango de su salida le corresponde**.
-
-Los rangos están en unidades de `d_model` y se resuelven contra el bloque al aplicar, no aquí. Eso
-es lo que permite que la misma tabla valga para `tiny`, `small` y `medium` sin tocarla, y lo que
-obliga a que `mlp_in` tenga un tratamiento aparte: `mlp.fc` mide `ff` de ancho, no `d_model`.
+La tabla traduce los nombres de los artículos («adaptamos Wq y Wv») a dónde vive esa matriz en este
+decoder y qué rango de su salida le corresponde. Los rangos van en unidades de `d_model`, así que la
+misma tabla vale para `tiny`, `small` y `medium`; la excepción es `mlp_in`, porque `mlp.fc` mide `ff`
+de ancho.
 
 ```python title="src/rukh/models/lora.py"
 class LoraConfig(BaseConfig):
@@ -186,15 +169,9 @@ class LoraConfig(BaseConfig):
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="76-96" />
 
-Cuatro campos y un `check()`. El docstring de `alpha` explica la única convención del método que
-parece arbitraria y no lo es: la corrección se escala por `alpha / r`, así que subir el rango no
-sube además lo fuerte que empuja el adaptador. Sin ese cociente, un barrido de rangos mediría dos
-cosas a la vez —cuántas direcciones tiene la corrección y cuánto pesa— y no se podría atribuir el
-resultado a ninguna.
-
-`check()` es un método y no un validador de pydantic a propósito: se llama desde `apply_lora`, y
-un `targets` vacío o con un nombre desconocido tiene que fallar **al aplicar**, cuando ya se sabe
-contra qué modelo, no al parsear el YAML.
+La corrección se escala por `alpha / r`, así que subir el rango no sube además lo fuerte que empuja
+el adaptador. Sin ese cociente, un barrido de rangos mediría dos cosas a la vez: cuántas direcciones
+tiene la corrección y cuánto pesa.
 
 ## `LoRALinear`: el envoltorio
 
@@ -248,24 +225,16 @@ class LoRALinear(nn.Module):
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="99-143" />
 
-Tres decisiones dentro, y las tres están comentadas en el propio fichero porque ninguna se deduce
-del código.
+Tres decisiones, comentadas en el fichero porque ninguna se deduce del código:
 
-**Los factores se construyen donde ya vive el peso que corrigen.** `apply_lora` corre _después_ de
-mover el modelo al dispositivo, porque el bucle carga el checkpoint primero y cargar necesita los
-nombres de módulo de un decoder normal. Un factor creado en CPU por defecto se encontraría una
-activación de CUDA en la primera pasada y la ejecución moriría ahí. Todos los tests de este fichero
-corren en CPU, que es exactamente donde el fallo es invisible; por eso hay un test que comprueba la
-**propiedad** —que el factor está donde el peso— en vez del dispositivo que toque.
-
-**`B` arranca en cero exacto.** Así el modelo adaptado **es** el modelo base en el paso 0. Cualquier
-otra inicialización movería los pesos antes de que llegara un solo gradiente, y toda comparación
-contra la base empezaría desde un modelo que ya es distinto. `A` sale de la misma
-`kaiming_uniform_` del artículo.
-
-**Una `A` y una `B` por rodaja.** `nn.ParameterList` y no un tensor apilado, porque las rodajas
-pueden tener anchuras distintas (`mlp_in` mide `ff`) y porque cada una tiene que poder recibir su
-gradiente por separado.
+- Los factores se construyen donde ya vive el peso que corrigen. `apply_lora` corre después de mover
+  el modelo a la GPU, y un factor creado en CPU se encontraría una activación de CUDA en la primera
+  pasada. Los tests corren en CPU, donde el fallo es invisible; por eso uno comprueba la propiedad
+  (el factor está donde el peso) y no el dispositivo.
+- **`B` arranca en cero**, así que el modelo adaptado es el modelo base en el paso 0. `A` sale de la
+  misma `kaiming_uniform_` del artículo.
+- Una `A` y una `B` por rodaja, en `nn.ParameterList`, porque las rodajas pueden tener anchuras
+  distintas.
 
 ```python title="src/rukh/models/lora.py"
     def forward(self, x: Tensor) -> Tensor:
@@ -292,22 +261,16 @@ gradiente por separado.
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="145-164" />
 
-El paso hacia delante es `base(x) + escala · Δ`, con `Δ` montado rodaja a rodaja sobre un tensor de
-ceros del tamaño de la salida. El `dropout` se aplica a la **entrada** del adaptador y no a su
-salida, que es la convención del artículo: lo que se regulariza es qué ve la corrección, no cuánto
-de ella llega.
-
-`merged_weight()` es la misma operación escrita sobre los pesos en vez de sobre las activaciones:
-`W + (alpha/r)·B·A`, cada corrección en su propia rodaja de salida. Lleva `@torch.no_grad()` porque
-es contabilidad y no parte del grafo, y clona el peso base en vez de sumarle en sitio, que es lo que
-permite llamarla sin destruir el modelo.
+El `dropout` se aplica a la entrada del adaptador, como en el artículo. `merged_weight()` es la misma
+operación sobre los pesos en vez de sobre las activaciones, y clona el peso base para poder llamarla
+sin destruir el modelo.
 
 <Callout kind="teoria" title="Por qué el forward no usa `merged_weight`">
-  Sería más corto: fundir y aplicar la lineal una vez. Y sería más caro: fundir cuesta una
-  multiplicación de 768 × 8 por 8 × 768 —589 824 multiplicaciones— **por paso y por capa**, mientras
-  que calcular `B(Ax)` sobre un lote de `n` vectores cuesta dos productos por un tensor de rango 8.
-  Con `r = 8` y `d_model = 768`, la vía del rango bajo es unas cuarenta veces más barata. Es la
-  razón de ser del método: la corrección nunca se materializa como matriz mientras se entrena.
+  Sería más corto, pero `merged_weight` corre sin gradiente y no entrenaría nada. Y aunque se
+  reescribiera con gradiente, un peso fundido no puede expresar el dropout sobre la entrada del
+  adaptador, y en QLoRA la base está en 4 bits: sumarle la corrección obligaría a descuantizar la
+  matriz entera en cada paso. Mientras se entrena, la corrección vive aparte de `W`; solo se funde
+  al final.
 </Callout>
 
 ## Aplicar los adaptadores
@@ -342,17 +305,10 @@ def _set_module(root: nn.Module, path: str, value: nn.Module) -> None:
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="167-191" />
 
-`_target_slices` es donde los rangos en unidades de `d_model` se convierten en índices reales, y
-donde está la excepción del MLP: `width = ff if module_name == "mlp.fc" else d_model`. Una rodaja
-calculada en la unidad equivocada no daría un error, daría un adaptador que cubre la cuarta parte de
-la matriz. Hay un test para eso.
-
-Agrupar **por módulo** es lo que hace que «consulta y valor» acabe siendo un solo `LoRALinear` con
-dos rodajas en vez de dos envoltorios sobre la misma `nn.Linear`, que es imposible.
-
-`_get_module` y `_set_module` son dos bucles de `getattr`/`setattr` por una ruta punteada. Existen
-porque `nn.Module` no tiene un `set_submodule` por ruta en la versión que usa el proyecto, y porque
-escribirlo aquí es más corto que la comprobación de versión que haría falta para usarlo.
+En `_target_slices` está la excepción del MLP: una rodaja calculada en la unidad equivocada no daría
+error, daría un adaptador que cubre la cuarta parte de la matriz. Y agrupar por módulo hace que
+«consulta y valor» sea un solo `LoRALinear` con dos rodajas, porque no se pueden poner dos
+envoltorios sobre la misma `nn.Linear`.
 
 ```python title="src/rukh/models/lora.py"
 def apply_lora(model: nn.Module, cfg: LoraConfig) -> int:
@@ -382,17 +338,10 @@ def apply_lora(model: nn.Module, cfg: LoraConfig) -> int:
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="194-216" />
 
-La función que decide qué **no** se entrena, que es la afirmación que hay que poder defender. El
-docstring lo dice sin rodeos: todo lo que está fuera de los adaptadores se congela, **incluidos los
-embeddings y la norma final**. Una ejecución de LoRA que además entrene la tabla de embeddings no es
-una ejecución de LoRA, y el número que devuelve esta función dejaría de significar lo que dice.
-
-Ese número —la suma de los parámetros con `requires_grad`— es lo que acaba en el log, en la card
-publicada y en la lección, así que se calcula del modelo y no de la fórmula. Un test comprueba que
-los dos coinciden, que es la manera de tener dos medidas independientes de lo mismo.
-
-El `TypeError` sobre un módulo que no es `nn.Linear` parece defensivo de más hasta que alguien añade
-un objetivo nuevo a `TARGETS` apuntando a una `LayerNorm`.
+Todo lo que está fuera de los adaptadores se congela, **incluidos los embeddings y la norma final**:
+una ejecución de LoRA que entrene la tabla de embeddings ya no es LoRA. El número que devuelve, el que
+acaba en el log y en la card, se cuenta del modelo y no de la fórmula; un test comprueba que los dos
+coinciden.
 
 ```python title="src/rukh/models/lora.py"
 def lora_modules(model: nn.Module) -> Iterator[tuple[str, LoRALinear]]:
@@ -411,9 +360,8 @@ def adapter_params(model: nn.Module) -> Iterator[nn.Parameter]:
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="219-230" />
 
-Dos generadores cortos que se usan en todas partes: en los tests, en el bucle, en el exportador y en
-el publicador. `lora_modules` recorre por ruta punteada porque esa ruta es lo que identifica un
-adaptador cuando ya no está montado —en el fichero safetensors, por ejemplo—.
+`lora_modules` recorre por ruta punteada porque esa ruta es lo que identifica un adaptador cuando ya
+no está montado, por ejemplo en el fichero safetensors.
 
 ## Fundir, de dos maneras
 
@@ -440,11 +388,9 @@ def merge_lora(model: nn.Module) -> int:
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="233-250" />
 
-`merge_lora` **muta**: pliega cada corrección en el peso, devuelve `requires_grad` a los pesos base
-y pone el `nn.Linear` de vuelta donde estaba el envoltorio. Después de esto el modelo es
-indistinguible de uno afinado entero —mismos nombres de módulo, mismo state dict, mismo grafo
-ONNX—, y esa es la propiedad que permite publicar un adaptador de 1,6 MB y aun así exportarlo,
-cuantizarlo y servirlo como un modelo cualquiera.
+`merge_lora` **muta**: pliega cada corrección en el peso y pone el `nn.Linear` de vuelta. Después, el
+modelo es indistinguible de uno afinado entero, y por eso un adaptador de 1,6 MB se puede exportar,
+cuantizar y servir como un modelo cualquiera.
 
 ```python title="src/rukh/models/lora.py"
 @torch.no_grad()
@@ -474,19 +420,11 @@ def merged_state_dict(model: nn.Module) -> dict[str, Tensor]:
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="253-275" />
 
-Y aquí está la razón de que hagan falta las dos. Mutar es lo que quiere una exportación y lo que
-**no** quiere un bucle de entrenamiento: un checkpoint escrito a mitad de ejecución no puede dejar el
-modelo incapaz de dar otro paso. `merged_state_dict` hace el plegado sobre una copia de los números
-y deja los envoltorios en su sitio.
-
-Las tres ramas del bucle son las tres clases de clave que tiene el state dict de un modelo
-envuelto. Una que acaba en `.base.weight` dentro de un adaptador: se renombra quitando el `.base.` y
-se sustituye por el peso fundido. Una que acaba en `.base.bias`: se renombra igual y se copia tal
-cual, porque LoRA no toca el sesgo. Y una que es un factor del adaptador (`.a.0`, `.b.1`): se
-descarta, porque los factores viven en su propio fichero.
-
-Lo que sale tiene exactamente los nombres de módulo de un `MoveDecoder` normal, que es lo que
-esperan el cargador, el exportador y el publicador.
+Mutar es lo que quiere una exportación y lo que no quiere un bucle de entrenamiento: un checkpoint
+escrito a mitad de ejecución no puede dejar el modelo incapaz de dar otro paso. `merged_state_dict`
+pliega sobre una copia: renombra `.base.weight` al peso fundido, copia el sesgo tal cual y descarta
+los factores, que viven en su propio fichero. Lo que sale tiene los nombres de un `MoveDecoder`
+normal.
 
 ```python title="src/rukh/train/loop.py"
         def save(path: Path, step: int) -> Path:
@@ -509,9 +447,8 @@ esperan el cargador, el exportador y el publicador.
 
 <Src file="src/rukh/train/loop.py" tag="p4" lines="227-242" />
 
-Así se usa desde el bucle, y de paso se ve la otra decisión: el optimizador **no se guarda** en una
-ejecución de LoRA. El estado de Adam para dos matrices pequeñas no vale 460 MB por checkpoint, y de
-todas formas no se puede reanudar dentro, porque el checkpoint lleva los pesos fundidos.
+En una ejecución de LoRA el optimizador no se guarda: no se podría reanudar dentro de un checkpoint
+con los pesos fundidos.
 
 ```python title="src/rukh/train/checkpoint.py"
     *,
@@ -546,21 +483,17 @@ todas formas no se puede reanudar dentro, porque el checkpoint lleva los pesos f
 
 <Src file="src/rukh/train/checkpoint.py" tag="p4" lines="103-130" />
 
-El parámetro `state` es todo lo que hizo falta cambiar en el guardado: sustituye a
-`model.state_dict()` cuando se le pasa algo. Es la clase de gancho que se agradece por lo que no
-hace: no hay ninguna rama `if lora` dentro de `save_checkpoint`, y el fichero que escribe no sabe
-que LoRA existe.
+El parámetro `state` es todo lo que hizo falta cambiar en el guardado, y no hay ninguna rama
+`if lora` dentro: el fichero que escribe no sabe que LoRA existe.
 
 <Transfer
   concept="Separar mutar de calcular"
   where="Cualquier operación cara que se quiera aplicar a veces en sitio y a veces sobre una copia: normalizar un dataframe, compactar un índice, aplicar migraciones."
 >
-  Dos funciones con el mismo cálculo dentro y políticas opuestas sobre el original casi siempre
-  acaban siendo la solución correcta, y casi siempre se descubre tarde: primero se escribe la que
-  muta, porque es la que hacía falta, y meses después un segundo llamante la usa sin darse cuenta de
-  que le deja el objeto inservible. El nombre importa más que el código: `merge_` y `merged_` dicen
-  lo mismo con dos tiempos verbales distintos, y la diferencia es exactamente la de una acción y su
-  resultado.
+  Dos funciones con el mismo cálculo y políticas opuestas sobre el original suelen acabar siendo la
+  solución correcta, y se descubre tarde: primero se escribe la que muta, y meses después otro
+  llamante la usa sin ver que le deja el objeto inservible. El nombre carga la diferencia: `merge_`
+  es una acción; `merged_`, su resultado.
 </Transfer>
 
 ## Guardar y cargar el adaptador
@@ -592,18 +525,11 @@ def save_adapter(model: nn.Module, path: Path | str, cfg: LoraConfig) -> Path:
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="278-299" />
 
-Las claves son las rutas que el adaptador **tendría en el modelo base**
-(`blocks.0.attn.qkv.lora_A.0`) y no las que crean los envoltorios (`blocks.0.attn.qkv.a.0`). Es una
-línea de diferencia y hace que cargar no dependa de cómo se escribió el envoltorio: el día que
-`LoRALinear` renombre sus `ParameterList`, los adaptadores publicados siguen cargándose.
-
-<Term id="safetensors">`safetensors`</Term> en vez de `torch.save` porque el fichero se publica, y
-un pickle de PyTorch ejecuta código al cargarse. El `.contiguous()` antes de guardar está porque
-`save_file` rechaza una vista no contigua, que es justo lo que devuelve un parámetro recién
-detachado en algunos casos.
-
-Y la configuración se escribe **al lado**, con el nombre fijo `adapter_config.json`. Un fichero de
-números sin el `r`, el `alpha` y los objetivos con los que se entrenó no se puede cargar de vuelta:
+Las claves son las rutas que el adaptador tendría en el modelo base (`blocks.0.attn.qkv.lora_A.0`),
+no las de los envoltorios: si `LoRALinear` renombra algún día sus `ParameterList`, los adaptadores
+publicados siguen cargándose. Se usa <Term id="safetensors">`safetensors`</Term> en vez de
+`torch.save` porque el fichero se publica, y un pickle de PyTorch ejecuta código al cargarse. Y la
+configuración va al lado, en `adapter_config.json`: sin el `r`, el `alpha` y los objetivos,
 `apply_lora` no sabría qué envolver.
 
 ```python title="src/rukh/models/lora.py"
@@ -630,11 +556,8 @@ def load_adapter(model: nn.Module, path: Path | str) -> LoraConfig:
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="302-320" />
 
-Cargar es aplicar la configuración que está al lado del fichero y meter los tensores. `strict=False`
-en el `load_state_dict` es obligatorio —el state dict que se le pasa solo tiene los factores, no el
-modelo— y por eso hay que comprobar `unexpected` a mano: un adaptador con tensores que el modelo no
-sabe dónde poner es un error, y con `strict=False` pasaría en silencio. `missing` no se comprueba,
-porque todo el modelo base está «ausente» de este state dict por construcción.
+`strict=False` es obligatorio, porque el state dict solo trae los factores, y por eso `unexpected` se
+comprueba a mano: un tensor que el modelo no sabe dónde poner pasaría en silencio.
 
 ## El adaptador como dos tensores
 
@@ -683,21 +606,11 @@ class AdapterLayout(BaseConfig):
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="323-362" />
 
-Aquí empieza la parte que existe por la demo, y el docstring la explica entera. `save_adapter`
-escribe una `A` y una `B` por rodaja adaptada, con su clave: la forma correcta para cargar en
-PyTorch y la forma equivocada para alimentar un grafo, porque **una entrada de ONNX es un tensor, no
-treinta y dos**.
-
-Apilar convierte el adaptador entero en `A (capas, rodajas, r, entrada)` y `B (capas, rodajas,
-ancho, r)`, que es lo que el navegador sube una vez por jugada. Es la diferencia entre 1,6 MB por
-estilo y 221 MB por estilo.
-
-Y el docstring dice también qué **no** cubre: apilar exige que todas las capas coincidan —un módulo
-adaptado por bloque, todas las rodajas del mismo ancho, la misma entrada—. Eso cubre las rodajas de
-consulta, clave y valor de la `qkv` fusionada, que es lo que este proyecto entrena y publica, y no
-cubre un adaptador que además toque el MLP, cuyo `fc` es cuatro veces más ancho. Ese caso tiene su
-propio camino (`merge_lora` y una exportación normal); lo único que no puede es viajar como un
-tensor.
+Aquí empieza la parte que existe por la demo. Una entrada de ONNX es **un tensor, no treinta y
+dos**, así que el adaptador se apila en `A (capas, rodajas, r, entrada)` y `B (capas, rodajas, ancho,
+r)`: es la diferencia entre 1,6 MB por estilo y 221 MB por estilo. Apilar exige que todas las capas
+coincidan, y eso cubre la `qkv` fusionada pero no un adaptador que toque el MLP; ese caso se funde y
+se exporta como un modelo normal.
 
 ```python title="src/rukh/models/lora.py"
 def adapter_layout(model: nn.Module) -> AdapterLayout:
@@ -731,13 +644,8 @@ def adapter_layout(model: nn.Module) -> AdapterLayout:
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="365-391" />
 
-Cuatro comprobaciones antes de construir el resultado, y cada una corresponde a un supuesto del
-párrafo anterior. El mensaje de error que importa es el primero: cuando hay adaptadores sobre más de
-una matriz por bloque, no dice «no soportado», dice **qué hacer en su lugar** («merge them
-instead»). Un error que nombra la alternativa ahorra media hora de leer código ajeno.
-
-`name.split(".", 2)[-1]` saca el sufijo `attn.qkv` de `blocks.0.attn.qkv`, que es lo que tienen en
-común todas las capas: el nombre lógico del módulo adaptado.
+Fíjate en el primer mensaje de error: en vez de «no soportado», dice qué hacer en su lugar («merge
+them instead»). Un error que nombra la alternativa ahorra media hora de leer código ajeno.
 
 ```python title="src/rukh/models/lora.py"
 @torch.no_grad()
@@ -760,12 +668,8 @@ def adapter_size(model: nn.Module) -> tuple[int, int]:
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="394-409" />
 
-`stack_adapter` es un doble `torch.stack` y una comprobación contra el layout que ya se calculó.
-Sale en CPU y en `float32` siempre, porque el destino es un búfer plano que descarga un navegador y
-no hay ninguna ventaja en que el fichero herede el `bf16` del entrenamiento.
-
-`adapter_size` devuelve la pareja de números que justifica el método entero: cuántos parámetros son
-el adaptador y cuántos la base.
+`stack_adapter` sale siempre en CPU y en `float32`, porque el destino es un búfer plano que descarga
+un navegador.
 
 ```python title="src/rukh/models/lora.py"
 def describe(model: nn.Module, cfg: LoraConfig) -> str:
@@ -789,10 +693,8 @@ def adapter_json(cfg: LoraConfig, base_repo: str, extra: dict[str, object] | Non
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="412-428" />
 
-Y las dos últimas funciones son de presentación. `describe` es la línea que el bucle escribe en el
-log al empezar —`LoRA r=8 alpha=16 on [q, v]: 393 216 trainable of 115 513 344 (0.34 %)`— y
-`adapter_json` es el fichero que viaja con el adaptador publicado diciendo sobre qué modelo se monta.
-Un adaptador sin esa línea es un montón de números sin modelo que corregir.
+`describe` es la línea que el bucle escribe en el log al empezar, y `adapter_json` el fichero que
+viaja con el adaptador publicado diciendo sobre qué modelo se monta.
 
 <Callout kind="ejecuta" title="El recuento, leído del modelo de verdad">
   Con `lora.py` completo ya se puede aplicar un adaptador al `medium` real, sin checkpoint: los pesos
@@ -802,10 +704,8 @@ Un adaptador sin esa línea es un montón de números sin modelo que corregir.
 uv run python -c "from rukh.models import MoveDecoder, preset; from rukh.models.lora import LoraConfig, apply_lora, describe; m = MoveDecoder(preset('medium')); c = LoraConfig(); apply_lora(m, c); print(describe(m, c))"
 ```
 
-Tiene que imprimir `LoRA r=8 alpha=16 on [q, v]: 393,216 trainable of 115,513,344 (0.34 %)`: los
-393 216 de la fórmula sobre los 115 120 128 del modelo. Si el primer número sale el doble, alguna
-rodaja está recibiendo dos parejas de factores; si el total no cuadra, `apply_lora` no está
-congelando lo que debería.
+Tiene que imprimir `LoRA r=8 alpha=16 on [q, v]: 393,216 trainable of 115,513,344 (0.34 %)`. Si el
+primer número sale el doble, alguna rodaja está recibiendo dos parejas de factores.
 
 </Callout>
 
@@ -823,10 +723,6 @@ congelando lo que debería.
 
 <Src file="src/rukh/train/loop.py" tag="p4" lines="87-93" />
 
-Un campo de configuración, y su docstring dice las tres consecuencias de encenderlo: todo lo de
-fuera de los adaptadores se congela, el optimizador solo ve `A` y `B`, y los checkpoints llevan los
-pesos **fundidos** para que el resto de la cadena no se entere de que hubo LoRA.
-
 ```python title="src/rukh/train/loop.py"
     if cfg.lora is not None:
         if resume is not None:
@@ -840,10 +736,8 @@ pesos **fundidos** para que el resto de la cadena no se entere de que hubo LoRA.
 
 <Src file="src/rukh/train/loop.py" tag="p4" lines="183-190" />
 
-Y el rechazo que cierra el círculo: un adaptador **no se puede reanudar** con `--resume`. Sus
-checkpoints llevan pesos fundidos, y unos pesos fundidos ya no dicen dónde acababa el adaptador —la
-suma `W + BA` no se puede descomponer de vuelta—. El bucle lo rechaza diciendo por qué y diciendo
-qué hacer.
+Una ejecución de LoRA no se puede reanudar con `--resume`: la suma `W + BA` fundida no se puede
+descomponer de vuelta. El bucle lo rechaza diciendo por qué y qué hacer.
 
 ```python title="src/rukh/train/loop.py"
         if cfg.lora is not None:
@@ -854,9 +748,6 @@ qué hacer.
 ```
 
 <Src file="src/rukh/train/loop.py" tag="p4" lines="296-300" />
-
-Al terminar la ejecución se escribe el adaptador al lado de los checkpoints fundidos. El `log.info`
-con los megabytes es lo que hace que el resultado del hito se vea en el log sin abrir el directorio.
 
 ## Las dos configuraciones de estilo
 
@@ -907,23 +798,14 @@ log_every: 10
 
 <Src file="configs/train/lora-e4.yaml" tag="p4" lines="1-41" />
 
-Dos comentarios del fichero son decisiones y no descripción.
+El comentario de `lr` es el ajuste de LoRA que más se equivoca. Solo se mueve el 0,34 % del modelo y
+`B` arranca en cero, así que con la tasa del afinado completo el adaptador seguiría cerca de la
+identidad después de 1 500 pasos: parecería que «no hace nada», como un fallo de la implementación.
+Las recetas habituales para LLM usan con LoRA una tasa entre diez y veinte veces más alta que con un
+afinado completo. `weight_decay: 0.0` va en la misma línea: penalizar la norma de `B` la empujaría
+hacia el cero del que acaba de salir.
 
-El de arriba: `r = 8` sobre consulta y valor no es solo la configuración del artículo, es **la más
-pequeña que tiene alguna posibilidad**. Lo que el adaptador aprenda tiene que pasar por ocho
-dimensiones por matriz, y ese cuello es a la vez la razón de que sea barato y el techo de lo que
-puede hacer.
-
-El de `lr`: **veinte veces** la tasa del afinado completo. Solo se mueve el 0,34 % del modelo y `B`
-arranca en cero exacto, así que a 1e-4 el adaptador seguiría cerca de la identidad después de 1 500
-pasos. Es el ajuste que más sorprende de LoRA y el que más se equivoca: reutilizar la tasa del
-afinado entero produce un adaptador que «no hace nada» y parece un fallo de la implementación.
-
-`weight_decay: 0.0` por la misma familia de razones: penalizar la norma de `B` es empujarla hacia el
-cero del que acaba de salir.
-
-La segunda configuración es la misma con tres líneas cambiadas, y por eso se cita solo por su
-diferencia:
+La segunda configuración cambia tres líneas:
 
 {/* prettier-ignore */}
 ```yaml title="configs/train/lora-d4.yaml"
@@ -946,25 +828,22 @@ run_name: lora-d4
 
 <Src file="configs/train/lora-d4.yaml" tag="p4" lines="38-38" />
 
-Tres líneas: el comentario del título, el corpus y el nombre de la ejecución. Las otras treinta y ocho
-son idénticas, y eso es lo que permite atribuir la diferencia entre los dos adaptadores al corpus y
-a nada más. Dos configuraciones que se diferencian en el rango, la tasa **y** el corpus producirían
-dos adaptadores distintos sin decir por qué.
+Las otras treinta y ocho son idénticas, así que la diferencia entre los dos adaptadores solo puede
+venir del corpus.
 
 ```bash title="Terminal"
 uv run rukh train --config configs/train/lora-e4.yaml
 uv run rukh train --config configs/train/lora-d4.yaml
 ```
 
-Cada uno son 1 500 pasos y unos **siete minutos**, y deja `adapter.safetensors` de 1 578 824 bytes
-con su `adapter_config.json` al lado. Los dos leen `data/tokens-style-e4` y `data/tokens-style-d4`,
-que se construyen en la lección siguiente: lánzalos cuando la termines.
+Cada uno son 1 500 pasos y unos siete minutos, y deja `adapter.safetensors` de 1 578 824 bytes con
+su `adapter_config.json` al lado. Los dos leen corpus que se construyen en la lección siguiente:
+lánzalos cuando la termines.
 
 ## Los catorce tests que definen qué es LoRA
 
-Escribir a mano una técnica publicada tiene un riesgo evidente: que lo escrito se parezca a la
-técnica y no lo sea. Los tests de este fichero son la definición operativa, y cada uno comprueba
-**una** afirmación del método.
+Estos tests son la definición operativa de LoRA en este repositorio: cada uno comprueba una
+afirmación del método, y si alguno falla, lo que has escrito es otra cosa.
 
 ```python title="tests/unit/test_lora.py"
 """Tests for rukh.models.lora: the hand-written adapters and what makes them LoRA.
@@ -1008,9 +887,9 @@ def _idx() -> torch.Tensor:
 
 <Src file="tests/unit/test_lora.py" tag="p4" lines="1-37" />
 
-El decoder de prueba son dos capas, dos cabezas y `d_model` 16, sembrado: eso permite montar dos
-modelos con exactamente los mismos pesos y comparar. `_idx()` siembra aparte, para que la entrada
-sea la misma en todos los tests sin que dependa de cuántos modelos se hayan construido antes.
+El decoder de prueba es diminuto y sembrado, para montar dos modelos con los mismos pesos y
+comparar; `_idx()` siembra aparte para que la entrada no dependa de cuántos modelos se hayan
+construido antes.
 
 ```python title="tests/unit/test_lora.py"
 def test_an_untrained_adapter_is_the_identity() -> None:
@@ -1040,14 +919,8 @@ def test_only_the_factors_are_trainable() -> None:
 <Src file="tests/unit/test_lora.py" tag="p4" lines="40-61" />
 
 El primero es la afirmación más fácil de romper sin enterarse: **un adaptador sin entrenar es la
-identidad**. `assert_close` y no `==` porque los logits son `float32` y la suma de un cero exacto
-puede reasociar la última operación; lo que se comprueba es que no hay ninguna diferencia
-apreciable, no que los bits sean idénticos.
-
-El segundo comprueba dos cosas distintas y las dos hacen falta: que el recuento que devuelve
-`apply_lora` **coincide** con la suma de los parámetros entrenables, y que el **conjunto** de esos
-parámetros es exactamente el de las `A` y las `B`. Lo segundo se compara por `id()`: no basta con
-que los números cuadren, tienen que ser los mismos objetos.
+identidad**. El segundo compara por `id()`: no basta con que el recuento cuadre, los parámetros
+entrenables tienen que ser los mismos objetos que las `A` y las `B`.
 
 ```python title="tests/unit/test_lora.py"
 def test_trainable_count_is_the_formula_on_the_card() -> None:
@@ -1091,20 +964,11 @@ def test_the_key_slice_never_moves_when_only_q_and_v_are_adapted() -> None:
 
 <Src file="tests/unit/test_lora.py" tag="p4" lines="64-100" />
 
-Tres tests sobre la proyección fusionada, que es la parte de esta implementación que no está en
-ningún tutorial.
-
-El de la fórmula comprueba que el recuento es `n_capas × n_objetivos × 2 × r × d_model` y nada más.
-Es el número que la card publica, y calcularlo por dos caminos independientes es lo que impide que
-una card diga una cosa y el modelo otra.
-
-El de los subespacios comprueba lo que el docstring del módulo promete: dos rodajas —`(0, d)` y
-`(2d, 3d)`, consulta y valor, con la clave intacta en medio—, dos `A` y dos `B`, y que las dos `A`
-**no son iguales**. Esa última aserción es la que detectaría una implementación que comparte factores
-entre rodajas, que sería más barata y no sería LoRA.
-
-Y el de la clave es el mismo hecho medido desde el otro lado: se llenan las `B` de ruido, se funde, y
-la franja central del peso tiene que salir **idéntica** mientras la de la consulta cambia.
+Tres tests sobre la proyección fusionada, la parte que no está en ningún tutorial. El de la fórmula
+calcula por un segundo camino el número que publica la card. El de los subespacios comprueba que
+las dos `A` no son iguales, que es lo que detectaría una implementación que comparte factores entre
+rodajas. Y el de la clave llena las `B` de ruido, funde y comprueba que la franja central del peso no
+se ha movido.
 
 ```python title="tests/unit/test_lora.py"
 def test_merging_reproduces_the_adapted_model_exactly() -> None:
@@ -1140,13 +1004,8 @@ def test_a_merged_model_has_the_state_dict_of_a_plain_decoder() -> None:
 
 <Src file="tests/unit/test_lora.py" tag="p4" lines="103-131" />
 
-Fundir tiene dos tests porque tiene dos propiedades. El primero es numérico: los logits del modelo
-envuelto y los del fundido coinciden con `rtol=1e-5`. El segundo es estructural: después de fundir,
-el state dict tiene **exactamente las mismas claves** que antes de aplicar LoRA —ni una `.base.` ni
-una `.a.0`—, que es lo que permite que el exportador y el publicador no se enteren de nada.
-
-Fíjate en que el primero comprueba también `merge_lora(model) == model.cfg.n_layer`: fundió un
-adaptador por capa, ni uno más ni uno menos. Y que no queda ninguno montado.
+Fundir tiene dos propiedades y dos tests: los logits coinciden con `rtol=1e-5`, y el state dict
+vuelve a tener las mismas claves que antes de aplicar LoRA, ni una `.base.` ni una `.a.0`.
 
 ```python title="tests/unit/test_lora.py"
 def test_adapter_round_trips_through_safetensors(tmp_path: Path) -> None:
@@ -1174,14 +1033,10 @@ def test_adapter_round_trips_through_safetensors(tmp_path: Path) -> None:
 
 <Src file="tests/unit/test_lora.py" tag="p4" lines="134-154" />
 
-La ida y vuelta por safetensors, que es el test del formato publicado. Se entrena un adaptador (o
-más bien se le mete ruido en las `B`, que a estos efectos es lo mismo), se guarda, se construye un
-modelo **limpio** y se carga encima. Los logits tienen que coincidir y la configuración tiene que
-volver igual.
-
-El `assert path.with_name("adapter_config.json").is_file()` es pequeño y es el que evita el peor
-fallo posible de este formato: un fichero de pesos publicado sin la configuración que dice cómo
-montarlos, que es indistinguible de un fichero correcto hasta que alguien intenta cargarlo.
+La ida y vuelta por safetensors es el test del formato publicado: se mete ruido en las `B`, se
+guarda, se carga sobre un modelo limpio y los logits tienen que coincidir. La aserción sobre
+`adapter_config.json` evita el peor fallo del formato: unos pesos publicados sin la configuración que
+dice cómo montarlos.
 
 ```python title="tests/unit/test_lora.py"
 def test_the_adapter_is_a_rounding_error_next_to_the_published_model() -> None:
@@ -1216,20 +1071,10 @@ def test_gradients_reach_the_factors_and_nothing_else() -> None:
 
 <Src file="tests/unit/test_lora.py" tag="p4" lines="157-184" />
 
-El primero de estos dos no prueba código: prueba la **afirmación del módulo**. El decoder de juguete
-son 39 000 parámetros y dos tercios son la tabla de embeddings, así que su proporción no dice nada.
-`medium` es el tamaño del que va la afirmación, así que el test hace la aritmética sobre el preset
-real y comprueba los tres números que la lección cita: 393 216 parámetros, menos del 0,4 % del
-modelo, y 1 572 864 bytes en `float32`.
-
-Es un test de una frase de la documentación, y el proyecto tiene unos cuantos. Lo que garantiza no es
-que el código funcione, es que el día que alguien cambie el preset `medium` la card no siga diciendo
-1,6 MB.
-
-El segundo comprueba que los gradientes llegan a los factores **y a nada más**: la tabla de
-embeddings sale sin `grad`, y los pesos base de cada adaptador también. Es la contrapartida
-dinámica de `apply_lora`: una cosa es declarar `requires_grad_(False)` y otra que el grafo lo
-respete.
+El primero no prueba código: prueba una frase de la documentación. Hace la aritmética sobre el
+preset `medium` real, para que el día que alguien lo cambie la card no siga diciendo 1,6 MB. El
+segundo comprueba que los gradientes llegan a los factores y a nada más: declarar
+`requires_grad_(False)` es una cosa, y que el grafo lo respete, otra.
 
 ```python title="tests/unit/test_lora.py"
 def test_targets_are_validated() -> None:
@@ -1274,14 +1119,9 @@ def test_the_factors_are_built_where_the_weight_they_correct_lives() -> None:
 
 <Src file="tests/unit/test_lora.py" tag="p4" lines="187-224" />
 
-Los cuatro últimos son cortos y cada uno cierra una grieta.
-
-La validación de objetivos, con sus dos casos. El del MLP, que comprueba que `mlp.fc` usa `ff` de
-ancho y `mlp.proj` usa `d_model`: una rodaja calculada en la unidad equivocada no falla, **trunca**.
-El de la escala, que es `alpha / r` y no otra cosa. Y el del dispositivo, que es el más interesante
-de los cuatro y está explicado en su propio docstring: comprueba la **propiedad** que hace imposible
-el fallo —que el factor vive donde el peso— en vez del dispositivo en el que el test resulta correr,
-porque el fallo solo se manifiesta en GPU y toda esta suite corre en CPU.
+Los cuatro últimos son cortos. El más interesante es el del dispositivo: como el fallo solo se ve en
+GPU y la suite corre en CPU, comprueba la propiedad que lo hace imposible (el factor vive donde el
+peso) en vez del dispositivo en el que resulta correr.
 
 <Callout kind="ejecuta" title="Los catorce tests, y el bucle con LoRA dentro">
   Con `test_lora.py` escrito, pásalo junto a los tests del bucle, que ahora cubren las dos piezas de
@@ -1292,13 +1132,10 @@ uv run pytest -m unit -q tests/unit/test_lora.py
 uv run pytest -m unit -q tests/unit/test_loop.py
 ```
 
-La primera son catorce tests en unos segundos, en CPU, sin descargar nada. Son la definición
-operativa de «esto es LoRA»: si uno falla, lo que has escrito es otra cosa. La segunda entrena
-decoders de juguete de verdad; entre sus tests están el de que una ejecución de LoRA solo entrena el
-adaptador y guarda un checkpoint normal, el de que `--resume` se rechaza en una ejecución de LoRA,
-el de que `init_from` y `--resume` a la vez se rechazan, y el aviso de que `best.pt` no es el
-resultado de un afinado. La comprobación que falta —que la regla de actualización es la misma que la
-de `peft`— necesita la envoltura de Hugging Face y está en la lección 5.
+La primera son catorce tests en unos segundos, en CPU. La segunda entrena decoders de juguete de
+verdad: una ejecución de LoRA solo entrena el adaptador y guarda un checkpoint normal, `--resume` se
+rechaza donde debe y aparece el aviso de `best.pt`. La comprobación que falta, contra `peft`,
+necesita la envoltura de Hugging Face y está en la lección 5.
 
 </Callout>
 
@@ -1306,12 +1143,8 @@ de `peft`— necesita la envoltura de Hugging Face y está en la lección 5.
 
 Una técnica publicada, escrita entera, con las dos adaptaciones que pide este decoder: una `A` y una
 `B` por rodaja de una proyección fusionada, y dos fundidos con políticas opuestas sobre el original.
-Y el formato del artefacto, que tiene tres formas porque tiene tres destinos: `ParameterList` para
-entrenar, safetensors por clave para cargar, y dos tensores apilados para un grafo.
+El artefacto tiene tres formas porque tiene tres destinos: `ParameterList` para entrenar,
+safetensors por clave para cargar y dos tensores apilados para un grafo. Y los catorce tests
+convierten «implementamos LoRA» en una afirmación comprobable.
 
-Se mide con el número que devuelve `apply_lora` —393 216 de 115 520 000, el 0,34 %— y con los
-catorce tests, que es lo que convierte «implementamos LoRA» en una afirmación comprobable.
-
-Lo siguiente son los datos que entrenan esos adaptadores: cómo se corta un corpus por la primera
-jugada sin que el predicado se pueda salir del SQL, y cómo se escriben las mismas partidas en el
-formato que lee un modelo general. Sigue en «Estilo y texto PGN».
+Lo siguiente son los datos que entrenan esos adaptadores. Sigue en «Estilo y texto PGN».

@@ -7,11 +7,11 @@ description:
   el número de otro modelo.'
 module: m4
 order: 6
-duration: 280
+duration: 210
 runtime: 20
 level: avanzado
 status: vigente
-updated: '2026-09-22'
+updated: '2026-09-23'
 keywords:
   - adaptador
   - ONNX
@@ -28,6 +28,8 @@ artifacts:
     label: chorcat/rukh-qwen3-pgn-qlora
 ---
 
+import AdapterSwap from '../../../components/figures/AdapterSwap.astro';
+
 Lección 6 de 10 del módulo «Fine-tuning e instrucción». Viene de «QLoRA con `transformers`» y sigue
 en «Diversidad y barridos».
 
@@ -35,17 +37,18 @@ en «Diversidad y barridos».
 
 El camino que va desde un `adapter.safetensors` de 1,6 MB hasta un navegador que cambia de estilo
 sin descargar otro modelo, y desde una ejecución hasta un repositorio del Hub con una card que dice
-qué cambió el adaptador y qué costó.
-
-Son dos ficheros nuevos —`src/rukh/export/adapter.py` y `src/rukh/publish/adapter.py`—, dos
-plantillas de card y los trozos nuevos de `publish/model.py`. El hilo que lo une todo es una sola
-decisión: **la corrección no se funde con los pesos**.
+qué cambió el adaptador y qué costó. Lo une todo una decisión: **la corrección no se funde con los
+pesos**.
 
 ## Por qué el adaptador no se funde antes de exportar
 
-Fundir un adaptador y exportar el resultado es la manera obvia de servir un estilo en el navegador,
-y tira por la ventana lo único que LoRA había comprado. Un estilo son 221 MB de ONNX para `medium`;
-dos estilos, 442 MB; y el fichero de 1,6 MB deja de significar nada.
+Fundir un adaptador y exportar el resultado es la manera obvia de servir un estilo, y tira por la
+ventana lo que LoRA había comprado: un estilo son 221 MB de ONNX; dos, 442 MB. La alternativa es
+exportar el modelo con los factores `A` y `B` como **entradas** del grafo, igual que los tokens, y
+darle en cada llamada los del estilo que toque. Es lo que hacen los servidores de LLM que sirven
+cientos de adaptadores sobre una misma base.
+
+<AdapterSwap />
 
 ```python title="src/rukh/export/adapter.py"
 """Exporting the decoder with its LoRA factors as **inputs of the graph**.
@@ -130,27 +133,11 @@ __all__ = [
 
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="1-78" />
 
-El docstring lista las tres propiedades que hacen honesto el fichero, y las tres tienen test.
-
-**Los ceros son el modelo base.** Un grafo que toma los factores como entradas y recibe ceros
-calcula exactamente lo que calcula la exportación normal, hasta el último bit de `float32`. Por eso
-el fichero adaptable **sustituye** al ordinario en vez de ser una segunda copia, y una demo sin
-estilo seleccionado no está corriendo otro modelo.
-
-**Los factores son de verdad entradas.** Alimentar otro adaptador cambia los logits sin tocar el
-fichero. Esa es la afirmación entera, y está a una aserción de estar comprobada.
-
-**<Term id="paridad">Paridad</Term> con PyTorch.** El mismo adaptador por `apply_lora` y por este
-grafo tiene que dar la misma jugada siguiente.
-
-Y dice lo que **no** hace: no acepta un adaptador de cualquier forma. Los factores viajan como un
-tensor cada uno, así que todos los bloques tienen que adaptar la misma matriz con las mismas
-anchuras de rodaja. Eso es cierto de la consulta, la clave y el valor sobre la `qkv` fusionada —lo
-que este proyecto entrena— y deja de serlo en cuanto entra el MLP.
-
-Los imports dicen de qué está hecho el fichero: seis nombres de `rukh.export.onnx` —incluidos dos
-privados, `_load` y `_write_graph`— y ocho de `rukh.models.lora`. No reimplementa ni el exportador ni
-el adaptador: los compone.
+Las tres propiedades del docstring tienen test. **Los ceros son el modelo base**, hasta el último bit
+de `float32`, así que el fichero adaptable sustituye al ordinario en vez de ser una segunda copia.
+Otro adaptador cambia los logits sin tocar el fichero. Y hay <Term id="paridad">paridad</Term> con
+PyTorch: el mismo adaptador por `apply_lora` y por este grafo da la misma jugada siguiente. El
+fichero no reimplementa ni el exportador ni el adaptador: los compone.
 
 ```python title="src/rukh/export/adapter.py"
 A_INPUT = "lora_a"
@@ -183,20 +170,15 @@ def browser_lora(cfg: LoraConfig) -> LoraConfig:
 
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="80-105" />
 
-Dos constantes con docstring y la función que resuelve el problema de dónde vive `alpha / r`.
-
-La corrección es `(alpha/r)·B·A`, y ese factor tiene que estar en un sitio y en uno solo. Si vive en
-el **grafo**, cualquier adaptador que se le dé tendría que haberse entrenado con el mismo `alpha` y
-el mismo `r`, y en un búfer plano de `float32` no hay nada contra lo que comprobarlo. Así que vive
-en el **fichero**: `write_web_adapter` multiplica `B` por la escala del adaptador antes de
-escribirlo, y el grafo que corre el navegador multiplica por uno. Un adaptador de cualquier rango y
-cualquier alpha es entonces correcto en ese grafo sin que nadie tenga que cuadrar dos números a mano.
+La corrección es `(alpha/r)·B·A`, y ese factor tiene que vivir en un solo sitio. En el grafo, todo
+adaptador tendría que haberse entrenado con el mismo `alpha` y el mismo `r`, sin nada contra lo que
+comprobarlo. Así que vive en el **fichero**: `write_web_adapter` multiplica `B` por la escala antes de
+escribirlo, y el grafo del navegador multiplica por uno.
 
 <Callout kind="teoria" title="Un dato sin su unidad es media medida">
-  «Está a 30» no dice nada hasta que sabes si son grados o metros, y entregar el 30 sin el símbolo
-  obliga a quien lo recibe a adivinarlo. La regla general: cuando un dato y su interpretación se
-  pueden separar, júntalos en el mismo fichero. Aquí la interpretación es el factor de escala, y
-  meterlo dentro de los números es lo que hace que el búfer sea autocontenido.
+  «Está a 30» no dice nada hasta que sabes si son grados o metros. Cuando un dato y su
+  interpretación se pueden separar, júntalos en el mismo fichero. Aquí la interpretación es el
+  factor de escala, y meterlo dentro de los números hace que el búfer sea autocontenido.
 </Callout>
 
 ```python title="src/rukh/export/adapter.py"
@@ -250,26 +232,12 @@ class SliceLoraFromInputs(nn.Module):
 
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="108-153" />
 
-`_Slot` es una caja con dos atributos y deliberadamente **no** es un `nn.Module`: `torch.export`
-avisa de que un tensor asignado a un módulo durante el trazado debería haber sido un búfer, y un
-búfer es exactamente lo que estos no pueden ser —un búfer se hornea en el fichero, y el punto es que
-no lo estén—.
-
-`SliceLoraFromInputs` es la misma aritmética que `LoRALinear.forward` con **un** cambio que le
-importa a ONNX: la corrección se arma con `cat` sobre todo el ancho de salida en vez de escribirse
-en una rodaja de un tensor de ceros.
-
-<Callout
-  kind="roto"
-  title="`ScatterND` se ejecuta en CPU aunque el resto del grafo vaya por WebGPU"
->
-  La asignación por índice —`delta[..., start:stop] = ...`— exporta como un nodo `ScatterND`, y
-  onnxruntime web lo ejecuta en la CPU aunque todo lo demás vaya por el acelerador. Una
-  concatenación de multiplicaciones y ceros se queda en el acelerador. Es la clase de detalle que no
-  se puede deducir leyendo el modelo: hay que exportar, abrir el grafo y mirar qué nodos aparecen.
-  La regla que deja es que **el código que se exporta no es el código que corre**, y entre los dos
-  hay un traductor con opiniones.
-</Callout>
+`_Slot` no es un `nn.Module` a propósito: un tensor asignado a un módulo se hornearía en el fichero
+como búfer, y el punto es que no lo esté. `SliceLoraFromInputs` es la aritmética de
+`LoRALinear.forward` con un cambio: la corrección se arma con `cat` en vez de escribirse en una
+rodaja de un tensor de ceros. La asignación por índice se exporta como un nodo `ScatterND`, que
+onnxruntime web ejecuta en la CPU aunque el resto vaya por WebGPU. Solo se descubre abriendo el grafo
+exportado: entre el código que escribes y el que corre hay un traductor con opiniones.
 
 ```python title="src/rukh/export/adapter.py"
 class AdaptableDecoder(nn.Module):
@@ -318,13 +286,8 @@ def _module(root: nn.Module, path: str) -> nn.Module:
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="156-196" />
 
 `AdaptableDecoder.forward` es toda la idea: antes de correr el modelo, reparte las capas de `lora_a`
-y `lora_b` por sus casillas. Durante el trazado eso se convierte en las conexiones del grafo; en
+y `lora_b` por sus casillas. Durante el trazado eso se convierte en conexiones del grafo; en
 ejecución, en dos entradas más.
-
-`build_adaptable` acepta un modelo **con o sin** adaptador ya puesto, y su docstring promete algo
-que importa: los envoltorios que salen no llevan factores propios. Lo que hubiera cargado lo
-devuelve `stack_adapter` antes del cambio, así que quien llama puede volver a metérselo y obtener el
-mismo modelo.
 
 ```python title="src/rukh/export/adapter.py"
 def zero_inputs(layout: AdapterLayout) -> dict[str, Any]:
@@ -344,10 +307,6 @@ def adaptable_inputs(model: nn.Module) -> dict[str, Any]:
 ```
 
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="199-212" />
-
-Las dos alimentaciones posibles: ceros —que hacen del grafo el modelo base— y el adaptador cargado.
-Que la primera exista como función con nombre, en vez de como un `np.zeros` escrito en tres sitios,
-es lo que permite que el test de «ceros son la base» diga lo que quiere decir.
 
 ```python title="src/rukh/export/adapter.py"
 def export_adaptable_onnx(
@@ -427,15 +386,8 @@ def export_adaptable_onnx(
 
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="215-287" />
 
-La exportación en sí reutiliza todo lo de M2 —`_write_graph`, `verify_dynamic_seq`,
-`write_metadata`— y solo añade dos entradas y seis claves de metadatos. Esas seis son las que
-permiten que el navegador sepa qué forma tienen los tensores que debe subir sin que nadie se lo
-escriba a mano en un `.ts`: `adapter_shape_a`, `adapter_shape_b`, `adapter_module`, `adapter_r`,
-`adapter_scale`.
-
-`verify_dynamic_seq` con `zero_inputs(layout)` es importante: comprobar que el eje de la secuencia
-sigue siendo dinámico exige **ejecutar** el grafo a dos longitudes, y ejecutarlo exige darle las dos
-entradas nuevas.
+La exportación reutiliza todo lo de M2 y añade dos entradas y seis claves de metadatos, con las que
+el navegador sabe qué tiene que subir sin que nadie se lo escriba a mano en un `.ts`.
 
 ```python title="src/rukh/export/adapter.py"
 def _write_web(
@@ -495,15 +447,9 @@ def write_web_adapter(model: nn.Module, out: Path | str, base_repo: str | None =
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="290-341" />
 
 El fichero que descarga el navegador es **deliberadamente aburrido**: `float32` little-endian en
-crudo, `A` primero y `B` después, sin cabecera de safetensors que interpretar en el worker y sin
-formas dentro de los bytes. El docstring dice por qué: la página lo descarga antes de poder hacer
-nada, y cada dependencia que necesite es una cosa más que puede fallar entre el Hub y el tablero.
-
-El `.json` al lado lleva las formas, el módulo, el rango, la escala aplicada y el modelo base. Y el
-nombre del sidecar sale de `with_suffix(".json")` sobre el propio búfer, así que un fichero escrito
-con otro nombre conserva sus metadatos al lado y no al lado de los de otro.
-
-`(b.cpu().float() * scale)` es la línea donde el `alpha / r` entra en el fichero.
+crudo, `A` primero y `B` después, sin cabecera que interpretar en el worker; cada dependencia es una
+cosa más que puede fallar entre el Hub y el tablero. Las formas, el rango y la escala van en el
+`.json` de al lado. `(b.cpu().float() * scale)` es la línea donde el `alpha / r` entra en el fichero.
 
 ```python title="src/rukh/export/adapter.py"
 def write_web_adapter_from_file(
@@ -558,18 +504,9 @@ def _adapter_sort_key(key: str) -> tuple[int, int]:
 
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="344-391" />
 
-Y la variante que lee el `adapter.safetensors` directamente, sin modelo base. El docstring dice el
-motivo con números: publicar un adaptador no debería necesitar 440 MB de pesos en disco para
-escribir 1,6 MB de flotantes.
-
-Lo que hace posible leerlo sin modelo es que el fichero guardado ya lo tiene todo: las claves llevan
-el número de bloque y el índice de rodaja, y el `adapter_config.json` de al lado lleva el rango y el
-alpha.
-
-`_adapter_sort_key` merece mirarse. Ordenar `blocks.10.attn.qkv.lora_A.1` alfabéticamente pone el
-bloque 10 antes del 2, y el orden de apilado **es** el orden en que el grafo indexa las capas. Un
-adaptador apilado con las capas cruzadas no falla: da otro modelo. Convertir el número a entero
-antes de ordenar es la corrección entera.
+La variante que lee el `adapter.safetensors` directamente evita cargar 440 MB de pesos para escribir
+1,6 MB de flotantes. Fíjate en `_adapter_sort_key`: ordenar alfabéticamente pone el bloque 10 antes
+del 2, y un adaptador apilado con las capas cruzadas no falla, da otro modelo.
 
 ```python title="src/rukh/export/adapter.py"
 def restore_lora_modules(model: MoveDecoder, cfg: LoraConfig) -> int:
@@ -590,10 +527,6 @@ def restore_lora_modules(model: MoveDecoder, cfg: LoraConfig) -> int:
 ```
 
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="394-408" />
-
-Y una función que existe solo para los tests, con su docstring diciéndolo. Exportar es el final de
-la vida de un modelo dentro de un proceso, así que en producción nadie necesita deshacer el cambio;
-los tests sí, y tenerla aquí es mejor que dejar que alcancen las interioridades desde fuera.
 
 ### El exportador, desde la línea de órdenes
 
@@ -655,14 +588,8 @@ los tests sí, y tenerla aquí es mejor que dejar que alcancen las interioridade
 
 <Src file="src/rukh/export/__init__.py" tag="p4" lines="228-280" />
 
-`export_all` gana tres parámetros y una rama. Lo interesante son los dos comentarios.
-
-El primero avisa de que `export_adaptable_onnx` **cambia el modelo que recibe**: sustituye las
-matrices adaptadas por portadores, así que deja de ser un decoder normal. Todo lo que viene después
-vuelve a cargar del checkpoint, y por eso hay un `load_model` extra unas líneas más abajo.
-
-El segundo dice cuál es la referencia de la paridad con adaptador cero: el **checkpoint sin tocar**.
-Sin corrección, el fichero adaptable tiene que ser el modelo del que se exportó y nada más.
+`export_adaptable_onnx` cambia el modelo que recibe, y por eso lo que viene después vuelve a cargar
+del checkpoint. La referencia de la paridad con adaptador cero es el checkpoint sin tocar.
 
 ```python title="src/rukh/export/__init__.py"
 def adapter_file(adapter: Path | str) -> Path:
@@ -708,14 +635,9 @@ def _adapter_parity(
 
 <Src file="src/rukh/export/__init__.py" tag="p4" lines="283-321" />
 
-`adapter_file` son dos líneas que arreglan un fallo que costó quince minutos de exportación. `rukh
-export --adapter` toma la **carpeta** que escribió una ejecución, porque es lo que el lector tiene
-delante; `load_adapter` toma el fichero de pesos y busca la configuración al lado. Darle la carpeta
-le hacía buscar `adapter_config.json` un nivel más arriba y morir en una ruta que nadie había
-escrito, después de exportar. La traducción ocurre una vez y aquí.
-
-Y `_adapter_parity` es la comprobación que sostiene todo lo demás: el mismo adaptador cargado en
-PyTorch y alimentado al grafo tiene que elegir la misma jugada en mil posiciones de validación.
+`adapter_file` traduce la carpeta de una ejecución, que es lo que el lector tiene delante, al fichero
+de pesos que espera `load_adapter`. Y `_adapter_parity` sostiene todo lo demás: el mismo adaptador en
+PyTorch y en el grafo tiene que elegir la misma jugada en mil posiciones de validación.
 
 ```bash title="Terminal"
 uv run rukh export --ckpt checkpoints/medium-v4-<fecha>/best.pt --out artifacts/onnx/medium-lora --fp16 --int8 --check-parity --positions 1000 --adapter-inputs --adapter checkpoints/lora-e4-<fecha>
@@ -791,12 +713,8 @@ def test_the_graph_declares_the_two_factors_as_inputs(tmp_path):
 
 <Src file="tests/unit/test_export_adapter.py" tag="p4" lines="1-61" />
 
-El primero comprueba la forma del contrato: tres entradas con nombre, y los metadatos que el
-navegador va a leer para saber qué subir. Las formas `"2,2,4,32"` y `"2,2,32,4"` son
-`(capas, rodajas, r, entrada)` y `(capas, rodajas, ancho, r)` sobre el decoder de juguete.
-
-`_trained_adapter` llena las `B` de ruido, que es lo que haría el entrenamiento: sin eso, todos los
-tests de «el adaptador cambia algo» pasarían trivialmente comparando el modelo consigo mismo.
+`_trained_adapter` llena las `B` de ruido: sin eso, los tests de «el adaptador cambia algo»
+compararían el modelo consigo mismo.
 
 ```python title="tests/unit/test_export_adapter.py"
 def test_zeros_are_the_base_model(tmp_path):
@@ -858,13 +776,9 @@ def test_two_adapters_give_two_different_answers_from_one_file(tmp_path):
 
 <Src file="tests/unit/test_export_adapter.py" tag="p4" lines="64-118" />
 
-Las cuatro afirmaciones del docstring, una por test. Ceros son el modelo base —comparado contra la
-exportación **normal**, no contra sí mismo—. El adaptador cambia los logits sin tocar el fichero.
-El grafo coincide con PyTorch. Y dos adaptadores distintos dan dos respuestas distintas **de un solo
-fichero**, que es la funcionalidad entera dicha en una aserción.
-
-Fíjate en las tolerancias: `< 1e-5` para «es el mismo modelo», `> 1e-3` para «es otro modelo». Las
-dos direcciones hacen falta, porque un test que solo comprobara la primera pasaría con un grafo que
+Un test por afirmación. El último, dos adaptadores distintos que dan dos respuestas distintas de un
+solo fichero, es la funcionalidad entera en una aserción. Fíjate en las tolerancias: `< 1e-5` para
+«es el mismo modelo» y `> 1e-3` para «es otro modelo»; solo con la primera pasaría un grafo que
 ignora las entradas.
 
 ```python title="tests/unit/test_export_adapter.py"
@@ -896,10 +810,6 @@ def _with_lora(model: MoveDecoder) -> MoveDecoder:
 ```
 
 <Src file="tests/unit/test_export_adapter.py" tag="p4" lines="121-145" />
-
-Tres bordes: el eje dinámico sobrevive a las entradas extra, un adaptador que no se puede apilar lo
-**dice** con el mensaje que nombra la alternativa, y los portadores se pueden convertir de vuelta en
-adaptadores normales.
 
 ```python title="tests/unit/test_export_adapter.py"
 def test_the_browser_file_feeds_the_unit_scale_graph_and_matches_pytorch(tmp_path):
@@ -952,14 +862,9 @@ def test_the_web_file_is_the_same_from_the_model_and_from_the_saved_adapter(tmp_
 
 <Src file="tests/unit/test_export_adapter.py" tag="p4" lines="148-193" />
 
-El camino del navegador de punta a punta, que es el test que comprueba la convención del `alpha/r`:
-se escribe el fichero plano, se lee como `numpy`, se remodela con las formas del sidecar y se
-alimenta a un grafo exportado con `browser_lora(LORA)` —es decir, con escala uno—. Tiene que
-reproducir el modelo que aplica `alpha / r` por su cuenta.
-
-Y el segundo comprueba que los dos caminos de escritura —desde el modelo y desde el fichero
-guardado— producen **los mismos bytes**. Es la garantía de que las dos copias del adaptador no
-pueden separarse.
+El camino del navegador de punta a punta comprueba la convención del `alpha/r`: el fichero plano,
+alimentado a un grafo con escala uno, tiene que reproducir el modelo que aplica `alpha / r` por su
+cuenta. Y los dos caminos de escritura producen los mismos bytes.
 
 ```python title="tests/unit/test_export_adapter.py"
 def test_the_quantized_files_still_take_the_adapter(tmp_path):
@@ -1010,29 +915,19 @@ def test_the_adapter_parity_takes_the_folder_a_run_wrote(tmp_path):
 
 <Src file="tests/unit/test_export_adapter.py" tag="p4" lines="196-239" />
 
-Y los dos últimos cubren dos fallos que no dan error hasta el final: un adaptador que la
-cuantización deja sin efecto y una carpeta de ejecución que el exportador no sabe leer.
-
-El de los ficheros cuantizados dice en su docstring por qué no se puede asumir: la cuantización
-dinámica reescribe las multiplicaciones cuya otra mitad es un inicializador, y las dos del adaptador
-no lo son —sus dos entradas vienen de fuera del grafo—. Nada garantiza que los conversores las dejen
-en paz, así que se comprueba. Y lo que se comprueba es **la funcionalidad**, no la estructura: que
-el adaptador siga cambiando la respuesta en fp16 y en int8.
-
-El de la carpeta documenta el fallo de `adapter_file` con su coste dentro: «murió en una ruta que
-nadie había escrito, después de quince minutos exportando».
+Los dos últimos cubren fallos que no dan error hasta el final. El de los ficheros cuantizados
+comprueba la funcionalidad, no la estructura: que el adaptador siga cambiando la respuesta en fp16 y
+en int8, porque nada garantiza que los conversores dejen en paz dos multiplicaciones cuyas entradas
+vienen de fuera del grafo.
 
 <Callout kind="roto" title="Un valor por defecto de la especificación que rompió el fp16">
-  El grafo `float32` cargaba perfectamente y el fp16 se negaba: `Type Error: Type (tensor(float16))
-  of output arg (val_20) of node (node_ConstantOfShape_18) does not match expected type
-  (tensor(float))`. Y el fp32 no lo sirve nadie. La causa: los rangos que nadie adapta son un
-  `ConstantOfShape` de ceros que el exportador escribe **sin** atributo `value`, porque la
-  especificación dice que el valor por defecto es un cero de `float32`. El conversor a fp16 retipa
-  el grafo alrededor y no toca el nodo, así que el fichero declara `float16` donde el nodo sigue
-  produciendo `float32`. La regla que deja: **un parámetro implícito es una dependencia como
-  cualquier otra**, y una herramienta que reescribe tu fichero no la ve. Lo encontró el test de
-  catorce segundos de arriba; sin él habrían sido cuarenta y cinco minutos de exportación y una demo
-  rota.
+  El grafo `float32` cargaba y el fp16, el que se sirve, se negaba: `Type Error: Type
+  (tensor(float16)) of output arg (val_20) of node (node_ConstantOfShape_18) does not match expected
+  type (tensor(float))`. Los rangos que nadie adapta son un `ConstantOfShape` de ceros escrito sin
+  atributo `value`, porque la especificación dice que por defecto es un cero de `float32`. El
+  conversor a fp16 retipa el grafo alrededor y no toca el nodo. **Un parámetro implícito es una
+  dependencia como cualquier otra**, y una herramienta que reescribe tu fichero no la ve. Lo
+  encontró el test de catorce segundos de arriba.
 </Callout>
 
 ### La corrección del fp16, entera
@@ -1088,19 +983,9 @@ def _align_constant_outputs(model: object) -> int:
 
 <Src file="src/rukh/export/quantize.py" tag="p4" lines="116-161" />
 
-El docstring es el diagnóstico que el callout de arriba resume. `convert_float_to_float16` retipa
-los **valores** del grafo y deja en paz el atributo `value` de `Constant` y `ConstantOfShape`, así
-que un nodo que produce un bloque de ceros sigue produciéndolos en `float32` dentro de un grafo que
-ya espera `float16`.
-
-El último párrafo es el caso raro y es el que rompió la demo: un `ConstantOfShape` **sin** atributo
-`value` es el mismo fallo escrito como una ausencia. La especificación dice que su valor por defecto
-es un cero de `float32`, así que el nodo que el exportador escribió confiando en el valor por defecto
-deja de encajar en silencio. La corrección es darle explícitamente el atributo del que dependía.
-
-Fíjate en la condición `if node.op_type != "ConstantOfShape" or wanted == TensorProto.FLOAT`: un
-`Constant` **siempre** trae su `value`, así que una ausencia ahí no es este fallo; y si lo que el
-grafo quiere es `float32`, el valor por defecto ya es el correcto.
+La corrección es darle al nodo, de forma explícita, el atributo del que dependía. Un `Constant`
+siempre trae su `value`, y si el grafo quiere `float32` el valor por defecto ya es el correcto; de
+ahí la condición del `if`.
 
 ```python title="src/rukh/export/parity.py"
 def parity(
@@ -1122,10 +1007,9 @@ def parity(
 
 <Src file="src/rukh/export/parity.py" tag="p4" lines="263-277" />
 
-Y la comprobación de paridad gana un `extra` para el resto de la alimentación. Su docstring dice la
-condición que hace válida la medición: el modelo del lado de PyTorch tiene que llevar **ya cargado**
-el mismo adaptador. Ceros en un lado y un adaptador entrenado en el otro medirían el adaptador, no la
-exportación.
+La comprobación de paridad gana un `extra` para las dos entradas nuevas, con una condición: el
+modelo del lado de PyTorch tiene que llevar ya cargado el mismo adaptador, o se mediría el adaptador
+y no la exportación.
 
 <Callout kind="ejecuta" title="El grafo adaptable, sobre un decoder de juguete">
   Con `export/adapter.py`, la corrección de `quantize.py` y el `extra` de `parity.py` en su sitio,
@@ -1136,9 +1020,8 @@ exportación.
 uv run pytest -q tests/unit/test_export_adapter.py
 ```
 
-Doce tests en verde, en CPU. Exportan de verdad a ONNX y lo ejecutan con onnxruntime, así que
-tardan algo más que el resto; el de los ficheros cuantizados es el que habría encontrado el fallo
-del fp16. Si salen como saltados, falta `onnxruntime` en el entorno.
+Doce tests en verde, en CPU. Exportan de verdad a ONNX y lo ejecutan, así que tardan algo más. Si
+salen como saltados, falta `onnxruntime` en el entorno.
 
 </Callout>
 
@@ -1191,14 +1074,9 @@ ADAPTER_CARD_TEMPLATE = "adapter.md.jinja"
 
 <Src file="src/rukh/publish/adapter.py" tag="p4" lines="1-42" />
 
-Un repositorio de modelo de este proyecto lleva pesos, tres exportaciones ONNX, un vocabulario y una
-card cuyos números salen de `rukh eval`. Un adaptador no tiene nada de eso. Son dos matrices por
-proyección adaptada y, por sí solo, no hace absolutamente nada: sin el checkpoint base exacto es un
-montón de números sin modelo que corregir.
-
-De ahí la forma de la card: empieza por el modelo base y por el comando que lo carga, y las métricas
-que publica son las que dicen qué **cambió** el adaptador. Publicar un adaptador con el Elo del
-modelo base y sin mención del efecto propio sería publicar el número de otro.
+Un adaptador, por sí solo, no hace nada: sin el checkpoint base exacto es un taco de notas adhesivas
+sin libro. Por eso su card empieza por el modelo base y el comando que lo carga, y publica lo que el
+adaptador **cambió**. Publicarlo con el Elo del modelo base sería publicar el número de otro.
 
 ```python title="src/rukh/publish/adapter.py"
 class AdapterCost(BaseConfig):
@@ -1271,19 +1149,11 @@ def adapter_params(lora: LoraConfig, n_layer: int, d_model: int) -> int:
 
 <Src file="src/rukh/publish/adapter.py" tag="p4" lines="45-110" />
 
-`AdapterCost` es una métrica leída en el modelo base **y** en el adaptado, con la misma suite y la
-misma semilla. Su docstring dice la afirmación que existe para sostener: un estilo que cambia la
-apertura es fácil; un estilo que cambia la apertura **y nada más** es la afirmación que vale, y solo
-es una afirmación si el «nada más» está medido.
-
-`AdapterEffect` es lo que cambió, y el docstring de `share_after` explica una decisión metodológica
-de las que no se ven: la probabilidad se lee **directamente de la softmax** sobre las veinte primeras
-jugadas legales, sin muestreo, sin temperatura y sin semilla. Contar aperturas de auto-partidas
-contestaría a la misma pregunta con ruido de muestreo encima, lo que para una card es estrictamente
-peor: un número publicado que se mueve entre ejecuciones invita al lector a promediarlo.
-
-Y `predicate` guarda, verbatim, cómo se seleccionó la rebanada: el mismo texto que escribió el
-manifiesto de la lección 4.
+`AdapterCost` mide lo mismo en el modelo base y en el adaptado, con la misma suite y semilla: un
+estilo que cambia la apertura es fácil; uno que cambia la apertura **y nada más** solo es una
+afirmación si el «nada más» está medido. `AdapterEffect` lee la probabilidad de la apertura
+directamente de la softmax, sin muestreo: contar aperturas de auto-partidas añadiría ruido, y un
+número publicado que se mueve entre ejecuciones invita a promediarlo.
 
 ```python title="src/rukh/publish/adapter.py"
 def publish_adapter(
@@ -1373,14 +1243,9 @@ def publish_adapter(
 
 <Src file="src/rukh/publish/adapter.py" tag="p4" lines="113-195" />
 
-Prepara una carpeta con **cinco** ficheros y la sube. Los cinco son: `adapter.safetensors` (para
-PyTorch), `adapter_config.json`, `README.md`, `web/adapter.bin` y `web/adapter.json`. Los mismos
-factores dos veces, escritos por la misma función a partir de los mismos tensores, que es lo que
-impide que se separen.
-
-`params` se calcula con la **fórmula** sobre la configuración del modelo base —`n_layer` y
-`d_model`—, no con el tamaño del fichero. Los valores por defecto, 16 y 768, son los de `medium`; si
-la configuración base llega, manda ella.
+La carpeta que se sube lleva cinco ficheros: `adapter.safetensors`, `adapter_config.json`,
+`README.md`, `web/adapter.bin` y `web/adapter.json`. Los mismos factores dos veces, escritos a partir
+de los mismos tensores para que no puedan separarse.
 
 ```python title="src/rukh/publish/adapter.py"
 QWEN_CARD_TEMPLATE = "qwen-adapter.md.jinja"
@@ -1450,13 +1315,9 @@ def qwen_card_context(
 
 <Src file="src/rukh/publish/adapter.py" tag="p4" lines="198-260" />
 
-La card de Qwen se construye de dos ficheros que la ejecución escribió sobre sí misma: el `run.json`
-de `rukh train qwen` —incluido si de verdad se usaron cuatro bits— y el informe de `rukh eval qwen`.
-El docstring lo dice sin rodeos: **nada aquí está escrito a mano**, y una card que citara la receta
-prevista en vez de la ejecutada sería el tipo de documento equivocado.
-
-Las cinco filas de `failures` son las cinco del desglose de la lección 5, ahora en la card: legal,
-ilegal aquí, no es una jugada, SAN ambigua, nada escrito.
+La card de Qwen se construye con lo que la ejecución escribió sobre sí misma (el `run.json` y el
+informe de la suite): nada está escrito a mano, porque una card que citara la receta prevista en vez
+de la ejecutada sería el documento equivocado.
 
 ```python title="src/rukh/publish/adapter.py"
 def _elo_text(elo: dict[str, Any]) -> str:
@@ -1525,31 +1386,24 @@ def publish_qwen_adapter(
 
 <Src file="src/rukh/publish/adapter.py" tag="p4" lines="263-324" />
 
-`_elo_text` maneja el caso que este módulo produjo de verdad: cuando se ganaron o se perdieron
-**todas** las partidas no hay intervalo, hay una cota de una cola. Qwen perdió 160 de 160, así que
-su card dice `< 807 (one-sided 95 % bound; every game lost)` y no un rango.
-
-Y `publish_qwen_adapter` toma una decisión contraria a la de nuestros adaptadores: la carpeta de
-`peft` **no se vuelve a montar**. El docstring dice por qué: `peft` ya escribió un
-`adapter_config.json` válido y un `adapter_model.safetensors`, y el Hub conoce ese formato.
-Reescribirlos al nuestro haría el fichero inservible con las dos líneas de `peft` que cualquier
-lector escribiría de verdad.
+Cuando se pierden todas las partidas no hay intervalo sino una cota: la card de Qwen dice
+`< 807 (one-sided 95 % bound; every game lost)`. Y aquí la carpeta de `peft` se publica tal cual: el
+Hub conoce ese formato, y reescribirla al nuestro la haría inservible con las dos líneas de `peft`
+que cualquier lector escribiría.
 
 <Transfer
   concept="Respetar el formato del ecosistema al que publicas"
   where="Publicar un paquete, un esquema OpenAPI, un plugin, un dataset: el destino tiene convenciones y romperlas cuesta a todos menos a ti."
 >
-  Es la tensión entre la coherencia interna de un proyecto y la utilidad externa de lo que publica.
-  Aquí gana la de fuera, y no siempre: los adaptadores propios sí se remontan al formato del
-  proyecto, porque el lector que los usa está usando `rukh`. El criterio es quién va a abrir el
-  fichero. Si es tu código, tu formato; si es el de otros, el suyo.
+  Los adaptadores propios sí usan el formato del proyecto, porque quien los abre está usando `rukh`.
+  El criterio es quién va a abrir el fichero: si es tu código, tu formato; si es el de otros, el
+  suyo.
 </Transfer>
 
 ## Las dos plantillas de card
 
-Las cards no se escriben: se generan con Jinja a partir de la ejecución y de la evaluación. La de un
-adaptador va entera porque es el documento que el lector encuentra al abrir el repositorio, y su
-estructura **es** la política de publicación de este proyecto.
+Las cards se generan con Jinja a partir de la ejecución y de la evaluación. La de un adaptador va
+entera porque su estructura es la política de publicación del proyecto.
 
 {/* prettier-ignore */}
 ````md title="src/rukh/data/cards/adapter.md.jinja"
@@ -1605,13 +1459,8 @@ Not measured yet.
 
 <Src file="src/rukh/data/cards/adapter.md.jinja" tag="p4" lines="1-48" />
 
-Las dos primeras frases del cuerpo son la política: «por sí solo no hace nada». Después, la tabla de
-qué es —rango, escala, matrices adaptadas, parámetros, tamaño— y el párrafo que dice a la vez por qué
-es tan pequeño y qué limita: la corrección tiene que pasar por `r` dimensiones por matriz.
-
-La sección «What it changed» tiene su `{% if %}`: cuando el efecto no se ha medido, la card dice
-**«Not measured yet»** en vez de omitir la sección. Una sección ausente se lee como un descuido; una
-frase que dice que no se midió es una afirmación.
+Cuando el efecto no se ha medido, la card dice «Not measured yet» en vez de omitir la sección: una
+sección ausente se lee como un descuido, y una frase que dice que no se midió es una afirmación.
 
 {/* prettier-ignore */}
 ````md title="src/rukh/data/cards/adapter.md.jinja"
@@ -1669,12 +1518,9 @@ the only reason a low-rank correction is worth keeping low-rank once it leaves t
 
 <Src file="src/rukh/data/cards/adapter.md.jinja" tag="p4" lines="50-99" />
 
-La tabla del coste, el corpus con su predicado, y dos secciones de uso: la de PyTorch, con el aviso
-de que la configuración viaja al lado, y la del navegador, que explica por qué existe el fichero
-plano y qué grafo lo espera.
-
-La última frase de esa sección es la tesis del hito: «la única razón por la que una corrección de
-rango bajo merece seguir siendo de rango bajo una vez sale del bucle de entrenamiento».
+La última frase de la sección del navegador es la tesis de la lección: «la única razón por la que
+una corrección de rango bajo merece seguir siendo de rango bajo una vez sale del bucle de
+entrenamiento».
 
 {/* prettier-ignore */}
 ````md title="src/rukh/data/cards/qwen-adapter.md.jinja"
@@ -1729,9 +1575,8 @@ chess site, with the two ratings as PGN tags:
 
 <Src file="src/rukh/data/cards/qwen-adapter.md.jinja" tag="p4" lines="1-47" />
 
-La card de Qwen es otra plantilla porque es otro documento: su `library_name` es `peft` y no `rukh`,
-y lo primero que dice es para qué existe —contestar una pregunta con un número—. La fila de
-«Precision» sale de `four_bit`, que es lo que la ejecución **hizo**, no lo que se le pidió.
+La card de Qwen es otro documento: su `library_name` es `peft`, lo primero que dice es qué pregunta
+contesta, y la fila «Precision» sale de lo que la ejecución hizo, no de lo que se le pidió.
 
 {/* prettier-ignore */}
 ````md title="src/rukh/data/cards/qwen-adapter.md.jinja"
@@ -1771,13 +1616,10 @@ Not evaluated yet.
 
 <Src file="src/rukh/data/cards/qwen-adapter.md.jinja" tag="p4" lines="49-80" />
 
-Y el desglose por modo de fallo, con el párrafo que explica por qué hay cuatro filas donde el
-decoder tendría una. La rama `{% else %}` vuelve a decir «Not evaluated yet» en vez de callarse.
-
 ## El publicador de modelos: la card no puede llevar el número de otro
 
-Los trozos de `publish/model.py` que necesita este módulo: los que ponen en la card de un modelo
-condicionado lo que hace su cabecera, y los que impiden publicar las métricas de otro checkpoint.
+Los trozos de `publish/model.py` que ponen en la card de un modelo condicionado lo que hace su
+cabecera, y los que impiden publicar las métricas de otro checkpoint.
 
 ```python title="src/rukh/publish/model.py"
 def demo_link(cfg: ModelPublishConfig, repo_id: str) -> tuple[str, bool]:
@@ -1838,16 +1680,10 @@ def sweep_context(sweep: dict[str, Any] | None) -> dict[str, Any] | None:
 
 <Src file="src/rukh/publish/model.py" tag="p4" lines="199-252" />
 
-`read_sweep` y `sweep_context` son lo que impide publicar `rukh-medium-elo` con un solo número. Un
-modelo cuyo punto entero es que contesta a `<wXXXX>` no se puede publicar solo con lo que puntúa en
-**una** cabecera: lo que la cabecera **hace** es la afirmación, y la afirmación o está medida en la
-card o es publicidad.
-
-La card imprime la tabla del barrido y los dos veredictos —monótono y separado— en palabras. Que
-sean dos y no uno es lo que la lección 7 explica.
-
-`demo_link` devuelve también un booleano: si la demo de verdad sirve ese modelo. Enlazar a la demo
-desde la card de un modelo que la demo no tiene sería prometer algo que no está.
+Un modelo cuyo punto entero es que contesta a `<wXXXX>` no se puede publicar con lo que puntúa en
+una sola cabecera: lo que la cabecera hace es la afirmación, y o está medida en la card o es
+publicidad. Por eso la card imprime la tabla del barrido y sus dos veredictos, que la lección 7
+explica.
 
 ```python title="src/rukh/publish/model.py"
 def check_eval_matches(ckpt: Path, stage: str, evaluation: dict[str, Any] | None) -> None:
@@ -1909,23 +1745,10 @@ def read_parity(folder: Path) -> dict[str, Any] | None:
 
 <Src file="src/rukh/publish/model.py" tag="p4" lines="267-321" />
 
-`check_eval_matches` es la guarda que este hito añadió después de que el fallo estuviera a punto de
-ocurrir **dos veces**. `read_eval` encuentra resultados por nombre de etapa, así que pasar el
-`--stage` equivocado produce una card cuyos pesos y métricas vienen de checkpoints distintos, y nada
-en la salida lo dice.
-
-La comprobación es por `sha256` del fichero, no por los pesos: `best.pt` y un `step-*.pt` con pesos
-idénticos siguen siendo ficheros distintos y se rechazan igual. El docstring dice que esa es la
-dirección segura —publica el fichero que se midió— y tiene razón: el falso positivo cuesta volver a
-evaluar, el falso negativo cuesta una card mentirosa.
-
-`counterpart_stage` es una línea y resuelve un problema de M4 heredado de M3: el Elo de un decoder
-es una propiedad del par modelo + muestreo, así que la suite se corre **dos veces** sobre un
-checkpoint y las dos quedan guardadas bajo `<stage>` y `<stage>-greedy`.
-
-Y `read_parity` decide qué hacer cuando no hay `parity.json`: nada. Ausente significa «nunca se
-midió» y la card no dice nada de paridad, que es la lectura honesta. Una card que omitiera en
-silencio un número malo sería peor que una sin número.
+`check_eval_matches` evita un fallo muy fácil: con el `--stage` equivocado, la card tendría pesos y
+métricas de checkpoints distintos y nada lo diría. Compara el `sha256` del fichero, así que rechaza
+incluso dos ficheros con pesos idénticos; el falso positivo cuesta volver a evaluar, el falso
+negativo cuesta una card mentirosa.
 
 ```bash title="Terminal"
 uv run rukh publish adapter --run checkpoints/lora-e4-<fecha> --repo chorcat/rukh-lora-e4 --base chorcat/rukh-medium --effect artifacts/publish/effects/lora-e4.json --dry-run
@@ -1978,23 +1801,13 @@ def publish_qwen_cmd(
 
 <Src file="src/rukh/cli.py" tag="p4" lines="1365-1400" />
 
-El docstring de la orden repite la decisión del fichero, y está bien que lo repita: es lo primero
-que ve quien escribe `rukh publish qwen --help`, y la pregunta «¿por qué este adaptador no está en
-el formato del proyecto?» se hace ahí antes que en el código.
-
-`--dry-run` imprime `dry-run (card written, nothing uploaded)` en vez de callarse. Una orden que
-sube ficheros y una que no deberían distinguirse en su salida sin tener que recordar qué banderas se
-escribieron.
-
-Y las últimas dos líneas enumeran los ficheros que se subieron. Es lo que permite comprobar de un
-vistazo que un adaptador publicado lleva sus cinco ficheros y no tres.
+`--dry-run` lo dice en la salida en vez de callarse: una orden que sube ficheros y una que no deben
+distinguirse sin recordar qué banderas se escribieron.
 
 <Callout kind="ejecuta" title="Publicar en seco">
-  Los tests de `publish/adapter.py` fijan los tres contratos de esta sección: una card no toma
-  prestado el Elo del modelo base cuando el suyo no existe (dice «no medido»), el recuento de
-  parámetros sale de la fórmula sobre el modelo base y no del tamaño del fichero, y la carpeta que
-  se sube lleva exactamente cinco ficheros, con los dos del navegador dentro. Después, un ensayo de
-  la orden sobre el Qwen de ensayo de la lección 5:
+  Los tests de `publish/adapter.py` fijan los contratos de esta sección: una card no toma prestado
+  el Elo del modelo base, el recuento de parámetros sale de la fórmula y la carpeta lleva los cinco
+  ficheros. Después, un ensayo de la orden sobre el Qwen de ensayo de la lección 5:
 
 ```sh
 uv run pytest -m unit -q tests/unit/test_publish_adapter.py
@@ -2011,14 +1824,9 @@ evaluación de ensayo, la sección «Results» lleva sus números; si no, dice �
 ## Qué has aprendido
 
 Cómo se lleva una corrección de rango bajo hasta un navegador sin fundirla: un grafo con dos
-entradas más, un búfer plano de `float32` con la escala ya aplicada, y seis claves de metadatos que
-dicen qué forma tiene lo que hay que subir. Y cómo se publica algo que no es un modelo: una card que
-empieza por lo que necesita para funcionar y que mide lo que cambió **y** lo que costó.
+entradas más y un búfer plano de `float32` con la escala ya aplicada. Y cómo se publica algo que no
+es un modelo: una card que empieza por lo que necesita para funcionar y mide lo que cambió y lo que
+costó. Con los factores como entradas, cambiar de estilo cuesta lo que pesa el estilo, no lo que
+pesa el modelo.
 
-Se mide con tres números que el exportador imprime: la paridad con los factores a cero, la
-diferencia entre dos adaptadores, y la paridad del adaptador cargado en PyTorch frente al grafo sobre
-mil posiciones. Y con el `parity.json` que queda al lado de los ONNX.
-
-Lo siguiente es lo que se mide **con** todo esto: la entropía de aperturas que llevaba tres hitos
-saliendo `n/a` y el barrido que corre la suite una vez por condición. Sigue en «Diversidad y
-barridos».
+Lo siguiente es lo que se mide con todo esto. Sigue en «Diversidad y barridos».

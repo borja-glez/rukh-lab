@@ -6,10 +6,10 @@ description:
   los reexportes— más los quince tests que convierten «funciona» en «sigue funcionando».'
 module: m2
 order: 2
-duration: 110
+duration: 100
 level: base
 status: vigente
-updated: '2026-09-22'
+updated: '2026-09-23'
 keywords:
   - decoder
   - atención
@@ -27,15 +27,12 @@ artifacts:
 
 ## Qué vas a construir
 
-El modelo entero: tres ficheros, **257 líneas** contando el `__init__.py`, y un fichero de tests de
-159 más. Es poco, y ese es el argumento de escribirlo a mano en vez de importar
-`nn.TransformerDecoder`: cabe en una sentada, no hay nada que no puedas leer, y cuando en M3 el
-encoder sea «lo mismo sin la máscara causal» sabrás exactamente qué frase estás cambiando.
+El modelo entero: tres ficheros, 257 líneas contando el `__init__.py`, y 159 de tests. Es poco, y
+ese es el argumento para escribirlo a mano en vez de importar `nn.TransformerDecoder`: cabe en una
+sentada, y cuando en M3 el encoder sea «lo mismo sin la máscara causal» sabrás qué frase cambias.
+Todo está aquí, en el tag `p2`; si copias los bloques en orden, tienes `src/rukh/models/`.
 
-Todo lo que sigue está aquí entero, en el tag `p2`, con su enlace a GitHub debajo de cada bloque.
-Si copias los bloques en orden, tienes `src/rukh/models/`.
-
-<Callout kind="hoy" title="Escríbelo, no lo copies">
+<Callout kind="guia" title="Escríbelo, no lo copies">
   La diferencia entre leer este fichero y escribirlo es la diferencia entre reconocer
   `q.view(shape).transpose(1, 2)` y saber por qué hay un `transpose` ahí. Escribe cada clase,
   ejecuta los tests después de cada una, y usa los bloques para comparar cuando algo no pase.
@@ -43,8 +40,7 @@ Si copias los bloques en orden, tienes `src/rukh/models/`.
 
 ## `config.py`: donde cada decisión se convierte en un número
 
-Es el fichero donde acaba todo lo que la lección anterior argumenta. Sin él, nada puede llamar a
-`preset("small")` ni leer `cfg.ff`.
+Aquí acaba todo lo que la lección anterior argumenta.
 
 ```python title="src/rukh/models/config.py"
 """Configuration of the hand-written GPT decoder and the three course presets."""
@@ -60,10 +56,9 @@ from rukh.config import BaseConfig
 
 <Src file="src/rukh/models/config.py" tag="p2" lines="1-9" />
 
-`BaseConfig` es el modelo de pydantic con `extra="forbid"` que se escribió en M0: una clave
-desconocida en un YAML es un error, no un valor ignorado. Aquí importa más que en ninguna otra
-config del proyecto, porque un `n_layers: 16` con la ese de más produciría un modelo de doce capas
-que nadie sabría que no es el que pidió.
+`BaseConfig` es el modelo de pydantic con `extra="forbid"` de M0: una clave desconocida es un error.
+Aquí importa más que en ninguna otra config, porque un `n_layers: 16` con la ese de más produciría un
+modelo de doce capas sin que nadie lo supiera.
 
 ```python title="src/rukh/models/config.py"
 class DecoderConfig(BaseConfig):
@@ -86,23 +81,18 @@ class DecoderConfig(BaseConfig):
 
 <Src file="src/rukh/models/config.py" tag="p2" lines="12-27" />
 
-Cada campo es una decisión. Las que no son evidentes:
+Las decisiones que no son evidentes:
 
-- **`d_ff: int | None = None`** en vez de `2048`. El ancho del MLP casi siempre es `4 * d_model`, y
-  escribirlo como un número obligaría a cambiar dos campos para cambiar la talla del modelo. `None`
-  significa «el que toca», y la propiedad `ff` de más abajo lo resuelve.
-- **`dropout: float = 0.0`**. Cero en el decoder, y no por descuido: con 240 millones de tokens y
-  39 millones de parámetros no hay escasez de datos contra la que regularizar, así que el dropout
-  solo frenaría el ajuste. El encoder de M3 lo enciende, porque va a ver muchísimas menos etiquetas
-  en su afinado.
-- **`pos: Literal["learned", "rope"] = "learned"`**. Aprendidas por defecto, por el argumento de la
-  lección anterior: con el contexto fijo en 200 ninguna partida es más larga que la tabla, así que
-  extrapolar no compra nada. <Term id="rope">RoPE</Term> queda detrás de una bandera —y con su
-  código escrito y probado— para que el día que alguien entrene las dos, la decisión cambie por una
-  medida y no por una opinión.
-- **`block: int = 200`** es el contexto, y aparece en cuatro sitios más del módulo: el recorte del
-  prompt, el límite de <Term id="ply">plies</Term> de una partida, la longitud que traza el exportador y los metadatos del
-  `.onnx`. Vive aquí porque es una propiedad del modelo, no del muestreador.
+- `d_ff: int | None = None`: el ancho del MLP casi siempre es `4 * d_model`, y `None` significa «el
+  que toca», para no tener que cambiar dos campos al cambiar de talla.
+- **`dropout: float = 0.0`**, a propósito: con 240 millones de tokens y 39 millones de parámetros no
+  hay escasez de datos contra la que regularizar. El encoder de M3 lo enciende, porque verá muchas
+  menos etiquetas.
+- `pos = "learned"` por el argumento de la lección anterior. <Term id="rope">RoPE</Term> queda
+  detrás de una bandera, escrito y probado, para que la decisión cambie algún día por una medida.
+- `block: int = 200` es el contexto, y reaparece en el recorte del prompt, el límite
+  de <Term id="ply">plies</Term>, el exportador y los metadatos del `.onnx`. Vive aquí porque es del
+  modelo.
 
 ```python title="src/rukh/models/config.py"
     @model_validator(mode="after")
@@ -122,15 +112,10 @@ Cada campo es una decisión. Las que no son evidentes:
 
 <Src file="src/rukh/models/config.py" tag="p2" lines="29-41" />
 
-Un validador de pydantic que corre **después** de construir el objeto (`mode="after"`), así que ve
-los campos ya con su tipo. Las tres comprobaciones son las tres formas de pedir un modelo imposible:
-una anchura que no se reparte entre las cabezas, un número no positivo donde hace falta al menos
-uno, y RoPE con una dimensión de cabeza impar —la rotación va por parejas de dimensiones, así que
-con 63 sobra una—.
-
-Sin esto, `d_model=100, n_head=8` no falla al construir la configuración: falla mucho más tarde,
-dentro de un `view()`, con un mensaje sobre formas de tensores que no menciona ninguno de los dos
-números que escribiste.
+El validador corre después de construir el objeto y cubre las tres formas de pedir un modelo
+imposible: una anchura que no se reparte entre las cabezas, un número no positivo y RoPE con una
+dimensión de cabeza impar (la rotación va por parejas). Sin él, `d_model=100, n_head=8` fallaría
+mucho más tarde, dentro de un `view()`, con un mensaje que no menciona ninguno de tus dos números.
 
 ```python title="src/rukh/models/config.py"
     @property
@@ -146,10 +131,8 @@ números que escribiste.
 
 <Src file="src/rukh/models/config.py" tag="p2" lines="43-51" />
 
-Dos propiedades derivadas y ningún campo. `head_dim` es 64 en `small` (512 / 8), 64 en `tiny`
-(256 / 4) y 64 en `medium` (768 / 12): los tres presets mantienen la regla de entre 64 y 128 por
-cabeza, por debajo de la cual una cabeza se queda sin resolución. Que sea una propiedad y no un
-campo es lo que impide que existan una `d_model`, una `n_head` y una `head_dim` que se contradigan.
+`head_dim` es 64 en los tres presets. Que sea una propiedad y no un campo impide que existan una
+`d_model`, una `n_head` y una `head_dim` que se contradigan.
 
 ```python title="src/rukh/models/config.py"
 PRESETS: dict[str, DecoderConfig] = {
@@ -161,10 +144,8 @@ PRESETS: dict[str, DecoderConfig] = {
 
 <Src file="src/rukh/models/config.py" tag="p2" lines="54-58" />
 
-Los tres presets del curso, en una línea cada uno, porque `DecoderConfig` ya trae los valores de
-`small` por defecto. Medidos: 5 309 952 parámetros y 189 segundos de entrenamiento para `tiny`,
-38 971 392 y 42 minutos para `small`, 115 120 128 para `medium`. Los tres siguen la diagonal de las
-leyes de escala —profundidad y anchura creciendo juntas— en vez de estirar solo una.
+Una línea por preset, porque `DecoderConfig` ya trae los valores de `small`. Los tres crecen en
+profundidad y anchura a la vez, siguiendo la diagonal de las leyes de escala.
 
 ```python title="src/rukh/models/config.py"
 def preset(name: str) -> DecoderConfig:
@@ -176,15 +157,13 @@ def preset(name: str) -> DecoderConfig:
 
 <Src file="src/rukh/models/config.py" tag="p2" lines="61-65" />
 
-Ese `model_copy(deep=True)` parece paranoia y no lo es: sin él, un entrenamiento que sobreescribiera
-`cfg.block` estaría modificando el objeto del diccionario, y el siguiente preset que alguien pidiera
-en el mismo proceso —por ejemplo, el barrido de tres tallas de `labs/m2/params.py`— vendría ya
-contaminado. Hay un test para exactamente eso, al final de esta lección.
+Sin el `model_copy(deep=True)`, un entrenamiento que sobreescribiera `cfg.block` modificaría el
+objeto del diccionario, y el siguiente preset pedido en el mismo proceso vendría contaminado. Hay un
+test para eso.
 
 ## `decoder.py`: el modelo
 
-Empezamos por la cabecera, que es donde se declara el contrato del
-fichero.
+La cabecera declara el contrato del fichero.
 
 ```python title="src/rukh/models/decoder.py"
 """``MoveDecoder``: a hand-written GPT decoder over the fixed UCI vocabulary.
@@ -212,16 +191,12 @@ IGNORE_INDEX = 0
 
 <Src file="src/rukh/models/decoder.py" tag="p2" lines="1-21" />
 
-«Código de modelo puro: sabe de tensores y no sabe nada del pipeline de datos». Esa frase del
-docstring es la razón de que el bucle de entrenamiento, el muestreador y el exportador a ONNX puedan
-importarlo los tres sin arrastrarse unos a otros. Si `MoveDecoder` supiera leer un `.npy`, exportarlo
-a ONNX significaría exportar el pipeline.
+«Código de modelo puro: sabe de tensores y nada del pipeline de datos». Por eso el bucle, el
+muestreador y el exportador pueden importarlo sin arrastrarse unos a otros.
 
-`IGNORE_INDEX = 0` es `<pad>`, y es el número más caro de olvidar de todo el módulo. La entropía
-cruzada del final del fichero lo recibe como `ignore_index`; sin eso, el modelo aprende que después
-de cualquier cosa viene `<pad>`, y lo aprende **con confianza**, porque es verdad de los datos que
-le enseñaste: todas las secuencias cortas acaban rellenas. El comentario apunta a
-`loader.IGNORE_INDEX` de M1 para que los dos no se separen nunca.
+**`IGNORE_INDEX = 0` es `<pad>`**, el número más caro de olvidar del módulo. Sin él en la entropía
+cruzada, el modelo aprende con toda confianza que después de cualquier cosa viene `<pad>`, porque es
+verdad en los datos: todas las secuencias cortas acaban rellenas.
 
 ```python title="src/rukh/models/decoder.py"
 def rope_tables(
@@ -236,14 +211,10 @@ def rope_tables(
 
 <Src file="src/rukh/models/decoder.py" tag="p2" lines="24-31" />
 
-Las tablas de RoPE: un coseno y un seno por posición y por dimensión. `inv_freq` reparte 32
-frecuencias entre las 64 dimensiones de una cabeza —una por pareja—, de 1 radián por posición a
-0,000133. `torch.outer` las multiplica por cada posición, y el `cat` duplica el bloque de ángulos
-porque la variante «por mitades» que usa la función siguiente espera la tabla entera, no media.
-
-Todo se calcula en `float32` aunque el modelo entrene en <Term id="bf16">bf16</Term>. Es deliberado:
-son ángulos acumulados a lo largo de 200 posiciones, y siete bits de mantisa no bastan para que la
-posición 199 tenga la fase que le toca.
+`inv_freq` reparte 32 frecuencias entre las 64 dimensiones de una cabeza, y el `cat` duplica los
+ángulos porque la variante por mitades espera la tabla entera. Todo en `float32` aunque se entrene
+en <Term id="bf16">bf16</Term>: siete bits de mantisa no bastan para que la posición 199 tenga la
+fase que le toca.
 
 ```python title="src/rukh/models/decoder.py"
 def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -258,10 +229,8 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 <Src file="src/rukh/models/decoder.py" tag="p2" lines="34-41" />
 
-La rotación, escrita para las 32 parejas a la vez. `cos[:t]` recorta la tabla a la longitud real de
-la secuencia, que puede ser menor que `block` —un prompt de diez jugadas no paga por doscientas
-posiciones—, y el `.to(dtype=x.dtype)` baja los ángulos a la precisión del tensor **después** de
-haberlos calculado bien.
+`cos[:t]` recorta la tabla a la longitud real, y los ángulos bajan a la precisión del tensor después
+de haberse calculado bien.
 
 ```python title="src/rukh/models/decoder.py"
 class CausalSelfAttention(nn.Module):
@@ -279,19 +248,17 @@ class CausalSelfAttention(nn.Module):
 
 <Src file="src/rukh/models/decoder.py" tag="p2" lines="44-54" />
 
-Una sola matriz `qkv` de `d_model × 3·d_model` produce consulta, clave y valor de golpe. Las cabezas
-no son parámetros: son una **reinterpretación de las columnas** de esa matriz, y por eso ocho cabezas
-cuestan exactamente lo que cuesta una. `resid_drop` es el dropout que se aplica a lo que la atención
-devuelve a la corriente residual; con `dropout: 0.0` es la identidad, y está ahí porque el encoder de
-M3 sí lo enciende.
+Una sola matriz `qkv` produce consulta, clave y valor. Las cabezas no son parámetros sino una
+reinterpretación de sus columnas, y por eso ocho cuestan lo que una.
 
 <Callout kind="roto" title="Los nombres de los módulos son el formato de disco">
-  `ln1`, `attn.qkv`, `attn.proj`, `ln2`, `mlp.fc`, `mlp.proj` y el orden en que se crean **son las
-  claves de todos los checkpoints escritos hasta hoy**. Renombrar uno no es una refactorización: es
-  una incompatibilidad silenciosa, porque `load_state_dict` con `strict=False` carga lo que reconoce
-  y deja el resto en la inicialización. El modelo arranca, entrena y es otro. Por eso
-  `rukh.train.load_state` —la lección siguiente— carga con `strict=False` y **después** comprueba a
-  mano que no falta ni sobra ninguna clave salvo la que sabe que falta.
+  `ln1`, `attn.qkv`, `attn.proj`, `ln2`, `mlp.fc` y `mlp.proj` son las claves de todos los
+  checkpoints escritos. Renombrar uno parece una refactorización y es una incompatibilidad
+  silenciosa: `load_state_dict` con `strict=False` carga lo que reconoce y deja el resto en la
+  inicialización, y el modelo arranca, entrena y es otro. Por eso `rukh.train.load_state` comprueba
+  a mano, después de cargar, que no falta ni sobra ninguna clave. Es el aviso «some weights were not
+  initialized» de Hugging Face: léelo siempre, porque el modelo funciona igual y ya no es el que
+  crees.
 </Callout>
 
 ```python title="src/rukh/models/decoder.py"
@@ -314,25 +281,15 @@ M3 sí lo enciende.
 
 <Src file="src/rukh/models/decoder.py" tag="p2" lines="56-70" />
 
-El `forward` de la atención es un baile de formas y merece leerse despacio, porque es donde se
-equivoca todo el mundo la primera vez.
-
-`self.qkv(x)` da `(B, T, 3d)` y `.split(d, dim=2)` lo corta en tres de `(B, T, d)`. El `view` parte
-la última dimensión en `(n_head, head_dim)` y el `transpose(1, 2)` mueve las cabezas delante del
-tiempo: `(B, H, T, D)`. Ese orden no es estético. `scaled_dot_product_attention` multiplica las dos
-últimas dimensiones, así que la cabeza tiene que quedar fuera del producto para que cada una haga su
-propia atención; con `(B, T, H, D)` el producto mezclaría cabezas y posiciones y el modelo
+El `forward` de la atención es un baile de formas donde se equivoca todo el mundo la primera vez.
+`split` da tres tensores `(B, T, d)`, el `view` parte la última dimensión en cabezas y el
+`transpose(1, 2)` las pone delante del tiempo: `(B, H, T, D)`. Ese orden importa, porque la atención
+multiplica las dos últimas dimensiones; con `(B, T, H, D)` mezclaría cabezas y posiciones y el modelo
 entrenaría igual de contento dando basura.
 
-A la vuelta, `transpose(1, 2)` deshace el intercambio y el `contiguous()` es obligatorio: después de
-un `transpose` el tensor tiene la memoria en otro orden y `view` se niega a reinterpretar algo que
-no es contiguo. La alternativa, `reshape`, copiaría en silencio; `contiguous().view()` dice lo que
-hace.
-
-`dropout_p=self.dropout if self.training else 0.0` es la línea que evita el error clásico de aplicar
-dropout al evaluar: `F.scaled_dot_product_attention` no consulta `self.training`, así que hay que
-decírselo. Y `is_causal=True` es la máscara: sin argumentos que construir, sin una matriz `T × T`
-que materializar, y con la implementación fusionada disponible.
+A la vuelta, el `contiguous()` es obligatorio: tras un `transpose` la memoria está en otro orden y
+`view` se niega a reinterpretarla. Y el `dropout_p` se apaga a mano al evaluar, porque la función no
+consulta `self.training`.
 
 ```python title="src/rukh/models/decoder.py"
 class Mlp(nn.Module):
@@ -350,9 +307,8 @@ class Mlp(nn.Module):
 
 <Src file="src/rukh/models/decoder.py" tag="p2" lines="73-83" />
 
-La parte aburrida y **dos tercios de los parámetros de un bloque**. `F.gelu` en vez de
-`nn.GELU` porque no hay estado que guardar, y la proyección de salida se llama `proj` a propósito:
-es el nombre que busca la inicialización escalada del constructor.
+Dos tercios de los parámetros de un bloque. La salida se llama `proj` a propósito: es el nombre que
+busca la inicialización escalada.
 
 ```python title="src/rukh/models/decoder.py"
 class Block(nn.Module):
@@ -372,10 +328,9 @@ class Block(nn.Module):
 
 <Src file="src/rukh/models/decoder.py" tag="p2" lines="86-98" />
 
-El bloque <Term id="pre-norm">pre-norm</Term>, con dos líneas que son el modelo entero:
-`x + attn(ln1(x))` y `x + mlp(ln2(x))`. La normalización está **dentro** de cada rama, nunca en el
-camino recto, y ese camino recto es la autopista por la que el gradiente llega de la pérdida al
-embedding sin pasar por doce peajes.
+El bloque <Term id="pre-norm">pre-norm</Term> en dos líneas: la normalización está dentro de cada
+rama, y el camino recto es la autopista por la que el gradiente llega de la pérdida al embedding
+sin pasar por doce peajes.
 
 ```python title="src/rukh/models/decoder.py"
 class MoveDecoder(nn.Module):
@@ -411,23 +366,14 @@ class MoveDecoder(nn.Module):
 
 <Src file="src/rukh/models/decoder.py" tag="p2" lines="101-129" />
 
-El constructor. De arriba abajo: la tabla de tokens, la de posiciones **solo si** `pos == "learned"`
-(con RoPE no hay tabla que aprender y el atributo se queda en `None`, que es lo que el `forward`
-consulta más abajo), el dropout de entrada, los doce bloques, el `LayerNorm` final, la cabeza de
-salida y el atado.
+La tabla de posiciones solo existe si `pos == "learned"`; con RoPE el atributo queda en `None`, que
+es lo que consulta el `forward`. Tres detalles que se pagan si cambian de orden:
 
-Tres detalles que se pagan caros si se cambian de orden:
-
-1. **El atado va antes de `self.apply(self._init_weights)`.** `lm_head.weight = self.tokens.weight`
-   no copia: hace que los dos nombres apunten al mismo tensor. Si la inicialización corriera antes,
-   daría igual; si el atado se hiciera después de entrenar un rato, los dos tensores ya habrían
-   divergido y atarlos tiraría uno de los dos.
-2. **Las tablas de RoPE se registran como buffer `persistent=False`.** Son derivadas de `block` y
-   `head_dim`, así que guardarlas en el checkpoint sería guardar algo recalculable y, peor, fijar el
-   contexto con el que se entrenó dentro del fichero de pesos.
-3. **La inicialización escalada va la última.** `apply` pone todo a `Normal(0, 0.02)` y después el
-   bucle baja a `0.02 / √24` los tensores cuyo nombre acaba en `proj.weight`. Al revés, `apply`
-   borraría el ajuste.
+1. **El atado no copia**: hace que dos nombres apunten al mismo tensor. Atar después de entrenar
+   tiraría uno de los dos.
+2. Las tablas de RoPE son buffers `persistent=False`: guardarlas sería guardar algo recalculable y
+   fijar el contexto dentro del fichero de pesos.
+3. La inicialización escalada va la última; al revés, `apply` borraría el ajuste.
 
 ```python title="src/rukh/models/decoder.py"
     @staticmethod
@@ -442,10 +388,8 @@ Tres detalles que se pagan caros si se cambian de orden:
 
 <Src file="src/rukh/models/decoder.py" tag="p2" lines="131-138" />
 
-La inicialización, que es la de GPT-2: normal de desviación 0,02 en cada `Linear` y cada
-`Embedding`, y sesgos a cero. Es un `staticmethod` porque no necesita nada del modelo y así
-`self.apply` puede pasárselo a cada submódulo. Los `LayerNorm` no aparecen: PyTorch ya los inicializa
-con ganancia 1 y sesgo 0, que es exactamente lo que se quiere.
+La inicialización de GPT-2: normal de desviación 0,02 y sesgos a cero. Los `LayerNorm` ya vienen con
+ganancia 1 y sesgo 0.
 
 ```python title="src/rukh/models/decoder.py"
     def num_params(self, non_embedding: bool = True) -> int:
@@ -458,11 +402,9 @@ con ganancia 1 y sesgo 0, que es exactamente lo que se quiere.
 
 <Src file="src/rukh/models/decoder.py" tag="p2" lines="140-145" />
 
-Contar parámetros parece trivial y tiene una convención dentro. `non_embedding=True` —el valor por
-defecto— resta la tabla de posiciones, que es la regla de nanoGPT: las tablas de posiciones no
-participan del cómputo por token de la misma manera que el resto, y dejarlas fuera hace comparables
-dos modelos con contextos distintos. Fíjate en que **no** resta la tabla de tokens, porque con
-`tie_embeddings` esa tabla también es la capa de salida y sí hace cómputo.
+`non_embedding=True` resta la tabla de posiciones, la convención de nanoGPT, para comparar modelos
+con contextos distintos. No resta la de tokens, porque atada también es la capa de salida y sí hace
+cómputo.
 
 ```python title="src/rukh/models/decoder.py"
     def forward(self, idx: Tensor, targets: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
@@ -493,19 +435,10 @@ dos modelos con contextos distintos. Fíjate en que **no** resta la tabla de tok
 
 <Src file="src/rukh/models/decoder.py" tag="p2" lines="147-170" />
 
-El `forward` del modelo, y la única rama de todo el fichero: posiciones aprendidas se **suman** al
-embedding antes de los bloques, RoPE no se suma a nada y viaja como `(cos, sin)` hasta dentro de la
-atención. Por eso `cos = sin = None` arranca a `None` y solo se llena en la rama de RoPE: la
-atención interpreta «`None`» como «esta configuración no usa rotación».
-
-La guarda de la primera línea —una secuencia más larga que el bloque es un `ValueError` con los dos
-números dentro— existe porque el fallo natural sería un `IndexError` dentro de `self.positions`, que
-no dice nada útil. Y la pérdida se calcula aquí, dentro del modelo, en vez de fuera: es lo que
-permite que el bucle de entrenamiento sea `_, loss = model(x, y)` y que el mismo modelo sirva para
-entrenar y para inferir sin envoltorios.
-
-El `reshape(-1, V)` aplana lote y tiempo en una sola dimensión de ejemplos, que es lo que
-`cross_entropy` espera. Y el `ignore_index=IGNORE_INDEX` es la línea de la que hablaba la cabecera.
+Las posiciones aprendidas se suman al embedding; RoPE viaja como `(cos, sin)` hasta la atención, que
+interpreta `None` como «sin rotación». La guarda de la primera línea da un `ValueError` con los dos
+números en vez de un `IndexError` inútil. Y la pérdida se calcula dentro del modelo, para que el
+bucle sea `_, loss = model(x, y)` y el mismo modelo sirva para entrenar e inferir.
 
 ```python title="src/rukh/models/decoder.py"
     @torch.no_grad()
@@ -518,18 +451,9 @@ El `reshape(-1, V)` aplana lote y tiempo en una sola dimensión de ejemplos, que
 
 <Src file="src/rukh/models/decoder.py" tag="p2" lines="172-177" />
 
-La inferencia: los logits del último paso y nada más. El `@torch.no_grad()` es lo
-que impide que una partida de doscientos plies vaya acumulando un grafo de autograd que nadie va a
-derivar.
-
-<Callout kind="roto" title="El recorte de `next_logits` no sirve para jugar">
-  `idx[:, -block:]` es correcto para una pasada suelta y **equivocado** para muestrear una partida
-  más larga que el contexto: se lleva por delante el `<bos>` y los dos tokens de Elo. El modelo
-  pierde el condicionamiento con el que se entrenó y, además, todas sus posiciones aprendidas se
-  desplazan tres lugares. La versión que usa el muestreador conserva la cabecera y recorta por el
-  medio; está en `prompt_ids`, en «Muestrear jugadas», y el recorte de aquí es solo la red de
-  seguridad para que el modelo nunca lance una excepción con una entrada larga.
-</Callout>
+El `@torch.no_grad()` impide que una partida de doscientos plies acumule un grafo de autograd que
+nadie va a derivar. El recorte `idx[:, -block:]` es solo una red de seguridad: se lleva por delante
+la cabecera, y el muestreador de «Muestrear jugadas» recorta de otra manera.
 
 ## `__init__.py`: la puerta del paquete
 
@@ -553,10 +477,8 @@ __all__ = [
 
 <Src file="src/rukh/models/__init__.py" tag="p2" lines="1-15" />
 
-Solo reexportes y ninguna decisión, salvo una que se nota en todo el resto del curso:
-`from rukh.models import MoveDecoder` funciona desde cualquier sitio, así que ningún otro fichero del
-proyecto importa `rukh.models.decoder` directamente. El día que el decoder se parta en dos ficheros
-—que es lo que M3 estuvo a punto de hacer—, esta lista es lo único que hay que tocar.
+Solo reexportes: `from rukh.models import MoveDecoder` funciona desde cualquier sitio, y el día que
+el decoder se parta en dos ficheros esta lista es lo único que hay que tocar.
 
 <Callout kind="ejecuta" title="El modelo ya se construye">
   Con los tres ficheros de `src/rukh/models/` escritos, construye los presets y haz una pasada:
@@ -566,17 +488,17 @@ uv run python -c "from rukh.models import MoveDecoder, preset; m = MoveDecoder(p
 uv run python -c "import torch; from rukh.models import MoveDecoder, preset; m = MoveDecoder(preset('tiny')); print(m(torch.ones(2, 10, dtype=torch.long))[0].shape)"
 ```
 
-La primera tiene que imprimir `38971392 38868992`: el total y el mismo sin la tabla de posiciones
-(200 × 512 = 102 400). La segunda, `torch.Size([2, 10, 2030])`: lote, tiempo y vocabulario. Un
-número distinto en la primera es una pieza que no está donde crees; un error de forma en la segunda
-suele ser un `view` o un `transpose` de la atención.
+La primera imprime `38971392 38868992`: el total y el mismo sin la tabla de posiciones (200 × 512).
+La segunda, `torch.Size([2, 10, 2030])`. Un error de forma suele ser un `view` o un `transpose` de la
+atención.
 
 </Callout>
 
 ## Los tests, que son el contrato
 
-Quince tests, y todos corren en CPU en menos de un segundo. No son una formalidad: son
-la definición ejecutable de qué es un `MoveDecoder`, y el módulo 3 los va a heredar casi enteros.
+Quince tests que corren en CPU en menos de un segundo y que M3 heredará casi enteros. Si alguna vez
+escribes o afinas otro modelo de secuencias, estos son los que merece la pena copiar: formas,
+causalidad, relleno ignorado, determinismo y unos pasos de gradiente que bajan la pérdida.
 
 ```python title="tests/unit/test_decoder.py"
 """Tests for rukh.models: shapes, causality, loss masking, RoPE, presets and determinism."""
@@ -607,11 +529,8 @@ def toy_batch(batch: int = 2, seq: int = 8, seed: int = 1) -> torch.Tensor:
 
 <Src file="tests/unit/test_decoder.py" tag="p2" lines="1-24" />
 
-Un modelo de juguete —dos capas, 32 dimensiones, vocabulario de 64— y dos ayudantes con semilla
-fija. Que sea de juguete es el punto: un test que tarda cuatro segundos en construir `small` es un
-test que nadie ejecuta al guardar el fichero. `TOY.model_copy(update=overrides)` deja que cada test
-cambie un campo sin repetir los otros cinco, y el `.eval()` apaga el dropout aunque aquí sea cero,
-porque un test que depende del valor por defecto de otro fichero es un test frágil.
+Un modelo de juguete: un test que tarda cuatro segundos en construir `small` es un test que nadie
+ejecuta al guardar.
 
 ```python title="tests/unit/test_decoder.py"
 def test_logits_have_batch_time_vocab_shape() -> None:
@@ -639,21 +558,15 @@ def test_future_tokens_do_not_change_past_logits(pos: str) -> None:
 
 <Src file="tests/unit/test_decoder.py" tag="p2" lines="27-47" />
 
-El primero comprueba las formas y que sin `targets` la pérdida es `None`. El segundo es **el test
-del módulo**: cambia todos los tokens posteriores a la posición 5 y exige que los logits anteriores
-no se muevan y que los posteriores sí. Está parametrizado sobre las dos formas de posición, porque
-RoPE toca la atención y podría romper la causalidad sin que el otro test se enterara.
-
-Dos detalles de cómo está escrito. El `assert not torch.equal(idx, changed)` comprueba que el propio
-test hace algo: la fórmula `(t + 7) % (V - 1) + 1` podría devolver el mismo token, y un test que
-compara una entrada consigo misma pasa siempre. Y el segundo `assert not torch.allclose(...)` sobre
-el futuro es el que impide la versión degenerada del test, un modelo que devuelva ceros.
+El segundo es **el test del módulo**: cambia los tokens posteriores a la posición 5 y exige que los
+logits anteriores no se muevan y los posteriores sí, con las dos formas de posición, porque RoPE toca
+la atención. `assert not torch.equal(idx, changed)` comprueba que el propio test cambia algo, y el
+`not allclose` sobre el futuro descarta un modelo que devuelva ceros.
 
 <Callout kind="teoria" title="Por qué `atol=1e-5` y no una igualdad exacta">
-  El lab `causal_mask.py` sí exige cero exacto, y este test no. La diferencia es que el lab compara
-  una pasada consigo misma en el mismo orden de operaciones, mientras que aquí PyTorch puede elegir
-  una implementación distinta de la atención según las formas. Cuando la tolerancia se puede exigir
-  a cero, se exige; cuando depende de un despachador que no controlas, se acota.
+  El lab `causal_mask.py` exige cero exacto porque compara una pasada consigo misma; aquí PyTorch
+  puede elegir otra implementación de la atención según las formas. Cuando la tolerancia se puede
+  exigir a cero, se exige; cuando depende de un despachador que no controlas, se acota.
 </Callout>
 
 ```python title="tests/unit/test_decoder.py"
@@ -684,13 +597,9 @@ def test_targets_give_a_scalar_loss_that_ignores_padding() -> None:
 
 <Src file="tests/unit/test_decoder.py" tag="p2" lines="50-72" />
 
-El de la pérdida enmascarada es más listo de lo que parece. Pone `<pad>` en la segunda mitad de los
-objetivos y exige que la pérdida salga **idéntica** a la de una secuencia recortada a la primera
-mitad: eso solo es cierto si `ignore_index` no solo ignora esas posiciones en la suma, sino también
-en el denominador de la media. Y la última línea fija la esquina fea: con todo relleno no hay nada
-que promediar y la pérdida es `NaN`, no cero. Que sea `NaN` es lo correcto —un cero sería una
-pérdida buenísima— y es la razón de que el bucle de entrenamiento filtre los `NaN` antes de
-registrarlos en MLflow.
+El de la pérdida enmascarada exige que rellenar la segunda mitad dé la misma pérdida que recortarla,
+lo que solo pasa si `ignore_index` también saca esas posiciones del denominador. Y con todo relleno
+la pérdida es `NaN`, no cero, que sería una pérdida buenísima; por eso el bucle filtra los `NaN`.
 
 ```python title="tests/unit/test_decoder.py"
 def test_same_seed_gives_the_same_weights_and_logits() -> None:
@@ -721,10 +630,9 @@ def test_next_logits_crop_sequences_longer_than_the_block() -> None:
 
 <Src file="tests/unit/test_decoder.py" tag="p2" lines="75-98" />
 
-Determinismo con semilla, `next_logits` coincidiendo con el último paso del `forward` completo, y el
-recorte: una secuencia de 21 tokens con `block=16` pasa por `next_logits` y **falla** por el
-`forward` directo. Los dos comportamientos son deliberados y están aquí escritos, que es la
-diferencia entre una decisión y una casualidad.
+Una secuencia de 21 tokens con `block=16` pasa por `next_logits` y falla por el `forward`: los dos
+comportamientos son deliberados, y escribirlos en un test es lo que distingue una decisión de una
+casualidad.
 
 ```python title="tests/unit/test_decoder.py"
 def test_embeddings_are_tied_and_can_be_untied() -> None:
@@ -758,14 +666,9 @@ def test_preset_copies_are_independent() -> None:
 
 <Src file="tests/unit/test_decoder.py" tag="p2" lines="101-127" />
 
-El atado se comprueba con `is`, no con `==`: lo que hay que garantizar no es que los dos tensores
-tengan los mismos números, es que **sean el mismo objeto**. Con `==` el test pasaría también con dos
-copias recién inicializadas de la misma semilla, que es justo el bug que se quiere cazar.
-
-`test_preset_sizes` usa `capsys.disabled()` para imprimir siempre las tres cuentas, incluso con
-`pytest -q`: es un test que además es un informe. Y la aserción es una horquilla generosa (38 a 45
-millones) en vez de la cifra exacta, porque el número exacto ya lo comprueba `labs/m2/params.py`
-contra la fórmula cerrada y un test que se rompe al tocar el vocabulario sería ruido.
+**El atado se comprueba con `is`**, no con `==`: con `==` pasarían dos copias inicializadas con la
+misma semilla, que es justo el bug que se quiere cazar. `test_preset_sizes` imprime las tres cuentas
+incluso con `-q`, y usa una horquilla porque la cifra exacta ya la comprueba `labs/m2/params.py`.
 
 ```python title="tests/unit/test_decoder.py"
 def test_config_rejects_unknown_keys_and_bad_shapes() -> None:
@@ -785,10 +688,8 @@ def test_d_ff_defaults_to_four_times_d_model() -> None:
 
 <Src file="tests/unit/test_decoder.py" tag="p2" lines="130-142" />
 
-Las tres formas de pedir un modelo imposible, en el mismo orden que el validador, y la resolución de
-`d_ff`. Fíjate en la última línea: no comprueba la propiedad, comprueba que el modelo **construido**
-tiene un `mlp.fc` de 48 salidas. La diferencia entre probar la configuración y probar que la
-configuración se usa.
+La última línea comprueba que el modelo construido tiene un `mlp.fc` de 48 salidas: probar que la
+configuración se usa, no solo la configuración.
 
 ```python title="tests/unit/test_decoder.py"
 def test_a_few_steps_of_gradient_descent_reduce_the_loss() -> None:
@@ -810,11 +711,9 @@ def test_a_few_steps_of_gradient_descent_reduce_the_loss() -> None:
 
 <Src file="tests/unit/test_decoder.py" tag="p2" lines="145-159" />
 
-Y el último, que es el que da más tranquilidad por línea escrita: diez pasos de AdamW sobre un lote
-de juguete tienen que bajar la pérdida. No comprueba que el modelo sea bueno; comprueba que los
-gradientes llegan a todas partes. Un tensor desconectado del grafo —un `.detach()` de más, un
-`torch.no_grad()` mal puesto, un `with` que sobra— no falla ningún otro test de este fichero y hace
-que el modelo no aprenda nunca.
+Diez pasos de AdamW tienen que bajar la pérdida. No dice que el modelo sea bueno, sino que los
+gradientes llegan a todas partes: un `.detach()` de más no falla ningún otro test y hace que el
+modelo no aprenda nunca.
 
 <Callout kind="ejecuta" title="Los quince tests del decoder">
   El fichero de tests está completo. Pásalo entero:
@@ -823,10 +722,8 @@ que el modelo no aprenda nunca.
 uv run pytest -m unit -q tests/unit/test_decoder.py
 ```
 
-Tienen que salir `15 passed` (trece funciones, dos de ellas parametrizadas sobre `learned` y
-`rope`), en CPU y en segundos. Por encima del resumen aparecen las tres líneas de
-`test_preset_sizes` aunque uses `-q`: `tiny`, `small` y `medium` con sus parámetros sin la tabla de
-posiciones y totales, y el total de `small` tiene que ser `38,971,392`.
+`15 passed` (dos funciones parametrizadas sobre `learned` y `rope`), y encima del resumen las tres
+líneas de `test_preset_sizes`, con `small` en `38,971,392`.
 
 </Callout>
 
@@ -837,17 +734,14 @@ posiciones y totales, y el total de `small` tiene que ser `38,971,392`.
   `small` y por qué el `assert` del script no salta?
 
   <Solution>
-    Falla `test_embeddings_are_tied_and_can_be_untied`, en el `assert tied.lm_head.weight is
-    tied.tokens.weight`, y no falla ningún otro: el modelo construye, entrena, muestrea y exporta
-    exactamente igual. Es el mejor ejemplo del módulo de por qué un test de identidad vale la pena:
-    el bug no produce un error, produce **otro modelo**, con un millón de parámetros más que se
-    entrenan por separado.
+    Falla `test_embeddings_are_tied_and_can_be_untied` y ningún otro: el modelo construye, entrena y
+    exporta igual. El bug no produce un error, produce otro modelo, con un millón de parámetros más
+    que se entrenan por separado.
 
-`params.py` sí cambia de número —2 030 × 512 = 1 039 360 parámetros más, 40 010 752 en total— y el
-`assert` **no salta**, porque la fórmula del script consulta `cfg.tie_embeddings`, que sigue siendo
-`True`… y el modelo ya no lo está. Es la contrapartida honesta del ejercicio: una fórmula que lee la
-configuración comprueba que la configuración y el modelo coinciden solo mientras el modelo obedezca
-la configuración. La identidad de los tensores hay que comprobarla mirando los tensores.
+`params.py` imprime 40 010 752 y su `assert` no salta, porque la fórmula lee `cfg.tie_embeddings`,
+que sigue en `True`. Una fórmula que lee la configuración solo comprueba el modelo mientras el
+modelo obedezca a la configuración; la identidad de los tensores hay que comprobarla mirando los
+tensores.
 
   </Solution>
 </Exercise>
@@ -855,13 +749,9 @@ la configuración. La identidad de los tensores hay que comprobarla mirando los 
 ## Qué has aprendido
 
 `src/rukh/models/` entero: una configuración que se niega a describir un modelo imposible, un
-decoder con una atención fusionada, una inicialización que tiene en cuenta cuántas veces
-se escribe en la corriente residual, y quince tests que son su contrato.
+decoder con atención fusionada, una inicialización que cuenta cuántas veces se escribe en la
+corriente residual y quince tests que son su contrato. Si `labs/m2/params.py` (lección 10) no
+imprime 38 971 392 para `small`, tienes una idea equivocada de tu propio modelo.
 
-**Cómo se mide**: `uv run pytest -m unit -q tests/unit/test_decoder.py` pasa los quince, y
-`uv run python labs/m2/params.py` —el lab de la lección 10— imprime **38 971 392** para `small` y
-comprueba que la fórmula escrita a mano cuadra con el modelo construido. Si las dos cifras no
-coinciden, tienes una idea equivocada de tu propio modelo.
-
-Lo siguiente es hacerlo converger: el bucle, el planificador de la tasa de aprendizaje, los
-checkpoints con procedencia y las dos configuraciones de entrenamiento del repositorio.
+Lo siguiente es hacerlo converger: el bucle, el planificador, los checkpoints con procedencia y las
+configuraciones de entrenamiento.

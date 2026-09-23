@@ -1,0 +1,217 @@
+---
+/**
+ * The four ways to fine-tune, told by what each one lets the gradient touch.
+ *
+ * One column per method, the same model drawn in each: an embedding row and four blocks standing
+ * in for `medium`'s sixteen. Trained parts are filled, frozen ones are left empty, and the 4-bit
+ * base of QLoRA is drawn dashed. The first two columns move every weight and publish a whole
+ * model; the last two freeze the base and publish a patch that sits beside it. That split, and
+ * not the name of the method, is what decides the cost, so it is written under each column with
+ * the measured size (461 MB for a float32 export of `medium`, 1.6 MB for a rank-8 adapter).
+ *
+ * The conditioned column differs from plain SFT only in its input strip: the first token is an
+ * instruction. That is on purpose -- it is the same training run with a different corpus.
+ *
+ * Static on purpose: there is nothing here that motion would explain better than the side-by-side.
+ */
+type Part = 'train' | 'frozen' | 'quant';
+
+interface Column {
+  title: string;
+  base: Part;
+  adapters: boolean;
+  tokens: { t: string; ask?: boolean }[];
+  kind: string;
+  size: string;
+}
+
+const columns: Column[] = [
+  {
+    title: 'SFT completo',
+    base: 'train',
+    adapters: false,
+    tokens: [{ t: 'e2e4' }, { t: 'e7e5' }, { t: '…' }],
+    kind: 'modelo entero',
+    size: '461 MB por versión',
+  },
+  {
+    title: 'Condicionado',
+    base: 'train',
+    adapters: false,
+    tokens: [{ t: '<w1500>', ask: true }, { t: 'e2e4' }, { t: '…' }],
+    kind: 'modelo entero',
+    size: '461 MB, varias órdenes',
+  },
+  {
+    title: 'LoRA',
+    base: 'frozen',
+    adapters: true,
+    tokens: [{ t: 'e2e4' }, { t: 'e7e5' }, { t: '…' }],
+    kind: 'parche',
+    size: '1,6 MB por versión',
+  },
+  {
+    title: 'QLoRA',
+    base: 'quant',
+    adapters: true,
+    tokens: [{ t: '1.' }, { t: 'e4' }, { t: '…' }],
+    kind: 'parche',
+    size: 'base en 4 bits',
+  },
+];
+
+const COL_W = 150;
+const colX = (index: number) => 10 + index * (COL_W + 7);
+const BLOCK_W = 88;
+const BLOCK_H = 20;
+/** Four blocks and the embedding row, top to bottom. */
+const rows = [0, 1, 2, 3, 4];
+const rowY = (row: number) => 44 + row * 27;
+
+const fillOf = (part: Part) => (part === 'train' ? 'var(--accent)' : 'var(--box-fill)');
+const opacityOf = (part: Part) => (part === 'train' ? 0.55 : 1);
+
+const legend: { part: Part; text: string; x: number }[] = [
+  { part: 'train', text: 'se entrena', x: 10 },
+  { part: 'frozen', text: 'congelado', x: 150 },
+  { part: 'quant', text: 'congelado y en 4 bits', x: 290 },
+];
+---
+
+<svg
+  viewBox="0 0 640 290"
+  role="img"
+  aria-label="Cuatro columnas con el mismo modelo dibujado: una fila de embeddings y cuatro bloques. En SFT completo se entrena todo y sale un modelo entero de 461 megabytes. En el condicionado también se entrena todo, y la entrada empieza por un token de instrucción, w1500. En LoRA el modelo queda congelado y se entrena una pieza pequeña junto a cada bloque: sale un parche de 1,6 megabytes. En QLoRA ocurre lo mismo, con la base además cuantizada a 4 bits."
+>
+  <g font-family="var(--font-mono)" font-size="10" fill="var(--muted)">
+    {columns.map((col, index) => {
+      const x = colX(index);
+      const blockX = x + (col.adapters ? 14 : (COL_W - BLOCK_W) / 2);
+      return (
+        <g>
+          <text x={x + COL_W / 2} y="20" text-anchor="middle" font-size="11" fill="var(--ink)">
+            {col.title}
+          </text>
+          {rows.map((row) => (
+            <g>
+              <rect
+                x={blockX}
+                y={rowY(row)}
+                width={BLOCK_W}
+                height={BLOCK_H}
+                fill={fillOf(col.base)}
+                fill-opacity={opacityOf(col.base)}
+                stroke={col.base === 'train' ? 'var(--accent)' : 'var(--line)'}
+                stroke-width="1"
+                stroke-dasharray={col.base === 'quant' ? '3 2' : undefined}
+              />
+              <text
+                x={blockX + BLOCK_W / 2}
+                y={rowY(row) + 14}
+                text-anchor="middle"
+                fill={col.base === 'train' ? 'var(--ink)' : 'var(--muted)'}
+              >
+                {row === 4 ? 'embeddings' : `bloque ${4 - row}`}
+              </text>
+              {col.adapters && row < 4 && (
+                <>
+                  <line
+                    x1={blockX + BLOCK_W}
+                    y1={rowY(row) + BLOCK_H / 2}
+                    x2={blockX + BLOCK_W + 8}
+                    y2={rowY(row) + BLOCK_H / 2}
+                    stroke="var(--accent)"
+                    stroke-width="1"
+                  />
+                  <rect
+                    x={blockX + BLOCK_W + 8}
+                    y={rowY(row) + 3}
+                    width="26"
+                    height={BLOCK_H - 6}
+                    fill="var(--accent)"
+                    fill-opacity="0.55"
+                    stroke="var(--accent)"
+                    stroke-width="1"
+                  />
+                </>
+              )}
+            </g>
+          ))}
+          {(() => {
+            let tx = x + 6;
+            return col.tokens.map((token) => {
+              const w = Math.max(30, token.t.length * 6.2 + 10);
+              const cell = (
+                <g>
+                  <rect
+                    x={tx}
+                    y="190"
+                    width={w}
+                    height="20"
+                    fill={token.ask ? 'var(--event)' : 'var(--paper)'}
+                    fill-opacity={token.ask ? 0.35 : 1}
+                    stroke={token.ask ? 'var(--event)' : 'var(--line)'}
+                    stroke-width="1"
+                  />
+                  <text x={tx + w / 2} y="204" text-anchor="middle" fill="var(--ink)">
+                    {token.t}
+                  </text>
+                </g>
+              );
+              tx += w + 4;
+              return cell;
+            });
+          })()}
+          <text x={x + COL_W / 2} y="232" text-anchor="middle" font-size="11" fill="var(--ink)">
+            {col.kind}
+          </text>
+          <text x={x + COL_W / 2} y="247" text-anchor="middle">
+            {col.size}
+          </text>
+        </g>
+      );
+    })}
+
+    <line
+      x1="318"
+      y1="30"
+      x2="318"
+      y2="252"
+      stroke="var(--line)"
+      stroke-width="1"
+      stroke-dasharray="4 4"
+    ></line>
+
+    {legend.map((item) => (
+      <g>
+        <rect
+          x={item.x}
+          y="268"
+          width="16"
+          height="12"
+          fill={fillOf(item.part)}
+          fill-opacity={opacityOf(item.part)}
+          stroke={item.part === 'train' ? 'var(--accent)' : 'var(--line)'}
+          stroke-width="1"
+          stroke-dasharray={item.part === 'quant' ? '3 2' : undefined}
+        />
+        <text x={item.x + 22} y="278">
+          {item.text}
+        </text>
+      </g>
+    ))}
+    <rect
+      x="480"
+      y="268"
+      width="16"
+      height="12"
+      fill="var(--event)"
+      fill-opacity="0.35"
+      stroke="var(--event)"
+      stroke-width="1"
+    ></rect>
+    <text x="502" y="278">
+      token de orden
+    </text>
+  </g>
+</svg>

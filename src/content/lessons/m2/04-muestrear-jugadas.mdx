@@ -6,10 +6,10 @@ description:
   de propuestas ilegales, que es la señal cruda sobre la que se monta toda la evaluación.'
 module: m2
 order: 4
-duration: 190
+duration: 175
 level: base
 status: vigente
-updated: '2026-09-22'
+updated: '2026-09-23'
 keywords:
   - temperatura
   - top-k
@@ -20,94 +20,90 @@ keywords:
 ---
 
 import SoftmaxPush from '../../../components/figures/SoftmaxPush.astro';
+import M2Temperature from '../../../components/figures/M2Temperature.astro';
 
 ## Qué vas a construir
 
-`src/rukh/infer/`: el código que convierte un vector de 2 030 números en una jugada legal y, de
-ahí, en una partida terminada. Es el puente entre el modelo y todo lo que viene después —la
-evaluación, el Elo, la demo—, y tiene dentro la decisión que hace medible el módulo entero: el
-muestreador devuelve **dos cosas**, la jugada y qué propuso la red.
+`src/rukh/infer/`: el código que convierte 2 030 números en una jugada legal y, de ahí, en una
+partida terminada. Es el puente hacia la evaluación, el Elo y la demo, y contiene la decisión que
+hace medible el módulo entero: el muestreador devuelve **dos cosas**, la jugada y qué propuso la red.
 
 ## Teoría justa: tres perillas y un orden
 
-El modelo da 2 030 logits. Convertirlos en una jugada es una decisión de diseño con tres perillas.
+Convertir 2 030 logits en una jugada es una decisión con tres perillas, las mismas que ajustas al
+llamar a la API de un LLM de texto.
 
-Antes de las perillas, una advertencia sobre la palabra que todo el mundo usa para la temperatura:
-**creatividad**. Es falsa, y entenderlo ahorra disgustos. Le preguntas a alguien que se conoce el
-restaurante qué pedir. A temperatura cero te dice siempre su plato favorito, el mismo cada vez;
-subiéndola empieza a nombrarte el segundo y el tercero de su lista; muy arriba te acaba proponiendo
-la ensalada que no le gusta a nadie. **No ha aprendido platos nuevos.** Solo está dispuesto a bajar
-más por la lista que ya tenía. La temperatura no añade opciones, redistribuye confianza entre las
-que el modelo ya había ordenado —y por eso bajar por la lista cuesta, en este proyecto, unos 180
-puntos de Elo—.
+**<Term id="temperatura">Temperatura</Term>.** Los logits se dividen por `T` antes del softmax. Con
+`T = 1` la distribución es la aprendida; con `T` pequeña la mejor jugada se lleva casi todo (en el
+límite, argmax); con `T` grande todo se aplana hacia el azar. Rukh usa 0,6: suficiente para que dos
+partidas no sean idénticas, poco para que el modelo se tire a la piscina.
 
-**<Term id="temperatura">Temperatura</Term>.** Se dividen los logits por `T` antes del softmax. Con
-`T = 1` la distribución es la que el modelo aprendió; con `T` pequeña las diferencias se amplifican
-y la mejor jugada se lleva casi toda la probabilidad (en el límite, `T → 0`, es el argmax); con `T`
-grande todo se aplana hacia el azar. Rukh usa 0,6 por defecto: suficiente para que dos partidas no
-sean idénticas, poco para que el modelo se tire a la piscina.
+A la temperatura se la llama «creatividad», y la palabra engaña. Pregúntale qué pedir a alguien que
+conoce el restaurante: a temperatura cero te dice siempre su plato favorito; subiéndola, el segundo y
+el tercero de su lista; muy arriba, la ensalada que no le gusta a nadie. No ha aprendido platos
+nuevos, solo baja más por la lista que ya tenía. Y bajar tiene precio: aquí, unos 180 puntos de Elo.
 
-**<Term id="top-k">Top-k</Term>.** Se conservan solo los `k` logits mayores y el resto pasa a menos
-infinito. Con `k = 20` de 2 030 jugadas, la cola —donde hay mil jugadas con probabilidad 0,0001
-cada una, que sumadas son un 10 % de probabilidad de hacer una tontería— desaparece. Temperatura y
-top-k no son alternativas sino complementarias: la temperatura reescala, el top-k recorta. Sin
-top-k, una temperatura alta muestrea basura; sin temperatura, el top-k solo limita cuánta basura.
-
-<Callout kind="teoria" title="Una propiedad del softmax que cuesta entrenamientos enteros">
-  Las tres perillas tienen algo en común que conviene ver ahora, porque explica errores que vas a
-  cometer mucho más adelante: **en un softmax, la probabilidad es un total fijo que se reparte**.
-  Suma uno. Siempre.
-
-Eso significa que **no puedes bajar una opción sin subir todas las demás**. Si decides que una
-jugada te gusta menos y empujas su puntuación hacia abajo, esa probabilidad no desaparece: se
-reparte entre el resto en proporción a lo que ya tenían.
+**<Term id="top-k">Top-k</Term>.** Se conservan los `k` logits mayores y el resto pasa a menos
+infinito. Con `k = 20` desaparece la cola: mil jugadas con probabilidad 0,0001 cada una, que sumadas
+son un 10 % de hacer una tontería. La temperatura reescala y el top-k recorta; sin top-k, una
+temperatura alta muestrea basura.
 
 <Figure
   n="01"
+  caption="Las mismas ocho jugadas con cuatro ajustes. La temperatura cambia cuánto se concentra la probabilidad, nunca el orden de las jugadas. El top-k, en el último panel, saca la cola del reparto antes de muestrear: las recortadas, en discontinuo, se quedan en cero y su masa se reparte entre las que quedan."
+>
+  <M2Temperature />
+</Figure>
+
+<Callout kind="teoria" title="Una propiedad del softmax que cuesta entrenamientos enteros">
+  Conviene verlo ahora, porque explica errores que cometerás mucho más adelante: **en un softmax,
+  la probabilidad es un total fijo que se reparte**. Suma uno siempre, así que no puedes bajar una
+  opción sin subir todas las demás en proporción a lo que ya tenían.
+
+<Figure
+  n="02"
   caption="Empujar hacia abajo la mejor jugada no la sustituye por la segunda. Las dos columnas suman uno, así que todo lo demás sube a la vez: la cola —las ocho jugadas que no querías— pasa de sumar el 26 % al 38 % sin que nadie la haya tocado. El softmax no tiene papelera."
 >
   <SoftmaxPush />
 </Figure>
 
-Quitas peso de un platillo de una balanza de brazos y no desaparece: se va al otro lado. Tú solo
-elegiste de dónde quitarlo, no adónde va.
+Es un presupuesto cerrado: si recortas una partida, el dinero no vuelve a Hacienda, se reparte entre
+las demás, incluidas las que nunca habrías querido subir. Tú eliges de dónde quitar, no adónde va.
 
-De ahí sale una regla que vale para cualquier cosa que le pidas a un modelo: **todo «esto no»
-necesita un «y conserva lo que ya estaba bien» emparejado.** Un objetivo que solo prohíbe está
-infraespecificado, porque no dice dónde poner lo que libera. Es la razón de que un prompt escrito
-como lista de prohibiciones —nunca digas X, nunca te disculpes, nunca uses viñetas— produzca
-salidas raras: has movido masa sin decir adónde. Y es exactamente el mecanismo por el que, en M5,
-un método de alineamiento mal montado destruye un modelo en un par de cientos de pasos.
+De ahí sale algo que vale para cualquier cosa que le pidas a un modelo: todo «esto no» necesita un
+«y conserva lo que ya estaba bien». Un prompt escrito como lista de prohibiciones produce salidas
+raras porque mueve masa sin decir adónde, y volverás a ver el mecanismo en M5, cuando una pérdida de
+alineamiento empuje hacia abajo las respuestas que no se quieren.
 
-El `top-k` es la versión sana de la misma idea: en vez de empujar hacia abajo lo que no quieres,
-**lo saca del reparto antes de repartir**. Nada que hayas descartado puede recibir masa.
-
-Pero cuidado con la conclusión fácil, porque hay una distinción que vale la mitad de la lección:
-el `top-k` actúa **al decodificar** y la cola engorda **en los pesos**. Tapar la cola al muestrear
-no arregla un modelo cuya cola creció durante el entrenamiento. Y tienes la prueba a la vista: la
-legalidad sin máscara se mide **sin temperatura y sin top-k** precisamente por eso, y es el número
-que se resiente cuando alguien mueve masa sin mirar adónde va.
+El `top-k` es la versión sana: saca del reparto lo que no quieres antes de repartir. Pero actúa al
+decodificar, y la cola engorda en los pesos. Por eso la legalidad sin máscara se mide sin
+temperatura y sin top-k: es el número que se resiente cuando alguien mueve masa sin mirar adónde va.
 
 </Callout>
 
-**La máscara de legalidad.** Antes de nada, se calcula con `python-chess` la lista de jugadas
-legales en la posición y se ponen a menos infinito todos los demás logits. Con la máscara puesta, el
-modelo **no puede** proponer una jugada ilegal. Eso hace la demo jugable y es lo que se usa en las
-partidas contra Stockfish. Y aquí está el argumento honesto de todo el módulo:
+**La máscara de legalidad.** Se calculan con `python-chess` las jugadas legales y todos los demás
+logits pasan a menos infinito: el modelo no puede proponer una jugada ilegal. Eso hace la demo
+jugable y es lo que se usa contra Stockfish. Pero tiene una trampa:
 
 <Callout kind="hoy" title="La máscara hace la demo jugable y la evaluación mentirosa">
-  Si solo mides con máscara, estás midiendo a `python-chess`, no a tu modelo. La pregunta
-  interesante —¿ha aprendido las reglas del ajedrez solo viendo secuencias de texto?— únicamente se
-  responde **sin** máscara: sueltas al modelo en mil posiciones de validación y cuentas qué
-  porcentaje de sus propuestas son legales. El harness la mide y la publica **dos veces**, porque
-  dentro hay dos preguntas distintas: `legality_argmax` toma el token más probable, sin temperatura
-  ni top-k, y `legality_sampled` saca uno como lo saca la demo. La segunda es siempre la menor de
-  las dos: es lo que vive un jugador. El listón del hito, ≥ 99 %, habla de lo que saben los pesos y
-  no de un ajuste del muestreador, así que es el **argmax**, y la muestreada va al lado con su
-  definición escrita. Publicar solo una de las dos sería quedarse con el número que conviene. Por
-  eso `SampleConfig` tiene `mask_illegal` y por eso `rukh play` tiene `--no-mask`: no es un modo de
-  depuración, es el experimento.
+  Si solo mides con máscara, mides a `python-chess`, no a tu modelo. La pregunta interesante (¿ha
+  aprendido las reglas solo viendo secuencias?) únicamente se responde sin máscara: mil posiciones
+  de validación y el porcentaje de propuestas legales. El harness la publica dos veces:
+  `legality_argmax` toma el token más probable, sin temperatura ni top-k, y `legality_sampled` saca
+  uno como la demo, y siempre sale menor. El listón del hito (≥ 99 %) es el del argmax, porque habla
+  de lo que saben los pesos, y la muestreada va al lado. Por eso `rukh play` tiene `--no-mask`: no
+  es un modo de depuración, es el experimento.
 </Callout>
+
+<Transfer
+  concept="Decodificación restringida"
+  where="El modo JSON de una API, una gramática que obliga a un LLM a emitir llamadas a herramientas válidas, un clasificador que solo puede contestar una de cinco etiquetas."
+>
+  Es la técnica con la que se obliga a un LLM a producir JSON válido: los logits de todo token que
+  rompería la gramática pasan a menos infinito. Y hereda la trampa: un 100 % de JSON válido con la
+  gramática puesta no dice nada de lo que el modelo sabe sin ella. Para saber si ha aprendido el
+  formato, mídelo con la restricción quitada.
+</Transfer>
 
 ## `sampler.py`: una jugada
 
@@ -140,10 +136,9 @@ HEADER_TOKENS = 3
 
 <Src file="src/rukh/infer/sampler.py" tag="p2" lines="1-24" />
 
-La cabecera dice para qué existe el fichero y `HEADER_TOKENS = 3` es la constante que aparece en
-tres sitios más del proyecto: el recorte del prompt de aquí abajo, el límite de <Term id="ply">plies</Term> de una partida
-y la construcción de prefijos de la evaluación. Es el `<bos>` más los dos tokens de Elo que M1 puso
-al principio de cada secuencia de entrenamiento.
+`HEADER_TOKENS = 3` es el `<bos>` más los dos tokens de Elo que M1 puso al principio de cada
+secuencia, y reaparece en el recorte del prompt, el límite de <Term id="ply">plies</Term> de una
+partida y los prefijos de la evaluación.
 
 ```python title="src/rukh/infer/sampler.py"
 class SampleConfig(BaseConfig):
@@ -176,19 +171,14 @@ class SampleConfig(BaseConfig):
 
 <Src file="src/rukh/infer/sampler.py" tag="p2" lines="27-52" />
 
-`SampleConfig` es `BaseConfig`, así que se puede leer de un YAML y una clave desconocida es un
-error. Los valores por defecto son los de la demo: 0,6 y 20.
-
-`temperature=0` es un valor legal y significa argmax, que es el motivo de que el validador acepte
-cero y rechace solo los negativos. `top_k=None` es «sin recorte» y `top_k=0` es un error, porque
-quedarse con las cero mejores jugadas no es una intención que nadie tenga.
+Los valores por defecto son los de la demo. `temperature=0` es legal y significa argmax;
+`top_k=None` es «sin recorte» y `top_k=0` es un error, porque nadie quiere quedarse con cero jugadas.
 
 <Callout kind="roto" title="El generador tiene que vivir donde viven los pesos">
-  `SampleConfig.generator(device)` construye el `torch.Generator` en el dispositivo que se le pida,
-  y no es una floritura: `torch.multinomial` **rechaza** un generador de CPU cuando las
-  probabilidades están en CUDA. Construirlo en otro sitio es una excepción que solo ocurre en la
-  máquina con GPU, es decir, nunca en los tests y siempre en la tirada larga. El docstring lo dice y
-  la función siguiente lo resuelve de una vez para todo el proyecto.
+  `torch.multinomial` rechaza un generador de CPU cuando las probabilidades están en CUDA. Es una
+  excepción que solo ocurre en la máquina con GPU: nunca en los tests, siempre en la tirada larga.
+  Cualquier código que solo se prueba en CPU esconde fallos así; la función siguiente lo resuelve
+  para todo el proyecto preguntándole al propio modelo dónde viven sus pesos.
 </Callout>
 
 ```python title="src/rukh/infer/sampler.py"
@@ -199,9 +189,7 @@ def model_generator(model: MoveDecoder, cfg: SampleConfig) -> torch.Generator | 
 
 <Src file="src/rukh/infer/sampler.py" tag="p2" lines="55-57" />
 
-Este es el arreglo del callout de arriba: el generador se construye en el dispositivo
-donde viven los pesos, preguntándoselo al propio modelo. Ninguno de los cinco sitios que muestrean
-tiene que acordarse.
+Ninguno de los cinco sitios que muestrean tiene que acordarse.
 
 ```python title="src/rukh/infer/sampler.py"
 def prompt_ids(history: Sequence[int], block: int) -> list[int]:
@@ -222,15 +210,12 @@ def prompt_ids(history: Sequence[int], block: int) -> list[int]:
 
 <Src file="src/rukh/infer/sampler.py" tag="p2" lines="60-73" />
 
-La función corta de la que depende que el modelo juegue como se entrenó. Un recorte por la izquierda
-a secas —`history[-block:]`, que es lo que hace `next_logits`— se lleva `<bos> <wXXXX> <bXXXX>` en
-cuanto una partida es más larga que el contexto. El modelo pierde el condicionamiento por Elo con el
-que se entrenó y, además, todas sus posiciones aprendidas quedan desplazadas tres lugares: la jugada
-que él cree que es la primera de la partida es en realidad la cuarta.
-
-Conservar la cabecera cuesta tres tokens de jugada —de doscientos— y mantiene el prompt con la forma
-de los datos de entrenamiento. La guarda `block <= HEADER_TOKENS` es el caso absurdo que solo
-aparece en un test, y devuelve algo en vez de un índice negativo.
+De esta función corta depende que el modelo juegue como se entrenó. Un recorte por la izquierda a
+secas (`history[-block:]`, lo que hace `next_logits`) se lleva la cabecera en cuanto la partida es
+más larga que el contexto: el modelo pierde el condicionamiento por Elo y todas sus posiciones
+aprendidas se desplazan tres lugares. Conservarla cuesta tres tokens de doscientos. Pasa lo mismo al
+recortar la conversación de un chat: si se va el mensaje de sistema, el modelo sigue hablando, pero
+ya no es el que configuraste.
 
 ```python title="src/rukh/infer/sampler.py"
 def legal_token_ids(board: chess.Board, tok: UciTokenizer) -> list[int]:
@@ -245,18 +230,10 @@ def legal_token_ids(board: chess.Board, tok: UciTokenizer) -> list[int]:
 
 <Src file="src/rukh/infer/sampler.py" tag="p2" lines="76-83" />
 
-Las jugadas legales, traducidas a ids del vocabulario. Hay dos decisiones:
-
-- **El enroque es `e1g1`**, el movimiento de dos casillas del rey, que es la cadena que enumera el
-  tokenizador de M1 y la que devuelve `Move.uci()` de `python-chess` en el modo por defecto. Si el
-  tokenizador hubiera enumerado la notación de Chess960 (`e1h1`, rey captura torre) el vocabulario y
-  el motor hablarían idiomas distintos y el enroque sería literalmente imposible.
-- **Una jugada legal que faltara del vocabulario se salta**, no se adivina. Con la enumeración de M1
-  no puede pasar; y si algún día pasa, una conjetura silenciosa sería peor que una jugada que el
-  muestreador simplemente no propone.
-
-El `sorted(set(...))` no es cosmético: el conjunto de ids tiene que ser determinista para que dos
-ejecuciones con la misma semilla den la misma partida.
+El enroque es `e1g1`, el movimiento de dos casillas del rey, la misma cadena en el tokenizador de M1
+y en `python-chess`; con la notación de Chess960 (`e1h1`) hablarían idiomas distintos y el enroque
+sería imposible. Una jugada que faltara del vocabulario se salta en vez de adivinarse. Y el
+`sorted` hace el orden determinista, para que la misma semilla dé la misma partida.
 
 ```python title="src/rukh/infer/sampler.py"
 def _filtered_logits(logits: torch.Tensor, legal: list[int], cfg: SampleConfig) -> torch.Tensor:
@@ -277,17 +254,13 @@ def _filtered_logits(logits: torch.Tensor, legal: list[int], cfg: SampleConfig) 
 
 <Src file="src/rukh/infer/sampler.py" tag="p2" lines="86-99" />
 
-**El orden de estas tres operaciones no es libre**, y es la mitad del diseño del muestreador.
+**El orden de estas tres operaciones no es libre.** El top-k antes de la máscara se quedaría con los
+veinte tokens más probables y luego tiraría los ilegales, lo que puede dejar dos candidatos o
+ninguno.
 
-Hacer el top-k **antes** de la máscara se quedaría con los veinte tokens más probables y después
-descartaría los ilegales, lo que puede dejar dos candidatos o ninguno. Poner la temperatura
-**después** del top-k reescalaría una distribución a la que ya le han quitado la cola, así que la
-perilla significaría algo distinto con cada `k`.
-
-Dos detalles más. El `logits.float()` de la primera línea sube a fp32 lo que puede venir en bf16:
-las divisiones por una temperatura pequeña y los `-inf` merecen el rango entero. Y `torch.topk(out,
-k).values[-1]` es el umbral —el valor del k-ésimo— y se compara con `<`, no con `<=`: un empate en
-el umbral conserva las dos jugadas empatadas en vez de elegir una por el orden del tensor.
+El `logits.float()` sube a fp32 lo que puede venir en bf16, porque dividir por una temperatura
+pequeña merece el rango entero. Y el umbral del top-k se compara con `<`, no con `<=`: un empate en
+el k-ésimo conserva las dos jugadas en vez de elegir una por el orden del tensor.
 
 ```python title="src/rukh/infer/sampler.py"
 def pick_move(
@@ -346,17 +319,12 @@ def pick_move(
 
 <Src file="src/rukh/infer/sampler.py" tag="p2" lines="130-149" />
 
-`pick_move` devuelve **dos cosas**, y esa es la decisión que hace medible todo el módulo: la jugada
-(`None` cuando el token propuesto no es legal aquí) y un informe con `legal`, `raw_token`, las cinco
-primeras y si se enmascaró. Un muestreador que solo devolviera la jugada haría imposible medir la
-tasa de legalidad sin máscara, que es la primera columna de la tabla única.
+`pick_move` devuelve la jugada (`None` si el token propuesto no es legal) y un informe con `legal`,
+`raw_token`, las cinco primeras y si se enmascaró. Sin ese informe no se podría medir la legalidad
+sin máscara, la primera columna de la tabla única.
 
-Lo demás son consecuencias. El `if cfg.mask_illegal and not legal` sale antes de gastar una pasada
-por el modelo en una posición terminada. El argmax se toma sobre `logits` y no sobre `probs`, que da
-lo mismo pero se lee mejor. `top5` se calcula sobre la distribución **realmente muestreada** —después
-de la máscara, la temperatura y el top-k—, así que sus probabilidades suman uno y no son las del
-modelo crudo; es lo que le interesa a quien depura una partida, y hay un test que lo fija. Y el
-`if p > 0` deja fuera los ceros que el top-k acaba de producir cuando hay menos de cinco candidatos.
+`top5` sale de la distribución realmente muestreada, después de máscara, temperatura y top-k, así
+que suma uno y no es la del modelo crudo: es lo que le interesa a quien depura una partida.
 
 ```python title="src/rukh/infer/sampler.py"
 def _as_move(token: str) -> chess.Move | None:
@@ -369,10 +337,8 @@ def _as_move(token: str) -> chess.Move | None:
 
 <Src file="src/rukh/infer/sampler.py" tag="p2" lines="152-157" />
 
-Aquí está el detalle que nadie recuerda: el vocabulario tiene tokens que no son jugadas
-—`<bos>`, `<eos>`, `<1-0>`, los de Elo—, y sin máscara el modelo puede proponerlos. `Move.from_uci`
-lanza `ValueError` con ellos, así que la conversión devuelve `None` y el informe lo cuenta como
-ilegal, que es exactamente lo que es.
+Sin máscara el modelo puede proponer tokens que no son jugadas (`<eos>`, los de Elo);
+`Move.from_uci` los rechaza y el informe los cuenta como ilegales, que es lo que son.
 
 ## `game.py`: una partida entera
 
@@ -413,10 +379,9 @@ FIFTY_MOVE_PLIES = 100
 
 <Src file="src/rukh/infer/game.py" tag="p2" lines="1-32" />
 
-Un oponente es **cualquier cosa con `choose(board) -> chess.Move`**: un `Protocol`, no una clase
-base. Eso es lo que permite que el mismo `play_game` sirva para el oponente aleatorio de los tests,
-para Stockfish en el harness de Elo y para lo que haga falta después, sin que ninguno de los tres
-tenga que heredar de nada.
+Un oponente es cualquier cosa con `choose(board) -> chess.Move`, un `Protocol` y no una clase base:
+el mismo `play_game` sirve para el oponente aleatorio de los tests y para Stockfish sin que ninguno
+herede de nada.
 
 ```python title="src/rukh/infer/game.py"
 class Opponent(Protocol):
@@ -487,16 +452,9 @@ class StockfishOpponent:
 
 <Src file="src/rukh/infer/game.py" tag="p2" lines="51-95" />
 
-El oponente de verdad. `UCI_Elo` de Stockfish no baja de 1320, así que para tener escalones por
-debajo hay que usar `Skill Level`, que es **otro mecanismo** —introduce errores deliberados— y cuya
-equivalencia en Elo es una convención y no una medida. El constructor acepta uno u otro y configura
-el motor en consecuencia, con `UCI_LimitStrength` encendido o apagado según cuál.
-
-Esa distinción, que aquí parecen dos ramas de un `if`, es la que dos lecciones más adelante resulta
-estar detrás de un error de 350 puntos de Elo en la tabla publicada del módulo.
-
-El gestor de contexto (`__enter__`/`__exit__` más `close`) existe porque `SimpleEngine.popen_uci`
-arranca un proceso. Sin cerrarlo, una suite que juega ocho escalones deja ocho Stockfish vivos.
+`UCI_Elo` no baja de 1320, así que por debajo se usa `Skill Level`, otro mecanismo (errores
+deliberados) cuya equivalencia en Elo es una convención, no una medida. El gestor de contexto existe porque `popen_uci` arranca un proceso: sin cerrarlo, ocho
+escalones dejan ocho Stockfish vivos.
 
 ```python title="src/rukh/infer/game.py"
 class GameResult(BaseModel):
@@ -520,9 +478,8 @@ class GameResult(BaseModel):
 
 <Src file="src/rukh/infer/game.py" tag="p2" lines="98-114" />
 
-`GameResult` con `result="*"` es una partida que se quedó sin contexto, no unas tablas, y por eso
-lleva el `fen` final: la lección del Elo la va a **adjudicar** en vez de apuntarle medio punto a
-cada uno.
+`result="*"` es una partida que se quedó sin contexto, no unas tablas, y por eso lleva el `fen`
+final: la lección del Elo la adjudicará en vez de darle medio punto a cada uno.
 
 ```python title="src/rukh/infer/game.py"
 def is_over(board: chess.Board) -> bool:
@@ -542,13 +499,10 @@ def is_over(board: chess.Board) -> bool:
 
 <Src file="src/rukh/infer/game.py" tag="p2" lines="117-129" />
 
-Es una optimización que se nota en toda la suite, porque se ejecuta en cada ply de cada partida.
-`board.is_game_over(claim_draw=True)`
-prueba **todas** las jugadas legales buscando una repetición reclamable; eso es cuadrático sobre una
-partida larga y se llama una vez por ply. Aquí se cubren las mismas tablas reclamables con el reloj
-de las cincuenta jugadas y con `is_repetition(3)`, que recorre la pila, y esa segunda comprobación
-va detrás de una guarda barata: hacen falta al menos ocho plies reversibles para que una repetición
-triple sea posible.
+Una optimización que se nota en toda la suite: `is_game_over(claim_draw=True)` prueba todas las
+jugadas legales buscando una repetición, cuadrático sobre una partida larga y llamado en cada ply.
+Aquí las mismas tablas se cubren con el reloj de las cincuenta jugadas y con `is_repetition(3)`
+detrás de una guarda barata.
 
 ```python title="src/rukh/infer/game.py"
 def _history(tok: UciTokenizer, white_elo: int, black_elo: int) -> list[int]:
@@ -617,21 +571,17 @@ def play_game(
 
 <Src file="src/rukh/infer/game.py" tag="p2" lines="140-190" />
 
-La partida. Tres decisiones que la tabla de resultados hereda:
+Tres decisiones que hereda la tabla de resultados:
 
-1. **Una propuesta ilegal se cuenta y se rescata.** `illegal += 1` y después un segundo `pick_move`
-   con una copia de la configuración que tiene la máscara puesta. La partida tiene que terminar, así
-   que hay que darle una jugada; pero el rescate no puede esconder que ocurrió. Ese contador es la
-   señal cruda de legalidad sobre la que está montado el harness entero.
-2. **El rescate no le vuelve a preguntar lo mismo.** No es un reintento: es un muestreo enmascarado.
-   Insistir hasta que el modelo conteste algo legal mediría un modelo distinto del que describe la
-   tasa de legalidad.
-3. **El límite por defecto es `block - HEADER_TOKENS - 1`.** El contexto menos la cabecera menos el
-   token que se está prediciendo: el número exacto de jugadas que caben en el prompt sin que el
-   recorte tenga que empezar a tirar jugadas.
+1. **Una propuesta ilegal se cuenta y se rescata** con un muestreo enmascarado. La partida tiene
+   que terminar, pero el rescate no puede esconder que ocurrió: ese contador es la señal cruda de
+   legalidad.
+2. El rescate no es un reintento. Insistir hasta que el modelo conteste algo legal mediría otro
+   modelo.
+3. El límite por defecto, `block - HEADER_TOKENS - 1`, es el número de jugadas que caben en el
+   prompt sin que el recorte empiece a tirar ninguna.
 
-Y el `history.append(tok.vocab.get(uci, tok.unk_id))` de cada ply incluye **las jugadas del
-oponente**: el prompt del modelo es la partida entera, no sus propias jugadas.
+El historial incluye las jugadas del oponente: el prompt es la partida entera.
 
 ```python title="src/rukh/infer/game.py"
 PIECE_VALUES = {
@@ -700,20 +650,11 @@ def _verdict(centipawns: float, margin: float) -> str:
 
 <Src file="src/rukh/infer/game.py" tag="p2" lines="216-248" />
 
-La <Term id="adjudicacion">adjudicación</Term> de una partida cortada existe porque anotarla como tablas **no es neutral**: le regala medio punto al bando que iba
-perdiendo, y con un modelo que se queda sin contexto en las partidas largas ese sesgo apunta siempre
-para el mismo lado. Así que la posición final se juzga: con una búsqueda corta del motor si lo hay,
-contando material si no, y el informe dice cuántas se adjudicaron y cómo.
-
-El margen de 200 centipeones (dos peones) es lo que separa «va ganando» de «está igualado», y se
-aplica igual a la evaluación del motor y al recuento de material. Ahí está el detalle honesto: el
-`try` captura los tres fallos del motor y **cae al material**, así que una adjudicación siempre
-devuelve algo. Y devuelve dos cosas, el resultado y **cómo** se decidió, porque un `1-0` por
-recuento de material y uno por análisis a profundidad 8 no valen lo mismo y el informe los cuenta
-por separado.
-
-El rey no está en `PIECE_VALUES`: sumarle un valor no cambiaría ninguna diferencia (siempre hay uno
-de cada) y elegir cuál sería una conversación sin final.
+La <Term id="adjudicacion">adjudicación</Term> existe porque apuntar una partida cortada como tablas
+no es neutral: le regala medio punto al bando que iba perdiendo. La posición final se juzga con una
+búsqueda corta del motor si lo hay, o contando material si no, con el mismo margen de dos peones. Si
+el motor falla se cae al material, así que siempre hay respuesta, y se devuelve también cómo se
+decidió, porque un `1-0` por recuento de material no vale lo mismo que uno a profundidad 8.
 
 ```python title="src/rukh/infer/game.py"
 def result_token(tok: UciTokenizer, result: str) -> int | None:
@@ -754,11 +695,9 @@ def legality_rate(
 
 <Src file="src/rukh/infer/game.py" tag="p2" lines="257-281" />
 
-`legality_rate` mide lo mismo que la métrica de la lección 5, en una versión que no necesita el
-harness. Lo que hay que leer es el denominador: las posiciones **sin jugada legal** —mate, ahogado—
-no se preguntan, así que tampoco se cuentan. Contarlas como fallo castigaría al modelo por una
-posición en la que no había nada que proponer; contarlas como acierto lo premiaría. No preguntar es
-la tercera opción y es la correcta.
+Mide lo mismo que la métrica de la lección 5, sin el harness. Fíjate en el denominador: las
+posiciones sin jugada legal (mate, ahogado) no se preguntan ni se cuentan. Contarlas como fallo o
+como acierto sesgaría la tasa hacia un lado u otro.
 
 ```python title="src/rukh/infer/__init__.py"
 """Inference: masked sampling of one move and self-play against an opponent."""
@@ -810,7 +749,7 @@ __all__ = [
 
 <Src file="src/rukh/infer/__init__.py" tag="p2" lines="1-45" />
 
-Los reexportes. Como en `models`, nadie fuera del paquete importa `rukh.infer.sampler`.
+Los reexportes: nadie fuera del paquete importa los submódulos.
 
 ## El comando
 
@@ -879,16 +818,9 @@ def play_cmd(
 
 <Src file="src/rukh/cli.py" tag="p2" lines="369-428" />
 
-`rukh play` es lo que convierte todo lo anterior en algo que se puede mirar. Dos detalles de la
-traducción de opciones a configuración: `top_k=top_k or None` hace que `--top-k 0` signifique «sin
-recorte» en la línea de órdenes, donde no se puede escribir `None`; y `mask_illegal=not no_mask`
-invierte la bandera, que se llama `--no-mask` porque la máscara está puesta por defecto.
-
-El `finally` que cierra Stockfish está ahí por la misma razón que el gestor de contexto de
-`StockfishOpponent`: una excepción a mitad de la quinta partida no puede dejar un proceso colgado.
-
-Y `--games` alterna colores con `model_color=index % 2 == 0`, que es la misma regla que usará el
-harness de Elo: jugar solo con blancas mediría el modelo y la ventaja de salida a la vez.
+`rukh play` convierte todo lo anterior en algo que se puede mirar. `--top-k 0` significa «sin
+recorte», porque en la línea de órdenes no se puede escribir `None`; el `finally` cierra Stockfish
+aunque una partida reviente; y `--games` alterna colores, como hará el harness de Elo.
 
 <Callout kind="ejecuta" title="La primera partida, con `tiny`">
   `rukh play` ya funciona con cualquier checkpoint. Pruébalo con el de `tiny` de la lección anterior
@@ -900,10 +832,9 @@ uv run rukh play --ckpt checkpoints/tiny-<fecha>/best.pt --games 2
 uv run rukh play --ckpt checkpoints/tiny-<fecha>/best.pt --games 2 --no-mask
 ```
 
-Cada orden imprime `opponent: random`, la línea `mask:` y una línea por partida con resultado,
-plies, ilegales y cómo terminó. Con máscara el contador de ilegales tiene que ser `0` en las dos;
-sin ella, lo normal con `tiny` es que salga alguno, y la partida termina igual porque cada propuesta
-ilegal se rescata con un muestreo enmascarado.
+Cada orden imprime el oponente, la línea `mask:` y una línea por partida con resultado, plies,
+ilegales y cómo terminó. Con máscara, `0` ilegales; sin ella, con `tiny` lo normal es que salga
+alguno, y la partida termina igual gracias al rescate.
 
 </Callout>
 
@@ -922,16 +853,11 @@ mask:     on
 illegal:  0 proposals
 ```
 
-Ciento diecisiete plies contra un oponente que juega al azar, y tablas por **ahogado**. No es la
-partida lucida que uno querría enseñar, y por eso está aquí. Con la máscara puesta el contador de
-ilegales es **0**, como tiene que ser: el muestreo enmascarado no puede producir una jugada ilegal,
-así que ese cero no dice nada del modelo —dice que la máscara funciona, y si alguna vez ves ahí un
-número distinto de cero, lo que está roto es la máscara—. El ahogado, en cambio, sí es del modelo:
-llegó a un final ganado contra un rival aleatorio y no supo dar mate.
+Ciento diecisiete plies contra un rival que juega al azar, y tablas por ahogado. No es la partida
+lucida que uno querría enseñar, y por eso está aquí. El `0 illegal` no dice nada del modelo, solo que
+la máscara funciona. El ahogado sí es del modelo: llegó a un final ganado y no supo dar mate.
 
-La misma partida sin máscara enseña el otro lado: cada vez que el modelo propone algo ilegal se
-cuenta y se rescata con un muestreo enmascarado, así que la partida siempre termina y el contador
-`illegal` es la señal cruda.
+Sin máscara, cada propuesta ilegal se cuenta:
 
 ```bash title="Terminal"
 uv run rukh play --ckpt checkpoints/small-<fecha>/best.pt --games 1 --no-mask
@@ -946,20 +872,15 @@ mask:     off
 illegal:  1 proposals
 ```
 
-Mate en 79 plies y **una sola propuesta ilegal en toda la partida**. Ese `1` es lo que conecta esta
-partida con la tabla de la lección 6, y merece la pena hacer la cuenta: es la única vez en el módulo
-en que una métrica agregada y un caso concreto se pueden contrastar a mano. Una legalidad por argmax
-del **99,4 %** son 6 fallos por cada 1 000 posiciones, es decir **uno cada 167 jugadas propuestas**.
-En una partida de 79 plies el modelo mueve la mitad de las veces —el otro lado es el oponente
-aleatorio—, así que propone unas 40 jugadas y el número esperado de ilegales es 0,24: sale 1. Con
-una sola partida eso es ruido puro y no confirma nada, pero el orden de magnitud coincide, y esa es
-la comprobación barata que conviene hacerse siempre que tengas una métrica agregada y un caso suelto
-delante. Si aquí hubieran salido quince ilegales, el 99,4 % de la tabla estaría midiendo otra cosa.
+Mate en 79 plies y una sola propuesta ilegal. Merece la pena contrastarlo con la tabla de la
+lección 6: una legalidad del 99,4 % es un fallo cada 167 propuestas. En 79 plies el modelo propone
+unas 40 jugadas, así que el número esperado de ilegales es 0,24, y sale 1. Con una partida eso es
+ruido, pero el orden de magnitud coincide. **Contrasta siempre una métrica agregada con un caso
+suelto**: si aquí hubieran salido quince ilegales, el 99,4 % estaría midiendo otra cosa.
 
 ## Los tests: veinticuatro contratos
 
-`tests/unit/test_sampler.py` es el fichero de tests más largo de la primera mitad del módulo, y el
-que más cosas fija de una vez. Vale la pena entero.
+`tests/unit/test_sampler.py` es el fichero de tests más largo de la primera mitad del módulo.
 
 ```python title="tests/unit/test_sampler.py"
 """Tests for rukh.infer: legality masking, temperature, promotions and whole games."""
@@ -1013,13 +934,9 @@ def history(tok: UciTokenizer) -> list[int]:
 
 <Src file="tests/unit/test_sampler.py" tag="p2" lines="1-47" />
 
-Un modelo de juguete **con el vocabulario de verdad** (2 030) y dos capas. Es la combinación que
-importa: las jugadas legales tienen que existir en el vocabulario real, y el resto puede ser
-minúsculo. Las fixtures son de ámbito `module` porque construir el tokenizador y el modelo una vez
-por test multiplicaría por veinte el tiempo del fichero.
-
-Y el comentario de la línea 28 explica una decisión de marcado: la partida contra Stockfish lleva
-solo `engine`, no `unit`, así que `pytest -m unit` nunca necesita el binario.
+Un modelo de juguete con el vocabulario de verdad: las jugadas legales tienen que existir en él, y
+el resto puede ser minúsculo. La partida contra Stockfish lleva solo la marca `engine`, así que
+`pytest -m unit` nunca necesita el binario.
 
 ```python title="tests/unit/test_sampler.py"
 @unit
@@ -1042,10 +959,8 @@ def test_castling_is_the_two_square_king_move(tok: UciTokenizer) -> None:
 
 <Src file="tests/unit/test_sampler.py" tag="p2" lines="50-65" />
 
-Veinte jugadas legales en la posición inicial —dieciséis de peón y cuatro de caballo—, ordenadas,
-sin repetidos, todas legales y **exactamente el mismo conjunto** que `board.legal_moves`. Esa última
-aserción es la que convierte el test de «no propone basura» en «no se deja ninguna». Y el del
-enroque fija el detalle que rompería el vocabulario entero.
+La última aserción, el mismo conjunto que `board.legal_moves`, convierte «no propone basura» en «no
+se deja ninguna».
 
 ```python title="tests/unit/test_sampler.py"
 @unit
@@ -1085,15 +1000,10 @@ def test_without_the_mask_an_illegal_token_is_reported_as_such(
 
 <Src file="tests/unit/test_sampler.py" tag="p2" lines="68-100" />
 
-Los dos lados de la máscara, y los dos son necesarios.
-
-Con máscara: **mil muestreos** a temperatura 1,5 y sin top-k —es decir, en las condiciones más
-favorables para que salga una tontería— y ni una sola jugada ilegal. El `len(seen) > 1` del final
-impide la versión degenerada del test, un muestreador que devolviera siempre la misma jugada.
-
-Sin máscara: se exige que aparezcan ilegales. «Un modelo sin entrenar casi nunca es legal por su
-cuenta», dice el comentario, y ese `assert illegal > 0` es lo que garantiza que la ruta sin máscara
-existe de verdad y no es la misma con otro nombre.
+Los dos lados de la máscara. Con ella, mil muestreos a temperatura 1,5 y sin top-k, las condiciones
+más favorables para una tontería, y ninguna ilegal; `len(seen) > 1` descarta un muestreador que
+devolviera siempre lo mismo. Sin ella, se exige que aparezcan ilegales, para garantizar que la ruta
+sin máscara existe de verdad.
 
 ```python title="tests/unit/test_sampler.py"
 @unit
@@ -1127,11 +1037,9 @@ def test_top_k_restricts_the_reported_distribution(model: MoveDecoder, tok: UciT
 
 <Src file="tests/unit/test_sampler.py" tag="p2" lines="103-129" />
 
-El de temperatura cero no compara con una constante: calcula el argmax **a mano**, sobre los logits
-restringidos a los ids legales, y exige que el muestreador dé eso mismo cinco veces seguidas. Y el
-de top-k comprueba tres cosas a la vez: que en 200 muestreos no salgan más de 3 jugadas distintas,
-que `top5` nunca tenga más de `k` entradas y que sus probabilidades **sumen uno**, que es la forma de
-fijar que el informe describe la distribución muestreada y no la cruda.
+El de temperatura cero calcula el argmax a mano sobre los logits legales y exige que el muestreador
+dé eso mismo. El de top-k exige que `top5` sume uno, que es la forma de fijar que el informe describe
+la distribución muestreada y no la cruda.
 
 ```python title="tests/unit/test_sampler.py"
 @unit
@@ -1159,10 +1067,8 @@ def test_a_finished_position_has_no_legal_tokens(model: MoveDecoder, tok: UciTok
 
 <Src file="tests/unit/test_sampler.py" tag="p2" lines="132-152" />
 
-La promoción y la posición terminada. El de la promoción no exige que el modelo promocione —no ha
-aprendido nada—, exige que **si** mueve el peón de a7, la jugada tenga promoción y su token mida
-cinco caracteres. El de mate comprueba la salida temprana de `pick_move`: sin jugadas legales,
-`None`, `legal=False` y un `top5` vacío, sin gastar una pasada por el modelo.
+El de la promoción no exige que el modelo sin entrenar promocione: exige que, si mueve el peón de
+a7, el token lleve la promoción. El de mate comprueba la salida temprana de `pick_move`.
 
 ```python title="tests/unit/test_sampler.py"
 @unit
@@ -1211,11 +1117,9 @@ def test_the_same_seed_replays_the_same_game(model: MoveDecoder, tok: UciTokeniz
 
 <Src file="tests/unit/test_sampler.py" tag="p2" lines="155-196" />
 
-Las partidas. El primero **replica la partida jugada sobre un tablero limpio** y comprueba que cada
-jugada es legal en su momento: si `play_game` mezclara el orden o empujara una jugada en el tablero
-equivocado, el test lo ve. El segundo exige que una partida sin máscara tenga propuestas ilegales y
-**aun así termine**, que es la propiedad del rescate. El tercero fija el límite por defecto y el
-cuarto, el determinismo: dos partidas con la misma semilla son la misma partida, jugada a jugada.
+El primero reproduce la partida sobre un tablero limpio y comprueba que cada jugada era legal en su
+momento. El segundo exige que una partida sin máscara tenga ilegales y aun así termine. Los otros
+fijan el límite por defecto y el determinismo: misma semilla, misma partida.
 
 ```python title="tests/unit/test_sampler.py"
 @unit
@@ -1266,9 +1170,8 @@ def test_sampling_runs_on_cuda(tok: UciTokenizer) -> None:
 
 <Src file="tests/unit/test_sampler.py" tag="p2" lines="224-239" />
 
-El de CUDA lleva la marca `gpu`, así que no corre en la CI —que no tiene GPU— y se salta solo si
-`torch.cuda.is_available()` dice que no. Es el test que habría cazado el fallo del generador del
-callout de arriba, y por eso existe: ese error **solo** aparece en la máquina con GPU.
+El de CUDA lleva la marca `gpu` y se salta sin GPU. Es el que caza el fallo del generador, que solo
+aparece en la máquina con GPU.
 
 ```python title="tests/unit/test_sampler.py"
 @unit
@@ -1292,10 +1195,8 @@ def test_a_long_game_still_carries_its_elo_tokens(model: MoveDecoder, tok: UciTo
 
 <Src file="tests/unit/test_sampler.py" tag="p2" lines="242-258" />
 
-Los dos del prompt. El primero es aritmético: con `block=10` y una cabecera de 3, quedan 7 jugadas,
-y tienen que ser las siete últimas. El segundo lo comprueba de verdad: una partida con 128 jugadas
-en un modelo de contexto 64 muestrea sin explotar, lo que solo es posible si el recorte ocurrió
-antes de llegar al decoder.
+Los del prompt: con `block=10` quedan la cabecera y las siete últimas jugadas, y una partida de 128
+jugadas en un modelo de contexto 64 muestrea sin explotar.
 
 ```python title="tests/unit/test_sampler.py"
 @unit
@@ -1322,9 +1223,8 @@ def test_adjudication_reads_material_when_there_is_no_engine() -> None:
 
 <Src file="tests/unit/test_sampler.py" tag="p2" lines="261-280" />
 
-El de la adjudicación fija el margen en los dos lados: con un peón de ventaja, tablas; con dos,
-victoria. «El margen es inclusivo», dice el comentario, y es el tipo de decisión que se toma una vez
-y se olvida si no está escrita en un test.
+El de la adjudicación fija el margen por los dos lados: un peón de ventaja son tablas; dos, victoria.
+Es el tipo de decisión que se olvida si no está escrita en un test.
 
 ```python title="tests/unit/test_sampler.py"
 @unit
@@ -1363,10 +1263,8 @@ def test_cli_play_is_registered() -> None:
 
 <Src file="tests/unit/test_sampler.py" tag="p2" lines="283-314" />
 
-Una partida cortada tiene `result="*"`, `cut=True`, un FEN que se puede reconstruir y se puede
-adjudicar. Y `test_cli_play_is_registered` comprueba que las cuatro opciones siguen en el `--help`:
-es un test de treinta segundos de escritura que caza el renombrado de una opción antes de que lo
-haga un lector del curso.
+`test_cli_play_is_registered` comprueba que las opciones siguen en el `--help`: treinta segundos de
+escritura que cazan el renombrado de una opción antes que un lector del curso.
 
 ```python title="tests/unit/test_sampler.py"
 @pytest.mark.engine
@@ -1383,7 +1281,7 @@ def test_a_game_against_stockfish(model: MoveDecoder, tok: UciTokenizer) -> None
 
 <Src file="tests/unit/test_sampler.py" tag="p2" lines="317-326" />
 
-Y el de Stockfish, marcado `engine`, que se salta cuando no hay binario.
+Y el de Stockfish, marcado `engine`.
 
 <Callout kind="ejecuta" title="Los tests del muestreador">
   Con el fichero entero escrito, pasa primero los de CPU y después los dos que necesitan algo más:
@@ -1393,10 +1291,8 @@ uv run pytest -m unit -q tests/unit/test_sampler.py
 uv run pytest -q -m "gpu or engine" tests/unit/test_sampler.py
 ```
 
-La primera tiene que dar `22 passed, 2 deselected`: los dos deseleccionados son el de CUDA y el de
-Stockfish. La segunda ejecuta solo esos dos: el de `gpu` pasa si hay CUDA y sale `skipped` si no, y
-el de `engine` pasa si `scripts/get_stockfish.py` dejó el motor en su sitio y sale `skipped` si no
-lo encuentra.
+La primera tiene que dar `22 passed, 2 deselected` (los de CUDA y Stockfish). La segunda ejecuta esos
+dos: cada uno pasa si tienes CUDA o el motor de `scripts/get_stockfish.py`, y sale `skipped` si no.
 
 </Callout>
 
@@ -1407,30 +1303,28 @@ lo encuentra.
   como mucho?
 
   <Solution>
-    Falla `test_masked_sampling_never_proposes_an_illegal_move`, pero no siempre en el mismo sitio:
-    lo normal es que reviente el `assert move is not None` en alguna de las mil iteraciones, porque
-    con el top-k aplicado primero puede ocurrir que **ninguno** de los tres tokens supervivientes sea
-    legal y la máscara los ponga todos a `-inf`. Un softmax de todo `-inf` da `NaN` y `multinomial`
-    protesta, o devuelve un índice arbitrario: el síntoma exacto depende de la versión de torch,
-    que es la peor propiedad que puede tener un error.
+    Falla `test_masked_sampling_never_proposes_an_illegal_move`, casi siempre en el
+    `assert move is not None`: con el top-k primero puede que ninguno de los tres supervivientes sea
+    legal, y la máscara los pone todos a `-inf`. Un softmax de todo `-inf` da `NaN` y `multinomial`
+    protesta o devuelve un índice arbitrario, según la versión de torch, que es la peor propiedad
+    que puede tener un error.
 
-En la posición inicial hay 20 jugadas legales de 2 030 tokens. Con el orden correcto, el top-k
-elige 3 **de esas 20**. Con el orden invertido, elige 3 de las 2 030 y después tacha las ilegales:
-el número de candidatos es entre 0 y 3, y el valor esperado, con un modelo sin entrenar, es
-3 × 20/2030 ≈ 0,03. Es decir, casi siempre cero.
+Con el orden correcto, el top-k elige 3 de las 20 legales. Invertido, elige 3 de 2 030 y luego tacha
+las ilegales: entre 0 y 3 candidatos, con un valor esperado de 3 × 20/2030 ≈ 0,03 en un modelo sin
+entrenar. Casi siempre cero.
 
   </Solution>
 </Exercise>
 
 ## Qué has aprendido
 
-Cómo se convierte un vector de 2 030 números en una partida terminada, y las cuatro decisiones que
-lleva dentro: el orden máscara → temperatura → top-k, el recorte que conserva la cabecera, el
-informe que sale junto a la jugada, y la adjudicación de lo que se quedó sin contexto.
+Cómo se convierte un vector de 2 030 números en una partida terminada: el orden máscara →
+temperatura → top-k, el recorte que conserva la cabecera, el informe que sale junto a la jugada y la
+adjudicación de lo que se quedó sin contexto. Y una idea que te llevas a cualquier LLM: la
+restricción al decodificar hace útil la salida, pero lo que sabe el modelo solo se mide sin ella.
 
-**Cómo se mide**: `uv run pytest -m unit -q tests/unit/test_sampler.py` pasa los veintidós tests de
-CPU (los de `gpu` y `engine` van aparte), y `uv run rukh play --ckpt checkpoints/small-<fecha>/best.pt` juega
-una partida entera con **cero** propuestas ilegales con máscara y una sola sin ella.
+Los veintidós tests de CPU en verde, y `rukh play` con `small`: cero ilegales con máscara y una sola
+sin ella.
 
 Lo siguiente es medir en serio: mil posiciones de validación, seis mil puzles y las dos definiciones
-de legalidad que no se pueden publicar por separado.
+de legalidad.

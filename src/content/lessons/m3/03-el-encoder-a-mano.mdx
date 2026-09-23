@@ -6,10 +6,10 @@ description:
   ignora el relleno, y el test que exige lo contrario que el de M2.'
 module: m3
 order: 3
-duration: 95
+duration: 80
 level: medio
 status: vigente
-updated: 2026-09-22
+updated: 2026-09-23
 keywords:
   - encoder
   - bidireccional
@@ -29,13 +29,10 @@ casillas».
 
 ## Qué vas a construir
 
-`src/rukh/models/encoder.py`, 184 líneas, y su fichero de tests. Con `layers.py` en su sitio, el
-modelo entero cabe en una clase: el bucle de bloques con `causal=False`, la máscara de claves que
-apaga el relleno, la cabeza que predice la jugada tapada y el <Term id="pooling">pooling</Term> que
-reduce la secuencia a un vector.
-
-Todo el código de la lección está aquí, entero, tal como está en el repositorio en el tag
-`p3`. Si copias los bloques en orden tienes el fichero.
+`src/rukh/models/encoder.py` y su fichero de tests. Con `layers.py` en su sitio, el modelo entero
+cabe en una clase: el bucle de bloques con `causal=False`, la máscara de claves que apaga el relleno,
+la cabeza que predice la jugada tapada y el <Term id="pooling">pooling</Term> que reduce la secuencia
+a un vector.
 
 ## El contrato, escrito antes que el código
 
@@ -80,16 +77,11 @@ from rukh.models.layers import rope_tables
 
 <Src file="src/rukh/models/encoder.py" tag="p3" lines="1-36" />
 
-El último párrafo es el que contiene una decisión y no una descripción: **el relleno se expresa
-como máscara de claves, no como una atención especial**.
-
-Hay dos formas de tratar el relleno en un encoder. Una es enmascarar las **claves**: cada posición
-puede consultar a todas menos a las de relleno. La otra es enmascarar también las **consultas**: las
-filas de las posiciones de relleno ni siquiera se calculan. La segunda suena mejor —ahorra trabajo—
-y es la que produce `NaN`, porque una fila cuyas claves están todas apagadas le da al softmax una
-fila entera de `-inf` y el softmax de eso no es cero, es indefinido. Rukh calcula esas filas, no las
-mira nunca, y exige que cada secuencia tenga al menos un token real. Cuesta unos microsegundos de
-cómputo inútil y quita una familia entera de `NaN` que aparecen tres capas más abajo.
+El último párrafo contiene la decisión: **el relleno se expresa como máscara de claves**. Cada
+posición puede consultar a todas menos a las de relleno. Enmascarar también las consultas, para no
+calcular las filas del relleno, suena más eficiente y es lo que produce `NaN`: una fila con todas sus
+claves apagadas le da al softmax una fila entera de `-inf`, y el softmax de eso es indefinido. Rukh
+calcula esas filas, no las mira nunca y exige que cada secuencia tenga al menos un token real.
 
 ## Dos constantes, y una de ellas es la lección
 
@@ -112,15 +104,8 @@ predicted" and "predict ``<pad>``" stay different things.
 <Src file="src/rukh/models/encoder.py" tag="p3" lines="38-50" />
 
 El docstring de `MMM_IGNORE_INDEX` es el porqué que la lección 1 anticipó, escrito donde vive la
-constante. La versión corta: en M2 «no puntúes esto» y «predice `<pad>`» querían decir lo mismo,
-porque el relleno nunca era un objetivo legítimo. Aquí sí puede serlo, así que el valor que significa
-«esta posición no entra en la pérdida» tiene que ser un número que no sea el id de nada. `-100` es
-además la convención de PyTorch y de Hugging Face, lo que ahorra explicarlo cada vez que alguien lee
-el código.
-
-Guarda el matiz de por qué esto es peligroso: **elegir mal esa constante no lanza ninguna
-excepción**. Simplemente unas cuantas posiciones dejan de puntuar, o puntúan sin deber, y la curva de
-pérdida sale preciosa. Lo caza un test que cuenta, no uno que comprueba formas; está en la lección 5.
+constante: aquí `<pad>` puede ser un objetivo legítimo, así que «no puntúes esto» tiene que ser un
+número que no sea el id de nada.
 
 ## La función que existe solo para el exportador
 
@@ -141,33 +126,26 @@ def _tracing() -> bool:
 
 <Src file="src/rukh/models/encoder.py" tag="p3" lines="53-64" />
 
-Diez de sus doce líneas son explicación, y con razón: es el tipo de código que alguien borra por
+Casi toda la función es su docstring, y con razón: es el tipo de código que alguien borra por
 «limpieza» en un año si no está escrito por qué está.
 
-El problema que resuelve es general y lo vas a volver a ver. Una comprobación de validez que **lee
-un tensor** para decidir si lanza —aquí, `if not mask.any(...)`— es una bifurcación que depende de
-los datos, y una captura de grafo no puede representar eso: el grafo tiene que ser el mismo para
-cualquier entrada. Bajo `torch.export`, el exportador se rinde y vuelve al tracer antiguo de
-TorchScript, que es el camino que M2 dejó cerrado a propósito. Bajo `torch.compile` es peor de una
-forma más silenciosa: Dynamo no puede demostrar la condición, así que corta el grafo alrededor de
-ella en **cada** paso, y un corte de grafo es un punto de sincronización entre CPU y GPU más dos
-mitades que se compilan por separado. El coste no es la comprobación, es el corte.
-
-La solución no es quitar la comprobación —protege de un `NaN` real— sino apagarla exactamente
-mientras alguien captura. Fuera de una captura, `is_exporting()` e `is_compiling()` son `False` y el
-comportamiento es el de siempre. Y la propiedad que hace que apagarla sea legítimo está en la última
-frase: **el grafo exportado es una función pura de su entrada de todos modos**, así que una
-comprobación que solo sirve para dar un mensaje mejor no cambia lo que el grafo calcula.
+Una comprobación que **lee un tensor** para decidir si lanza —aquí, `if not mask.any(...)`— es una
+bifurcación que depende de los datos, y una captura de grafo no puede representarla: el grafo tiene
+que ser el mismo para cualquier entrada. Bajo `torch.export`, el exportador vuelve al tracer antiguo
+de TorchScript, el camino que M2 dejó cerrado. Bajo `torch.compile`, Dynamo corta el grafo alrededor
+de la condición en cada paso, con una sincronización entre CPU y GPU cada vez. La comprobación
+protege de un `NaN` real, así que no se quita: se apaga solo mientras alguien captura, y fuera de
+una captura todo se comporta como siempre.
 
 <Transfer concept="Guardas que dependen de los datos bajo una captura de grafo" where="Cualquier modelo que se exporte, compile o trace: ONNX, TensorRT, torch.compile, XLA.">
-  La regla operativa es corta: **una validación que lee un tensor es una bifurcación de datos, y las
-  bifurcaciones de datos no se capturan**. Antes de exportar un modelo, busca los `if` que miran
-  dentro de un tensor —comprobaciones de rango, `assert` sobre conteos, ramas según una longitud— y
-  decide para cada uno si va fuera de la función que se captura o si se apaga durante la captura.
+  Una validación que lee un tensor es una bifurcación de datos, y las bifurcaciones de datos no se
+  capturan. Antes de exportar un modelo, busca los `if` que miran dentro de un tensor
+  —comprobaciones de rango, `assert` sobre conteos, ramas según una longitud— y decide para cada uno
+  si va fuera de la función que se captura o si se apaga durante la captura.
 
-El síntoma cuando no lo haces no suele ser un error claro. Es un exportador que «funciona» pero cae
-a un camino antiguo, un `torch.compile` que no acelera nada porque rompe el grafo veinte veces por
-paso, o una forma que se queda fijada al valor que tenía el tensor de ejemplo.
+El síntoma cuando no lo haces no suele ser un error claro: un exportador que «funciona» pero cae a
+un camino antiguo, un `torch.compile` que no acelera nada, o una forma que se queda fijada al valor
+del tensor de ejemplo.
 
 </Transfer>
 
@@ -210,33 +188,21 @@ class PositionEncoder(nn.Module):
 
 <Src file="src/rukh/models/encoder.py" tag="p3" lines="67-98" />
 
-Léelo al lado del `__init__` de `MoveDecoder` de M2: es la misma secuencia de líneas. Embedding de
-tokens, tabla de posiciones si toca, dropout, la pila de bloques, la normalización final, la cabeza,
-el atado, las tablas de RoPE, la inicialización. Lo único que cambia de verdad es `causal=False` en
-la construcción de los bloques y que la cabeza se llama `mlm_head` en vez de `lm_head`, porque
-predice una jugada **tapada** y no la siguiente.
+Léelo al lado del `__init__` de `MoveDecoder` de M2: es la misma secuencia. Cambian `causal=False` en
+los bloques y el nombre de la cabeza, `mlm_head`, porque predice una jugada tapada y no la
+siguiente. Tres detalles son decisiones:
 
-Tres detalles que sí son decisiones.
-
-**`self.cfg.tokens` y `self.cfg.seq` en vez de `vocab_size` y `block`.** Las propiedades de
-`EncoderConfig` de la lección anterior resuelven el esquema, así que este constructor no pregunta ni
-una vez por `cfg.input` para decidir un tamaño. El único `if` que mira el esquema es el del atado,
-que es una decisión y no una cuenta.
-
-**El atado es condicional y el decoder lo tenía incondicional.** `tie_embeddings and input == "moves"`:
-atar significa que el vector que representa `e2e4` y el vector contra el que se puntúa `e2e4` son el
-mismo objeto, y eso solo tiene sentido si la entrada y la salida son el mismo vocabulario. Con 2 030
-jugadas, atar ahorra 779 520 parámetros —el 5 % del modelo— y además impone esa simetría, que es lo
-que uno quiere que signifique un <Term id="embedding">embedding</Term>. Con 47 tokens de casillas, lo
-que se ahorraría son 18 048 parámetros y a cambio se obligaría al embedding de entrada a hacer de
-clasificador de salida sin ninguna razón.
-
-**La inicialización escalada de las proyecciones residuales**, `0.02 / sqrt(2 · n_layer)`, es la de
-GPT-2 y se aplica después de `self.apply(layers.init_weights)`, sobrescribiendo lo que aquella puso.
-El orden importa: al revés, la inicialización general borraría la escalada. Cada bloque suma dos
-veces al residuo (atención y MLP), así que con ocho capas hay dieciséis sumas y la varianza del
-residuo crecería con la profundidad si cada proyección de salida empezara con la misma escala que
-las demás. Dividir por `sqrt(2 · n_layer)` compensa exactamente ese crecimiento. La regla `name.endswith("proj.weight")` alcanza tanto a `attn.proj` como a `mlp.proj`, que son precisamente las dos que escriben en el residuo.
+- `self.cfg.tokens` y `self.cfg.seq` resuelven el esquema, así que el constructor no pregunta por
+  `cfg.input` para decidir un tamaño. El único `if` que mira el esquema es el del atado.
+- **El atado es condicional.** Solo tiene sentido si la entrada y la salida son el mismo
+  vocabulario: con 2 030 jugadas ahorra 779 520 parámetros, el 5 % del modelo, e impone que un
+  <Term id="embedding">embedding</Term> signifique lo mismo al entrar y al salir. Con 47 tokens de
+  casillas se ahorrarían 18 048 y se obligaría al embedding de entrada a hacer de clasificador sin
+  ninguna razón.
+- La inicialización escalada de las proyecciones residuales, `0.02 / sqrt(2 · n_layer)`, es la de
+  GPT-2 y va después de `self.apply(layers.init_weights)`; al revés, la general la borraría. Cada
+  bloque suma dos veces al residuo, así que con ocho capas hay dieciséis sumas y la varianza
+  crecería con la profundidad; dividir por `sqrt(2 · n_layer)` lo compensa.
 
 ## Contar parámetros y leer el relleno
 
@@ -256,15 +222,12 @@ las demás. Dividir por `sqrt(2 · n_layer)` compensa exactamente ese crecimient
 
 <Src file="src/rukh/models/encoder.py" tag="p3" lines="100-110" />
 
-`num_params` es el de M2 sin cambios, y con `non_embedding=False` es el que da los 15 052 800 de la
-lección 1. Ojo con la convención de nanoGPT que implementa: **resta la tabla de posiciones, no la de
-tokens**, aunque el nombre diga «embedding». Es una convención de comparación entre modelos, no una
-definición; cuando se publica un tamaño se publica el total.
+`num_params` es el de M2, y con `non_embedding=False` da los 15 052 800 de la lección 1. Ojo con la
+convención de nanoGPT: resta la tabla de posiciones, no la de tokens, aunque el nombre diga
+«embedding». Cuando se publica un tamaño se publica el total.
 
-`padding_mask` es un `!=` con nombre, y ese nombre es lo que la hace útil: `idx != 0` aparecería
-suelto en cinco sitios del proyecto y el día que `<pad>` dejara de ser el 0 habría que encontrarlos
-todos. Que sea `staticmethod` permite llamarla sin instanciar el modelo, que es lo que hacen los
-labs y los tests.
+`padding_mask` es un `!=` con nombre: sin él, `idx != 0` aparecería suelto en cinco sitios y el día
+que `<pad>` dejara de ser el 0 habría que encontrarlos todos.
 
 ## La guarda que impide el NaN
 
@@ -289,32 +252,22 @@ labs y los tests.
 
 <Src file="src/rukh/models/encoder.py" tag="p3" lines="112-127" />
 
-Hace tres cosas, y la de en medio es la única que se ve.
+Hace tres cosas. `mask[:, None, None, :]` convierte `(B, T)` en `(B, 1, 1, T)`: los dos ejes de
+tamaño uno son la cabeza y la consulta, y se **difunden**, así que la misma máscara vale para las
+seis cabezas y las doscientas consultas sin materializar veintitrés millones de booleanos por capa.
 
-La primera es el cambio de forma: `mask[:, None, None, :]` convierte `(B, T)` en `(B, 1, 1, T)`.
-Esos dos ejes de tamaño uno son la cabeza de atención y la consulta, y al ser uno se **difunden**:
-la misma máscara de claves vale para las seis cabezas y para las doscientas consultas de la
-secuencia. Si en vez de difundir se materializara la matriz `(B, n_head, T, T)`, un lote de 96
-secuencias de 200 tokens con seis cabezas serían veintitrés millones de booleanos por capa, y no
-aportarían nada que no esté en los 19 200 de la versión difundida.
+La comprobación de forma existe porque un `attention_mask` de `(B, 1, T)`, lo que devuelve más de
+una librería, se difundiría sin protestar contra el eje de las cabezas y enmascararía otra cosa.
 
-La segunda es la comprobación de forma. Un `attention_mask` de `(B, 1, T)` —que es lo que devuelve
-más de una librería— se difundiría sin protestar contra el eje de las cabezas y enmascararía otra
-cosa. Que falle con el mensaje `attention_mask must be (B, T)` cuesta dos líneas.
-
-La tercera es la guarda del `NaN`. `mask.any(dim=-1)` dice, por secuencia, si le queda algún token
-real; `.all()` exige que le quede a todas. Una fila sin ninguno haría que el softmax de la atención
-recibiera una fila entera de `-inf` y devolviera `NaN`, que se propaga en silencio hasta el `loss` y
-lo convierte en `nan` ocho capas después, cuando ya no hay forma de saber de dónde salió. Y aquí
-está el `not _tracing()` de la función anterior: la comprobación **solo** se salta bajo una captura
-de grafo.
+Y la guarda del `NaN`: `mask.any(dim=-1).all()` exige que a cada secuencia le quede algún token
+real. Sin ella, el `NaN` del softmax se propagaría en silencio y aparecería en el `loss` ocho capas
+después, cuando ya no hay forma de saber de dónde salió. Solo se salta bajo una captura de grafo.
 
 <Callout kind="hoy" title="Dónde aparece una fila entera de relleno, que no es un caso imposible">
-  Parece un caso de laboratorio y no lo es. Aparece en cuanto un lote se arma con un `collate` que
-  rellena hasta un múltiplo fijo y alguna secuencia viene vacía porque un filtro la dejó sin tokens;
-  o en la última tanda de un `DataLoader` con `drop_last=False` cuando el conjunto no es múltiplo
-  del tamaño de lote y el resto se completa con ceros. El error de arriba convierte esos dos casos
-  en un fallo de un segundo en vez de en una tirada de cuarenta minutos que acaba en `nan`.
+  Aparece en cuanto un `collate` rellena hasta un múltiplo fijo y alguna secuencia viene vacía
+  porque un filtro la dejó sin tokens, o en la última tanda de un `DataLoader` con `drop_last=False`
+  cuando el resto se completa con ceros. El error de arriba convierte esos casos en un fallo de un
+  segundo en vez de en una tirada de cuarenta minutos que acaba en `nan`.
 </Callout>
 
 ## El `forward`, que es el del decoder con un argumento más
@@ -341,19 +294,14 @@ de grafo.
 
 <Src file="src/rukh/models/encoder.py" tag="p3" lines="129-145" />
 
-La diferencia de fondo con el `forward` de `MoveDecoder` está en el tipo de retorno: **devuelve los
-estados ocultos, no logits**. El decoder termina en `lm_head` porque solo tiene una pregunta; el
-encoder devuelve `(B, T, d_model)` y deja que quien llame decida qué hacer con ese tensor —la cabeza
-de jugada tapada, el pooling, las tres cabezas supervisadas, los embeddings que se exportan en la
-lección 9—. Esa es la forma que tiene el código de decir «una posición admite muchas preguntas».
+La diferencia con el `forward` de `MoveDecoder` está en lo que devuelve: **estados ocultos, no
+logits**. El decoder termina en `lm_head` porque solo tiene una pregunta; el encoder devuelve
+`(B, T, d_model)` y deja que quien llame decida: la cabeza de jugada tapada, el pooling, las cabezas
+supervisadas o los embeddings que se exportan en la lección 9.
 
-La comprobación de longitud está antes de tocar nada porque el fallo natural sería otro y peor: con
-posiciones aprendidas, una secuencia más larga que la tabla daría un error de índice dentro de
-`nn.Embedding`, que menciona un tamaño de tabla y no la longitud que se pasó. Con RoPE ni siquiera
-fallaría: `cos[:t]` se quedaría corto en silencio.
-
-La línea del bucle, `block(x, cos, sin, key_mask)`, es donde se junta todo lo de la lección 2: la
-máscara viaja hasta `F.scaled_dot_product_attention`, y como no es `None`, `is_causal` se apaga solo.
+La comprobación de longitud va antes de todo porque el fallo natural sería peor: con posiciones
+aprendidas, un error de índice dentro de `nn.Embedding` que no menciona la longitud; con RoPE, ni
+siquiera un error, porque `cos[:t]` se quedaría corto en silencio.
 
 ## La cabeza de jugada tapada
 
@@ -378,20 +326,15 @@ máscara viaja hasta `F.scaled_dot_product_attention`, y como no es `None`, `is_
 
 <Src file="src/rukh/models/encoder.py" tag="p3" lines="147-162" />
 
-Es la pérdida de la <Term id="mlm">MLM</Term> y nada más. El `reshape(-1, …)` aplana lote y tiempo
-en una sola dimensión porque `F.cross_entropy` espera `(N, C)` y `(N,)`; no hay ninguna sutileza ahí
-más que no equivocarse de orden.
+Es la pérdida de la <Term id="mlm">MLM</Term> y nada más. La sutileza está en `ignore_index`: con
+`reduction="mean"`, la entropía cruzada divide por el número de posiciones no ignoradas, no por
+`N`, así que un lote donde el sorteo tapó pocas jugadas no produce un número artificialmente
+pequeño. El precio es un caso degenerado: si ninguna posición está tapada, el denominador es cero y
+la pérdida sale `nan`. Es aritmética, y por eso el bucle de la lección 5 comprueba
+`torch.isfinite(loss)` antes de acumular.
 
-Donde sí la hay es en `ignore_index`. La entropía cruzada de PyTorch, con `reduction="mean"` (el
-valor por defecto), divide por **el número de posiciones que no están ignoradas**, no por `N`. Eso es
-justo lo que hace falta: la pérdida es la media sobre las posiciones tapadas, así que un lote donde
-el sorteo tapó pocas jugadas no produce un número artificialmente pequeño. El precio es un caso
-degenerado que conviene conocer: si en un lote **ninguna** posición está tapada, el denominador es
-cero y la pérdida sale `nan`. No es un error del código —es aritmética— y por eso el bucle de
-entrenamiento de la lección 5 comprueba `torch.isfinite(loss)` antes de acumular.
-
-Que la firma devuelva `(logits, loss)` y no solo la pérdida es lo que permite que el bucle de
-validación calcule la exactitud top-1 con los mismos logits, sin una segunda pasada hacia delante.
+Devolver `(logits, loss)` permite que la validación calcule la exactitud top-1 con los mismos
+logits, sin una segunda pasada.
 
 ## El pooling, y por qué el `clamp`
 
@@ -421,30 +364,19 @@ validación calcule la exactitud top-1 con los mismos logits, sin una segunda pa
 
 <Src file="src/rukh/models/encoder.py" tag="p3" lines="164-184" />
 
-Aquí está la operación que convierte un encoder en un extractor de representaciones, y son dos
-líneas de aritmética con tres decisiones dentro.
+Es la operación que convierte un encoder en un extractor de representaciones, con tres decisiones
+dentro:
 
-**La máscara se deriva de `idx` cuando no se la pasan.** Es lo que hace que el caso correcto sea el
-caso por defecto: quien llama a `pool(idx)` sin pensar obtiene la media de los tokens reales, no la
-media de los tokens reales y del relleno. El argumento explícito sigue estando para el llamante que
-tiene una máscara distinta —por ejemplo el afinado, que reutiliza la que ya calculó.
+- **La máscara se deriva de `idx` cuando no se la pasan**, así que el caso correcto es el caso por
+  defecto: `pool(idx)` promedia los tokens reales y nunca el relleno.
+- La media se escribe como suma ponderada partida por el peso total, no como
+  `hidden[mask].mean()`, que aplanaría el lote entero y perdería a qué secuencia pertenece cada
+  vector. Multiplicar por una máscara y sumar por el eje del tiempo lo hace por lote, sin ramas.
+- `clamp(min=1.0)` en el denominador, porque `pool` acepta una máscara explícita que `_key_mask` no
+  validó, y una división por cero en PyTorch no lanza: da `inf` o `nan`.
 
-**La media se escribe como suma ponderada partida por el peso total**, no como `hidden[mask].mean()`.
-La razón es la forma: `hidden[mask]` aplana el lote entero en una lista de vectores y pierde a qué
-secuencia pertenece cada uno, así que habría que reagrupar. Multiplicar por una máscara de ceros y
-unos y sumar por el eje del tiempo hace lo mismo por lote, sin ramas, y es lo que un kernel de GPU
-sabe hacer rápido.
-
-**`clamp(min=1.0)` en el denominador.** El caso que evita —una secuencia entera de relleno— ya está
-prohibido arriba por `_key_mask`, así que es un cinturón además del tirante, y aun así merece la pena:
-`pool` se puede llamar con una máscara explícita distinta de la que `_key_mask` validó, y una
-división por cero no da una excepción en PyTorch, da `inf` o `nan`. Un `clamp` de un carácter frente
-a un vector de `nan` que se propaga a través de tres cabezas lineales.
-
-El `if how not in (…)` de arriba parece burocracia y no lo es: `how` viene de un YAML
-(`pooling: mean` en las configuraciones de la lección 6), y un `pooling: media` escrito por alguien
-que trabaja en español caería silenciosamente en la rama de la media si la comprobación fuera
-`if how == "cls": … else: media`.
+El `if how not in (…)` tampoco es burocracia: `how` viene de un YAML, y un `pooling: media` caería
+en silencio en la rama de la media si la comprobación fuera `if how == "cls": … else: media`.
 
 ## El test que tiene que decir lo contrario que el de M2
 
@@ -480,14 +412,9 @@ def toy_batch(batch: int = 2, seq: int = 8, seed: int = 1) -> torch.Tensor:
 <Src file="tests/unit/test_encoder.py" tag="p3" lines="1-26" />
 
 El modelo de juguete tiene dos capas y 32 dimensiones porque un test que tarde un segundo se ejecuta
-y uno que tarde un minuto no. Dos detalles suyos son decisiones.
-
-`dropout=0.0` en `TOY` **y** `.eval()` en `toy_model`: el cinturón y el tirante otra vez, porque la
-mitad de estos tests comparan dos pasadas hacia delante y cualquier aleatoriedad las haría fallar de
-vez en cuando. Un test que falla una de cada veinte veces es peor que no tenerlo.
-
-`torch.randint(1, …)` empieza en **1** y no en 0: el 0 es `<pad>`, así que un lote sorteado desde
-cero tendría relleno aleatorio en medio y los tests de relleno medirían otra cosa.
+y uno que tarde un minuto no. `dropout=0.0` y `.eval()` a la vez, porque la mitad de estos tests
+comparan dos pasadas y cualquier aleatoriedad los haría fallar de vez en cuando. Y
+`torch.randint(1, …)` empieza en 1 porque el 0 es `<pad>`.
 
 ```python title="tests/unit/test_encoder.py"
 def test_forward_returns_one_hidden_state_per_token() -> None:
@@ -512,20 +439,14 @@ def test_a_later_token_does_change_the_earlier_outputs(pos: str) -> None:
 <Src file="tests/unit/test_encoder.py" tag="p3" lines="29-45" />
 
 Este es **el** test del módulo. En M2 el mismo experimento terminaba en `assert torch.allclose(…)`:
-cambiar un token futuro no podía mover ni un decimal de un logit pasado, y si lo movía es que la
-máscara causal se había roto. Aquí el `assert` lleva un `not` delante, y el módulo entero está en esa
-negación.
+cambiar un token futuro no podía mover ni un decimal de un logit pasado. Aquí el `assert` lleva un
+`not` delante.
 
-Dos cosas del montaje merecen leerse. `(x + 7) % (vocab_size - 1) + 1` cambia todos los tokens de la
-cola **y se mantiene dentro de `[1, vocab_size - 1]`**, es decir, nunca produce un 0: si produjera
-relleno, el resultado podría explicarse por el relleno y no por la bidireccionalidad. Y el
-`assert not torch.equal(idx, changed)` de antes comprueba que la transformación cambió algo de
-verdad; sin él, un cambio que por aritmética dejara el tensor igual haría que el test pasara por el
-motivo equivocado, que es el modo de fallo clásico de un test cuya aserción es una negación.
-
-El `parametrize` sobre `pos` está porque la bidireccionalidad no debe depender de cómo se codifique
-la posición. Con RoPE la posición entra dentro de la atención y no como una suma al principio, así
-que es un camino de código distinto y merece su comprobación.
+`(x + 7) % (vocab_size - 1) + 1` cambia la cola sin producir nunca un 0, para que el resultado no
+pueda explicarse por el relleno. Y el `assert not torch.equal(idx, changed)` comprueba que la
+transformación cambió algo: sin él, el test podría pasar por el motivo equivocado, el fallo clásico
+de una aserción negativa. El `parametrize` sobre `pos` cubre RoPE, que mete la posición dentro de la
+atención y es otro camino de código.
 
 ```python title="tests/unit/test_encoder.py"
 def test_padding_does_not_leak_into_the_real_tokens() -> None:
@@ -553,18 +474,13 @@ def test_an_entirely_masked_sequence_is_refused() -> None:
 
 <Src file="tests/unit/test_encoder.py" tag="p3" lines="48-68" />
 
-El primero es el test que de verdad prueba que la máscara sirve, y lo prueba **por los dos lados**.
-La primera mitad dice que con máscara la respuesta no depende de cuánto relleno viaje con la
-secuencia. La segunda dice que sin máscara **sí** depende, y esa mitad es la que impide que el test
-pase por casualidad: si la máscara no hiciera nada, las dos comparaciones darían el mismo resultado y
-la segunda aserción fallaría.
+El primero prueba la máscara por los dos lados: con máscara la respuesta no depende del relleno, y
+sin máscara sí. La segunda mitad es la que impide que el test pase por casualidad. Es un patrón que
+vale la pena copiar: **un test de un mecanismo comprueba que sin el mecanismo el resultado cambia**.
+Si no, lo único que has demostrado es que el modelo no mira la entrada.
 
-Es un patrón que vale la pena copiar: **un test de un mecanismo comprueba que sin el mecanismo el
-resultado cambia**. Si no, lo único que has demostrado es que el modelo no mira la entrada.
-
-El segundo caza las dos formas de llamar mal a `_key_mask`, con el `match` sobre el texto del
-mensaje. El `match=r"\(B, T\)"` con la barra invertida está así porque `pytest.raises(match=…)` es
-una expresión regular y los paréntesis serían un grupo.
+El segundo caza las dos formas de llamar mal a `_key_mask`. La barra invertida de `r"\(B, T\)"` está
+porque `match` es una expresión regular.
 
 ```python title="tests/unit/test_encoder.py"
 def test_mean_pooling_ignores_the_padding() -> None:
@@ -584,11 +500,9 @@ def test_mean_pooling_ignores_the_padding() -> None:
 
 <Src file="tests/unit/test_encoder.py" tag="p3" lines="71-83" />
 
-La propiedad que se está fijando es exactamente la que la lección 1 describía como envenenamiento: la
-representación de una secuencia **no puede depender de con quién le toque viajar en el lote**. Las
-dos primeras aserciones lo dicen para las dos formas de pooling. Las dos siguientes comprueban que la
-suma ponderada partida por el peso da lo mismo que un `mean` normal cuando no hay relleno, que es la
-forma de detectar una errata en el eje del `sum` o del `clamp`.
+La propiedad que se fija es la de la lección 1: la representación de una secuencia no puede depender
+de con quién le toque viajar en el lote. Las dos siguientes aserciones comprueban que la suma
+ponderada da lo mismo que un `mean` normal sin relleno, que es como se caza una errata en el eje.
 
 ```python title="tests/unit/test_encoder.py"
 def test_masked_lm_scores_only_the_masked_positions() -> None:
@@ -614,18 +528,11 @@ def test_masked_lm_scores_only_the_masked_positions() -> None:
 
 <Src file="tests/unit/test_encoder.py" tag="p3" lines="86-104" />
 
-Las dos últimas aserciones son el contrato de `MMM_IGNORE_INDEX` convertido en código, y hay que
-leerlas juntas.
-
-`torch.isnan(…)` con todas las etiquetas ignoradas **documenta el `nan` en vez de esconderlo**. Ya
-sabes de dónde viene: `reduction="mean"` divide por el número de posiciones puntuadas y ahí son
-cero. Escribirlo como aserción tiene dos efectos: deja claro que es aritmética y no un fallo, y
-convierte en una rotura de test cualquier cambio futuro que decida devolver `0.0` en ese caso —que
-sería lo peor de los dos mundos, porque un cero se suma a la media de la época sin que nadie lo note.
-
-La de `pad_label` es la que justifica la constante entera: una etiqueta de valor 0 produce una
-pérdida **finita**, o sea que se puntúa. En el decoder de M2, con `ignore_index=0`, esa misma
-etiqueta habría desaparecido de la pérdida sin decir nada.
+Las dos últimas aserciones son el contrato de `MMM_IGNORE_INDEX` en código. `torch.isnan(…)` con
+todas las etiquetas ignoradas documenta el `nan` en vez de esconderlo, y rompe el test si alguien
+decide devolver `0.0` en ese caso, un cero que se sumaría a la media de la época sin que nadie lo
+note. La de `pad_label` dice que una etiqueta 0 se puntúa; en el decoder de M2, con
+`ignore_index=0`, habría desaparecido de la pérdida sin decir nada.
 
 ```python title="tests/unit/test_encoder.py"
 def test_the_masked_move_head_is_tied_only_for_moves() -> None:
@@ -655,14 +562,10 @@ def test_the_squares_scheme_has_69_fixed_positions() -> None:
 
 <Src file="tests/unit/test_encoder.py" tag="p3" lines="107-129" />
 
-El primero comprueba el atado con `is` y no con `torch.equal`, y la diferencia es todo. `is` pregunta
-si son **el mismo tensor**; `equal` preguntaría si tienen los mismos números, y dos tensores
-inicializados con la misma semilla los tienen sin estar atados. Un test de atado escrito con `equal`
-pasa el primer día y deja de significar nada en cuanto empieza el entrenamiento.
-
-El segundo es el que vigila que las propiedades `seq` y `tokens` de `EncoderConfig` se apliquen de
-verdad: `model.positions.num_embeddings == 69` falla si alguien construye la tabla de posiciones con
-`cfg.block` en lugar de `cfg.seq`, que es el bug que esas propiedades existen para evitar.
+El primero comprueba el atado con `is`: pregunta si son el mismo tensor. Con `torch.equal` bastaría
+con tener los mismos números, y dos tensores inicializados con la misma semilla los tienen sin estar
+atados. El segundo falla si alguien construye la tabla de posiciones con `cfg.block` en lugar de
+`cfg.seq`.
 
 ```python title="tests/unit/test_encoder.py"
 def test_same_seed_gives_the_same_weights_and_hidden_states() -> None:
@@ -691,16 +594,10 @@ def test_preset_size(capsys: pytest.CaptureFixture[str]) -> None:
 
 <Src file="tests/unit/test_encoder.py" tag="p3" lines="132-153" />
 
-El de la semilla tiene las dos mitades otra vez: misma semilla, mismos números **bit a bit**
-(`torch.equal`); semilla distinta, números distintos. Sin la segunda, un modelo que devolviera ceros
-pasaría el test.
-
-El del tamaño es el que cierra la errata que la lección 1 contaba. Comprueba una **banda** y no un
-número exacto, que es lo correcto para un test de cordura: fijar 15 052 800 haría que cualquier
-cambio legítimo de la configuración rompiera un test que no trata de eso. Y el comentario deja
-escrito, en el repositorio y no en una conversación, que la banda «18M-25M» del plan era una
-estimación que su propia configuración no alcanza. El `capsys.disabled()` imprime las dos cuentas
-aunque pytest capture la salida: es un test que además informa.
+El de la semilla tiene las dos mitades otra vez: sin la segunda, un modelo que devolviera ceros
+pasaría. El del tamaño comprueba una banda y no un número exacto, para que un cambio legítimo de la
+configuración no rompa un test que no trata de eso; `capsys.disabled()` imprime las dos cuentas
+aunque pytest capture la salida.
 
 ```python title="tests/unit/test_encoder.py"
 def test_config_rejects_unknown_keys_and_bad_shapes() -> None:
@@ -738,15 +635,14 @@ def test_a_few_steps_of_gradient_descent_reduce_the_loss() -> None:
 
 <Src file="tests/unit/test_encoder.py" tag="p3" lines="156-186" />
 
-El primero recorre las validaciones de la lección 2, y el `n_layers=3` del principio —con la ese— es
-el test de `extra="forbid"`: una errata en un YAML tiene que ser un error y no un valor por defecto
-aplicado en silencio.
+El primero recorre las validaciones de la lección 2; el `n_layers=3` —con la ese— es el test de
+`extra="forbid"`.
 
 El último es el más barato y el que más veces salva. Diez pasos de `AdamW` sobre un lote fijo tienen
-que bajar la pérdida, y si no bajan, algo estructural está roto: un gradiente que no llega —una
-`detach` de más, un `no_grad` mal puesto— o una máscara que impide aprender. No comprueba que el
-modelo sea bueno; comprueba que **puede aprender**, que es lo que hace falta antes de gastar
-dieciséis minutos de GPU.
+que bajar la pérdida; si no bajan, algo estructural está roto: un `detach` de más, un `no_grad` mal
+puesto, una máscara que impide aprender. No comprueba que el modelo sea bueno, sino que **puede
+aprender**, antes de gastar dieciséis minutos de GPU. Conviene tenerlo en cualquier modelo que
+escribas.
 
 <Exercise n="01" title="Rompe la bidireccionalidad y mira qué test se queja">
   En una copia del repositorio, cambia `causal=False` por `causal=True` en el `__init__` de
@@ -756,9 +652,7 @@ dieciséis minutos de GPU.
 
 <Solution>
   Con `causal=True` falla `test_a_later_token_does_change_the_earlier_outputs`, las dos variantes del
-  `parametrize`, y solo ese: todo lo demás del encoder es indiferente a la dirección. Es el test que
-  existe exactamente para eso y por eso vale la pena que la aserción sea una negación explícita en
-  vez de un comentario.
+  `parametrize`, y solo ese: todo lo demás del encoder es indiferente a la dirección.
 
 Quitando el `attn_mask` de la llamada de atención fallan dos:
 `test_padding_does_not_leak_into_the_real_tokens` en su **primera** aserción —la respuesta pasa a
@@ -772,15 +666,15 @@ cambie, seguiría pasando: por sí sola no demuestra nada.
 
 ## Qué has aprendido
 
-El modelo entero es el decoder de M2 con otro nombre más tres cosas que el decoder no necesitaba
-—una máscara de claves para el relleno, una etiqueta que significa «no puntúes esto» y que no se
-puede confundir con un id, y una reducción de la secuencia a un vector que no promedia lo que no
-existe.
+El modelo entero es el decoder de M2 más tres cosas que el decoder no necesitaba: una máscara de
+claves para el relleno, una etiqueta de «no puntúes esto» que no se confunde con ningún id, y una
+reducción de la secuencia a un vector que no promedia lo que no existe. Y un patrón de test para
+cualquier proyecto: para probar un mecanismo, comprueba también que sin él el resultado cambia.
 
 **Cómo se mide**: `uv run pytest tests/unit/test_encoder.py -q` pasa los doce tests (trece casos,
 contando el `parametrize`), y entre ellos el que en M2 tenía que fallar. En tu repositorio se
-ejecutan al final de la lección siguiente: este fichero de tests y `config.py` importan
-`rukh.models.squares`, y `rukh/models/__init__.py` importa las cabezas, y las dos cosas llegan allí. `PositionEncoder(EncoderConfig()).num_params(False)` imprime 15 052 800.
+ejecutan al final de la lección siguiente, porque los tests y `config.py` importan
+`rukh.models.squares` y `__init__.py` importa las cabezas, y las dos cosas llegan allí.
 
 Lo siguiente son las tres cabezas que leen ese vector y el traductor de FEN a 69 tokens, que es la
 segunda representación de entrada del experimento del módulo.

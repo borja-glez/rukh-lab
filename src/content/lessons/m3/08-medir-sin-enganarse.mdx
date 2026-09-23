@@ -6,10 +6,10 @@ description:
   Pearson y Spearman a la vez, y por qué el reparto de los datos va por partida y no por posición.
 module: m3
 order: 8
-duration: 205
+duration: 165
 level: avanzado
 status: vigente
-updated: 2026-09-22
+updated: 2026-09-23
 keywords:
   - encoder
   - bidireccional
@@ -36,60 +36,88 @@ keywords:
   - tasa base
 ---
 
-Lección 8 de 11 del módulo «El encoder». Viene de «Evaluar el encoder» y sigue en «Exportar el
-encoder». Es la segunda mitad de `src/rukh/eval/encoder.py` —las métricas y el reparto del
-umbral— más el baseline entero, y la parte más transferible del módulo.
+import M3OperatingPoint from '../../../components/figures/M3OperatingPoint.astro';
+
+Esta lección es la segunda mitad de `src/rukh/eval/encoder.py` —las métricas y el reparto del
+umbral— más el baseline entero. Es la parte del módulo que más vas a reutilizar: sirve igual para
+un detector de fraude, un filtro de spam o un reranker de un RAG, en cuanto la clase que te
+interesa es rara.
 
 ## Cómo se mide y contra qué
 
-Al terminar esta sección sabrás leer las cifras que produce `rukh eval encoder`, explicar por qué la
-baseline es deliberadamente malo, elegir un <Term id="punto-de-operacion">punto de operación</Term> sin hacer trampa y decir qué
-significa cada métrica en un problema donde una clase es rara.
+Al terminar sabrás leer las cifras de `rukh eval encoder`, explicar por qué el baseline es malo a
+propósito y elegir un <Term id="punto-de-operacion">punto de operación</Term> sin hacer trampa.
 
-Un encoder no juega partidas, así que no se puede medir como al decoder. Se mide por lo que sabe de
-posiciones que no ha visto: la partición de validación del reparto por partidas, que es el **10 %**
-de las partidas (`val_fraction: 0.1`, nunca el 10 % de las posiciones sueltas), y **con la línea
-base medida sobre exactamente las mismas filas**.
-
-Estos son los números reales del hito, para que leas el resto de la sección sabiendo adónde va:
+Un encoder no juega partidas, así que se mide por lo que sabe de posiciones que no ha visto: la
+partición de validación, que es el 10 % de las partidas (`val_fraction: 0.1`, no el 10 % de las
+posiciones sueltas), con el baseline medido sobre las mismas filas. Estos son los números del hito:
 
 <div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
 
-| Criterio del hito                   | Listón            | Al cerrar el hito         | Hoy        | ¿Se cumple? |
-| ----------------------------------- | ----------------- | ------------------------- | ---------- | ----------- |
-| F1 de error sobre la heurística     | +5 puntos         | **+9,2** (0,180 vs 0,089) | **+9,7**   | **sí**      |
-| Correlación del valor con Stockfish | ≥ 0,80 (Spearman) | 0,520                     | **0,6665** | **no**      |
+| Criterio del hito                   | Listón            | Al cerrar el hito     | Hoy    | ¿Se cumple? |
+| ----------------------------------- | ----------------- | --------------------- | ------ | ----------- |
+| F1 de error sobre la heurística     | +5 puntos         | +9,2 (0,180 vs 0,089) | +9,7   | sí          |
+| Correlación del valor con Stockfish | ≥ 0,80 (Spearman) | 0,520                 | 0,6665 | **no**      |
 
 </div>
 
-La columna «hoy» existe porque el módulo siguió midiendo después de publicarse, y lo que se
-encontró —que la pérdida optimizaba una cosa distinta de la que puntúa el criterio— está más abajo,
-en «La pérdida no medía lo que el criterio mide». La cifra sube de 0,520 a 0,6665 y **sigue sin
-cumplir**, que es exactamente por lo que la tabla tiene dos columnas y no una reescrita. Todas las
-cifras «al cerrar el hito» de esta lección son del mismo checkpoint, el afinado `last-n` del esquema
-de jugadas (`checkpoints/encoder-heads-moves-20260919-101904/best.pt`), que es el que se publicó;
-cuando aparezca otro se dirá cuál.
+La columna «hoy» es la del modelo después de cambiar la pérdida de la cabeza de valor (lo cuenta
+«La pérdida no medía lo que el criterio mide», más abajo): sube de 0,520 a 0,6665 y sigue sin
+cumplir. Salvo donde se diga otra cosa, las cifras de esta lección son del checkpoint publicado al
+cerrar el hito, el afinado `last-n` del esquema de jugadas.
 
-Un criterio cumplido y otro no, y las dos cosas se publican con el mismo tamaño de letra. Hay además
-una tercera cifra, `val/blunder_acc = 96,78 %`, que no es ningún criterio y que si se leyera como si
-lo fuera sería la mentira más cómoda del módulo. Empezamos por ella.
+Hay una tercera cifra, `val/blunder_acc = 96,78 %`, que no es ningún criterio y que, leída como si
+lo fuera, sería la mentira más cómoda del módulo. Antes de desmontarla hacen falta tres
+definiciones.
+
+### Precisión, exhaustividad y F1
+
+Las tres hablan de un detector que marca algunas filas como «error».
+
+La **precisión** responde a «de lo que marqué, cuánto era de verdad». Es la que le importa a la
+demo: una barra que grita «error» en jugadas correctas se apaga a los cinco minutos. La
+**exhaustividad** responde a «de lo que había, cuánto marqué», y es la que le importa a quien
+analiza sus partidas. Las dos tiran en sentidos opuestos: bajar el umbral captura más errores
+reales y también más falsas alarmas. Dónde plantarse es una decisión de producto, no matemática.
+
+F1 es la media armónica de las dos, `2·P·R/(P+R)`, y se usa porque castiga el desequilibrio: con
+precisión 1,0 y exhaustividad 0,01, la media aritmética daría 0,5 y la armónica da 0,02. Es la
+velocidad media de un viaje de ida y vuelta: si vas a 100 km/h y vuelves a 20, la media sale 33 y
+no 60, porque en el tramo lento pasas cinco veces más tiempo. La pata lenta manda.
+
+El checkpoint publicado saca 11,7 % de precisión, 39,6 % de exhaustividad y 18,0 % de F1. De dónde
+salen esas cifras es el resto de la lección.
+
+<Exercise n="01" title="Media aritmética contra media armónica, con los números del informe">
+  La cabeza publicada tiene precisión 0,117 y exhaustividad 0,396. Calcula la media aritmética y
+  la armónica de las dos. Después haz lo mismo con la heurística de material de más abajo (0,047 y
+  0,771). ¿Cuál de las dos medias le daría a la heurística un número más parecido al del encoder, y
+  por qué es eso lo que no se quiere?
+
+  <Solution>
+    Encoder: aritmética `(0,117 + 0,396) / 2 = 0,257`; armónica
+    `2 · 0,117 · 0,396 / (0,117 + 0,396) = 0,0927 / 0,513 = 0,181`, que es el 18,0 % del informe
+    salvo redondeo. Heurística: aritmética `(0,047 + 0,771) / 2 = 0,409`; armónica
+    `2 · 0,047 · 0,771 / 0,818 = 0,089`, el 8,9 % del informe.
+
+    Con la aritmética la heurística ganaría (0,409 frente a 0,257): la exhaustividad del 77 %
+    compensa de sobra una precisión de una entre veinte. Con la armónica pierde por la mitad. Eso
+    es lo que se quiere: que marcar dos de cada tres jugadas como error no se pueda disfrazar de
+    detector.
+
+  </Solution>
+</Exercise>
 
 ### El 96,78 % que no significa nada
 
-Esta es la subsección más transferible del módulo, y no tiene nada que ver con el ajedrez: vale para
-cualquier detector de algo raro que vayas a construir en tu vida —fraude, fallos de máquina,
-diagnósticos, moderación—, que es decir, para casi todos.
+Los errores son el 3,72 % de las filas etiquetadas, y de ahí salen tres consecuencias que valen
+para cualquier detector de algo raro: fraude, fallos de máquina, diagnósticos, moderación.
 
-**Los errores son el 3,72 % de las filas etiquetadas.** De ahí salen tres consecuencias, en orden de
-gravedad.
-
-**Uno: la exactitud no mide nada.** Un detector que conteste siempre "no hay error" acierta el
-**96,3 %** de las veces sin mirar el tablero. Nuestra cabeza saca 96,78 %. Los cuatro decimales de
-diferencia son todo lo que la exactitud es capaz de decir de un modelo que, como vas a ver, sí ha
-aprendido algo. Cuando una clase es rara, la exactitud mide la <Term id="tasa-base">tasa base</Term> y disfraza de resultado una
-propiedad del dataset.
-
-Esa frase está en el código, y está ahí porque tiene que viajar con cada número de esta sección:
+**Uno: la exactitud no mide nada.** Un detector que conteste siempre «no hay error» acierta el
+96,3 % de las veces sin mirar el tablero. Nuestra cabeza saca 96,78 %. Esas décimas son todo lo que
+la exactitud sabe decir de un modelo que, como vas a ver, sí ha aprendido algo. Cuando una clase es
+rara, la exactitud mide la <Term id="tasa-base">tasa base</Term> y disfraza de resultado una
+propiedad del dataset. La advertencia está en el código, para que viaje con cada número:
 
 ```python title="src/rukh/eval/encoder.py"
 def base_rate_caveat(base_rate: float | None) -> str:
@@ -123,62 +151,58 @@ def sentence(text: str) -> str:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="317-343" />
 
-Una función que devuelve **una advertencia** y no una cifra. Merece existir por dos razones. La
-primera: la frase aparece en tres sitios —las notas del resultado, el informe en Markdown y
-la <Term id="model-card">model card</Term> que se publica— y tenerla escrita una vez es lo que impide
-que una de las tres se quede con una versión más suave.
+La frase aparece en tres sitios: las notas, el informe y la <Term id="model-card">model card</Term>; escrita una sola vez, ninguna de las tres puede quedarse
+con una versión más suave. Y calcula el contrafáctico, `(1 - base_rate) * 100`: «la exactitud no
+significa mucho aquí» es una opinión; «un modelo que siempre contesta que no saca 96,3 %» es un
+dato, y el lector hace la resta solo.
 
-La segunda es que **calcula el número del contrafáctico**: `(1 - base_rate) * 100` es lo que saca el
-detector que no mira nada. Una advertencia que dice «la exactitud no significa mucho aquí» es una
-opinión; una que dice «un modelo que siempre contesta "no hay error" saca 96,3 %» es un dato al lado
-del 96,78 % del modelo, y el lector hace la resta solo.
-
-El docstring de `sentence` explica por qué no es `str.capitalize`: ese método pone en minúscula el
-resto de la cadena, así que convertiría `ROC AUC` en `Roc auc` de paso. Es el tipo de detalle que
-parece trivial hasta que un informe publicado dice «F1» en tres grafías distintas.
-
-**Dos: el F1 en un umbral arbitrario tampoco mide lo que crees.** Esta es la que engaña a gente con
-experiencia. El F1 de esta cabeza en el umbral fijo de 0,5 es **exactamente 0,0000**. Precisión
-cero, exhaustividad cero, cero posiciones marcadas de 3 660. La razón está en una sola línea del
-informe:
+**Dos: el F1 en un umbral arbitrario tampoco mide lo que crees.** Esta engaña a gente con
+experiencia. El F1 de esta cabeza en el umbral fijo de 0,5 es 0,0000: cero posiciones marcadas de
+3 660. La razón está en una línea del informe:
 
 ```text
 encoder    probability span: 0.0020 to 0.3102 (mean 0.0353)
 ```
 
-**La probabilidad más alta que esta cabeza le da a una posición en todo el conjunto es 0,3102.** En
-0,5 no se dispara nunca, así que ese F1 era cero por construcción antes de entrenar nada. Y no es
-que el modelo esté roto: es que un sigmoide entrenado con entropía cruzada sobre una clase del 3,7 %
-aprende, correctamente, que la respuesta esperada casi siempre es "no", y coloca toda su masa de
-probabilidad abajo. Ordena bien las posiciones y las ordena todas por debajo de 0,5. **Un F1 en un
-umbral fijo mide la calibración de un sigmoide que nadie calibró, no la calidad de la
-representación.**
+La probabilidad más alta que esta cabeza le da a una posición en todo el conjunto es 0,3102, así
+que en 0,5 no se dispara nunca. Y el modelo sí sabe algo: ordena bien las posiciones (lo dirá el
+ROC AUC), solo que las deja todas por debajo de 0,5. Sin esa línea del informe, el cero parecería
+un modelo que no funciona.
 
-Esa línea del informe no es un adorno: sale del `RankingResult` de la lección anterior, que guarda el
-mínimo, el máximo y la media de las probabilidades **como campos del resultado**. Sin ella, el cero
-parece un modelo roto.
+Hay dos razones para ese cero. La primera es la <Term id="calibracion">calibración</Term>: un
+modelo está calibrado cuando sus probabilidades significan lo que dicen, como el meteorólogo que,
+de todos los días en que anuncia un 30 % de lluvia, acierta más o menos en tres de cada diez. Nadie
+calibró esta cabeza, así que su 0,5 no tiene por qué querer decir «más probable que sí que que no».
+La segunda es más de fondo: aunque estuviera calibrada, 0,5 sería un mal umbral para F1 con una
+clase del 3,7 %, porque casi ninguna jugada es, vista desde fuera, más probablemente error que no.
+Para un clasificador calibrado, el umbral que maximiza F1 está en la mitad del mejor F1 alcanzable:
+con un F1 en torno a 0,18, alrededor de 0,09, del orden del 0,066 que encontrará el barrido de
+abajo. Sea cual sea la razón, **un F1 en un umbral fijo mide el umbral, no la representación.**
 
-**Tres: elegir el umbral es legítimo, y hay una única forma honesta de hacerlo.** El umbral es un
-hiperparámetro como cualquier otro, y nadie te obliga a dejarlo en el 0,5 que viene de fábrica. Lo
-que no vale es elegirlo mirando las filas que después vas a puntuar, porque entonces el número que
-publicas es el máximo de una búsqueda sobre el propio conjunto de evaluación y no una estimación de
-nada. El procedimiento correcto es:
+<Figure
+  n="01"
+  caption="El eje de las probabilidades que emite la cabeza de errores, de 0 a 1. Todas las de la mitad score caen en la franja de la izquierda, entre 0,002 y 0,310. El umbral de fábrica, 0,5, queda fuera de la franja y no marca ninguna posición; el umbral elegido en la mitad tune, 0,0663, cae dentro y marca 488."
+>
+  <M3OperatingPoint />
+</Figure>
 
-1. Parte las filas etiquetadas del conjunto held-out en dos mitades, **por `game_id`** y nunca por
-   posición, por la misma razón que el reparto principal (la sección «Fuga de datos»). Aquí salen
-   3 793 filas / 2 455 partidas en la mitad `tune` y 3 660 filas / 2 368 partidas en la mitad
-   `score`.
-2. En la mitad `tune`, barre el umbral y quédate con el que maximiza F1. Aquí sale **0,0663**.
-3. **Publica el F1 medido en la mitad `score`**, que no ha visto ningún umbral. Aquí sale **0,180**.
+**Tres: elegir el umbral es legítimo, si se hace en otras filas.** El umbral es un hiperparámetro
+como cualquier otro. Lo que no vale es elegirlo mirando las filas que después vas a puntuar: el
+número publicado sería el máximo de una búsqueda sobre el propio conjunto de evaluación, no una
+estimación de nada. El procedimiento:
 
-Y publica también lo que se mueve entre las dos mitades, porque es la parte que casi nadie enseña:
-el mismo umbral 0,0663 da **0,171** en la mitad `tune` donde se eligió y **0,180** en la mitad
-`score`. Esta vez la mitad que no eligió salió casi un punto por encima; con el checkpoint `full`
-de la tabla de la lección 1 fue al revés (0,184 en `tune`, 0,179 en `score`). Lo que hay que leer no es el
-signo, es el tamaño: con 144 errores en 3 660 filas, un punto de F1 es lo que separa dos mitades del
-mismo conjunto sin cambiar nada. Elegir el umbral en las filas que luego se puntúan convierte esa
-diferencia en optimismo garantizado, y esa es la razón entera de que las dos mitades no sean las
-mismas filas.
+1. Parte las filas etiquetadas del conjunto held-out en dos mitades, por `game_id` y nunca por
+   posición (la sección «Fuga de datos» explica por qué). Aquí salen 3 793 filas / 2 455 partidas
+   en la mitad `tune` y 3 660 filas / 2 368 partidas en la mitad `score`.
+2. En la mitad `tune`, barre el umbral y quédate con el que maximiza F1. Aquí sale 0,0663.
+3. Publica el F1 medido en la mitad `score`, que no ha visto ningún umbral. Aquí sale 0,180.
+
+Publica también lo que se mueve entre las dos mitades: el mismo umbral da 0,171 en `tune` y 0,180
+en `score` (con el checkpoint `full` de la lección 1 fue al revés, 0,184 y 0,179). Importa el
+tamaño, no el signo: con 144 errores en 3 660 filas, un punto de F1 separa dos mitades del mismo
+conjunto sin cambiar nada. Elegir el umbral en las filas que luego se puntúan convierte esa
+oscilación en optimismo garantizado. Es la misma disciplina que separar validación y test al
+ajustar hiperparámetros.
 
 ### El reparto del umbral, en código
 
@@ -202,18 +226,10 @@ def threshold_halves(games: Sequence[int], seed: int) -> np.ndarray:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="346-360" />
 
-La palabra que hace este reparto correcto es `threshold` metida en medio de la cadena que se
-digiere: `f"{seed}:threshold:{game_id}"`. Es una **sal**, y sin ella los dos repartos del proyecto
-—el de entrenamiento/validación de la lección 6 y este— serían el mismo CRC-32 de la misma semilla y
-del mismo id, y por tanto estarían correlacionados. Con la misma semilla, las partidas que caen en
-validación caerían siempre en la misma mitad de umbral, y eso no rompe nada hoy pero convierte dos
-sorteos independientes en uno.
-
-Es la misma técnica que se usa para que dos usos distintos de una función de hash no colisionen, y
-cuesta una palabra.
-
-Lo demás es el reparto de la lección 6 con `% 2` en vez de una fracción: mitad y mitad, por partida,
-reproducible.
+Es el reparto de la lección 6 con `% 2`, y lo que lo hace correcto es la palabra `threshold` en
+medio de la cadena: una **sal**. Sin ella, este sorteo y el de entrenamiento/validación serían el
+mismo CRC-32 de la misma semilla y el mismo id, y dos repartos que deben ser independientes
+saldrían correlacionados.
 
 ```python title="src/rukh/eval/encoder.py"
 def f1_at(truth: Sequence[int], scores: Sequence[float], threshold: float) -> float:
@@ -259,63 +275,37 @@ def best_threshold(
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="428-466" />
 
-El barrido del umbral, y hay cuatro decisiones dentro que merecen leerse despacio.
-
-**Los candidatos son las puntuaciones distintas, no una rejilla.** Un barrido de `0.01` a `0.99` en
-pasos de `0.01` puede saltarse el óptimo entero cuando todas las probabilidades viven por debajo de
-0,31, y desde luego se lo salta cuando viven por debajo de 0,01. Los únicos umbrales que pueden
-cambiar algo son los valores que el modelo produjo: entre dos de ellos, la decisión de todas las filas
-es la misma. Con eso el barrido es **exacto** y cuesta un `argsort`.
-
-**Se incluye el umbral configurado entre los candidatos.** Así el barrido nunca devuelve algo _peor_
-que el 0,5 de fábrica en las filas donde eligió, que es la única garantía que un barrido puede dar
-honestamente. Y es también un recordatorio de lo que un barrido no garantiza: nada sobre otras filas.
-De ahí que el número que se publica se mida en otro sitio.
-
-**Los empates van al umbral más bajo** (`candidates.sort(key=lambda pair: (-pair[1], pair[0]))`
-ordena por F1 descendente y, a igualdad, por umbral ascendente). Con una clase rara, el umbral más
-bajo marca más posiciones, así que es el menos afortunado de los dos: si dos umbrales dan el mismo F1
-en la mitad `tune`, el que marca más tiene menos probabilidad de estar aprovechando una casualidad.
-
-**El cálculo es vectorizado con una acumulada.** Ordenando por puntuación descendente,
-`hits = cumsum(labels == 1)` son los verdaderos positivos acumulados y `seen` son las marcadas, así
-que precisión y exhaustividad salen para **todos** los umbrales a la vez. La alternativa —un bucle que
-llame a `classification` por cada umbral candidato— sería cuadrática: con 3 793 filas, catorce
-millones de comparaciones en vez de un `argsort`.
-
-El `last = np.append(ordered[1:] != ordered[:-1], True)` es la máscara de «último elemento de cada
-grupo de puntuaciones iguales», y está ahí porque un umbral no puede separar dos filas con la misma
-probabilidad. Sin ella, el barrido evaluaría puntos que ningún umbral puede alcanzar.
+El barrido tiene dos decisiones que no se ven a simple vista. Los candidatos son las puntuaciones
+distintas y no una rejilla de `0.01` a `0.99`, que se saltaría el óptimo cuando todas las
+probabilidades viven por debajo de 0,31: entre dos valores que el modelo produjo, la decisión de
+todas las filas es la misma, así que probar solo esos valores hace el barrido exacto. Y el cálculo
+es una acumulada: ordenando por puntuación descendente, `hits` son los aciertos acumulados y `seen`
+las marcadas, así que precisión y exhaustividad salen para todos los umbrales con un solo
+`argsort`. La máscara `last` se queda con el final de cada grupo de puntuaciones iguales, porque un
+umbral no puede separar dos filas con la misma probabilidad.
 
 <Callout kind="teoria" title="Y las métricas que ningún umbral puede halagar">
-  Junto al F1 ajustado, el informe publica dos cifras que no dependen de ningún umbral, porque son
-  las que de verdad dicen si la representación sabe algo.
+  Junto al F1 ajustado, el informe publica dos cifras que no dependen de ningún umbral: son las que
+  dicen si la representación sabe algo.
 
-**<Term id="roc-auc">ROC AUC</Term>** es la probabilidad de que, cogidos al azar un error y una jugada tranquila, el modelo
-puntúe más alto el error. 0,5 es una moneda. Aquí sale **0,740**: en tres de cada cuatro parejas,
-el orden es el correcto. Ese es el número que dice que la cabeza no está vacía, y es el mismo
-modelo cuyo F1 en 0,5 era cero.
+**<Term id="roc-auc">ROC AUC</Term>** es la probabilidad de que, cogidos al azar un error y una
+jugada tranquila, el modelo puntúe más alto el error. 0,5 es una moneda. Aquí sale 0,740: en tres
+de cada cuatro parejas el orden es el correcto, con el mismo modelo cuyo F1 en 0,5 era cero.
 
-**La <Term id="precision-media">precisión media</Term>** es el área bajo la curva de precisión-exhaustividad, y su referencia no es
-0,5 sino **la tasa base**: un orden aleatorio saca 0,037. Aquí sale **0,112**, el triple.
-Es una cifra fea comparada con el ROC AUC, y no es un error de cálculo: con una clase tan rara,
-el ROC AUC se deja impresionar por lo bien que el modelo ordena los negativos entre sí, mientras
-que la precisión media solo mira si los positivos suben. Cuando las dos discrepan así, la
-pesimista es la que se parece a lo que verá el usuario.
+La <Term id="precision-media">precisión media</Term> es el área bajo la curva de
+precisión-exhaustividad, y su referencia es la tasa base: un orden aleatorio saca 0,037. Aquí sale
+0,112, el triple. Parece fea al lado del ROC AUC porque con una clase tan rara el ROC AUC se deja
+impresionar por lo bien que el modelo ordena los negativos entre sí, mientras que la precisión media
+solo mira si los positivos suben arriba, como la primera página de un buscador. Cuando discrepan
+así, la pesimista es la que se parece a lo que verá el usuario, y es la que conviene mirar al
+evaluar la recuperación de un RAG.
 
-Las dos tienen una imagen fuera del ajedrez. ROC AUC es un juez al que le enseñan, de dos en dos,
-un culpable y un inocente elegidos al azar y le preguntan cuál le parece más sospechoso: la
-proporción de parejas que acierta. Con muchísimos inocentes, ordenar bien a los inocentes entre sí
-también cuenta, y eso infla la cifra. La precisión media es la primera página de un buscador: solo
-mira si los resultados relevantes están arriba, y le da igual lo bien ordenada que esté la página
-cuarenta. Cuando lo que importa es lo que el usuario ve primero, la segunda es la que manda.
-
-Las dos están implementadas a mano sobre rangos en `src/rukh/eval/encoder.py`, sin `scipy` ni
-`scikit-learn`: son dos funciones cortas y no merecen una dependencia.
+Las dos están escritas a mano sobre rangos, sin `scipy` ni `scikit-learn`.
 
 </Callout>
 
-Van enteras, porque cada comprobación tapa una forma distinta de engañarse. Primero la que cuenta:
+Van enteras, porque cada comprobación tapa una forma distinta de engañarse. Primero la que cuenta
+aciertos, donde solo hay que mirar los ceros de los casos degenerados:
 
 ```python title="src/rukh/eval/encoder.py"
 def classification(
@@ -350,17 +340,9 @@ def classification(
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="287-314" />
 
-La matriz de confusión y las tres métricas, y lo único que hay que mirar son los **tres ceros de los
-casos degenerados**.
-
-`precision = 0.0` cuando no se marcó nada. Matemáticamente la precisión de cero marcas es
-indefinida —un cero partido por cero—, y hay dos convenciones: cero o `nan`. Aquí es cero porque el
-caso ocurre de verdad en este módulo (el umbral fijo de 0,5 no marca ninguna fila) y un `nan` en la
-tabla del informe sería peor de leer que un 0,0 % junto a las 0 marcadas que lo explican.
-
-`f1 = 0.0` cuando precisión y exhaustividad son las dos cero, por el mismo motivo. Y ese es el
-0,0000 del umbral fijo: no es un modelo roto, es la fórmula aplicada a un detector que no marcó
-nada.
+La precisión de cero marcas es cero partido por cero, y hay dos convenciones: cero o `nan`. Aquí es
+cero porque el caso ocurre de verdad (el umbral fijo de 0,5 no marca ninguna fila) y un 0,0 % junto
+a las 0 marcadas que lo explican se lee mejor que un `nan`. Ese es el 0,0000 del umbral fijo.
 
 ```python title="src/rukh/eval/encoder.py"
 def roc_auc(truth: Sequence[int], scores: Sequence[float]) -> float | None:
@@ -385,22 +367,11 @@ def roc_auc(truth: Sequence[int], scores: Sequence[float]) -> float | None:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="363-380" />
 
-El ROC AUC calculado con **la identidad de Mann-Whitney** en vez de recorriendo una curva. Las dos
-dan el mismo número; esta es más corta y es exacta con empates.
-
-La idea: la suma de los rangos de los positivos, menos la suma mínima posible que tendrían si fueran
-los peores de todos (`n(n+1)/2`), dividida por el número de parejas positivo-negativo, **es**
-exactamente la proporción de parejas bien ordenadas. Se lee mejor al revés: si los positivos tienen
-los rangos más altos, la suma es máxima y el resultado es 1.
-
-El docstring dice por qué importan los rangos medios: **un predictor constante saca exactamente
-0,5** en vez de 0 o 1 según cómo el algoritmo de ordenación haya roto el empate. Sin eso, la
-métrica que se supone que es inmune a la calibración dependería de un detalle de la implementación
-del `sort`.
-
-El `return None` cuando no hay positivos o no hay negativos es correcto y no una salida perezosa: el
-ROC AUC no está definido si falta una de las dos clases, y `None` se serializa como `null` y el
-informe escribe `n/a`.
+El ROC AUC sale de la identidad de Mann-Whitney en vez de recorrer una curva: la suma de los rangos
+de los positivos, menos la mínima posible (`n(n+1)/2`), dividida por el número de parejas
+positivo-negativo, es la proporción de parejas bien ordenadas. Los rangos medios hacen que un
+predictor constante saque 0,5 y no 0 o 1 según cómo la ordenación rompiera los empates. Sin una de
+las dos clases el ROC AUC no está definido, y el informe escribe `n/a`.
 
 ```python title="src/rukh/eval/encoder.py"
 def average_precision(truth: Sequence[int], scores: Sequence[float]) -> float | None:
@@ -432,15 +403,10 @@ def average_precision(truth: Sequence[int], scores: Sequence[float]) -> float | 
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="383-407" />
 
-La misma técnica de la acumulada que `best_threshold`, y la misma máscara de empates. El docstring
-dice el fallo que la máscara evita, y es espectacular: **un predictor que devuelve el mismo número
-en todas las filas sacaría 1,0** si los empates se rompieran por suerte. Basta con que el orden
-estable ponga los positivos primero: con recall subiendo de 0 a 1 mientras la precisión sigue
-valiendo 1, el área es 1. Tratar cada grupo de puntuaciones iguales como **un solo paso** es lo que
-lo convierte en la tasa base, que es la respuesta correcta.
-
-Ese es el tipo de bug que produce un número perfecto en una métrica que nadie sospecha, y por eso el
-comentario está en la línea de la máscara.
+La misma acumulada que `best_threshold`, y la misma máscara de empates. Sin ella, un predictor que
+devuelve el mismo número en todas las filas sacaría 1,0 si el orden estable pusiera los positivos
+primero: un número perfecto del que nadie sospecharía. Tratar cada grupo de puntuaciones iguales
+como un solo paso lo deja en la tasa base, que es la respuesta correcta.
 
 ```python title="src/rukh/eval/encoder.py"
 def ranking(truth: Sequence[int], scores: Sequence[float], name: str = "encoder") -> RankingResult:
@@ -463,9 +429,8 @@ def ranking(truth: Sequence[int], scores: Sequence[float], name: str = "encoder"
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="410-425" />
 
-Las dos métricas sin umbral **más el rango de las puntuaciones**, en un solo registro. Es el paquete
-que responde «¿sabe algo esta cabeza?» sin que nadie haya elegido un punto de operación, y el rango
-es lo que explica el F1 del umbral de fábrica.
+Las dos métricas sin umbral más el rango de las puntuaciones, en un registro que responde «¿sabe
+algo esta cabeza?» sin que nadie haya elegido un punto de operación.
 
 ```python title="src/rukh/eval/encoder.py"
 def _finite(*arrays: np.ndarray) -> np.ndarray:
@@ -537,37 +502,22 @@ def measure_blunder(
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="671-735" />
 
-El procedimiento de tres pasos, en código. Léelo y verás que las tres líneas que producen los
-números publicados usan **todas** `[score]`, y la que elige el umbral usa `[tune]`. No hay ninguna
-excepción, y eso es la garantía.
-
-La comprobación `usable` es la que merece detenerse. Exige cuatro cosas: que cada mitad tenga al
-menos un error **y** al menos una jugada tranquila. Si falta cualquiera de las cuatro, el barrido en
-`tune` no tendría nada que optimizar o la medida en `score` no tendría nada que medir. En ese caso el
-código hace lo único honesto que se puede hacer: usa todas las filas para las dos cosas, **lo marca**
-con `threshold_split_degenerate`, y el informe imprime un aviso que dice que el F1 es una cota
-superior y no un número held-out.
-
-Fíjate en cómo lo marca: `tune` y `score` pasan a ser **las dos** máscaras de todo. No es una
-chapuza: es la forma de que el resto de la función siga siendo el mismo código, y de que `tune_items`
-y `score_items` salgan los dos iguales al total, lo que hace el problema visible en la salida sin
-leer el booleano.
-
-`margin = 100.0 * (f1_encoder - f1_heuristica)` en **puntos** y no en proporción, porque el criterio
-del hito está escrito en puntos. Convertir en el sitio donde se compara con la constante evita el
-error de comparar 0,092 con 5.
+El procedimiento de tres pasos, en código: todas las líneas que producen números publicados usan
+`[score]`, y la que elige el umbral usa `[tune]`. La comprobación `usable` exige que cada mitad
+tenga al menos un error y al menos una jugada tranquila; si no, el código usa todas las filas para
+las dos cosas y lo marca con `threshold_split_degenerate`, y el informe avisa de que el F1 es una
+cota superior. `margin` va en puntos porque el criterio del hito está escrito en puntos, y así nadie
+compara 0,092 con 5.
 
 ### La heurística de material y movilidad
 
-El baseline cabe en una página: peón 1, caballo 3, alfil 3, torre 5, dama 9, rey 0. A eso se le
-suma la movilidad —jugadas legales de las blancas menos las de las negras, a 0,05 peones cada una,
-o sea que veinte jugadas de diferencia valen un peón— y se convierte a la misma escala acotada que
-la etiqueta, `tanh(puntuación / 4)` en peones, que es idéntico a `tanh(cp / 400)` en centipeones.
-Para juzgar una jugada, se juega en un tablero de `python-chess` y se deja que el rival conteste con
-su captura o promoción más rentable, a un solo <Term id="ply">ply</Term>; si el balance de material del que movió cae un
-punto o más, la heurística dice "error".
-
-El fichero abre declarando lo que no sabe hacer:
+El baseline cabe en una página: el material de toda la vida (peón 1, caballo y alfil 3, torre 5,
+dama 9) más la movilidad, pasado a la misma escala acotada que la etiqueta. Para juzgar una jugada,
+se juega en un tablero de `python-chess` y se deja que el rival conteste con su captura o promoción
+más rentable, a un solo <Term id="ply">ply</Term>; si el material del que movió cae un punto o más,
+la heurística dice «error». Es el equivalente, en un clasificador de texto, a una regla de palabras
+clave: tonta, rápida y sorprendentemente difícil de batir por mucho. El fichero abre declarando lo
+que no sabe hacer:
 
 ```python title="src/rukh/eval/heuristic.py"
 """The dumb baseline the encoder has to beat: material, mobility and a one-ply look at captures.
@@ -605,6 +555,12 @@ fixed, because fixing them would make the baseline a small engine instead of a f
 
 <Src file="src/rukh/eval/heuristic.py" tag="p3" lines="1-31" />
 
+La sección «What it cannot see» es la decisión de diseño del fichero: **el baseline es malo a
+propósito**, y sus cegueras se escriben en vez de arreglarse. Uno que ya entendiera los sacrificios
+sería un competidor, y el margen dejaría de significar «el modelo aprendió algo más que contar
+piezas». Lo innegociable es medirlo igual: mismas filas, misma definición de acierto, mismo umbral
+de 100 centipeones en la etiqueta.
+
 ```python title="src/rukh/eval/heuristic.py"
 from __future__ import annotations
 
@@ -617,17 +573,8 @@ from pydantic import BaseModel, ConfigDict
 
 <Src file="src/rukh/eval/heuristic.py" tag="p3" lines="33-39" />
 
-Los imports dicen que el baseline no depende de `torch`: es ajedrez y aritmética. Por eso puede
-correr en la CI sin GPU y por eso sus veredictos se pueden cachear sin pensar en pesos.
-
-Una sección entera del docstring titulada **«What it cannot see»**. Eso es la decisión de diseño del
-fichero: es mala a propósito, y las cegueras se escriben en vez de arreglarse.
-
-Un baseline que ya entendiera los sacrificios no sería un suelo: sería un competidor, y el margen
-dejaría de significar "el modelo aprendió algo más que contar piezas". Lo que sí es innegociable es
-medirla **igual**: mismas filas, misma definición de acierto, mismo umbral de 100 centipeones en la
-etiqueta. Un margen medido sobre dos conjuntos distintos no es un margen, es una comparación de
-anécdotas.
+Sin `torch`: es ajedrez y aritmética, así que corre en la CI sin GPU y sus veredictos se cachean
+sin pensar en pesos.
 
 ```python title="src/rukh/eval/heuristic.py"
 PIECE_VALUES: dict[chess.PieceType, float] = {
@@ -658,17 +605,10 @@ POSITIONAL_SACRIFICE = "g4e6"
 
 <Src file="src/rukh/eval/heuristic.py" tag="p3" lines="41-64" />
 
-`VALUE_SCALE = 4.0` es la otra mitad de «medirla igual»: `tanh(puntuación / 4)` en peones es
-exactamente `tanh(cp / 400)` en centipeones, así que el baseline y el modelo se leen en la misma
-escala y sus correlaciones se pueden poner en la misma tabla. Es un 4 que vale una línea de docstring
-porque sin ella parece arbitrario.
-
-El rey vale 0 y el docstring dice por qué: nunca se captura, así que sumarlo con cualquier valor daría
-el mismo número en los dos lados y solo añadiría ruido a la aritmética.
-
-Y `GAME_OF_THE_CENTURY` es una constante con un FEN y un nombre. Que la ceguera del baseline
-tenga su posición escrita en el código, con su test, es lo que convierte «no ve los sacrificios» de
-una frase en una propiedad comprobable.
+`VALUE_SCALE = 4.0` es la otra mitad de «medirlo igual»: `tanh(puntuación / 4)` en peones es
+`tanh(cp / 400)` en centipeones, la escala de la etiqueta. Y `GAME_OF_THE_CENTURY` da a la ceguera
+del baseline una posición escrita en el código, con su test: «no ve los sacrificios» pasa de frase
+a propiedad comprobable.
 
 ```python title="src/rukh/eval/heuristic.py"
 class Verdict(BaseModel):
@@ -689,10 +629,8 @@ class Verdict(BaseModel):
 
 <Src file="src/rukh/eval/heuristic.py" tag="p3" lines="67-80" />
 
-Un veredicto que trae **los dos materiales además de la diferencia**. Igual que el
-`ClassificationResult` guarda los conteos, esto guarda lo que explica el número: el test del
-sacrificio de Fischer comprueba `material_before == 1.0` y `material_after == -8.0`, y de ahí sale
-el 9 de la pérdida. Sin esos dos campos, un `loss` de 9,0 no se puede auditar.
+El veredicto trae los dos materiales además de la diferencia: sin ellos, un `loss` de 9,0 no se
+puede auditar.
 
 ```python title="src/rukh/eval/heuristic.py"
 def material(board: chess.Board) -> float:
@@ -733,22 +671,11 @@ def score(board: chess.Board, mobility_weight: float = MOBILITY_WEIGHT) -> float
 
 <Src file="src/rukh/eval/heuristic.py" tag="p3" lines="83-116" />
 
-`_moves_for` es la función con una decisión de verdad dentro. La pregunta «¿cuántas jugadas legales
-tiene el negro?» no se puede hacer si mueve el blanco, porque `board.legal_moves` solo enumera las
-del bando que mueve. Cambiar el turno sobre una **copia** es la única forma de hacer esa pregunta.
-
-Si en vez de eso se contaran solo las del bando que mueve, la movilidad dependería de la **paridad
-del ply** y no de la posición: la misma posición valdría distinto según a quién le tocase, y la serie
-de valores de una partida se convertiría en un zigzag que no dice nada.
-
-El `swapped.ep_square = None` es el detalle que un cazador de bugs agradecería. Al cambiar el turno a
-mano, la casilla de captura al paso que había quedado del avance doble anterior pasa a ser ilegal —el
-peón que podría capturar al paso es ahora del bando que acaba de mover— y `python-chess` generaría
-una jugada imposible. Borrarla es la corrección.
-
-`board.copy(stack=False)` copia sin la historia de jugadas, que es lo único que se necesita y lo que
-hace la copia barata. Con la pila, copiar un tablero en la jugada 60 copiaría sesenta posiciones, y
-esto se hace dos veces por fila sobre diez mil filas.
+`_moves_for` tiene la única decisión del bloque. `board.legal_moves` solo enumera las jugadas del
+bando que mueve, así que para contar las del otro se cambia el turno sobre una copia. Contar solo
+las del que mueve haría depender la movilidad de la paridad del ply, y la serie de valores de una
+partida sería un zigzag. `ep_square = None` borra la casilla de captura al paso, que al cambiar el
+turno a mano sería ilegal.
 
 ```python title="src/rukh/eval/heuristic.py"
 def value(board: chess.Board, mobility_weight: float = MOBILITY_WEIGHT) -> float:
@@ -762,9 +689,6 @@ def value_of(fen: str, mobility_weight: float = MOBILITY_WEIGHT) -> float:
 ```
 
 <Src file="src/rukh/eval/heuristic.py" tag="p3" lines="119-126" />
-
-Dos funciones triviales, y una frase basta: el baseline se lee en la misma escala acotada que la
-etiqueta, así que su correlación con Stockfish se puede poner en la misma tabla que la del modelo.
 
 ```python title="src/rukh/eval/heuristic.py"
 def _material_moves(board: chess.Board) -> Iterator[chess.Move]:
@@ -791,23 +715,12 @@ def worst_material(board: chess.Board, color: chess.Color) -> float:
 
 <Src file="src/rukh/eval/heuristic.py" tag="p3" lines="129-148" />
 
-`_material_moves` enumera **solo lo que puede cambiar el material**: capturas y promociones. Es la
-optimización que hace viable el baseline sobre diez mil filas —en una posición típica hay treinta
-jugadas legales y dos o tres capturas— y a la vez es exacta para lo que se está calculando, porque
-ninguna otra jugada mueve el contador de material en un ply.
-
-El `and not board.is_capture(move)` del filtro evita rendir dos veces una promoción con captura, que
-`generate_legal_captures` ya ha dado.
-
-`worst_material` empieza en `material_for(board, color)` —el material actual— y toma el mínimo sobre
-las respuestas. Empezar ahí es lo que hace que una posición donde el rival no tiene ninguna captura
-rentable devuelva el material tal cual, en vez de `+inf` o un error.
-
-Y aquí están las dos cegueras que el docstring del módulo declara. **No ve la recaptura**: la
-respuesta se busca a un solo ply, así que un cambio igualado cuya recaptura llega dos plies después se
-lee como una pérdida. **Cobra dos veces una pieza colgada**: si una pieza ya estaba en el aire antes
-de mover, cualquier jugada tranquila posterior carga con esa pérdida, porque el "antes" es el material
-en el tablero y no lo mejor que el jugador podría haber conservado.
+`_material_moves` enumera solo lo que puede cambiar el material en un ply, capturas y promociones:
+dos o tres de las treinta jugadas legales típicas, sin perder nada. `worst_material` empieza en el
+material actual y toma el mínimo sobre las respuestas. Aquí están las dos cegueras del docstring: no
+ve la recaptura propia, porque la búsqueda acaba en un ply, y cobra otra vez una pieza que ya
+colgaba antes de mover, porque el «antes» es el material del tablero y no lo mejor que el jugador
+podía conservar.
 
 ```python title="src/rukh/eval/heuristic.py"
 def judge(
@@ -839,33 +752,17 @@ def judge(
 
 <Src file="src/rukh/eval/heuristic.py" tag="p3" lines="151-175" />
 
-`mover = board.turn` **antes** del `push`, que es la línea que decide el signo de todo. Después de
-empujar la jugada, el turno es del otro, así que `material_for(board, board.turn)` daría el material
-del rival. Es exactamente el mismo cuidado con el signo que la etiqueta de la lección 6, y la última
-frase del docstring dice lo que importa: las dos juzgan la misma jugada desde el mismo lado.
+`mover = board.turn` antes del `push` decide el signo de todo: después de empujar la jugada, el
+turno es del otro. `loss = before - after` es una resta y la etiqueta usaba una suma, sin
+contradicción: aquí los dos números ya están desde el punto de vista del que movió; en la etiqueta,
+el segundo venía del lado del rival.
 
-`loss = before - after`, una resta, mientras la etiqueta usaba una suma. No es una inconsistencia: aquí
-los dos números están **ya** desde el punto de vista del que movió, porque los dos salen de
-`material_for(..., mover)`. En la etiqueta, el segundo venía del lado del rival.
-
-Y hay una asimetría que conviene decir antes de leer el margen, porque no pesa igual sobre los dos
-esquemas: la heurística recibe **la posición anterior y la jugada** —vuelve a jugarla en un tablero
-para saber qué cambió—. El encoder de casillas solo ve el FEN resultante, y detectar un error sin
-ver de dónde vienes es más difícil que detectarlo viéndolo, así que para él el margen está medido
-en contra: si aun así gana, ha aprendido algo que no es contar piezas. El esquema de jugadas, en
-cambio, lleva la línea dentro —su entrada es el prefijo de la partida— y esa desventaja no la tiene.
-Los dos ganaron: el de casillas, que no la ve, por 5,7 puntos; el de jugadas, que la lleva dentro,
-por 9,2.
-
-Hay una segunda asimetría, y esta va a favor del modelo, así que también se dice: la heurística es
-una regla de sí/no **sin umbral que ajustar**, de modo que no se le dio ninguna mitad `tune` ni se
-barrió nada en su lado. La comparación enfrenta a un modelo en su mejor punto de operación contra
-una regla en el único que tiene. Es una cortesía que recibe el modelo y no el baseline, está
-escrita en el informe para que no sea injusta en silencio, y conviene tenerla en la cabeza al leer
-los +9,2 puntos del esquema de jugadas, que son los de la tabla que sigue.
-
-Estas son las tres filas del desglose por punto de operación del informe del afinado `last-n` del
-esquema de jugadas, sobre la mitad `score`, y la historia está en la de abajo:
+La comparación tiene dos asimetrías, y el informe dice las dos. En contra del modelo: la heurística
+recibe la posición anterior y la jugada, y el encoder de casillas solo ve el FEN resultante (el
+esquema de jugadas lleva la línea dentro). Aun así ganaron los dos: el de casillas por 5,7 puntos,
+el de jugadas por 9,2. A favor del modelo: la heurística es una regla de sí o no sin umbral que
+ajustar, así que se enfrenta un modelo en su mejor punto de operación contra una regla en el único
+que tiene. El desglose del afinado `last-n` de jugadas, sobre la mitad `score`:
 
 <div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
 
@@ -877,28 +774,24 @@ esquema de jugadas, sobre la mitad `score`, y la historia está en la de abajo:
 
 </div>
 
-Mira la fila de la heurística: precisión 4,7 %, exhaustividad **77,1 %**, 2 359 posiciones
-marcadas de 3 660. La regla grita "error" en dos de cada tres jugadas de la partida. Encuentra casi
-todos los errores **porque marca casi todo**, y de ahí su exhaustividad envidiable y su precisión
-ridícula. El encoder gana el margen por el otro lado: marca 488 posiciones en vez de 2 359 —cinco
-veces menos— y acierta en el 11,7 % de ellas contra el 4,7 % de la regla. Dos detectores con F1 de
-8,9 % y 18,0 % y con perfiles opuestos, que es exactamente por qué el titular lleva la precisión y
-la exhaustividad al lado y no solo el F1.
+La heurística marca 2 359 posiciones de 3 660: grita «error» en dos de cada tres jugadas y encuentra
+casi todos los errores porque marca casi todo. El encoder gana por el otro lado: marca cinco veces
+menos y acierta en el 11,7 % contra el 4,7 %. Son perfiles opuestos, y por eso el titular lleva la
+precisión y la exhaustividad al lado del F1.
+
+Sin adornos: de cada diez posiciones que el modelo marca, casi nueve no son errores, y de cada cinco
+errores reales se le escapan tres. Como producto todavía no sirve. Como medida, dobla a una
+heurística que sí entiende de material, que es lo que el módulo quería demostrar: +9,2 puntos contra
+un listón de cinco. **Batir al baseline no es estar listo**, y el informe lo dice.
 
 ### Qué no puede ver, con sus tests
 
-El ejemplo que el propio código lleva escrito en `src/rukh/eval/heuristic.py` es la partida del
-siglo: **Donald Byrne contra Robert Fischer, Nueva York, 1956**, con Fischer de trece años. Después
-de 17.Rf1 (17.Kf1 en notación inglesa), Fischer jugó **17…Ae6** (`g4e6`, _17…Be6_), ofreciendo la
-dama. Es una de las jugadas más famosas de la historia del ajedrez y la partida acaba siendo una
-victoria de las negras.
-
-La heurística mira esa posición, ve que las blancas pueden jugar 18.Axb6 y llevarse una dama por
-nada, calcula una pérdida de nueve puntos de material y **llama error garrafal a 17…Ae6**. No se
-equivoca en la aritmética: se equivoca en todo lo demás, porque un sacrificio posicional es
-literalmente invisible para algo que solo cuenta piezas.
-
-Y eso está en un test, con el nombre de la partida en el docstring:
+El ejemplo que lleva escrito el código es la partida del siglo: Donald Byrne contra Robert Fischer,
+Nueva York, 1956, con Fischer de trece años. Después de 17.Rf1 (17.Kf1 en notación inglesa), Fischer
+jugó 17…Ae6 (`g4e6`, _17…Be6_), ofreciendo la dama, y acabó ganando. La heurística ve que las
+blancas pueden llevarse la dama con 18.Axb6, calcula una pérdida de nueve puntos y **llama error
+garrafal a una de las jugadas más famosas de la historia**. La aritmética es correcta; un sacrificio
+posicional es invisible para algo que solo cuenta piezas. Y eso está en un test:
 
 ```python title="tests/unit/test_heuristic.py"
 def test_the_baseline_cannot_see_a_positional_sacrifice() -> None:
@@ -918,10 +811,9 @@ def test_the_baseline_cannot_see_a_positional_sacrifice() -> None:
 
 <Src file="tests/unit/test_heuristic.py" tag="p3" lines="84-96" />
 
-**Un test que fija un comportamiento equivocado a propósito.** Es raro y es correcto: el baseline
-no debe mejorar sin que alguien lo decida, porque el margen del hito se mide contra ella. Si alguien
-añadiera una búsqueda de dos plies, este test fallaría, y eso es lo que se quiere: el cambio tendría
-que ser deliberado y habría que volver a medir el margen.
+Es un test que fija un comportamiento equivocado a propósito. El baseline no debe mejorar sin que
+alguien lo decida, porque el margen del hito se mide contra él: si alguien añadiera una búsqueda de
+dos plies, este test fallaría y obligaría a volver a medir el margen.
 
 ```python title="tests/unit/test_heuristic.py"
 HANGING_QUEEN = "r1bqkbnr/pppp1ppp/2n5/4p2Q/4P3/8/PPPP1PPP/RNB1KBNR w KQkq - 2 3"
@@ -952,12 +844,8 @@ def test_mobility_moves_the_score_without_moving_the_material() -> None:
 
 <Src file="tests/unit/test_heuristic.py" tag="p3" lines="25-48" />
 
-El primero usa la posición inicial como caso de referencia y aprovecha una simetría exacta: veinte
-jugadas legales para cada bando, así que la movilidad es cero y el valor también. Un test que da
-`0.0` en tres cifras a la vez es un test de que las tres funciones están de acuerdo.
-
-El tercero es el que comprueba que la movilidad **hace algo**: dos posiciones con las mismas piezas y
-puntuaciones distintas. Sin él, un `MOBILITY_WEIGHT` accidentalmente a cero pasaría inadvertido.
+El tercero comprueba que la movilidad hace algo: sin él, un `MOBILITY_WEIGHT` a cero por accidente
+pasaría inadvertido.
 
 ```python title="tests/unit/test_heuristic.py"
 def test_the_baseline_flags_a_hanging_queen() -> None:
@@ -995,14 +883,9 @@ def test_losing_a_piece_for_a_pawn_is_a_blunder() -> None:
 
 <Src file="tests/unit/test_heuristic.py" tag="p3" lines="51-81" />
 
-Los cuatro casos que definen la regla, y los cuatro con una partida real detrás. El del **cambio
-igualado** es el más interesante: 4.Axc6 en la Apertura Española se recaptura inmediatamente, y la
-búsqueda de un ply ve exactamente esa recaptura, así que la pérdida sale cero. Es la ceguera de la
-recaptura funcionando **a favor** en este caso: cuando la recaptura es inmediata, el ply la ve; cuando
-llega dos plies después, no.
-
-Que ese test exista con un comentario que lo explica es lo que impide que alguien «arregle» la
-profundidad y rompa los cambios igualados en la dirección contraria.
+Los cuatro casos que definen la regla. El del cambio igualado es el interesante: tras 4.Axc6 en la
+Apertura Española, la respuesta de un ply es la recaptura del rival, así que la pérdida sale cero.
+Cuando la recaptura es inmediata, el ply la ve; cuando llega dos plies después, no.
 
 ```python title="tests/unit/test_heuristic.py"
 def test_the_value_is_on_the_label_s_own_scale() -> None:
@@ -1023,90 +906,27 @@ def test_a_promotion_is_material_even_when_nothing_is_captured() -> None:
 
 <Src file="tests/unit/test_heuristic.py" tag="p3" lines="99-112" />
 
-El primero es el que ata las dos escalas, y es el test que hace comparables las dos correlaciones de
-la tabla: cuatro peones de ventaja son `tanh(1)` tanto en la escala de la etiqueta como en la de la
-baseline. El `mobility_weight=0.0` está para aislar el material de la movilidad, que en esa posición
-no es cero.
-
-El segundo comprueba la rama de las promociones de `_material_moves`, que es la que un lector
-distraído habría dejado fuera pensando que solo las capturas mueven el material. Una promoción sube
-ocho puntos —aparece una dama y desaparece un peón— sin capturar nada.
-
-### Precisión, exhaustividad y F1 cuando una clase es rara
-
-Con el <Term id="desbalanceo">desbalanceo</Term> ya desmontado, las tres cifras que sí se publican.
-
-La **precisión** responde a "de lo que marqué, cuánto era de verdad": verdaderos positivos entre
-todo lo marcado. Es la que le importa a la demo, porque una barra que grita "error" en jugadas
-correctas se apaga a los cinco minutos. Aquí, **11,7 %**.
-
-La **exhaustividad** responde a "de lo que había, cuánto marqué": verdaderos positivos entre todos
-los errores reales. Es la que le importa a alguien que quiera usar esto para analizar sus partidas,
-porque un error que no se detecta no se aprende. Aquí, **39,6 %**.
-
-Las dos se mueven en contra. Bajar el umbral de decisión captura más errores reales y también más
-falsas alarmas; subirlo hace lo contrario. Elegir el punto de esa curva es una decisión de producto
-—en Rukh el valor de fábrica está en `configs/eval/encoder.yaml` como `threshold: 0.5`, y ya has
-visto lo que ese valor de fábrica le hace a una clase del 3,7 %— y no tiene una respuesta
-matemática. **F1** es la media armónica de las dos, `2·P·R/(P+R)`, y se usa porque castiga el
-desequilibrio: con precisión 1,0 y exhaustividad 0,01, la media aritmética daría un respetable 0,5 y
-la armónica da 0,02, que es la cifra honesta. Aquí, **18,0 %**.
-
-La media armónica es la de la velocidad media de un viaje de ida y vuelta. Si vas a 100 km/h y
-vuelves a 20, la media no es 60: es 33, porque en el tramo lento pasas cinco veces más tiempo. La
-pata lenta manda, y eso es exactamente lo que se quiere de una métrica que no debe dejarse comprar
-por una precisión perfecta sobre tres aciertos.
-
-Conviene mirar esos tres números sin adornos: de cada diez posiciones que el modelo marca como
-error, casi nueve no lo son, y de cada cinco errores reales se le escapan tres. Como producto,
-todavía no sirve para nada. Como medida, es **el doble** que una heurística que sí entiende de
-material, sobre las mismas filas y con la posición anterior escondida, y eso es lo que el módulo
-pretendía demostrar. El listón del hito es superar el F1 de la heurística en **cinco puntos** y
-salen **+9,2**: criterio cumplido, con el nivel absoluto dicho en voz alta para que nadie confunda
-"bate al baseline" con "está listo".
-
-<Exercise n="01" title="Media aritmética contra media armónica, con los números del informe">
-  La cabeza publicada tiene precisión 0,117 y exhaustividad 0,396. Calcula la media aritmética y
-  la armónica de las dos. Después haz lo mismo con la heurística (0,047 y 0,771). ¿Cuál de las
-  dos medias le daría a la heurística un número más parecido al del encoder, y por qué es
-  exactamente eso lo que no se quiere?
-
-  <Solution>
-    Encoder: aritmética `(0,117 + 0,396) / 2 = 0,257`; armónica
-    `2 · 0,117 · 0,396 / (0,117 + 0,396) = 0,0927 / 0,513 = 0,181`, que es el 18,0 % del informe
-    salvo redondeo. Heurística: aritmética `(0,047 + 0,771) / 2 = 0,409`; armónica
-    `2 · 0,047 · 0,771 / 0,818 = 0,089`, el 8,9 % del informe.
-
-    Con la aritmética la heurística **ganaría** (0,409 frente a 0,257): la exhaustividad del 77 %
-    compensa de sobra una precisión de una entre veinte. Con la armónica pierde por la mitad,
-    porque la pata mala manda. Eso es lo que se quiere de la métrica: que marcar dos de cada tres
-    jugadas como error no se pueda disfrazar de detector.
-
-  </Solution>
-</Exercise>
+El primero ata las dos escalas (cuatro peones de ventaja son `tanh(1)` en las dos), y es lo que hace
+comparables las correlaciones del modelo y del baseline. El segundo cubre la rama de las
+promociones, la que se olvida quien piensa que solo las capturas mueven el material.
 
 ### Pearson y Spearman, y por qué las dos
 
 Para el valor no hay umbral que elegir: es una regresión, y lo que se mide es si el número predicho
 acompaña al real.
 
-**Pearson** mide si los valores se alinean en una recta. Es sensible a la escala: si predices
-sistemáticamente la mitad de lo que hay, Pearson lo nota. **Spearman** es Pearson calculado sobre
-los rangos —las posiciones en el orden, con la media de los rangos para los empates—, así que solo
-mide si el orden coincide y le da igual la escala. Es la diferencia entre el podio y los cronos de
-una carrera: Spearman pregunta si has acertado quién sube a cada escalón; Pearson pregunta además
-si los tiempos que has predicho se parecen a los reales. Puedes clavar el podio y fallar todos los
-cronos por un minuto.
+**Pearson** mide si los valores se alinean en una recta, y es sensible a la escala: si predices
+sistemáticamente la mitad de lo que hay, lo nota. **Spearman** es Pearson calculado sobre los
+rangos, así que solo mide si el orden coincide. Es la diferencia entre el podio y los cronos de una
+carrera: Spearman pregunta si has acertado quién sube a cada escalón; Pearson, además, si los
+tiempos se parecen a los reales. Puedes clavar el podio y fallar todos los cronos por un minuto.
 
-Las dos discrepan exactamente en un caso, y es un caso que aquí va a ocurrir: cuando el modelo
-tiene el **orden** bien y la **escala** mal. Es justo lo que le hace un `tanh` acotado a una
-puntuación en centipeones que no lo está: las posiciones extremas se aplastan contra ±1 y la
-relación deja de ser lineal aunque el ranking sea perfecto. Publicar solo Pearson haría parecer peor
-un modelo que ordena bien; publicar solo Spearman escondería un modelo que ordena bien pero cuya
-barra de evaluación marca 0,3 donde debería marcar 0,8, que en la demo es un fallo visible. Por eso
-van las dos, y por eso el plan del hito pide ≥ 0,8, leído sobre Spearman.
-
-Las tres funciones están escritas a mano, y no traen `scipy` al proyecto por tan poco:
+Discrepan cuando el orden está bien y la escala mal, algo que un `tanh` acotado favorece: las
+posiciones extremas se aplastan contra ±1 y la relación deja de ser lineal aunque el orden sea
+perfecto. Solo Pearson haría parecer peor un modelo que ordena bien; solo Spearman escondería una
+barra de evaluación que marca 0,3 donde debería marcar 0,8. Por eso van las dos, y el criterio del
+hito se lee sobre Spearman, como en un buscador, donde lo que importa es el orden de los
+resultados. Las tres funciones están escritas a mano:
 
 ```python title="src/rukh/eval/encoder.py"
 def pearson(x: Sequence[float], y: Sequence[float]) -> float | None:
@@ -1127,14 +947,11 @@ def pearson(x: Sequence[float], y: Sequence[float]) -> float | None:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="469-482" />
 
-Pearson como el coseno del ángulo entre los dos vectores centrados, que es lo que es. Restar la media
-primero y usar el producto escalar (`first @ second`) es más corto y más estable numéricamente que la
-fórmula de las sumas de productos, que resta dos números grandes casi iguales.
-
-El `denominator == 0.0` con `return None` es el caso de una serie constante, y merece el `None` y no
-un cero: la correlación de algo que no varía **no está definida**, no es «no hay correlación». La
-diferencia importa cuando la serie constante es la predicción, porque un cero se lee como «el modelo
-no sabe nada» y un `null` se lee como «el modelo devolvió siempre lo mismo», que es otro diagnóstico.
+Pearson es el coseno del ángulo entre los dos vectores centrados; restar la media primero es más
+estable que la fórmula de sumas de productos, que resta dos números grandes casi iguales. La
+correlación de algo que no varía no está definida, y el `None` lo respeta: un cero se leería como
+«el modelo no sabe nada», y un `null` dice «el modelo devolvió siempre lo mismo», que es otro
+diagnóstico.
 
 ```python title="src/rukh/eval/encoder.py"
 def ranks(values: Sequence[float]) -> list[float]:
@@ -1164,15 +981,9 @@ def spearman(x: Sequence[float], y: Sequence[float]) -> float | None:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="485-507" />
 
-`ranks` es la única sutileza de un Spearman a mano: **los empates reciben la media de los rangos que
-abarcan**. Darles rangos consecutivos arbitrarios inventaría un orden que los datos no tienen, y aquí
-los empates abundan porque un `tanh` acotado aplasta muchas posiciones sobre casi el mismo número, y
-porque la heurística de material produce el mismo valor para todas las posiciones con el mismo
-material y la misma movilidad.
-
-El mismo `ranks` es el que usa `roc_auc`, y por el mismo motivo. Que las dos métricas compartan el
-tratamiento de empates no es casualidad: las dos son medidas de orden, y en las dos un empate mal
-tratado inventa información.
+La única sutileza de un Spearman a mano: los empates reciben la media de los rangos que abarcan.
+Darles rangos consecutivos inventaría un orden que los datos no tienen, y aquí abundan, porque la
+heurística da el mismo valor a todas las posiciones con igual material y movilidad.
 
 ```python title="src/rukh/eval/encoder.py"
 def correlation(
@@ -1193,14 +1004,9 @@ def correlation(
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="510-523" />
 
-Las dos siempre juntas, en un registro que además dice contra qué. No hay ninguna forma de publicar
-solo una de las dos sin cambiar el código, y eso es la mitad del trabajo.
-
-Un detalle de medida antes de los números: las dos correlaciones se calculan contra
-`tanh(cp / 400)`, la escala acotada con la que se entrena la cabeza, y **nunca contra el `cp` en
-bruto**. Un mate forzado vale ±9 999 centipeones, y media docena de filas así decidirían el Pearson
-del conjunto entero. Correlacionar contra la escala en la que se entrena no es hacerlo fácil: es
-correlacionar contra la etiqueta. En el código eso es una línea con un comentario de tres:
+Las dos siempre juntas, en un registro que dice contra qué se midieron: `tanh(cp / 400)`, la escala
+con la que se entrena la cabeza, y nunca el `cp` en bruto, donde un mate forzado vale ±9 999
+centipeones y media docena de filas así decidirían el Pearson del conjunto entero.
 
 ```python title="src/rukh/eval/encoder.py"
 def measure(
@@ -1245,64 +1051,37 @@ def measure(
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="738-775" />
 
-`scored = _finite(labels, baseline["blunder"])` es la línea que garantiza que las dos partes de la
-comparación se saltan **las mismas filas**: la máscara es la intersección de «la etiqueta existe» y
-«el baseline pudo juzgar». Como las dos son `nan` exactamente en las filas sin predecesor, la
-intersección es esa misma condición, pero calcularla así en vez de asumirlo es lo que hace que siga
-siendo cierto si mañana una de las dos gana otro motivo para faltar.
-
-Fíjate en que **la detección de errores se mide sobre las filas etiquetadas y la correlación del
-valor sobre todas**. No es una inconsistencia: la etiqueta de valor existe para todas las filas —es
-una propiedad de la posición— y la de error solo para las que tienen predecesor. De ahí los dos
-denominadores del informe: 10 000 posiciones y 7 453 con etiqueta de error, de las que 3 660 se
-puntúan.
-
-Y la última condición: `meets_all_goals` solo se calcula si los **dos** criterios se pudieron medir.
-Un `and` sobre un `None` daría algo que no es ni sí ni no, y publicar «el hito no se cumple» cuando
-en realidad falta una medida es tan malo como lo contrario.
+`scored = _finite(...)` garantiza que modelo y baseline se saltan las mismas filas; hoy coinciden,
+pero calcularlo en vez de asumirlo lo mantiene cierto si mañana una de las dos gana otro motivo para
+faltar. La detección de errores se mide sobre las filas etiquetadas y la correlación sobre todas,
+porque la etiqueta de error solo existe para las que tienen predecesor. De ahí los denominadores del
+informe: 10 000 posiciones, 7 453 con etiqueta de error y 3 660 de ellas en la mitad `score`. Y
+`meets_all_goals` solo se calcula si los dos criterios se pudieron medir.
 
 #### El criterio de valor no se cumple, y esta es la cifra
 
 <div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
 
-| Esquema            |  Spearman |   Pearson | Listón del hito |
-| ------------------ | --------: | --------: | --------------- |
-| `moves` · `full`   |     0,407 |     0,442 | ≥ 0,80 → **no** |
-| `moves` · `last-n` | **0,520** |     0,648 | ≥ 0,80 → **no** |
-| `squares`          |     0,422 | **0,688** | ≥ 0,80 → **no** |
+| Esquema            | Spearman | Pearson | Listón del hito |
+| ------------------ | -------: | ------: | --------------- |
+| `moves` · `full`   |    0,407 |   0,442 | ≥ 0,80 → no     |
+| `moves` · `last-n` |    0,520 |   0,648 | ≥ 0,80 → no     |
+| `squares`          |    0,422 |   0,688 | ≥ 0,80 → no     |
 
 </div>
 
-**El mejor Spearman publicado es 0,52 y el listón es 0,80.** No está cerca, no es un decimal, no hay
-manera de contarlo como un aprobado raspado: el criterio de valor del hito **no se cumple** y se
-publica sin cumplir, que es lo que el propio plan del hito manda hacer cuando pasa esto.
+El mejor Spearman publicado al cerrar el hito es 0,52 contra un listón de 0,80: el criterio de
+valor no se cumple, y se publica sin cumplir, como manda el plan del hito.
 
-Antes de seguir, vuelve a la tabla de resultados de la lección 1 y mira la pareja que importa: contra
-el encoder publicado, `squares` tiene **mejor Pearson (0,688 contra 0,648) y peor Spearman (0,422
-contra 0,520)**. Acabas de leer que esas dos medidas se separan exactamente cuando el orden está
-bien y la escala mal, y aquí una entrada gana en escala y pierde en orden.
+Mira la pareja que importa: `squares` tiene **mejor Pearson y peor Spearman** que `moves · last-n`
+(0,688 contra 0,648, y 0,422 contra 0,520). Una entrada gana en escala y pierde en orden, y como son
+dos representaciones distintas y no dos tiradas, eso es una pista y no ruido.
 
-Eso no es ruido —son dos representaciones distintas, no dos tiradas—, es una **huella dactilar**.
-Estuvo publicada y nadie tiró del hilo. Guárdala: volvemos a ella en cuanto acabe el diagnóstico.
-
-El diagnóstico **del momento** tenía tres piezas y ninguna era "hace falta un modelo más grande":
-
-1. **Cuatro mil pasos de afinado.** Es el presupuesto del módulo, no un punto de convergencia, y ya
-   viste que el preentrenamiento seguía bajando cuando se cortó.
-2. **Cobertura de etiquetas del 9,8 %** —y, atención, la curva dice que esta pieza **no** es la que
-   duele. De los cinco millones de posiciones muestreadas, solo 488 159 recibieron una evaluación de
-   Stockfish al cruzarlas con el conjunto público de evaluaciones, y la cabeza de valor aprende de
-   las 438 093 que sobreviven al reparto. Parecen pocas; la lección 11 las mide, y con el 25 % de
-   ellas el error del valor es el mismo. O sea que el problema no es la **cantidad** de etiquetas
-   sino lo que cada una aporta: etiquetas más informativas, no más etiquetas.
-3. **`tanh(cp/400)` comprime justo donde hay densidad.** La inmensa mayoría de las posiciones de
-   club están entre −100 y +100 centipeones, y ahí el `tanh` las aplasta contra el cero: la señal
-   que la cabeza tiene que aprender a distinguir es minúscula precisamente donde están casi todos
-   los datos. Una escala menos comprimida repartiría mejor el rango útil. Sería un termómetro muy
-   fino entre 39 y 41 grados y casi ciego entre 36 y 37, que es donde está casi todo el mundo.
-
-Ese razonamiento está bien hecho y se equivocó. Las tres piezas apuntaban a los datos y a la
-etiqueta; ninguna miró la pérdida.
+Las sospechas naturales apuntaban a los datos: cuatro mil pasos de afinado, que son un presupuesto
+y no una convergencia; pocas etiquetas (488 159 posiciones con Stockfish, aunque la curva de la
+lección 11 descarta esta: con el 25 % el error del valor es el mismo); y la etiqueta
+`tanh(cp/400)`, que aplasta contra el cero la franja de ±100 centipeones donde están casi todas las
+posiciones de club. Ninguna miraba la pérdida.
 
 <Exercise n="02" title="Multiplica todas las probabilidades por tres">
   Las probabilidades de la cabeza de error van de 0,0020 a 0,3102. Imagina que, sin tocar un peso,
@@ -1315,53 +1094,35 @@ etiqueta; ninguna miró la pérdida.
     0,5 y se marca alguna. El número cambia sin que el modelo haya cambiado, lo que demuestra que
     ese F1 medía la escala del sigmoide y no la representación.
 
-    ROC AUC y precisión media **no se mueven ni una milésima**: multiplicar por tres es monótono,
-    no cambia ningún orden, y las dos solo miran el orden —las dos pasan por `ranks`, y los rangos
-    son invariantes a cualquier transformación creciente—. El F1 ajustado tampoco: el barrido en
-    `tune` encontraría 0,199 en vez de 0,0663 y marcaría exactamente las mismas 488 posiciones,
-    porque los candidatos del barrido son las propias puntuaciones y se han movido todas igual.
-    Todo lo que dependa de un umbral fijo mide calibración; todo lo que dependa solo del orden mide
-    lo que la cabeza sabe. Es la razón de que el informe publique las dos familias, y de que el
-    titular no sea nunca el número del umbral de fábrica.
+    ROC AUC y precisión media no se mueven ni una milésima: multiplicar por tres no cambia ningún
+    orden, y las dos solo miran el orden. El F1 ajustado tampoco: el barrido en `tune` encontraría
+    0,199 en vez de 0,0663 y marcaría las mismas 488 posiciones, porque los candidatos son las
+    propias puntuaciones y se han movido todas igual. Lo que depende de un umbral fijo mide
+    calibración; lo que depende solo del orden mide lo que la cabeza sabe.
 
   </Solution>
 </Exercise>
 
 #### La pérdida no medía lo que el criterio mide
 
-**Una pérdida y una métrica que se describen con las mismas palabras pueden tener mínimos
-distintos.** Esa es la regla, y lo que sigue es cómo se descubrió que este módulo llevaba tiempo
-incumpliéndola.
-
-Vuelve a la huella dactilar. Si una entrada gana en escala y pierde en orden, la pregunta que nadie
-hizo es **qué está minimizando la pérdida**. Y la respuesta estaba en la línea de `MultiHead.loss`
-que la lección 4 mostró sin comentarla:
+Si una entrada gana en escala y pierde en orden, la pregunta es qué está minimizando la pérdida, y
+la respuesta está en una línea de `MultiHead.loss` de la lección 4:
 
 ```text
 "value": F.mse_loss(outputs["value"], targets["value"].to(outputs["value"].dtype)),
 ```
 
-`F.mse_loss` minimiza la **distancia** entre cada predicción y su etiqueta. El plan del hito puntúa con
-Spearman, que solo mira el **orden** y al que la distancia le da exactamente igual. Son dos
-funciones distintas, con mínimos distintos, y en lenguaje corriente se dicen igual —«acertar el
-valor»—, que es por lo que el fallo es invisible.
+`F.mse_loss` minimiza la distancia entre cada predicción y su etiqueta; el criterio puntúa con
+Spearman, que solo mira el orden. En lenguaje corriente las dos cosas se dicen igual, «acertar el
+valor», y por eso el fallo es invisible: **una pérdida y una métrica que se describen con las mismas
+palabras pueden tener mínimos distintos**. Una predicción lejísimos de todas las etiquetas que las
+ordena perfectamente saca Spearman 1 y un MSE malísimo; otra cerquísima que confunde dos saca un MSE
+excelente y pierde orden. Con capacidad de sobra coincidirían; un modelo pequeño tiene que elegir
+dónde equivocarse.
 
-Una predicción que está lejísimos de todas las etiquetas pero las ordena perfectamente saca un
-Spearman de 1 y un MSE malísimo. Otra que está cerquísima de todas y confunde dos saca un MSE
-excelente y pierde orden. Entrenábamos la segunda y puntuábamos la primera.
-
-Un profesor con **una tarde** para corregir puede quedarse cerca de la nota que cada alumno merece,
-o acertar quién va delante de quién. No da para las dos. Y lo único que se hará con esas notas es
-**ordenar** a los alumnos para una beca: si confunde el primero con el segundo, da igual lo finas
-que fueran las demás. Con presupuesto infinito las dos cosas coinciden; con una tarde, no.
-
-El arreglo es una pérdida que mire pares: por cada dos posiciones del lote, si la etiqueta dice que
-`i` vale más que `j`, la predicción debería ponerlas en ese orden, y el voto pesa según lo lejos que
-estén las etiquetas —distinguir una ganada de una perdida cuenta más que separar dos iguales, que
-es justo donde un evaluador sin búsqueda no tiene nada que hacer—.
-
-Ese arreglo **no está en `p3`**: llegó después de cerrar el hito, y el bloque que sigue es del
-tag `p4`, que es donde vive. En `p3`, la cabeza de valor solo tiene `F.mse_loss`.
+El arreglo es una pérdida que mire pares: si la etiqueta dice que `i` vale más que `j`, la
+predicción debería ponerlas en ese orden, y el voto pesa según lo lejos que estén las etiquetas. El
+código es del tag `p4`: llegó después de cerrar el hito.
 
 ```python title="src/rukh/models/heads.py"
 def pairwise_rank_loss(pred: Tensor, target: Tensor, margin: float = 0.0) -> Tensor:
@@ -1388,160 +1149,101 @@ def pairwise_rank_loss(pred: Tensor, target: Tensor, margin: float = 0.0) -> Ten
 
 <Src file="src/rukh/models/heads.py" tag="p4" lines="36-55" note="de p4, no de p3" />
 
-El peso `|target_i − target_j|` es la mitad del arreglo. Una pérdida de ordenación sin ponderar
-gastaría casi todo su gradiente en separar posiciones que el motor separa por diez centipeones
-—que es justo donde una pasada sin búsqueda no tiene nada que decir— en vez de en las parejas que
-deciden la partida.
-
-Las otras tres líneas son las que hacen que sea derivable y estable. `F.softplus(-(sign · diff_pred))`
-es el sustituto suave de «¿salió bien el orden?»: cuando el orden está bien, `sign · diff_pred` es
-positivo y el `softplus` de un negativo grande tiende a cero; cuando está mal, crece linealmente.
-Un `sign()` a secas no tendría derivada útil. Y `F.softplus` en vez de `log(1 + exp(x))` escrito a
-mano porque la versión de PyTorch no desborda con argumentos grandes.
-
-El `total > 0` con retorno de cero cubre el lote cuyas etiquetas son todas iguales: no hay orden que
-aprender, y dividir por un peso total de cero sería un `nan` que arruinaría el paso.
+El peso `|target_i − target_j|` es la mitad del arreglo: sin él, casi todo el gradiente se iría en
+separar posiciones que el motor separa por diez centipeones, justo donde una pasada sin búsqueda no
+tiene nada que decir. `F.softplus(-(sign · diff_pred))` es el sustituto suave de «¿salió bien el
+orden?»: tiende a cero cuando el orden está bien y crece linealmente cuando está mal, algo que un
+`sign()` a secas no permitiría derivar. Es la misma pérdida por pares, con otros nombres, que la de
+un reward model en M5.
 
 <div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
 
-| Qué cambia                                 | Pearson    | Spearman   | F1 de error |
-| ------------------------------------------ | ---------- | ---------- | ----------- |
-| nada (`F.mse_loss` sola)                   | 0,6476     | 0,5205     | 0,1804      |
-| **+ término de ordenación**                | 0,6621     | **0,6395** | 0,1774      |
-| + término de ordenación y el triple de red | **0,7261** | **0,6665** | **0,1855**  |
+| Qué cambia                                 | Pearson | Spearman | F1 de error |
+| ------------------------------------------ | ------- | -------- | ----------- |
+| nada (`F.mse_loss` sola)                   | 0,6476  | 0,5205   | 0,1804      |
+| + término de ordenación                    | 0,6621  | 0,6395   | 0,1774      |
+| + término de ordenación y el triple de red | 0,7261  | 0,6665   | 0,1855      |
 
 </div>
 
-Dos cosas que leer aquí, y la segunda es la importante.
-
-La primera: **no hubo intercambio**. Se esperaba ceder Pearson para ganar Spearman y subieron los
-dos, así que la pérdida anterior no estaba «optimizando otra cosa legítima», estaba peor alineada
-con la tarea en los dos ejes.
-
-La segunda es una **atribución**: cambiar la pérdida valió **+0,119** de Spearman y triplicar el
-modelo **+0,027**. Cuatro veces más barato mirar qué optimizas que comprar más red. El reflejo de
-subir de talla es el más caro de los disponibles y casi siempre el peor informado.
+Se esperaba ceder Pearson para ganar Spearman y subieron los dos: la pérdida anterior estaba peor
+alineada con la tarea en los dos ejes. Y la atribución: cambiar la pérdida valió +0,119 de Spearman
+y triplicar el modelo +0,027. **Mirar qué optimizas rindió cuatro veces más que comprar más red**, y
+fue mucho más barato.
 
 <Transfer concept="Desalineamiento entre la pérdida sustituta y la métrica de evaluación" where="Un reranker entrenado con entropía cruzada binaria cuando la métrica de producto es nDCG@5.">
-  La regla se puede aplicar el lunes y es de una sola frase: **escribe el criterio de evaluación
-  primero, y después di en voz alta qué función minimiza tu pérdida y si su mínimo es el mismo. Si
-  el criterio es un orden, la pérdida lleva pares.**
-
-Dónde aparece este bug fuera de aquí, literalmente el mismo:
-
-- Un **reranker** entrenado para predecir «relevante sí/no» cuando lo que se despliega es un top-5
-  ordenado.
-- Un **LLM como juez** afinado con MSE para dar una nota de 1 a 5, cuando en producción se le pide
-  «elige la mejor de estas dos».
-- **Embeddings** ajustados contra puntuaciones de similitud cuando la recuperación solo mira qué
-  entra en el top-k y en qué orden.
-
-En los tres casos el número de entrenamiento sube, el del producto no se mueve, y nadie encuentra
-por qué porque los dos se describen con las mismas palabras.
+  Escribe el criterio de evaluación primero, y después di en voz alta qué función minimiza tu
+  pérdida y si su mínimo es el mismo. Si el criterio es un orden, la pérdida lleva pares. El mismo
+  fallo aparece en un reranker entrenado para «relevante sí/no» cuando lo que se despliega es un
+  top-5 ordenado, en un LLM como juez afinado con MSE para dar notas de 1 a 5 cuando en producción
+  se le pide «elige la mejor de estas dos», o en embeddings ajustados contra puntuaciones de
+  similitud cuando la recuperación solo mira el top-k. El número de entrenamiento sube, el del
+  producto no se mueve, y nadie encuentra por qué.
 
 </Transfer>
 
 #### 0,6665 no significa «regular en todas partes»
 
-Con la pérdida arreglada el criterio sigue sin cumplirse: 0,6665 frente a 0,80. La pregunta útil no
-es cuánto falta, es **dónde falla**, y eso se responde cortando la métrica en vez de mirándola
-entera.
+Con la pérdida arreglada el criterio sigue sin cumplirse: 0,6665 frente a 0,80. La pregunta útil es
+dónde falla, y se responde cortando la métrica en vez de mirándola entera.
 
 <div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
 
-| Cómo de decidida está la posición | Posiciones       | Spearman   |
-| --------------------------------- | ---------------- | ---------- |
-| menos de 50 cp (casi igualadas)   | 6 099 (**61 %**) | 0,4625     |
-| 50 a 150 cp                       | 2 775 (28 %)     | 0,5844     |
-| 150 a 400 cp                      | 496 (5 %)        | 0,5196     |
-| más de 400 cp (decididas)         | 626 (6 %)        | **0,8797** |
+| Cómo de decidida está la posición | Posiciones   | Spearman   |
+| --------------------------------- | ------------ | ---------- |
+| menos de 50 cp (casi igualadas)   | 6 099 (61 %) | 0,4625     |
+| 50 a 150 cp                       | 2 775 (28 %) | 0,5844     |
+| 150 a 400 cp                      | 496 (5 %)    | 0,5196     |
+| más de 400 cp (decididas)         | 626 (6 %)    | **0,8797** |
 
 </div>
 
-**Donde la ventaja está clara el encoder ya pasa el listón.** Lo que hunde la media es el 61 % de
-posiciones casi igualadas, y ordenar dos posiciones que el motor separa por menos de medio peón
-exige ver táctica: una secuencia concreta de capturas que cambia el signo. Una pasada hacia delante
-sin búsqueda no la tiene y no la va a tener por entrenar más.
+Donde la ventaja está clara, el encoder ya pasa el listón. Lo que hunde la media es el 61 % de
+posiciones casi igualadas: ordenar dos posiciones que el motor separa por menos de medio peón exige
+ver táctica, una secuencia concreta de capturas que cambia el signo, y una pasada hacia delante sin
+búsqueda no la tiene ni la va a tener por entrenar más.
 
 Las dos lecturas del mismo 0,6665 llevan a acciones opuestas. «Regular en todo» dice _entrena más_.
-«Excelente en lo evidente, casi azar en lo que decide» dice _este enfoque tiene techo: cambia el
+«Excelente en lo evidente, flojo en lo que decide» dice _este enfoque tiene techo: cambia el
 enfoque o cambia el listón_. La segunda es la verdadera, y solo aparece al cortar.
 
-Un médico **sin acceso a analíticas** clava los brazos rotos y con los cansancios acierta poco más
-que a cara o cruz, no por malo sino porque eso no se diagnostica mirando. Su media dice «regular» y
-no describe a nadie. Mandarlo a otro curso no arregla la segunda mitad: hace falta el laboratorio,
-que es otra cosa.
-
-<Transfer concept="Evaluación desagregada por rebanadas" where="Un RAG al 68 % que es 95 % en consultas de un salto y 30 % en comparativas de varios.">
-  Una métrica global es un promedio sobre subpoblaciones que pueden comportarse al revés la una de
-  la otra. Antes de gastar un euro en arreglar un número que no llega, **córtalo por dificultad**:
-  es la medida más informativa y la más barata de repetir de todas las que hay.
-
-Y el diagnóstico cambia la factura. Un RAG al 68 % que acierta el 95 % de las preguntas de un
-salto y el 30 % de las comparativas no se arregla subiendo de modelo; se arregla con un
-planificador que parta la consulta. Un agente con 70 % de éxito que falla toda tarea de más de
-tres llamadas no tiene un problema de prompt, tiene un problema de arquitectura.
-
+<Transfer
+  concept="Evaluación desagregada por rebanadas"
+  where="Un RAG al 68 % que es 95 % en consultas de un salto y 30 % en comparativas de varios."
+>
+  Una métrica global es un promedio sobre subpoblaciones que pueden comportarse al revés. Antes de
+  gastar un euro en arreglar un número que no llega, córtalo por dificultad. Un RAG al 68 % que
+  acierta el 95 % de las preguntas de un salto y el 30 % de las comparativas no se arregla subiendo
+  de modelo, sino con un planificador que parta la consulta. Un agente con 70 % de éxito que falla
+  toda tarea de más de tres llamadas tiene un problema de arquitectura, no de prompt.
 </Transfer>
 
 <Callout kind="mundo-real" title="Publicar el número que no sale">
-  La tentación cuando un criterio falla es reescribir el criterio: leer Pearson en vez de Spearman
-  (0,648 suena mucho mejor que 0,520), correlacionar solo sobre las posiciones decididas —donde el
-  encoder saca 0,88—, o cambiar el listón a 0,40 y declarar victoria. Las tres producen un informe
-  verdadero y un resultado falso. El listón se fija **antes** de medir precisamente para que no se
-  pueda mover después, y un criterio que se mueve deja de ser un criterio y pasa a ser una
-  descripción de lo que salió. El coste de publicar un 0,52 contra un 0,80 es una tarde incómoda; el
-  coste de haberlo maquillado es que ninguna cifra del proyecto vuelve a significar nada.
+  La tentación cuando un criterio falla es reescribirlo: leer Pearson en vez de Spearman (0,648
+  suena mejor que 0,520), correlacionar solo sobre las posiciones decididas —donde el encoder saca
+  0,88— o bajar el listón a 0,40. Las tres producen un informe verdadero y un resultado falso. Por
+  eso el listón se fija antes de medir. Publicar un 0,52 contra un 0,80 cuesta una tarde incómoda;
+  maquillarlo cuesta que ninguna cifra del proyecto vuelva a significar nada.
 </Callout>
 
 ## Fuga de datos: por qué el reparto va por partida
-
-Al terminar esta sección sabrás reconocer la fuga concreta de este módulo y explicar por qué un
-reparto aleatorio de filas, que en otros problemas es correcto, aquí es una trampa.
 
 Una <Term id="fuga-de-datos">fuga de datos</Term> es cualquier camino por el que información de
 validación llega al entrenamiento. Nunca se manifiesta como un error: los números mejoran, las
 curvas salen bonitas y el problema aparece cuando el modelo sale al mundo.
 
-El reparto obvio de una tabla de un millón de posiciones sería aleatorio por filas: el 90 % a
-entrenamiento, el 10 % a validación. Aquí eso es una fuga, y la razón es esta.
-
-Toma una partida cualquiera y sus posiciones consecutivas, ply 30 y ply 31. La segunda es la primera
-**más una jugada**: treinta y una de las treinta y dos piezas siguen donde estaban, la estructura de
-peones es la misma, el plan es el mismo, la evaluación de Stockfish casi la misma. Si el ply 30 cae
-en entrenamiento y el 31 en validación, el modelo está siendo evaluado sobre una posición que ya
-vio, con un cambio cosmético. Un modelo que memoriza partidas puntúa igual de bien que uno que
-entiende ajedrez, y la métrica de validación —cuyo único trabajo es distinguir esas dos cosas— deja
-de hacerlo. Peor: la fuga es **invisible**. No hay ninguna cifra en el informe que la delate; el
-modelo simplemente parece mejor de lo que es hasta que lo pones en la demo.
-
-La solución es partir por `game_id`: una partida entera va a un lado o al otro, nunca a los dos. El
-código es `game_split` de la lección 6 —un CRC-32 de `"semilla:partida"` y un módulo— y esa pureza
-no es decorativa: `hash()` de Python cambia entre procesos por el aleatorizador de hashes, y un hash
-de dataframe puede cambiar de versión a versión. Un reparto que no es reproducible no es un reparto,
-es una lotería que vuelves a jugar cada vez que ejecutas el script. El CRC-32 con semilla es un bombo
-grabado en vídeo: cada vez que reproduces la cinta salen las mismas bolas en el mismo orden, en
-cualquier máquina y dentro de un año; `hash()` es volver a girar el bombo en cada proceso. El test que
-lo acompaña comprueba que ningún `game_id` aparece en los dos lados.
-
-Y aquí está la parte que esta lección añade: **el reparto del umbral usa exactamente la misma
-política**, con `threshold_half`. Si las dos mitades de las filas etiquetadas se partieran por
-posición, el umbral se elegiría sobre el ply 30 y se mediría sobre el 31 de la misma partida, que es
-ajustar sobre las filas que se puntúan por la puerta de atrás. Una fuga dentro de otra, dos niveles
-más abajo y mucho más fácil de no ver.
-
-Y la misma lógica se aplica a la etiqueta de error, que necesita la posición anterior de la misma
-partida: si la posición de la que se calcula el `loss_cp` cayera al otro lado del reparto, estarías
-construyendo la etiqueta de validación con una fila de entrenamiento. Por eso el cruce se hace antes
-de partir, y por eso una posición cuyo predecesor no está en la tabla no recibe la etiqueta 0: recibe
-`null`.
+La lección 6 contó la de este módulo: dos posiciones consecutivas de la misma partida se diferencian
+en una jugada, así que un reparto por filas evaluaría al modelo sobre posiciones que ya vio con un
+cambio cosmético. Por eso el reparto va por `game_id`. Esta lección añade que el reparto del umbral
+sigue la misma política: partido por posición, el umbral se elegiría sobre el ply 30 y se mediría
+sobre el 31 de la misma partida, una fuga dentro de otra y mucho más fácil de no ver.
 
 <Callout kind="mundo-real" title="La misma trampa, en otros dominios">
-  Series temporales partidas al azar en vez de por fecha. Historiales médicos del mismo paciente en
-  los dos lados. Fotos de la misma sesión, con la misma iluminación, repartidas por imagen en vez de
-  por sesión. Reseñas del mismo usuario. El patrón siempre es el mismo: **las filas no son
-  independientes y el reparto finge que sí lo son**. La pregunta que hay que hacerse antes de partir
-  cualquier tabla es "¿qué agrupa a estas filas?", y partir por eso.
+  Series temporales partidas al azar en vez de por fecha. Historiales del mismo paciente en los dos
+  lados. Fotos de la misma sesión repartidas por imagen. Preguntas de evaluación de un RAG generadas
+  a partir de los mismos documentos con los que se ajustó el recuperador. Siempre es lo mismo: **las
+  filas no son independientes y el reparto finge que sí**. Antes de partir cualquier tabla,
+  pregúntate qué agrupa a esas filas, y parte por eso.
 </Callout>
 
 ## El orquestador y sus notas
@@ -1587,12 +1289,9 @@ def evaluate_encoder(
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="778-813" />
 
-La primera nota se escribe **antes de medir nada**, y eso no es casual: es la descripción del
-procedimiento, no un comentario sobre los resultados, así que no puede depender de cómo hayan
-salido.
-
-La nota de la curva ausente es un ejemplo de mensaje de error útil: no dice «falta la curva», dice
-**qué orden ejecutar** para que deje de faltar.
+La primera nota se escribe antes de medir nada: describe el procedimiento, así que no puede depender
+de cómo salgan los resultados. La de la curva ausente no dice solo «falta la curva», dice qué orden
+ejecutar para que deje de faltar.
 
 ```python title="src/rukh/eval/encoder.py"
     try:
@@ -1635,18 +1334,10 @@ La nota de la curva ausente es un ejemplo de mensaje de error útil: no dice «f
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="833-844" />
 
-Las dos notas que sí dependen de lo medido, y las dos se escriben **con el número dentro**: «el
-encoder está a +9,2 puntos de F1 del baseline; el plan pide al menos +5». Una nota que dice qué se
-pedía al lado de lo que salió es una nota que no hay que cruzar con otro documento.
-
-«A missing label table becomes a note, never a crash»: sin la tabla de etiquetas, la suite devuelve
-un resultado **con todos los campos vacíos y una nota que dice por qué**, en vez de una traza. La
-diferencia importa porque esta suite corre dentro de la publicación de un modelo: un fallo dejaría la
-publicación a medias, mientras que un resultado con una nota deja escrito en el informe qué falta.
-
-El `try/finally` alrededor de la caché es lo de siempre con un recurso: la base SQLite se cierra
-aunque el modelo reviente en medio de la pasada hacia delante. Sin él, un fallo dejaría el fichero
-bloqueado y la siguiente ejecución fallaría por un motivo que no tiene nada que ver.
+Las notas que dependen de lo medido llevan el número dentro («el encoder está a +9,2 puntos de F1
+del baseline; el plan pide al menos +5»), así que no hay que cruzarlas con otro documento. Y sin la
+tabla de etiquetas la suite devuelve campos vacíos con una nota que dice por qué, en vez de una
+traza: corre dentro de la publicación de un modelo, y un fallo la dejaría a medias.
 
 ```python title="src/rukh/eval/encoder.py"
     notes.append(
@@ -1696,20 +1387,10 @@ def blunder_notes(result: EncoderResult) -> list[str]:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="845-887" />
 
-La nota que el código adjunta al número dice, con esas palabras, que la comparación «no es un terreno
-de juego nivelado» —«it is not a level playing field»— aunque sea exactamente la que piden los <Term id="criterio-de-aceptacion">criterios de aceptación</Term>
-del módulo. Una advertencia que reconoce que la comparación que el propio plan pide no es del todo justa, y que se publica al lado
-del número. Eso es lo que separa un informe de un escaparate.
-
-Fíjate en el detalle del `+ ("" if degenerate else ", which no threshold ever saw")`: la frase «que
-ningún umbral vio nunca» **solo se escribe cuando es verdad**. Si el reparto degeneró, esa cláusula
-desaparece y se añade una nota que lo explica. Una afirmación condicionada a que se cumpla su
-condición, en vez de una plantilla fija que a veces miente.
-
-`blunder_notes` devuelve una lista vacía cuando no hay nada medido, en vez de notas con `n/a`. El
-docstring dice por qué existe como función aparte: **el informe y la model card comparten este
-texto**. La lección 9 lo verá otra vez, cuando la plantilla Jinja de la model card lea estas mismas
-notas.
+Una nota admite que la comparación de los <Term id="criterio-de-aceptacion">criterios de aceptación</Term> del módulo «is not a level playing field». La cláusula «which no
+threshold ever saw» solo se escribe cuando es verdad: si el reparto degeneró, desaparece y entra una
+nota que lo explica, en vez de una plantilla fija que a veces miente. `blunder_notes` es una función
+aparte porque el informe y la model card comparten este texto (lo verás otra vez en la lección 9).
 
 ## El informe
 
@@ -1739,9 +1420,8 @@ def _detector_row(measured: ClassificationResult | None, operating_point: str) -
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="907-927" />
 
-`_verdict_cell` con sus tres estados es el detalle que impide el redondeo cómodo: un criterio que no
-se pudo medir sale como `not measured` y no como `no`. Las dos cosas son distintas y confundirlas
-sería contar un fallo de instrumentación como un fallo del modelo, o al revés.
+`_verdict_cell` tiene tres estados: un criterio que no se pudo medir sale como `not measured`, no
+como `no`, para no contar un fallo de instrumentación como un fallo del modelo.
 
 ```python title="src/rukh/eval/encoder.py"
 def _blunder_section(result: EncoderResult) -> list[str]:
@@ -1780,10 +1460,8 @@ def _blunder_section(result: EncoderResult) -> list[str]:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="930-961" />
 
-La sección del informe que produjo la tabla de tres filas de más arriba. Lo que hay que ver es que
-**el aviso de la tasa base va primero**, antes de cualquier cifra, y que la explicación del reparto
-va antes de la tabla. Un informe que pone los números arriba y los asteriscos abajo es un informe que
-se lee mal a propósito.
+La sección que produjo la tabla de tres filas de más arriba. El aviso de la tasa base va antes de
+cualquier cifra, y la explicación del reparto antes de la tabla: los asteriscos no van al pie.
 
 ```python title="src/rukh/eval/encoder.py"
     if result.tune_f1 is not None:
@@ -1808,10 +1486,6 @@ se lee mal a propósito.
 ```
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="962-980" />
-
-«The distance between that and the `score` half above is what picking an operating point costs». Esa
-frase es la lección de la sección convertida en una línea del informe, con los dos números al lado
-para que el lector haga la resta. Casi ningún informe publica el par.
 
 ```python title="src/rukh/eval/encoder.py"
     measured = result.encoder_blunder_ranking
@@ -1846,9 +1520,7 @@ para que el lector haga la resta. Casi ningún informe publica el par.
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="981-1008" />
 
-La sección «Without an operating point» y la línea del rango de las probabilidades. Es de donde sale
-el `probability span: 0.0020 to 0.3102 (mean 0.0353)` del principio de esta lección, y es la cifra
-que explica el cero del umbral fijo sin que nadie tenga que deducirlo.
+De aquí sale el `probability span` del principio de la lección.
 
 ```python title="src/rukh/eval/encoder.py"
 def render_markdown(result: EncoderResult) -> str:
@@ -1902,16 +1574,9 @@ def render_markdown(result: EncoderResult) -> str:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="1011-1057" />
 
-La tabla del titular, y el orden de sus filas es una decisión editorial: el F1 ajustado, el F1 fijo,
-el del baseline, el margen, el veredicto, las dos métricas sin umbral, **la tasa base**, las dos
-correlaciones, el veredicto del valor, la exactitud del resultado y los tres denominadores.
-
-El fijo va **el segundo**, justo debajo del que se publica. Enterrarlo al final habría sido igual de
-cierto y mucho peor.
-
-Y la última fila es la que responde «¿sobre cuántas filas?» con los tres números a la vez: 10 000
-posiciones, 7 453 con etiqueta de error, 3 660 puntuadas. Una métrica calculada sobre el denominador
-equivocado de los tres es otra métrica.
+En la tabla del titular, el orden de las filas es una decisión editorial: el F1 fijo va justo debajo
+del que se publica, porque enterrarlo al final habría sido igual de cierto y mucho peor. La última
+fila responde «¿sobre cuántas filas?» con los tres denominadores a la vez.
 
 ```python title="src/rukh/eval/encoder.py"
     if encoder is not None or baseline is not None:
@@ -1962,14 +1627,7 @@ equivocado de los tres es otra métrica.
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="1058-1101" />
 
-La tabla de la correlación lleva **el baseline al lado del modelo**, con la misma diana. Es la
-comparación que responde «¿el modelo es mejor que contar piezas para decir cuánto vale una posición?»
-sin que nadie tenga que buscar el número de la heurística en otro sitio.
-
-La sección «Labels needed» construye sus columnas a partir de las claves que los puntos de la curva
-traigan (`sorted({key for point … for key in point.metrics})`). Es lo que hace que la tabla siga
-funcionando si el entrenamiento añade una métrica nueva: no hay lista de columnas escrita en el
-renderizador.
+La tabla de la correlación lleva el baseline al lado del modelo, con la misma diana.
 
 ```python title="src/rukh/eval/encoder.py"
 def track_result(result: EncoderResult, cfg: EncoderEvalConfig) -> str | None:
@@ -1991,9 +1649,8 @@ def track_result(result: EncoderResult, cfg: EncoderEvalConfig) -> str | None:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="1104-1118" />
 
-El `model_sha` como **tag** de la ejecución y no como métrica: en MLflow los tags se pueden
-filtrar y buscar, así que «enséñame todas las evaluaciones de este fichero de pesos» es una consulta
-y no una arqueología.
+El `model_sha` va como tag de la ejecución: en MLflow los tags se filtran, así que «todas las
+evaluaciones de este fichero de pesos» es una consulta.
 
 ```python title="src/rukh/eval/encoder.py"
 def _metrics(result: EncoderResult) -> dict[str, float]:
@@ -2043,16 +1700,9 @@ def _metrics(result: EncoderResult) -> dict[str, float]:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="1121-1163" />
 
-«Only what was actually measured»: cada bloque tiene su `if … is not None`, así que una métrica que
-no se pudo calcular **no aparece** en MLflow en vez de aparecer como cero. Un cero registrado es una
-medida; una ausencia es una ausencia, y en un gráfico de MLflow las dos cosas se ven distintas.
-
-Los tres booleanos de criterio se registran como `float(met)` —0 o 1— porque MLflow solo acepta
-números. Es una conversión que vale la pena hacer: con ella se puede filtrar «todas las evaluaciones
-que cumplieron el criterio de errores» en la interfaz.
-
-Y `blunder_f1_tune` está en la lista. El número optimista, registrado al lado del honesto, en el
-sistema donde queda para siempre.
+Una métrica que no se pudo calcular no aparece en MLflow, en vez de aparecer como cero. Los
+booleanos de criterio van como `float(met)` porque MLflow solo acepta números. Y `blunder_f1_tune`,
+el número optimista, se registra al lado del honesto.
 
 <Callout kind="ejecuta" title="La suite del encoder, entera y sin GPU">
   Con la segunda mitad de `encoder.py` y con `heuristic.py` escritos, el paquete `rukh.eval` vuelve a
@@ -2064,37 +1714,30 @@ sistema donde queda para siempre.
 uv run pytest -m unit -q tests/unit/test_heuristic.py tests/unit/test_eval_encoder.py tests/unit/test_report.py
 ```
 
-Tiene que dar `52 passed`: diez de la heurística, incluido el que fija que llama error garrafal a
-17…Ae6; treinta y dos de la suite, entre ellos que el umbral se elige en la mitad `tune` y se mide
-en la `score` y que el informe avisa cuando el reparto degenera; y los diez del informe de M2, sin
-cambiar ninguno, que comprueban que sacar `write_report_files` no ha movido el informe del decoder. La evaluación de verdad, sobre
-las 10 000 posiciones held-out y con un checkpoint entrenado, es el lab 4 de la lección 11.
+Tiene que dar `52 passed`: diez de la heurística, incluido el de 17…Ae6; treinta y dos de la suite,
+entre ellos que el umbral se elige en `tune` y se mide en `score`; y los diez del informe de M2, sin
+cambiar ninguno. La evaluación de verdad, sobre las 10 000 posiciones held-out y con un checkpoint
+entrenado, es el lab 4 de la lección 11.
 
 </Callout>
 
 ## Qué has aprendido
 
-Que las dos cifras que todo el mundo mira primero —la exactitud y el F1 en el umbral de fábrica— no
-dicen nada sobre una clase rara, y que la forma de arreglarlo es publicar las que ningún umbral puede
-halagar, elegir el punto de operación en unas filas y medirlo en otras, y decir en el informe
-cuánto cuesta esa elección. Y que un baseline solo vale como comparación si es malo a propósito y
-se mide **exactamente igual**: mismas filas, misma definición de acierto, y sus cegueras escritas y
-con test en vez de arregladas.
+Con una tasa base del 3,7 %, la exactitud del 96,78 % y el F1 de 0,0000 en 0,5 no dicen nada; el
+mismo modelo tiene 0,740 de ROC AUC. Lo que sirve con cualquier detector de algo raro, sea de
+ajedrez, de fraude o de spam, es publicar las métricas que ningún umbral puede halagar, elegir el
+punto de operación en unas filas, medirlo en otras y decir cuánto cuesta esa elección.
 
-Si de todo el módulo solo te quedas con una cosa, que sea esta: **con una tasa base del 3,7 %, la
-exactitud del 96,78 % no dice nada y el F1 de 0,0000 en el umbral de 0,5 tampoco; el mismo modelo
-tiene 0,740 de ROC AUC, y el número publicable sale de elegir el umbral en unas filas y puntuar en
-otras.** No es una particularidad del ajedrez: es lo que hay que hacer con cualquier detector de algo
-raro.
+Un baseline solo vale como comparación si es malo a propósito y se mide igual: mismas filas, misma
+definición de acierto, y sus cegueras escritas y con test.
 
-Y la segunda: **una pérdida y una métrica que se describen con las mismas palabras pueden tener
-mínimos distintos.** Escribe el criterio primero, y después di en voz alta qué función minimiza tu
-pérdida. Aquí, mirar eso valió cuatro veces más que triplicar el modelo.
+Y una pérdida y una métrica que se describen con las mismas palabras pueden tener mínimos distintos:
+escribe el criterio primero y comprueba que tu pérdida apunta a él. Aquí, eso rindió cuatro veces
+más que triplicar el modelo.
 
-**Cómo se mide**: `uv run pytest tests/unit/test_heuristic.py -q` pasa los diez tests, incluido el
-que fija que el baseline llama error garrafal a 17…Ae6. `uv run rukh eval encoder` imprime el
-margen, las dos métricas sin umbral con lo que sacaría una moneda al lado, las dos correlaciones y
-las siete notas.
+Para comprobarlo: `uv run pytest tests/unit/test_heuristic.py -q` pasa los diez tests, y
+`uv run rukh eval encoder` imprime el margen, las dos métricas sin umbral con lo que sacaría una
+moneda al lado, las dos correlaciones y las siete notas.
 
 Lo siguiente es la exportación: el encoder en ONNX con dos salidas, la paridad de las decisiones de
 error en tres precisiones, los embeddings de posición y la model card que reutiliza estas mismas
