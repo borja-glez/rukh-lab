@@ -7,6 +7,16 @@
  * from one panel to the next is the knob. The last panel shows the cut moves as hollow bars at
  * the width they had before the cut, because the point is what top-k takes away. Every number is
  * computed here from the logits, so the labels cannot drift from the bars.
+ *
+ * Animated: the T = 0.6 and T = 2 panels start from the shape the model learned (the T = 1 bars)
+ * and turn into their own, and the top-k panel starts from T = 2 and applies the cut: the five
+ * tail bars empty out and the three that remain grow to take their mass. The T = 1 panel stays
+ * still, as the reference. What the motion teaches is that a knob reshapes one distribution
+ * rather than producing a different one: at T = 0.6 the long bar grows and every other one
+ * shrinks, at T = 2 the long bar shrinks and the tail grows, and in neither does a bar ever pass
+ * the one above it. Each bar gets its starting width as a fraction of its final one, `--from`,
+ * computed here from the same logits; the percentages dim while the bars are moving, because
+ * they are the numbers of the final shape. With motion reduced, the final shapes are what stays.
  */
 const moves = ['g1f3', 'b1c3', 'f1c4', 'd2d4', 'f2f4', 'd1h5', 'a2a3', 'g1e2'];
 const logits = [2.6, 1.7, 1.5, 1.1, 0.4, -0.1, -0.8, -1.2];
@@ -23,11 +33,13 @@ const topK = (probs: number[], k: number) => {
 };
 
 const hot = softmax(logits, 2);
+const learned = softmax(logits, 1);
+/* `start` is what the animation morphs from; null for the panel that stays still. */
 const panels = [
-  { title: 'T = 0,6 · la de Rukh', probs: softmax(logits, 0.6), before: null },
-  { title: 'T = 1 · lo que aprendió', probs: softmax(logits, 1), before: null },
-  { title: 'T = 2 · más plana', probs: hot, before: null },
-  { title: 'T = 2 y top-k = 3', probs: topK(hot, 3), before: hot },
+  { title: 'T = 0,6 · la de Rukh', probs: softmax(logits, 0.6), before: null, start: learned },
+  { title: 'T = 1 · lo que aprendió', probs: learned, before: null, start: null },
+  { title: 'T = 2 · más plana', probs: hot, before: null, start: learned },
+  { title: 'T = 2 y top-k = 3', probs: topK(hot, 3), before: hot, start: hot },
 ];
 
 const origin = (i: number) => ({ x: (i % 2) * 324 + 8, y: Math.floor(i / 2) * 212 + 22 });
@@ -35,12 +47,14 @@ const row = (j: number) => 22 + j * 19;
 const width = (p: number) => Math.max(1.5, p * 210);
 const pct = (p: number) => `${Math.round(p * 100)} %`;
 const tail = (probs: number[]) => pct(probs.slice(3).reduce((s, p) => s + p, 0));
+const from = (start: number, end: number) => `--from:${(width(start) / width(end)).toFixed(4)}`;
 ---
 
 <svg
   viewBox="0 0 640 420"
   role="img"
-  aria-label={`Las mismas ocho jugadas legales con cuatro ajustes de muestreo. A temperatura 0,6 la mejor se lleva el ${pct(panels[0].probs[0])}; a temperatura 1, el ${pct(panels[1].probs[0])}; a temperatura 2, el ${pct(hot[0])} y las cinco peores suman el ${tail(hot)}. El orden de las jugadas no cambia en ningún caso. Con temperatura 2 y top-k 3, las cinco peores quedan a cero y las tres primeras se reparten todo.`}
+  class="fig--temperature"
+  aria-label={`Las mismas ocho jugadas legales con cuatro ajustes de muestreo; en la versión animada, cada panel parte de la forma aprendida (o de la de temperatura 2, el de top-k) y se transforma en la suya sin que ninguna jugada adelante a otra. A temperatura 0,6 la mejor se lleva el ${pct(panels[0].probs[0])}; a temperatura 1, el ${pct(panels[1].probs[0])}; a temperatura 2, el ${pct(hot[0])} y las cinco peores suman el ${tail(hot)}. El orden de las jugadas no cambia en ningún caso. Con temperatura 2 y top-k 3, las cinco peores quedan a cero y las tres primeras se reparten todo.`}
 >
   <g font-family="var(--font-mono)" font-size="10" fill="var(--ink)">
     {panels.map((panel, i) => {
@@ -57,6 +71,18 @@ const tail = (probs: number[]) => pct(probs.slice(3).reduce((s, p) => s + p, 0))
               </text>
               {panel.before && panel.probs[j] === 0 && (
                 <rect
+                  class="fig-temperature__cut"
+                  x={o.x + 40}
+                  y={o.y + row(j) - 6}
+                  width={width(panel.before[j])}
+                  height="12"
+                  fill="var(--accent)"
+                  fill-opacity="0.85"
+                  opacity="0"
+                />
+              )}
+              {panel.before && panel.probs[j] === 0 && (
+                <rect
                   x={o.x + 40}
                   y={o.y + row(j) - 6}
                   width={width(panel.before[j])}
@@ -68,6 +94,8 @@ const tail = (probs: number[]) => pct(probs.slice(3).reduce((s, p) => s + p, 0))
               )}
               {panel.probs[j] > 0 && (
                 <rect
+                  class={panel.start ? 'fig-temperature__bar' : undefined}
+                  style={panel.start ? from(panel.start[j], panel.probs[j]) : undefined}
                   x={o.x + 40}
                   y={o.y + row(j) - 6}
                   width={width(panel.probs[j])}
@@ -77,6 +105,7 @@ const tail = (probs: number[]) => pct(probs.slice(3).reduce((s, p) => s + p, 0))
                 />
               )}
               <text
+                class={panel.start ? 'fig-temperature__pct' : undefined}
                 x={
                   o.x +
                   46 +
@@ -88,7 +117,12 @@ const tail = (probs: number[]) => pct(probs.slice(3).reduce((s, p) => s + p, 0))
               </text>
             </>
           ))}
-          <text x={o.x} y={o.y + row(8) + 6} fill="var(--muted)">
+          <text
+            class={panel.start ? 'fig-temperature__pct' : undefined}
+            x={o.x}
+            y={o.y + row(8) + 6}
+            fill="var(--muted)"
+          >
             {panel.before ? 'recortadas: 0 %' : `las cinco últimas suman ${tail(panel.probs)}`}
           </text>
         </>
