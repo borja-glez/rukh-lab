@@ -6,7 +6,7 @@ description:
   ponderada por tokens, los checkpoints con procedencia y las dos configuraciones del repositorio.'
 module: m2
 order: 3
-duration: 205
+duration: 190
 runtime: 45
 level: base
 status: vigente
@@ -32,81 +32,62 @@ artifacts:
 ## Qué vas a construir
 
 `uv run rukh train --config configs/train/small.yaml`, y el código de `src/rukh/train/` que hay
-detrás. Al terminar tendrás `tiny` entrenado en **189 segundos** y `small` en **42 minutos**, con
-sus veinte checkpoints, sus curvas en MLflow y la propiedad de la que depende todo lo demás: si el
-proceso se corta, `--resume` continúa donde estaba en vez de empezar otra vez.
+detrás. Al terminar tendrás `tiny` entrenado en 189 segundos y `small` en 42 minutos, con sus
+veinte checkpoints, sus curvas en MLflow y una propiedad de la que depende todo lo demás: si el
+proceso se corta, `--resume` continúa donde estaba.
 
-Un modelo bien construido no entrena solo. La receta que sigue es casi la misma que usaría
-cualquiera para un GPT pequeño y, con otros números, la de cualquier LLM que se preentrena hoy:
-AdamW, warmup y coseno, recorte de gradiente y bf16. El objeto de esta lección es que cada número
-tenga un motivo que sepas defender.
+La receta (AdamW, warmup y coseno, recorte de gradiente y bf16) es, con otros números, la de
+cualquier LLM que se preentrena hoy. El objetivo es que cada número tenga un motivo que sepas
+defender.
 
 <LabRoutes lesson="m2/03-la-receta-de-entrenamiento" />
 
 ## Teoría justa: los cinco números de la receta
 
-**<Term id="adamw">AdamW</Term> con β = 0,9 / 0,95.** Adam guarda dos medias móviles por parámetro:
-la del gradiente (β₁ = 0,9, una especie de inercia) y la de su cuadrado (β₂), y divide la primera
-por la raíz de la segunda, de manera que cada parámetro recibe un paso normalizado por lo ruidoso
-que es su gradiente. El valor por defecto de β₂ en PyTorch es 0,999, que promedia sobre unos mil
-pasos; en modelos de lenguaje se baja a 0,95 (unos veinte pasos) porque la escala de los gradientes
-cambia deprisa al principio y una media demasiado larga reacciona tarde. Es el valor de GPT-3 y el
-de nanoGPT.
+**<Term id="adamw">AdamW</Term> con β = 0,9 / 0,95.** Adam guarda dos medias móviles por parámetro,
+la del gradiente (β₁, una especie de inercia) y la de su cuadrado (β₂), y divide una por la raíz de
+la otra: cada parámetro recibe un paso normalizado por lo ruidoso que es su gradiente. El β₂ por
+defecto de PyTorch, 0,999, promedia unos mil pasos; en modelos de lenguaje se baja a 0,95 (unos
+veinte) porque la escala de los gradientes cambia deprisa al principio. Es el valor de GPT-3 y de
+nanoGPT.
 
-**Weight decay 0,1, solo en las matrices.** El decaimiento de pesos resta en cada paso una fracción
-del propio peso: empuja todo hacia cero salvo que el gradiente lo sostenga, así que solo se queda
-grande lo que de verdad hace falta. En las matrices —la atención, el MLP, los embeddings— eso es
-regularización clásica. En los parámetros de `LayerNorm` y en los sesgos, no: su tamaño no es
-capacidad sino un ajuste de escala o un desplazamiento, y encogerlos solo estropea la señal.
+**Weight decay 0,1, solo en las matrices.** El decaimiento resta en cada paso una fracción del
+propio peso, así que solo se queda grande lo que el gradiente sostiene. En las matrices es
+regularización clásica. En los `LayerNorm` y los sesgos no, porque su tamaño es una escala o un
+desplazamiento, no capacidad.
 
-**<Term id="warmup">Warmup</Term> de 1 000 pasos y después coseno.** La tasa de aprendizaje empieza
-en cero, sube en línea recta hasta 6e-4 en el paso 1 000 y desde ahí baja siguiendo medio coseno
-hasta el 10 % de ese valor en el paso 20 000, donde se queda.
+**<Term id="warmup">Warmup</Term> de 1 000 pasos y después coseno.** La tasa sube en línea recta de
+cero a 6e-4 en el paso 1 000 y desde ahí baja en medio coseno hasta el 10 % en el paso 20 000.
 
-Qué pasa sin warmup. En el paso 1, Adam tiene una estimación del segundo momento hecha con un único
-gradiente, y el cociente que calcula es casi arbitrario. Es como calcular tu velocidad media en un
-viaje cuando llevas recorrido el primer metro: el número existe, pero todavía no significa nada. Y
-como el paso de Adam está normalizado, con esa media sin sentido un parámetro puede moverse de
-golpe tanto como la tasa de aprendizaje entera. Sobre una red recién inicializada, con 24
-escrituras en la corriente residual, eso basta para que las activaciones exploten, el softmax de la
-atención sature y el modelo caiga en un mínimo tonto: predecir siempre las jugadas más frecuentes
-del corpus. La curva no revienta con un `NaN` espectacular; se queda plana en una pérdida mediocre
-y no baja nunca. El warmup es no fiarse de esa media hasta que hay kilómetros detrás: cuesta el 5 %
-de los pasos y elimina ese riesgo.
+¿Por qué el warmup? En el paso 1, Adam estima el segundo momento con un único gradiente, y el
+cociente es casi arbitrario: como calcular tu velocidad media cuando llevas recorrido el primer
+metro. Con el paso normalizado, un parámetro puede moverse de golpe la tasa entera; sobre una red
+recién inicializada eso basta para que el softmax de la atención sature y el modelo caiga en un
+mínimo tonto, predecir siempre las jugadas más frecuentes. No hay un `NaN` espectacular: la curva se
+queda plana y no baja nunca. El warmup cuesta el 5 % de los pasos. El coseno es la lógica inversa:
+cerca del mínimo, pasos grandes solo te sacan de él, y el suelo del 10 % evita que los últimos miles
+de pasos no hagan nada.
 
-La bajada en coseno tiene una lógica parecida por el otro lado: al final del entrenamiento el
-modelo está cerca de un mínimo y pasos grandes solo lo sacan de él. El suelo del 10 % evita que los
-últimos miles de pasos no hagan nada.
+**<Term id="recorte-de-gradiente">Clipping</Term> a 1,0.** Si la norma global del gradiente pasa de
+1,0, se reescala el vector entero. Es un seguro contra un lote raro que tiraría horas de
+entrenamiento. El `grad_norm` se registra en MLflow y es el mejor termómetro: debe bajar y
+estabilizarse. Si está pegado a 1,0 paso tras paso, el recorte salta siempre y el problema es otro:
+la tasa de aprendizaje es demasiado alta.
 
-**<Term id="recorte-de-gradiente">Clipping</Term> a 1,0.** Antes de cada `optimizer.step()` se calcula la norma global del gradiente y, si
-pasa de 1,0, se reescala el vector entero para que valga 1,0. Es un seguro contra un lote raro: sin
-él, una única secuencia patológica puede mover los pesos lo suficiente como para tirar horas de
-entrenamiento. El `grad_norm` se registra en MLflow, y mirarlo es la mejor forma de saber si el
-entrenamiento está sano: debe bajar y estabilizarse, no dar picos. Es el limitador de velocidad de
-un coche de alquiler: no cambia cómo conduces mientras vas por debajo, y el día que pisas de más
-porque la carretera te engañó, es lo que evita el accidente. Si salta en cada curva —el `grad_norm`
-pegado a 1,0 paso tras paso—, el problema no es el limitador, es que vas demasiado deprisa para esa
-carretera: la tasa de aprendizaje es alta.
-
-**<Term id="bf16">bf16</Term>, y por qué no fp16.** Los dos son formatos de 16 bits y los dos
-doblan el rendimiento en una GPU moderna. La diferencia está en cómo reparten los bits. fp16 usa 5
-para el exponente y 10 para la mantisa: mucha precisión, poco rango, con el número normal más
-pequeño alrededor de 6·10⁻⁵. Los gradientes de una red profunda viven justo ahí abajo, así que en
-fp16 se van a cero: por eso entrenar en fp16 obliga a un `GradScaler` que multiplica la pérdida por
-un factor grande, lo baja si aparecen infinitos, y de vez en cuando te regala un `NaN` a las tres
-de la mañana. bf16 usa 8 bits de exponente —**el mismo rango que fp32**— y 7 de mantisa: menos
-precisión por número, pero nada se desborda por abajo. No hace falta escalar nada. Son dos reglas
-del mismo precio: fp16 es una regla fina y corta —marca las décimas de milímetro, pero solo llega
-a 20 centímetros—, bf16 es gruesa y larga —milímetros enteros, pero llega hasta donde llega una
-de metro—. Para un gradiente, que puede ser minúsculo o enorme y casi nunca necesita la tercera
-cifra, la larga es la que sirve. En la RTX 5090 (sm_120) bf16 es nativo, así que la elección es
-gratis. Los pesos maestros siguen en fp32 y el optimizador acumula en fp32; bf16 es solo la
-precisión de las operaciones dentro del `autocast`.
+**<Term id="bf16">bf16</Term>, y por qué no fp16.** Los dos son de 16 bits y doblan el rendimiento,
+pero reparten los bits distinto. fp16 tiene 5 de exponente y 10 de mantisa: mucha precisión y poco
+rango, con el menor número normal hacia 6·10⁻⁵, justo donde viven los gradientes de una red
+profunda. Por eso entrenar en fp16 exige un `GradScaler` y te regala algún `NaN` a las tres de la
+mañana. bf16 tiene 8 de exponente, **el mismo rango que fp32**, y 7 de mantisa: nada se desborda por
+abajo. Son dos reglas del mismo precio: fp16 marca décimas de milímetro pero solo llega a 20
+centímetros; bf16 marca milímetros y llega al metro. Para un gradiente, que puede ser minúsculo o
+enorme y casi nunca necesita la tercera cifra, sirve la larga. Los pesos maestros y el optimizador
+siguen en fp32; bf16 es solo la precisión dentro del `autocast`.
 
 ## `schedule.py`: la tasa de aprendizaje de cada paso
 
-Empezamos por el fichero más pequeño del módulo, que es además el que separa una ejecución que
-converge de una que se queda plana veinte mil pasos.
+El fichero más pequeño del módulo, y el que separa una ejecución que converge de una que se queda
+plana veinte mil pasos.
 
 ```python title="src/rukh/train/schedule.py"
 """Learning-rate schedule: a linear warmup followed by a cosine decay to a floor."""
@@ -122,10 +103,8 @@ if TYPE_CHECKING:  # pragma: no cover - only for type checkers
 
 <Src file="src/rukh/train/schedule.py" tag="p2" lines="1-9" />
 
-El `TYPE_CHECKING` no es un adorno: `schedule.py` necesita el tipo de `TrainConfig` para anotarse, y
-`loop.py` importa `lr_at`. Importarlo de verdad sería un ciclo. Bajo `TYPE_CHECKING` el import no
-ocurre en tiempo de ejecución y el verificador de tipos sí lo ve, que es lo que hace
-falta.
+El `TYPE_CHECKING` evita un import circular: `loop.py` importa `lr_at` y `schedule.py` solo necesita
+el tipo de `TrainConfig` para anotarse.
 
 ```python title="src/rukh/train/schedule.py"
 def lr_at(step: int, cfg: TrainConfig) -> float:
@@ -149,16 +128,10 @@ def lr_at(step: int, cfg: TrainConfig) -> float:
 
 <Src file="src/rukh/train/schedule.py" tag="p2" lines="12-28" />
 
-La rampa es una regla de tres y el coseno son dos líneas. Lo que merece un párrafo son las dos
-guardas:
-
-- **`step < 0` es un error**, no un cero. Una tasa negativa no existe, y si un llamante calcula mal
-  un paso lo que quieres es enterarte ahí y no cuarenta minutos después.
-- **`span <= 0` devuelve el suelo.** Ocurre cuando `warmup >= max_steps`, que suena absurdo hasta que
-  alguien lanza `--max-steps 300` sobre una configuración con `warmup: 500` para probar algo rápido.
-  Sin esa rama, la división por cero. Y pasado `max_steps` el `min(1.0, …)` deja la tasa clavada en
-  el suelo, de modo que una ejecución reanudada que se pase nunca recibe una tasa negativa ni
-  creciente.
+Lo interesante son las guardas. `step < 0` es un error, para enterarte ahí y no cuarenta minutos
+después. `span <= 0` devuelve el suelo: pasa cuando alguien lanza `--max-steps 300` sobre una
+configuración con `warmup: 500` para probar algo rápido. Y el `min(1.0, …)` deja la tasa clavada en
+el suelo pasado `max_steps`, así que una ejecución reanudada nunca recibe una tasa creciente.
 
 ```python title="tests/unit/test_schedule.py"
 """Tests for rukh.train.schedule: linear warmup then cosine decay to a floor."""
@@ -186,10 +159,8 @@ def test_warmup_is_linear_and_reaches_the_peak() -> None:
 
 <Src file="tests/unit/test_schedule.py" tag="p2" lines="1-21" />
 
-El test del warmup no comprueba tres puntos: comprueba que los 101 primeros valores están ordenados
-y que **todos los incrementos son el mismo número** (el conjunto de deltas redondeadas tiene un solo
-elemento). Eso es lo que significa «lineal», y es lo que distingue una rampa de cualquier otra curva
-creciente que pase por los tres puntos que se te ocurra mirar.
+El test del warmup comprueba que todos los incrementos son el mismo número (el conjunto de deltas
+tiene un solo elemento). Eso es «lineal»; tres puntos los cumple cualquier curva creciente.
 
 ```python title="tests/unit/test_schedule.py"
 def test_cosine_decays_to_the_floor_and_stays_there() -> None:
@@ -222,17 +193,15 @@ def test_config_rejects_unknown_keys() -> None:
 
 <Src file="tests/unit/test_schedule.py" tag="p2" lines="24-49" />
 
-Y los otros cuatro cubren el otro extremo: que el coseno baje de forma monótona, que el punto medio
-del descenso valga exactamente la media entre el pico y el suelo (la propiedad del coseno que
-verifica que la fórmula es la que crees), que pasado `max_steps` no siga bajando, y los dos casos
-degenerados. El último no es del planificador sino de la configuración: `TrainConfig(learning_rate=…)`
-tiene que explotar, porque `learning_rate` no es el nombre del campo y un YAML con esa clave
-entrenaría con 6e-4 sin decir nada.
+Los demás cubren el descenso monótono, el punto medio (que tiene que valer la media entre pico y
+suelo, la propiedad que confirma que la fórmula es la que crees) y los casos degenerados. El último
+es de la configuración: `TrainConfig(learning_rate=…)` tiene que explotar, porque un YAML con esa
+clave mal escrita entrenaría con 6e-4 sin decir nada.
 
 ## `loop.py`: el bucle
 
-Buena parte del fichero es la contabilidad que hace que una ejecución sea reproducible seis meses
-después. Empezamos por la cabecera, que es un resumen de las decisiones.
+Buena parte del fichero es contabilidad para que una ejecución sea reproducible seis meses después.
+La cabecera resume las decisiones.
 
 ```python title="src/rukh/train/loop.py"
 """The training loop: AdamW with a cosine schedule, bf16, checkpoints and MLflow logging.
@@ -257,9 +226,8 @@ micro-batch with fewer real tokens does not count as much as a full one.
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="1-18" />
 
-Léela entera: es la especificación de la receta, escrita donde no se pierde. Los dos párrafos que
-importan son el de reanudar —«que sea indistinguible de no haber parado nunca» es un requisito, no
-una intención— y el de las dos cifras de rendimiento.
+Fíjate en el párrafo de reanudar: «indistinguible de no haber parado nunca» es un requisito que el
+código cumple más abajo.
 
 ```python title="src/rukh/train/loop.py"
 from __future__ import annotations
@@ -339,21 +307,17 @@ class TrainConfig(BaseConfig):
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="56-89" />
 
-`TrainConfig` es la receta entera, y como hereda de `BaseConfig` una clave desconocida en el YAML es
-un error. Los valores por defecto son los de `small`. Tres campos que no son obvios:
+`TrainConfig` es la receta entera, con los valores de `small` por defecto. Tres campos no obvios:
 
-- **`grad_accum: 4`**, con `batch_size: 64`, son 256 secuencias efectivas. La <Term id="acumulacion-de-gradiente">acumulación de gradiente</Term> no es un lote más grande gratis: es partir el lote que no cabe en la GPU en cuatro pasadas que sí caben.
-- **`unique_run_name: True`** añade una marca de tiempo al nombre. Sin ella, una segunda ejecución de
-  la misma configuración sobreescribiría los `step-*.pt` de la primera, que son los que
-  lee la isla `TrainingReplay` de este módulo. El docstring del campo lo dice ahí mismo, que es
-  donde se lee.
-- **`model: DecoderConfig | None`** permite describir un modelo a mano en el YAML en vez de usar un
-  preset. Es lo que hace que `configs/train/*.yaml` no tenga que crecer un preset por experimento.
+- `grad_accum: 4` con `batch_size: 64` son 256 secuencias efectivas.
+  La <Term id="acumulacion-de-gradiente">acumulación de gradiente</Term> parte el lote que no cabe en la
+  GPU en cuatro pasadas que sí caben.
+- `unique_run_name` añade una marca de tiempo para que una segunda ejecución no sobreescriba los
+  `step-*.pt` de la primera, que son los que lee la isla `TrainingReplay`.
+- `model` permite describir un modelo a mano en el YAML sin crear un preset por experimento.
 
-Y `decoder()` es la única línea del fichero que toca la forma del modelo: coge el preset (o el
-`model` explícito) y le aplica el `block` de la ejecución. El contexto vive en dos sitios porque son
-dos cosas distintas —la ventana del modelo y la longitud de las ventanas que empaqueta el
-cargador—, y esta línea es la que garantiza que coincidan.
+`decoder()` aplica el `block` de la ejecución al modelo: la ventana del modelo y la de las
+secuencias que empaqueta el cargador tienen que coincidir.
 
 ```python title="src/rukh/train/loop.py"
 def pick_device() -> str:
@@ -376,14 +340,10 @@ def param_groups(model: nn.Module, weight_decay: float) -> list[dict[str, Any]]:
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="92-107" />
 
-`pick_device` mira primero `RUKH_DEVICE`, y esa variable de entorno es lo que permite a los tests
-forzar CPU en una máquina con GPU sin tocar ninguna configuración.
-
-`param_groups` reparte el decaimiento de pesos, y la regla es «tensores de dos dimensiones o más».
-Un `LayerNorm` tiene una ganancia por canal inicializada a 1; empujarla hacia cero es apagar el
-canal, no regularizarlo. Un sesgo tiene una dimensión y desplaza, no escala. Son unos pocos miles de
-parámetros de los 39 millones, y meterlos en el grupo equivocado degrada el entrenamiento en
-silencio.
+`RUKH_DEVICE` permite a los tests forzar CPU en una máquina con GPU. `param_groups` aplica el
+decaimiento a los tensores de dos dimensiones o más: la ganancia de un `LayerNorm` empieza en 1, y
+empujarla hacia cero apaga el canal. Son unos pocos miles de parámetros, y meterlos en el grupo
+equivocado degrada el entrenamiento en silencio.
 
 ```python title="src/rukh/train/loop.py"
 def forever(loader: DataLoader[Batch]) -> Iterator[Batch]:
@@ -394,10 +354,9 @@ def forever(loader: DataLoader[Batch]) -> Iterator[Batch]:
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="110-113" />
 
-`forever` convierte un `DataLoader` finito en un flujo infinito. El bucle cuenta pasos, no
-épocas, así que necesita que los lotes no se acaben; `yield from` reinicia el cargador —y con él su
-barajado— cada vez que se agota. En la tirada de `small` eso ocurre 4,3 veces, y esa cifra es la que
-la última lección del módulo convierte en un diagnóstico.
+El bucle cuenta pasos, no épocas, así que `forever` reinicia el cargador (y su barajado) cada vez que
+se agota. En la tirada de `small` eso ocurre 4,3 veces, cifra que la última lección del módulo
+convierte en un diagnóstico.
 
 ```python title="src/rukh/train/loop.py"
 def maybe_compile(
@@ -431,19 +390,14 @@ def maybe_compile(
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="116-142" />
 
-`torch.compile` es perezoso: no compila al llamarlo, compila la primera vez que una pasada llega a
-Inductor. En Windows sin MSVC (o sin Triton) eso significa que el fallo aparece **a mitad de la
-ejecución**, cuando ya has invertido media hora. Forzar la compilación aquí con un lote de la forma de
-entrenamiento hace que el fallo ocurra donde todavía se puede caer a modo _eager_.
+`torch.compile` es perezoso: compila la primera vez que una pasada llega a Inductor, y en Windows
+sin MSVC el fallo aparecería a mitad de la ejecución. Forzarlo aquí con un lote de prueba hace que
+falle donde todavía se puede caer a modo _eager_, con un aviso. La máquina de referencia entrena
+`small` en eager por esto, y lo dice.
 
-Y la caída es un aviso, no una excepción: `log.warning` y se entrena igual. La máquina de referencia
-entrena `small` entero en eager por esto, a 422 000 tokens por segundo, y lo dice en vez de fingir
-que la bandera funcionó.
-
-Fíjate en los dos `model.zero_grad(set_to_none=True)`. El lote de prueba hace un `backward()` de
-verdad y deja gradientes en todos los parámetros; sin borrarlos, el primer paso real sumaría a los
-suyos los de un lote de unos. No revienta nada, y por eso se escapa con facilidad: el modelo empieza
-con un paso envenenado que la curva no deja ver.
+Los dos `zero_grad` importan: el lote de prueba deja gradientes, y sin borrarlos el primer paso real
+sumaría los de un lote de unos. No revienta nada, y por eso se escapa: un paso envenenado que la
+curva no deja ver.
 
 ```python title="src/rukh/train/loop.py"
 @torch.no_grad()
@@ -485,22 +439,17 @@ def evaluate(
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="145-179" />
 
-La evaluación, y tres decisiones dentro:
+Cuatro decisiones en la evaluación:
 
-1. **`was_training` en vez de `model.train()` al final.** La función se llama desde el bucle (donde
-   el modelo está entrenando) y desde scripts (donde no). Restaurar el estado que había es lo que
-   impide que evaluar un checkpoint lo deje silenciosamente en modo entrenamiento.
-2. **Un número fijo de <Term id="lote">lotes</Term>.** 50 lotes de 64 × 200 son 640 000 tokens, y esta medida se satura
-   mucho antes de que haga falta un mes entero de partidas de validación. Esa observación es la que
-   la última lección del módulo convierte en 238 millones de tokens más de material de
-   entrenamiento.
-3. **La <Term id="perdida">pérdida</Term> ponderada por tokens**, no como media de medias: un lote con más relleno no debe
-   pesar lo mismo que uno lleno. Y el `torch.isfinite(loss)` filtra el lote degenerado —todo
-   `<pad>`— que la lección anterior dejó devolviendo `NaN`.
-
-Fíjate también en `(logits.argmax(dim=-1) == y)[mask]`: el top-1 se cuenta solo sobre las posiciones
-que no son relleno. Contarlo sobre todas daría una cifra altísima y sin sentido, porque acertar
-`<pad>` es gratis.
+1. `was_training` restaura el estado que había, para que evaluar un checkpoint desde un script no lo
+   deje en modo entrenamiento.
+2. Un número fijo de <Term id="lote">lotes</Term>: 50 de 64 × 200 son 640 000 tokens, muy por debajo
+   de un mes entero de validación. La última lección del módulo convierte esa observación en 238
+   millones de tokens más para entrenar.
+3. **La <Term id="perdida">pérdida</Term> ponderada por tokens**, no como media de medias, para que
+   un lote con más relleno no pese como uno lleno. `torch.isfinite` filtra el lote todo `<pad>` que
+   devuelve `NaN`.
+4. El top-1 se cuenta solo sobre posiciones que no son relleno; acertar `<pad>` es gratis.
 
 ```python title="src/rukh/train/loop.py"
 def run_dir(cfg: TrainConfig, resume: Path | None = None) -> Path:
@@ -536,10 +485,10 @@ def skip_batches(batches: Iterator[Batch], count: int) -> int:
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="182-210" />
 
-`run_dir` decide dónde escribe la ejecución y `skip_batches` es la mitad menos obvia de reanudar. Una
-ejecución reanudada que empezara otra vez por la primera ventana de la primera <Term id="epoca">época</Term> entrenaría dos
-veces sobre las mismas partidas mientras el planificador cree que va por la mitad. Adelantar el flujo
-es barato —las ventanas son rodajas de un memmap— y se registra, porque no es gratis.
+`skip_batches` es la mitad menos obvia de reanudar. Sin ella, la ejecución empezaría por la primera
+ventana de la primera <Term id="epoca">época</Term> y entrenaría dos veces sobre las mismas partidas
+mientras el planificador cree que va por la mitad. Adelantar es barato, porque las ventanas son
+rodajas de un memmap.
 
 ```python title="src/rukh/train/loop.py"
 def train(cfg: TrainConfig, resume: Path | None = None, device: str | None = None) -> Path:
@@ -568,9 +517,9 @@ def train(cfg: TrainConfig, resume: Path | None = None, device: str | None = Non
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="213-234" />
 
-La entrada de `train`. La comprobación que vale su peso es la del vocabulario: si el paquete de
-tokens dice 2 030 y el modelo espera otra cosa, el entrenamiento **funcionaría** —los índices son
-enteros y caben— y produciría un modelo que habla otro idioma. Ese error no se detecta después.
+La comprobación que vale su peso es la del vocabulario: si el paquete dice 2 030 y el modelo espera
+otra cosa, el entrenamiento funcionaría igual (los índices caben) y produciría un modelo que habla
+otro idioma, un error que después no se detecta.
 
 ```python title="src/rukh/train/loop.py"
     model = MoveDecoder(model_cfg).to(where)
@@ -612,10 +561,9 @@ enteros y caben— y produciría un modelo que habla otro idioma. Ese error no s
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="250-266" />
 
-El `warmup` de la línea 254 no es el warmup de la tasa de aprendizaje: es el lote de unos con el que
-se fuerza la compilación, y va **dentro del mismo `autocast`** con el que va a correr el bucle. Si se
-compilara en fp32 y se ejecutara en bf16, la primera pasada real recompilaría, que es justo lo que
-este bloque existe para descubrir pronto.
+Este `warmup` no es el de la tasa: es el lote de unos que fuerza la compilación, dentro del mismo
+`autocast` que el bucle. Compilar en fp32 y ejecutar en bf16 obligaría a recompilar en la primera
+pasada real.
 
 ```python title="src/rukh/train/loop.py"
     from rukh.tracking import git_sha, start_run
@@ -649,9 +597,9 @@ este bloque existe para descubrir pronto.
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="268-294" />
 
-Todo lo que hace falta para identificar una ejecución seis meses después: la configuración entera, el
-hash del vocabulario, el SHA del manifiesto de datos, el dispositivo y el número de parámetros. Y
-`save` es una clausura porque necesita `this_run`, que solo existe dentro del `with`.
+Todo lo que identifica una ejecución seis meses después: configuración, hash del vocabulario, SHA
+del manifiesto de datos, dispositivo y parámetros. `save` es una clausura porque necesita
+`this_run`, que solo existe dentro del `with`.
 
 ```python title="src/rukh/train/loop.py"
         clock = time.perf_counter()
@@ -680,16 +628,14 @@ hash del vocabulario, el SHA del manifiesto de datos, el dispositivo y el númer
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="296-317" />
 
-El corazón, con tres detalles que se equivocan con facilidad:
+El corazón, con tres detalles fáciles de equivocar:
 
-- **`(loss / cfg.grad_accum).backward()`.** Es lo que hace que los cuatro gradientes acumulados
-  equivalgan a una media y no a una suma. Sin esa división, el tamaño del paso dependería de cuántos
-  micro-lotes se acumulen, y cambiar `grad_accum` para que quepa en otra GPU cambiaría la receta.
-- **La pérdida se acumula en la GPU**, en dos tensores escalares, y solo se lee con `.item()` al
-  registrar. Acumular en Python costaría una sincronización por micro-lote en vez de una por paso.
-- **`clip_grad_norm_(model.parameters(), …)`**, no la de `runnable`. Con `torch.compile`, `runnable`
-  es un envoltorio; los parámetros son los mismos objetos, pero pedirlos al modelo original es lo que
-  garantiza que el recorte se aplica a la norma **global** de todos ellos y no a la de un subconjunto.
+- `(loss / cfg.grad_accum).backward()` hace que los gradientes acumulados sean una media y no una
+  suma. Sin la división, cambiar `grad_accum` para que quepa en otra GPU cambiaría la receta.
+- La pérdida se acumula en la GPU y solo se lee con `.item()` al registrar: una sincronización por
+  paso en vez de una por micro-lote.
+- El recorte se pide sobre `model.parameters()`, no sobre el envoltorio compilado, para garantizar
+  que se aplica a la norma global.
 
 ```python title="src/rukh/train/loop.py"
             done = step + 1
@@ -728,17 +674,11 @@ El corazón, con tres detalles que se equivocan con facilidad:
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="319-350" />
 
-La contabilidad. `done = step + 1` para que «cada 500 pasos» signifique lo que parece, y el `or last`
-en las tres condiciones para que la última iteración siempre registre, evalúe y guarde aunque
-`max_steps` no sea múltiplo de nada.
-
-El `best.pt` se escribe solo cuando la pérdida de validación mejora, así que al acabar tienes dos
-cosas distintas: el último checkpoint y el mejor. En la tirada de `small` son el mismo, y eso es una
-medida, no una suposición: la validación seguía bajando en el paso 20 000.
-
-Los tres `clock = time.perf_counter()` son el detalle aburrido que hace que `tokens_per_s` signifique
-algo: sin ellos, el tiempo de una evaluación o de escribir un checkpoint de 150 MB entraría en la
-medida de la velocidad de entrenamiento.
+El `or last` garantiza que la última iteración registre, evalúe y guarde aunque `max_steps` no sea
+múltiplo de nada. `best.pt` se escribe solo cuando la validación mejora; en la tirada de `small`
+coincide con el último checkpoint porque la validación seguía bajando en el paso 20 000. Y los
+`clock = time.perf_counter()` sacan de `tokens_per_s` el tiempo de evaluar o de escribir un
+checkpoint de 150 MB.
 
 ```python title="src/rukh/train/loop.py"
 def log_metrics(metrics: dict[str, float], step: int) -> None:
@@ -756,10 +696,8 @@ def log_metrics(metrics: dict[str, float], step: int) -> None:
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="353-363" />
 
-Y el registro, con la regla que se aplica a todo el proyecto: **perder la traza nunca cuesta una
-ejecución**. Un MLflow caído, un disco lleno o una métrica `NaN` producen un aviso y el entrenamiento
-sigue. El filtro de `NaN` no es cosmético: MLflow rechaza el valor y la excepción, sin el `try`,
-tiraría la ejecución en el primer lote raro.
+**Perder la traza nunca cuesta una ejecución**: un MLflow caído o una métrica `NaN` (que MLflow
+rechaza) producen un aviso y el entrenamiento sigue.
 
 ## `checkpoint.py`: qué es un checkpoint y qué no
 
@@ -794,10 +732,9 @@ TIED_HEAD = "lm_head.weight"
 
 <Src file="src/rukh/train/checkpoint.py" tag="p2" lines="1-26" />
 
-«Solo valores de Python y tensores» tiene una consecuencia concreta: el fichero se puede leer con
-`torch.load(..., weights_only=True)`, que es el modo que **no** ejecuta código al deserializar. Un
-checkpoint es un fichero que la gente se descarga; un pickle arbitrario es una ejecución remota
-esperando a ocurrir.
+«Solo valores de Python y tensores» permite leerlo con `torch.load(..., weights_only=True)`, el modo
+que no ejecuta código al deserializar. Un checkpoint es un fichero que la gente se descarga, y un
+pickle arbitrario es una ejecución remota esperando a ocurrir.
 
 ```python title="src/rukh/train/checkpoint.py"
 def step_name(step: int) -> str:
@@ -830,9 +767,9 @@ def read_manifest_sha(manifest: Path) -> str | None:
 
 <Src file="src/rukh/train/checkpoint.py" tag="p2" lines="29-54" />
 
-Las dos funciones de procedencia, y las dos devuelven `None` en vez de fallar. Es deliberado y está
-escrito: entrenar desde un paquete de tokens copiado a otra máquina, donde no hay `data/`, tiene que
-funcionar; lo que no puede pasar es que el checkpoint **afirme** una procedencia que no tiene.
+Las dos funciones de procedencia devuelven `None` en vez de fallar: entrenar con un paquete copiado
+a otra máquina tiene que funcionar, pero el checkpoint no puede afirmar una procedencia que no
+tiene.
 
 ```python title="src/rukh/train/checkpoint.py"
 def rng_state() -> dict[str, Any]:
@@ -864,13 +801,8 @@ def set_rng_state(state: Mapping[str, Any]) -> None:
 
 <Src file="src/rukh/train/checkpoint.py" tag="p2" lines="57-81" />
 
-El estado de los tres generadores. El de NumPy se guarda desarmado a mano —`get_state(legacy=True)`
-devuelve una tupla con un array de 624 enteros— porque la tupla no es serializable como valores
-simples y el requisito de la cabecera es que todo lo sea. El de torch sí es un tensor, que es un
-valor permitido.
-
-`set_rng_state` se salta lo que falte en vez de fallar: un checkpoint viejo sin la entrada de NumPy
-se sigue pudiendo cargar.
+El estado de NumPy se desarma a mano porque su tupla no son valores simples, y la cabecera exige que
+todo lo sea. `set_rng_state` se salta lo que falte, así que un checkpoint viejo se sigue cargando.
 
 ```python title="src/rukh/train/checkpoint.py"
 def save_checkpoint(
@@ -915,24 +847,20 @@ def save_checkpoint(
 
 <Src file="src/rukh/train/checkpoint.py" tag="p2" lines="84-121" />
 
-El payload entero. Los tres primeros campos —paso, pesos, estado del optimizador— más el `rng` son
-lo que hace que `--resume` continúe en vez de reiniciar; los cuatro de procedencia son lo que hace
-que alguien pueda decir, seis meses después, con qué partidas y con qué código se entrenó.
-
-Y la escritura es **atómica**: fichero temporal y `replace`. Un `torch.save` directo sobre
-`best.pt` que se interrumpa a mitad —se va la luz, se llena el disco— deja un fichero corrupto donde
-antes había uno bueno. Con el temporal, el peor caso es un `.tmp` huérfano.
+Paso, pesos, optimizador y `rng` hacen que `--resume` continúe; los campos de procedencia dicen con
+qué partidas y qué código se entrenó. Y la escritura es **atómica**: un `torch.save` directo sobre
+`best.pt` que se corte a mitad deja un fichero corrupto donde había uno bueno; con el temporal y
+`replace`, el peor caso es un `.tmp` huérfano.
 
 <Transfer
   concept="Un checkpoint no son los pesos"
   where="Un fine-tuning en instancias spot que la nube te quita sin avisar; una evaluación de varias horas; cualquier modelo que otra persona vaya a descargar."
 >
-  Para reanudar sin que se note hacen falta los pesos, el estado del optimizador, el paso (que fija
-  la tasa del planificador), los generadores aleatorios y por dónde iba el flujo de datos. Para que
-  otro se fíe, además, la procedencia: qué datos, qué vocabulario, qué commit. Y para que se pueda
-  descargar sin riesgo, un formato que no ejecute código al cargarse (`weights_only`, o
-  `safetensors`, que llega en «Publicar el modelo»). Guardar solo `model.state_dict()` es la versión
-  que funciona hasta el primer corte.
+  Para reanudar sin que se note hacen falta los pesos, el optimizador, el paso (que fija la tasa),
+  los generadores aleatorios y por dónde iba el flujo de datos. Para que otro se fíe, la
+  procedencia. Y para descargarlo sin riesgo, un formato que no ejecute código (`weights_only`, o
+  `safetensors` en «Publicar el modelo»). Guardar solo `model.state_dict()` funciona hasta el primer
+  corte.
 </Transfer>
 
 ```python title="src/rukh/train/checkpoint.py"
@@ -962,12 +890,10 @@ def load_state(model: nn.Module, state: Mapping[str, Any]) -> None:
 
 <Src file="src/rukh/train/checkpoint.py" tag="p2" lines="124-145" />
 
-`load_state` es el sitio donde vive la consecuencia de los tied embeddings. `lm_head.weight` y
-`tokens.weight` son **el mismo tensor** con dos nombres, y lo que `rukh publish` escribe deja fuera
-el nombre atado (dos nombres para un tensor es lo que hace que `safetensors` rechace el fichero).
-Cargar con `strict=True` fallaría; cargar con `strict=False` y callar aceptaría cualquier cosa. La
-solución es cargar con `strict=False` y **comprobar a mano** que lo único que falta es exactamente
-el nombre que se sabe que falta.
+Aquí vive la consecuencia de los tied embeddings. `lm_head.weight` y `tokens.weight` son el mismo
+tensor con dos nombres, y `rukh publish` deja fuera el atado porque `safetensors` rechaza dos nombres
+para un tensor. `strict=True` fallaría y `strict=False` a secas aceptaría cualquier cosa, así que se
+carga sin estricto y se comprueba a mano que solo falta el nombre que se sabe que falta.
 
 ```python title="src/rukh/train/checkpoint.py"
 def load_model(
@@ -999,12 +925,8 @@ def restore(
 
 <Src file="src/rukh/train/checkpoint.py" tag="p2" lines="148-172" />
 
-`load_model` reconstruye el modelo **desde el checkpoint**, no desde una configuración que le pases:
-el `model_cfg` viaja dentro. Es lo que permite que `rukh eval`, `rukh play`, `rukh export` y
-`rukh publish model` reciban una ruta y ya está. Y devuelve el payload entero además del modelo,
-porque los cuatro comandos necesitan algo distinto de él.
-
-Y el paquete, que es la puerta por la que entra todo lo anterior:
+`load_model` reconstruye el modelo desde el `model_cfg` que viaja dentro del checkpoint, así que
+`rukh eval`, `play`, `export` y `publish` solo necesitan una ruta.
 
 ```python title="src/rukh/train/__init__.py"
 """Training: the loop, the learning-rate schedule and checkpoint handling."""
@@ -1056,10 +978,8 @@ __all__ = [
 
 <Src file="src/rukh/train/__init__.py" tag="p2" lines="1-45" />
 
-Reexportes: la tercera lista de este tipo del módulo. `rukh.train` es lo
-que importan el harness de evaluación (`load_model`, `pick_device`), el exportador (`load_model`), el
-publicador (`load_model`, `TIED_HEAD`) y los labs. Ninguno de ellos sabe que hay tres ficheros
-detrás.
+El harness, el exportador, el publicador y los labs importan de `rukh.train` sin saber que hay tres
+ficheros detrás.
 
 ```python title="tests/unit/test_checkpoint.py"
 """Tests for rukh.train.checkpoint: round-trip, provenance and RNG restoration."""
@@ -1142,11 +1062,9 @@ def test_save_and_load_reproduce_weights_and_step(tmp_path: Path) -> None:
 
 <Src file="tests/unit/test_checkpoint.py" tag="p2" lines="35-73" />
 
-El test de ida y vuelta da un paso de optimizador **antes** de guardar, y eso es lo que lo hace
-valer: con los pesos recién inicializados, dos modelos con la misma semilla son iguales aunque el
-checkpoint no guarde nada. Después compara tensor a tensor y, además, compara los logits, que es la
-comprobación que cazaría un estado cargado en el módulo equivocado. Y `assert not
-list(tmp_path.glob("*.tmp"))` es el test de la escritura atómica: el temporal no se queda.
+El test de ida y vuelta da un paso de optimizador antes de guardar: con pesos recién inicializados,
+dos modelos con la misma semilla son iguales aunque el checkpoint no guarde nada. Compara también
+los logits, y el `glob("*.tmp")` comprueba que la escritura atómica no deja el temporal.
 
 ```python title="tests/unit/test_checkpoint.py"
 def test_restoring_the_rng_repeats_the_same_draws(tmp_path: Path) -> None:
@@ -1173,9 +1091,9 @@ def test_restoring_the_rng_repeats_the_same_draws(tmp_path: Path) -> None:
 
 <Src file="tests/unit/test_checkpoint.py" tag="p2" lines="76-95" />
 
-El de los generadores es el más bonito del fichero. Guarda, saca tres números de tres bibliotecas
-distintas, reinicia las tres semillas a otra cosa, restaura el checkpoint y exige **los mismos tres
-números**. Es la definición operativa de «reanudar es indistinguible de no haber parado».
+El de los generadores guarda, saca tres números de tres bibliotecas, cambia las semillas, restaura y
+exige los mismos tres números: la definición operativa de «reanudar es indistinguible de no haber
+parado».
 
 ```python title="tests/unit/test_checkpoint.py"
 def test_vocab_hash_and_manifest_sha_are_defensive(tmp_path: Path) -> None:
@@ -1201,10 +1119,7 @@ def test_a_foreign_file_is_not_a_checkpoint(tmp_path: Path) -> None:
 
 <Src file="tests/unit/test_checkpoint.py" tag="p2" lines="98-116" />
 
-Y los dos últimos: la procedencia que devuelve `None` en los tres casos en que no la hay (directorio
-sin `meta.json`, `meta.json` sin la clave, fichero ausente) y un `.pt` cualquiera que no es un
-checkpoint de Rukh. Ese último mensaje de error se lee más veces de las que parece, porque los pesos
-de Hugging Face también son un `.pt`.
+Los dos últimos cubren la procedencia ausente y un `.pt` cualquiera que no es un checkpoint de Rukh.
 
 <Callout kind="ejecuta" title="El planificador y los checkpoints">
   Con `schedule.py`, `loop.py`, `checkpoint.py` y el `__init__.py` del paquete escritos, los dos
@@ -1222,8 +1137,8 @@ checkpoints se escriben en el directorio temporal de pytest. Si falla la importa
 
 ## `tracking.py`: que una ejecución reanudada sea una sola curva
 
-M0 dejó `start_run` escribiendo en la base SQLite local. M2 le añade una cosa, y es la que hace que
-reanudar no parta la gráfica en dos.
+M0 dejó `start_run` escribiendo en la base SQLite local. M2 le añade lo necesario para que reanudar
+no parta la gráfica en dos.
 
 ```python title="src/rukh/tracking.py"
 def start_run(
@@ -1244,8 +1159,8 @@ def start_run(
 
 <Src file="src/rukh/tracking.py" tag="p2" lines="61-74" />
 
-El parámetro nuevo es `run_id`. Va al final y con valor por defecto, así que las llamadas de M0 y M1
-siguen valiendo tal cual.
+El parámetro nuevo, `run_id`, va al final y con valor por defecto: las llamadas de M0 y M1 siguen
+valiendo.
 
 ```python title="src/rukh/tracking.py"
     started = None
@@ -1267,11 +1182,10 @@ siguen valiendo tal cual.
 
 <Src file="src/rukh/tracking.py" tag="p2" lines="85-99" />
 
-Reabrir una ejecución existente en vez de crear una nueva. Las dos guardas son la misma idea aplicada
-dos veces: un `run_id` que no se puede reabrir —borrado, o de otra base— cae a una ejecución nueva con
-un aviso, y volver a registrar los parámetros de una ejecución reabierta es un error de MLflow que
-tampoco puede costar el entrenamiento. Sin ellas, reanudar una ejecución cuyo MLflow se borró tira
-cuarenta minutos de GPU por un problema de contabilidad.
+Las dos guardas aplican la misma regla: un `run_id` que no se puede reabrir cae a una ejecución
+nueva con un aviso, y el error de MLflow al volver a registrar los parámetros tampoco puede costar
+el entrenamiento. Sin ellas, un MLflow borrado tiraría cuarenta minutos de GPU por un problema de
+contabilidad.
 
 ## Las dos configuraciones
 
@@ -1308,14 +1222,10 @@ log_every: 10
 
 <Src file="configs/train/small.yaml" tag="p2" lines="1-27" />
 
-El modelo del curso. Ninguna clave es decorativa: `BaseConfig` rechaza las que
-no reconoce, así que lo que está aquí es lo que `TrainConfig` sabe leer. Los números son
-los de la receta de arriba; el resto son decisiones de operación: `eval_every: 500` (cuarenta
-evaluaciones en la ejecución), `ckpt_every: 1000` (veinte checkpoints, que son los que recorre la isla
-de «Exportar a ONNX»), `workers: 4` para que el cargador no sea el cuello de botella y `seed: 42`.
-
-El comentario de la cabecera guarda la medida (440 000 tokens/s, unos 40 minutos) al lado de la
-estimación que corrigió, que es donde alguien la va a buscar.
+El modelo del curso. Los números son los de la receta; el resto es operación: cuarenta
+evaluaciones, veinte checkpoints (los que recorre la isla de «Exportar a ONNX») y cuatro workers para
+que el cargador no sea el cuello de botella. El comentario de cabecera guarda la medida al lado de
+la estimación que corrigió, que es donde alguien la va a buscar.
 
 {/* prettier-ignore */}
 ```yaml title="configs/train/tiny.yaml"
@@ -1348,17 +1258,11 @@ log_every: 10
 
 <Src file="configs/train/tiny.yaml" tag="p2" lines="1-25" />
 
-Y el modelo con el que se itera. Compara las dos: **cambian siete claves**. El preset; el
-`batch_size` (128 en vez de 64) y el `grad_accum` (2 en vez de 4), que multiplicados dan las mismas
-256 secuencias efectivas, porque un modelo cuatro veces más pequeño cabe entero con lotes del
-doble; la tasa de aprendizaje, 1e-3 en vez de 6e-4, porque un modelo pequeño tolera pasos mayores;
-`max_steps`, `warmup` y `eval_every`. Fíjate en la proporción del warmup: 500 de 6 000 es el 8 % de
-la ejecución, frente al 5 % de `small`. Una ejecución corta necesita calentar relativamente más, porque
-el riesgo del warmup no es proporcional a los pasos totales sino a lo mal calibrado que está Adam
-en los primeros.
-
-El comentario de `tiny.yaml` promete «menos de 20 minutos en una 5090»; la tirada real fueron
-**189 segundos**.
+El modelo con el que se itera. Lotes de 128 por 2 dan las mismas 256 secuencias efectivas, porque un
+modelo pequeño cabe con lotes del doble; y la tasa sube a 1e-3 porque tolera pasos mayores. El
+warmup ocupa el 8 % de la ejecución frente al 5 % de `small`: el riesgo que cubre depende de lo mal
+calibrado que está Adam en los primeros pasos, no de cuántos pasos haya en total. La tirada real
+tardó 189 segundos, no los veinte minutos que promete el comentario.
 
 ## Lanzarlo
 
@@ -1410,13 +1314,9 @@ def train_cmd(
 
 <Src file="src/rukh/cli.py" tag="p2" lines="324-366" />
 
-El comando, que es lo que la cabecera de `cli.py` promete: «una cáscara fina sobre la biblioteca».
-Carga el YAML, aplica las dos sobreescrituras de la línea de órdenes y llama a `train`. Las dos
-opciones tienen su razón: `--preset` para lanzar la misma receta con otra talla sin copiar el
-fichero, y `--max-steps` para las pruebas de trescientos pasos del ejercicio de más abajo.
-
-Fíjate en que `--preset` también pone `model: None`. Sin eso, una configuración con un `model`
-explícito ignoraría el preset que acabas de pedir por la línea de órdenes y entrenarías otra cosa.
+Una cáscara fina sobre la biblioteca. `--preset` lanza la misma receta con otra talla (y pone
+`model: None`, o un `model` explícito del YAML ignoraría lo que pides), y `--max-steps` sirve para
+las pruebas de trescientos pasos del ejercicio de más abajo.
 
 <Callout kind="ejecuta" title="Una ejecución de humo antes de la de verdad">
   Antes de gastar minutos de GPU, comprueba que el bucle arranca, evalúa y guarda con una tirada de
@@ -1429,12 +1329,10 @@ uv run rukh train --config configs/train/tiny.yaml --max-steps 300
 ```
 
 La segunda termina imprimiendo `preset: tiny`, `steps: 300` y la ruta de
-`checkpoints/tiny-<fecha>/step-300.pt`; en esa carpeta tiene que haber también un `best.pt`.
-`<fecha>` es la marca de tiempo de la carpeta que escribió tu entrenamiento
-(`ls -td checkpoints/tiny-*/ | head -1` te da la última); a partir de aquí el curso la escribe así.
-Por el camino verás dos líneas `step 250` y `step 300` con `val/loss` y `val/top1`. Si `torch.compile`
-no puede compilar (en Windows sin Triton, por ejemplo) aparece el aviso `training eagerly` y la
-ejecución sigue: es la caída de `maybe_compile`, no un error.
+`checkpoints/tiny-<fecha>/step-300.pt`, con un `best.pt` al lado. `<fecha>` es la marca de tiempo de
+tu carpeta (`ls -td checkpoints/tiny-*/ | head -1` te da la última); el curso la escribe así a partir
+de aquí. Verás dos líneas `step 250` y `step 300` con `val/loss` y `val/top1`. Si sale el aviso
+`training eagerly`, es la caída de `maybe_compile`, no un error.
 
 </Callout>
 
@@ -1444,9 +1342,8 @@ ejecución sigue: es la caída de `maybe_compile`, no un error.
 uv run rukh train --config configs/train/tiny.yaml
 ```
 
-La consola de esta tirada no se capturó. El run sí quedó registrado: estas son las 24 evaluaciones
-de validación de `tiny-20260919-061533` tal como están en `mlruns/mlflow.db`, de principio a fin
-del entrenamiento (189 segundos en total, poco más de tres minutos):
+La consola de esta tirada no se capturó, pero el run quedó en MLflow: estas son las 24 evaluaciones
+de `tiny-20260919-061533` tal como están en `mlruns/mlflow.db` (189 segundos en total):
 
 ```text
 step   250  val/loss 4.5869  val/top1 0.1903
@@ -1475,26 +1372,21 @@ step  5750  val/loss 2.0251  val/top1 0.4106
 step  6000  val/loss 2.0200  val/top1 0.4121
 ```
 
-Mientras corre, abre MLflow (`uv run rukh mlflow ui`) y mira cuatro series. `train/loss` debe bajar
-deprisa los primeros cientos de pasos y después despacio. `val/loss` debe acompañarla; cuando se
-separen —la de entrenamiento sigue bajando y la de validación se queda plana o sube— has llegado al
-sobreajuste y el `best.pt` ya está guardado del paso anterior. `lr` debe dibujar la rampa de warmup
-y el coseno. Y `grad_norm` debe estabilizarse: picos recurrentes significan que el clipping está
-trabajando demasiado y que la tasa de aprendizaje es alta para este modelo.
+Mientras corre, abre MLflow (`uv run rukh mlflow ui`) y mira cuatro series. `train/loss` baja deprisa
+y luego despacio. `val/loss` la acompaña; cuando se separen, has llegado al sobreajuste y el
+`best.pt` ya está guardado. `lr` dibuja la rampa y el coseno. Y `grad_norm` se estabiliza; picos
+recurrentes significan una tasa demasiado alta para este modelo.
 
-Cada 1 000 pasos se escribe un checkpoint, y esos checkpoints son los que alimentan la
-repetición del entrenamiento de la lección 7.
+Para leer esas pérdidas: son entropía cruzada en nats, y su exponencial es la perplejidad, entre
+cuántas jugadas equiprobables duda el modelo. Sin entrenar, `ln(2030) ≈ 7,6`, perplejidad 2 030; el
+2,02 final de `tiny` es una perplejidad de 7,5, y en una posición típica hay unas treinta jugadas
+legales.
 
 ### `small`, el modelo del curso
 
-12 capas, 512 dimensiones, 8 cabezas, 38 971 392 parámetros, 20 000 pasos de 64 × 4 secuencias
-(51 200 tokens por paso, 1 024 millones de tokens en total), tasa 6e-4 con 1 000 de warmup.
-
-Cuánto tardó: el bucle sostuvo **422 000 tokens/s** de mediana en esta 5090 —423 309 en el último
-paso registrado—, en modo eager (`torch.compile` no arranca en este Windows porque no hay Triton, y
-el bucle cae a eager sin romperse). Mil veinticuatro millones de tokens a esa velocidad son **2 498
-segundos de principio a fin: 42 minutos**, cuando el diseño, antes de medir nada, estimaba entre
-cuatro y ocho horas.
+20 000 pasos de 64 × 4 secuencias, 1 024 millones de tokens. El bucle sostuvo **422 000 tokens/s**
+de mediana en esta 5090, en modo eager (sin Triton, `torch.compile` no arranca en este Windows): 2 498
+segundos, **42 minutos**, cuando el diseño estimaba entre cuatro y ocho horas antes de medir nada.
 
 ```bash title="Terminal"
 uv run rukh train --config configs/train/small.yaml
@@ -1523,13 +1415,9 @@ steps:      20000
 checkpoint: …\rukh\checkpoints\small-20260919-062911\step-20000.pt
 ```
 
-Sesenta y dos segundos entre evaluaciones consecutivas, que son 500 pasos: 8 pasos por segundo,
-51 200 tokens cada uno. La cuenta cierra.
-
-Si el proceso se corta —se reinicia la máquina, se cae el driver—, no se pierde nada:
-`--resume checkpoints/small-<fecha>/step-12000.pt` continúa exactamente donde estaba, con el optimizador,
-los generadores y la misma ejecución de MLflow. Esa es la diferencia entre guardar los pesos y guardar
-un checkpoint.
+Sesenta y dos segundos entre evaluaciones, 500 pasos: 8 pasos por segundo de 51 200 tokens. La cuenta
+cierra. Si el proceso se corta, `--resume checkpoints/small-<fecha>/step-12000.pt` continúa donde
+estaba, con el optimizador, los generadores y la misma ejecución de MLflow.
 
 <Callout kind="ejecuta" title="Qué dejó la tirada de `small`">
   Al terminar, mira la carpeta de la ejecución y lo que lleva dentro el mejor checkpoint:
@@ -1539,33 +1427,27 @@ ls checkpoints/small-*/
 uv run python -c "import glob; from rukh.train import load_checkpoint; p = load_checkpoint(sorted(glob.glob('checkpoints/small-*/best.pt'))[-1]); print(p['step'], p['best_val'], p['vocab_hash'], p['git_sha'])"
 ```
 
-Tiene que haber veinte `step-*.pt`, de `step-1000.pt` a `step-20000.pt`, más `best.pt`. La segunda
-orden imprime el paso del mejor checkpoint, su pérdida de validación y la procedencia; en la tirada
-de referencia el mejor fue el último: paso `20000` y una pérdida de 1,5197. Un `None` en `vocab_hash` significa que
-el paquete de tokens no tenía `meta.json`.
+Tiene que haber veinte `step-*.pt` más `best.pt`. La segunda orden imprime el paso del mejor, su
+pérdida y la procedencia; en la tirada de referencia, paso `20000` y 1,5197. Un `None` en
+`vocab_hash` significa que el paquete de tokens no tenía `meta.json`.
 
 </Callout>
 
 <Exercise n="01" title="Tres entrenamientos de 300 pasos que explican la receta">
-  Con `--max-steps 300`, lanza `tiny` tres veces: (a) tal cual; (b) con `warmup: 0` en una copia de
-  la configuración; (c) con `lr: 1.0e-2`. Compara las tres curvas de `train/loss` y de `grad_norm`
-  en MLflow. Después responde: ¿se distinguen las tres en los primeros diez pasos? ¿Por qué es eso
-  peligroso?
+  Con `--max-steps 300`, lanza `tiny` tres veces: (a) tal cual; (b) con `warmup: 0`; (c) con
+  `lr: 1.0e-2`. Compara `train/loss` y `grad_norm` en MLflow. ¿Se distinguen las tres en los primeros
+  diez pasos? ¿Por qué es eso peligroso?
 
   <Solution>
-    Lo esperable: (a) baja suave desde `ln(2030) ≈ 7,6`. (b) sin warmup pega un salto en los
-    primeros pasos: o la pérdida sube por encima de 8 antes de volver, o se queda estancada
-    alrededor de 6, que es aproximadamente la entropía de la distribución de jugadas más frecuentes
-    del corpus; el modelo ha caído en "predecir siempre lo común". (c) con lr diez veces mayor,
-    `grad_norm` se pega al techo del clipping en casi todos los pasos, señal de que el paso real lo
-    decide el clipping y no el optimizador; la pérdida oscila o diverge.
+    Lo esperable: (a) baja suave desde `ln(2030) ≈ 7,6`. (b) pega un salto al principio: o sube por
+    encima de 8 antes de volver, o se estanca hacia 6, la entropía de las jugadas más frecuentes (el
+    modelo predice siempre lo común). (c) tiene el `grad_norm` pegado al techo del clipping, así que
+    el paso lo decide el recorte y no el optimizador; la pérdida oscila o diverge.
 
-Lo peligroso es la comparación en los primeros diez pasos: **las tres bajan**. Cualquier
-configuración razonable baja de 7,6 a 5 en unos pocos cientos de pasos, simplemente aprendiendo la
-frecuencia marginal de cada jugada. Mirar la curva al principio no distingue un entrenamiento sano
-de uno roto; hay que esperar a la zona donde la pendiente se suaviza, o mirar métricas que no sean
-la pérdida (legalidad, top-1). Es la razón de que `eval_every` sea 250 en `tiny`: la señal útil
-llega de la validación, no del bucle.
+Lo peligroso: **las tres bajan** al principio. Cualquier configuración razonable baja de 7,6 a 5
+aprendiendo solo la frecuencia de cada jugada. La curva temprana no distingue un entrenamiento sano
+de uno roto; hay que esperar a que la pendiente se suavice o mirar otras métricas, y por eso
+`tiny` evalúa cada 250 pasos.
 
   </Solution>
 </Exercise>
@@ -1576,18 +1458,14 @@ llega de la validación, no del bucle.
   por qué, y di qué tendría que pasar para que eso fuera un problema.
 
   <Solution>
-    No es magia ni una fuga al revés: son dos medidas distintas del mismo momento. `train/loss` se
-    registra cada `log_every` pasos y es la media de los micro-lotes de **ese** paso, que el modelo
-    vio cuando todavía era peor que ahora; `val/loss` se mide con los pesos del instante, después de
-    haber dado esos pasos. Al principio el modelo mejora tan rápido dentro de una ventana de
-    registro que la diferencia se nota.
+    Son dos medidas de momentos distintos. `train/loss` es la media de los micro-lotes de ese paso,
+    calculada con los pesos de antes de actualizarlos; `val/loss` se mide con los pesos de después.
+    Al principio el modelo mejora tan deprisa que la diferencia se nota.
 
-Con `dropout: 0.0` no hay una segunda explicación posible (con dropout, la de entrenamiento también
-sería más alta por tener la red mutilada). Las dos curvas se cruzan en el paso 3 000 de `small` y
-desde ahí el hueco crece de forma monótona, que es lo normal. Sería un problema si la de validación
-siguiera por debajo pasados unos miles de pasos: eso significaría que el conjunto de validación es
-más fácil que el de entrenamiento —partidas más cortas, jugadores más homogéneos— y que las dos
-cifras no se pueden restar.
+Con `dropout: 0.0` no hay otra explicación. Las curvas se cruzan en el paso 3 000 de `small` y desde
+ahí el hueco crece, que es lo normal. Sería un problema si la validación siguiera por debajo miles
+de pasos después: querría decir que el conjunto de validación es más fácil (partidas más cortas,
+jugadores más homogéneos) y que las dos cifras no se pueden restar.
 
   </Solution>
 </Exercise>
@@ -1595,14 +1473,12 @@ cifras no se pueden restar.
 ## Qué has aprendido
 
 El bucle entero y las cinco decisiones de la receta, cada una con lo que se rompe si se cambia. Y
-tres propiedades que no son del modelo sino de la infraestructura, y que valen más que cualquiera de
-ellas: una ejecución reanudada es indistinguible de una que no paró, un checkpoint sabe con qué datos
-y con qué código se escribió, y perder la traza nunca cuesta una ejecución.
+tres propiedades de infraestructura que valen para cualquier entrenamiento largo, sea de ajedrez o
+de un LLM: reanudar es indistinguible de no haber parado, un checkpoint sabe con qué datos y qué
+código se escribió, y perder la traza nunca cuesta una ejecución.
 
-**Cómo se mide**: `uv run pytest -m unit -q tests/unit/test_schedule.py tests/unit/test_checkpoint.py`
-en verde (nueve tests), `tiny` entrenado en 189 segundos hasta una pérdida de validación de **2,0200**
-y un top-1 de **41,21 %**, y `small` en 42 minutos hasta **1,5197** y **51,20 %**. En MLflow, la
-rampa de warmup dibujada y el `grad_norm` estable.
+Los nueve tests en verde, `tiny` en 189 segundos hasta una validación de 2,0200 y un top-1 del
+41,21 %, y `small` en 42 minutos hasta **1,5197** y **51,20 %**.
 
-Lo siguiente es sacarle una jugada: los logits son 2 030 números y convertirlos en `e2e4` es una
-decisión de diseño con tres perillas y un orden que no es libre.
+Lo siguiente es sacarle una jugada: convertir 2 030 logits en `e2e4` es una decisión de diseño con
+tres perillas y un orden que no es libre.

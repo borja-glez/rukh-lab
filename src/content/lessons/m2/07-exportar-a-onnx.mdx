@@ -6,7 +6,7 @@ description:
   `.onnx` elige lo mismo que PyTorch. Con las dos islas que dejan mirar dentro del modelo.'
 module: m2
 order: 7
-duration: 180
+duration: 165
 runtime: 20
 level: medio
 status: vigente
@@ -35,22 +35,20 @@ import TrainingReplay from '../../../islands/TrainingReplay.tsx';
 ## Qué vas a construir
 
 El fichero que descarga el navegador. `src/rukh/export/` convierte un checkpoint de PyTorch en tres
-`.onnx` —fp32, fp16 e int8— y mide si los tres eligen la misma jugada que el original. Y al final de
-la lección, las dos visualizaciones del módulo: la repetición del entrenamiento checkpoint a
-checkpoint y el mapa de atención de una partida.
+`.onnx` (fp32, fp16 e int8) y mide si los tres eligen la misma jugada que el original. Al final,
+las dos visualizaciones del módulo: el entrenamiento checkpoint a checkpoint y el mapa de atención
+de una partida.
 
-El navegador no ejecuta PyTorch. El puente es <Term id="onnx">ONNX</Term>: un formato que describe
-el grafo y los pesos, que `onnxruntime-web` sabe ejecutar con WebGPU o con WASM. Es el mismo
-problema que resuelve cualquier despliegue de un modelo fuera del entorno donde se entrenó —un
-móvil, un servidor sin Python, un LLM en GGUF para tu portátil—, y las comprobaciones de esta
-lección son las que harías en cualquiera de ellos.
+El navegador no ejecuta PyTorch. El puente es <Term id="onnx">ONNX</Term>, un formato que describe
+el grafo y los pesos y que `onnxruntime-web` ejecuta con WebGPU o con WASM. Es el problema de
+cualquier despliegue fuera del entorno de entrenamiento (un móvil, un servidor sin Python, un LLM en
+GGUF para tu portátil), y las comprobaciones de esta lección valen para todos.
 
 <LabRoutes lesson="m2/07-exportar-a-onnx" />
 
 ## Las dependencias nuevas
 
-M2 añade cinco paquetes al `pyproject.toml` de M0, y los cinco son de esta lección y de la
-siguiente:
+M2 añade cinco paquetes al `pyproject.toml` de M0, todos para esta lección y la siguiente:
 
 ```toml title="pyproject.toml"
   "onnx>=1.23",
@@ -62,12 +60,10 @@ siguiente:
 
 <Src file="pyproject.toml" tag="p2" lines="25-29" />
 
-`onnx` para leer y escribir el fichero, `onnxscript` porque el exportador moderno de PyTorch lo
-necesita, `onnxruntime` para **ejecutar** lo exportado (la paridad y la comprobación del eje
-dinámico), `onnxconverter-common` para la conversión a fp16 en condiciones y `safetensors` para
-publicar los pesos en el Hub, que es la lección 9.
-
-Ninguno es un framework de entrenamiento: el decoder sigue escrito a mano.
+`onnx` lee y escribe el fichero, `onnxscript` lo necesita el exportador moderno de PyTorch,
+`onnxruntime` ejecuta lo exportado (para la paridad y el eje dinámico), `onnxconverter-common` hace
+la conversión a fp16 y `safetensors` sirve para publicar los pesos en el Hub (lección 9). Ninguno es
+un framework de entrenamiento: el decoder sigue escrito a mano.
 
 <Callout kind="ejecuta" title="Las dependencias nuevas, instaladas">
   Después de añadir las cinco líneas al `pyproject.toml`, sincroniza y comprueba que se importan:
@@ -77,8 +73,8 @@ uv sync --extra cu128 --group dev   # --extra cpu si no tienes GPU NVIDIA
 uv run python -c "import onnx, onnxruntime, onnxscript, onnxconverter_common, safetensors; print(onnx.__version__, onnxruntime.__version__)"
 ```
 
-`uv sync` actualiza el `uv.lock` con los paquetes nuevos, y la segunda orden imprime dos versiones
-que tienen que cumplir los mínimos de arriba: `onnx` 1.23 o más y `onnxruntime` 1.30 o más.
+`uv sync` actualiza el `uv.lock`, y la segunda orden imprime dos versiones que tienen que ser al
+menos `onnx` 1.23 y `onnxruntime` 1.30.
 
 </Callout>
 
@@ -108,21 +104,17 @@ metadata, so the browser knows the limit without being told separately.
 
 <Src file="src/rukh/export/onnx.py" tag="p2" lines="1-19" />
 
-Cuatro párrafos y tres decisiones, cada una de las cuales se paga si se omite.
+Tres decisiones, y cada una se paga si se omite:
 
-**El grafo no es el modelo.** La demo solo necesita la distribución de la **siguiente** jugada, así
-que lo que se exporta es un envoltorio cuyo `forward` devuelve el último paso: `(B, V)` en vez de
-`(B, T, V)`. Eso divide el tensor de salida por la longitud del contexto —doscientas veces menos
-números por inferencia— y le ahorra al navegador recortar un megabyte de logits por jugada.
-
-**Hay dos exportadores y no dan el mismo grafo.** El de dynamo es el moderno y el que pide el
-diseño; el de TorchScript sigue ahí como respaldo. Cuál corrió se graba en el fichero, porque una
-prueba de paridad solo significa algo cuando se sabe qué grafo se está comparando.
-
-**Un eje dinámico declarado es una promesa, no un hecho.** El trazador antiguo hornea alegremente la
-longitud trazada en el grafo mientras te dice que el eje es dinámico. La demo alarga la secuencia una
-jugada por turno, así que ese fallo aparecería en el navegador en la segunda jugada de la primera
-partida.
+- **Se exporta un envoltorio, no el modelo.** La demo solo necesita la distribución de la siguiente
+  jugada, así que el `forward` exportado devuelve `(B, V)` en vez de `(B, T, V)`: doscientas veces
+  menos números por jugada.
+- Hay dos exportadores y no dan el mismo grafo. Dynamo es el moderno; TorchScript queda de
+  respaldo. Cuál corrió se graba en el fichero, porque una paridad solo significa algo si sabes qué
+  grafo comparas.
+- **Un eje dinámico declarado es una promesa.** El trazador antiguo hornea la longitud trazada en el
+  grafo mientras dice que el eje es dinámico. Como la demo alarga la secuencia una jugada por turno,
+  el fallo saltaría en la segunda jugada de la primera partida. Por eso se comprueba ejecutando.
 
 ```python title="src/rukh/export/onnx.py"
 from __future__ import annotations
@@ -169,9 +161,6 @@ class LastStepLogits(nn.Module):
 
 <Src file="src/rukh/export/onnx.py" tag="p2" lines="48-57" />
 
-Es el envoltorio del primer párrafo de la cabecera: `logits[:, -1, :]` convierte la salida
-`(B, T, V)` en `(B, V)`, y el navegador recibe doscientas veces menos números en cada jugada.
-
 ```python title="src/rukh/export/onnx.py"
 class ExportResult(BaseModel):
     """What was written and how."""
@@ -199,10 +188,9 @@ class ExportResult(BaseModel):
 
 <Src file="src/rukh/export/onnx.py" tag="p2" lines="60-81" />
 
-`ExportResult` tiene dos campos que son la misma idea escrita dos veces: `dynamic_seq` es **lo que
-el fichero acepta de verdad**, no lo que se pidió, y `dynamic_seq_verified` dice si se pudo
-comprobar (hace falta `onnxruntime` instalado). Un informe que no distingue «es verdad» de «no lo
-he podido mirar» miente por omisión.
+En `ExportResult`, `dynamic_seq` es lo que el fichero acepta de verdad y `dynamic_seq_verified`
+dice si se pudo comprobar (hace falta `onnxruntime`). Un informe que no distingue «es verdad» de «no
+lo he podido mirar» miente por omisión.
 
 ```python title="src/rukh/export/onnx.py"
 def target_path(out: Path) -> Path:
@@ -235,9 +223,8 @@ def _dynamic_axes(dynamic_batch: bool, dynamic_seq: bool) -> dict[str, dict[int,
 
 <Src file="src/rukh/export/onnx.py" tag="p2" lines="90-106" />
 
-Dos funciones casi iguales porque los dos exportadores esperan formatos distintos: `dynamic_shapes`
-para dynamo, `dynamic_axes` para el legado. Y el legado necesita además que se le declare el eje de
-lote **de la salida**, que dynamo deduce.
+Dos funciones casi iguales porque cada exportador espera su formato; el antiguo necesita además
+que le declares el eje de lote de la salida, que dynamo deduce solo.
 
 ```python title="src/rukh/export/onnx.py"
 @contextlib.contextmanager
@@ -266,16 +253,12 @@ def _utf8_console() -> Iterator[None]:
 
 <Src file="src/rukh/export/onnx.py" tag="p2" lines="109-130" />
 
-Un gestor de contexto para un problema de Windows, y merece estar aquí porque la cadena de
-consecuencias es de las que enseñan. `torch.onnx.export(dynamo=True)` imprime marcas de verificación
-Unicode en su barra de progreso. La consola de Windows es cp1252 por defecto, así que eso lanza un
-`UnicodeEncodeError` **dentro** del exportador y la exportación entera falla por un motivo que no
-tiene nada que ver con el modelo. El fallo cae al exportador antiguo, que produce un grafo cuyo fp16
-`onnxruntime` **se niega a cargar**.
-
-Es decir: una configuración regional de la consola acaba en un modelo que el navegador no puede
-ejecutar. Reconfigurar los flujos para que sustituyan los caracteres que no puede codificar es
-barato y rompe la cadena en el primer eslabón.
+Un arreglo de Windows con una cadena de consecuencias que enseña. El exportador dynamo imprime
+marcas Unicode en su barra de progreso; la consola de Windows es cp1252, así que salta un
+`UnicodeEncodeError` dentro del exportador, se cae al antiguo, y ese produce un fp16 que
+`onnxruntime` se niega a cargar. Una configuración regional de la consola acaba en un modelo que el
+navegador no puede ejecutar. Sustituir los caracteres que no se pueden codificar rompe la cadena en
+el primer eslabón.
 
 ```python title="src/rukh/export/onnx.py"
 def export_onnx(
@@ -340,9 +323,7 @@ def export_onnx(
 
 <Src file="src/rukh/export/onnx.py" tag="p2" lines="157-186" />
 
-El `try`/`except` es la caída al exportador antiguo, con el motivo guardado en `warning` para que
-acabe impreso. `# noqa: BLE001` con su explicación al lado: cualquier fallo del exportador tiene que
-caer, no parar.
+El `except` cae al exportador antiguo y guarda el motivo en `warning` para que acabe impreso.
 
 ```python title="src/rukh/export/onnx.py"
     works = verify_dynamic_seq(path, seq_len, model.cfg.block)
@@ -384,14 +365,10 @@ caer, no parar.
 
 <Src file="src/rukh/export/onnx.py" tag="p2" lines="187-221" />
 
-Y aquí está la comprobación que da nombre al tercer párrafo del docstring. Si se pidió un eje
-dinámico y la ejecución a dos longitudes dice que no lo es, **se lanza una excepción con
-instrucciones**: reexporta sin eje dinámico y rellena la entrada, o arregla el exportador. No se
-publica un fichero que va a fallar en el navegador.
-
-`really_dynamic = dynamic_seq if works is None else works` es la regla de «publica lo que
-funcionó»: cuando no se pudo comprobar (sin `onnxruntime`) se publica lo que se pidió, y
-`dynamic_seq_verified` queda en `False` para que se sepa.
+Si se pidió un eje dinámico y la ejecución a dos longitudes dice que no lo es, la exportación se
+para con instrucciones: mejor un error aquí que un fichero que falla en el navegador. Cuando no se
+pudo comprobar (sin `onnxruntime`), `really_dynamic` se queda con lo pedido y
+`dynamic_seq_verified` en `False` para que se sepa.
 
 ```python title="src/rukh/export/onnx.py"
 def sequence_lengths(seq_len: int, block: int) -> list[int]:
@@ -427,8 +404,8 @@ def verify_dynamic_seq(path: Path, seq_len: int, block: int) -> bool | None:
 
 <Src file="src/rukh/export/onnx.py" tag="p2" lines="230-249" />
 
-Las dos longitudes son la trazada y otra distinta y legal: una más si cabe, una menos si no. Es el
-mínimo para distinguir un eje dinámico de uno horneado, y cuesta dos inferencias.
+La trazada y otra legal distinta: dos inferencias bastan para distinguir un eje dinámico de uno
+horneado.
 
 ```python title="src/rukh/export/onnx.py"
 def set_metadata(path: Path, entries: dict[str, str]) -> dict[str, str]:
@@ -457,16 +434,13 @@ def set_metadata(path: Path, entries: dict[str, str]) -> dict[str, str]:
 
 <Src file="src/rukh/export/onnx.py" tag="p2" lines="252-273" />
 
-Los metadatos `rukh_*` viajan **dentro** del fichero. Un `.onnx` suelto en un disco tiene que seguir
-sabiendo cuál es su ventana de contexto y qué vocabulario habla; guardarlo en un JSON al lado
-funciona hasta que alguien mueve el fichero, y alguien lo va a mover.
+Los metadatos `rukh_*` viajan dentro del fichero: un `.onnx` suelto tiene que seguir sabiendo su
+ventana de contexto y su vocabulario. Un JSON al lado funciona hasta que alguien mueve el fichero, y
+alguien lo moverá.
 
-Y el bloque de las últimas líneas es un hallazgo que solo aparece exportando de verdad: el
-exportador de dynamo escribe los pesos en un fichero `.onnx.data` **al lado** del grafo y apunta los
-inicializadores allí. El `onnx.load`/`onnx.save` de aquí arriba los ha traído a memoria y los ha
-vuelto a escribir dentro, así que el fichero satélite es peso muerto que se publicaría al Hub o se
-enviaría al navegador sin que nadie lo lea. Se borra —pero solo después de comprobar que ningún
-inicializador sigue apuntando fuera.
+Las últimas líneas borran el `.onnx.data` que dynamo deja al lado con los pesos. Tras el
+`load`/`save` los pesos ya están dentro, así que el satélite sería peso muerto camino del Hub o del
+navegador; se borra solo después de comprobar que ningún inicializador apunta fuera.
 
 ```python title="src/rukh/export/onnx.py"
 def write_metadata(path: Path, props: dict[str, Any]) -> dict[str, str]:
@@ -515,9 +489,9 @@ a smaller fallback here that casts the float initializers with ``onnx.numpy_help
 
 <Src file="src/rukh/export/quantize.py" tag="p2" lines="1-12" />
 
-WebGPU corre el grafo fp16 (unos 80 MB); el respaldo en WASM corre el int8 (unos 40), que es la
-diferencia entre una demo que carga en un móvil y una que no. La <Term id="cuantizacion">cuantización</Term> se restringe a `MatMul` y `Gemm`: son los pesos que ocupan casi todo el
-fichero, y cuantizar el resto cuesta exactitud a cambio de nada.
+WebGPU corre el fp16 (unos 80 MB) y el respaldo en WASM el int8 (unos 40), que es lo que separa una
+demo que carga en un móvil de una que no. La <Term id="cuantizacion">cuantización</Term> se limita a
+`MatMul` y `Gemm`: son casi todo el fichero, y cuantizar el resto cuesta exactitud a cambio de nada.
 
 ```python title="src/rukh/export/quantize.py"
 from __future__ import annotations
@@ -596,13 +570,9 @@ def to_fp16(path: Path, out: Path | None = None) -> QuantizeResult:
 
 <Src file="src/rukh/export/quantize.py" tag="p2" lines="52-76" />
 
-`to_fp16` intenta `onnxconverter_common` y, si no está, cae a un respaldo propio. Y **dice cuál
-corrió** en el campo `method`, que acaba impreso en la consola. Dos conversiones distintas producen
-dos ficheros distintos, así que una paridad del 99,80 % sin saber cuál se usó no es reproducible.
-
-`keep_io_types=True` es la clave de la conversión buena: las entradas y las salidas del grafo se
-quedan en float32 y solo los pesos internos bajan a fp16. El contrato con quien llama al modelo no
-cambia.
+`to_fp16` anota en `method` qué conversión corrió, porque dos conversiones dan dos ficheros
+distintos y una paridad sin saber cuál se usó no es reproducible. `keep_io_types=True` deja las
+entradas y salidas en float32 y solo baja los pesos internos: quien llama al modelo no nota nada.
 
 ```python title="src/rukh/export/quantize.py"
 def _cast_initializers(model: object) -> object:
@@ -646,11 +616,8 @@ def _cast_initializers(model: object) -> object:
 
 <Src file="src/rukh/export/quantize.py" tag="p2" lines="79-115" />
 
-El respaldo, para cuando `onnxconverter_common` no está. Hace lo mismo a mano —retipa cada
-inicializador flotante, retipa los valores intermedios, retipa los tensores de los atributos— y
-después añade un nodo `Cast` delante de cada salida para devolver float32. Esas tres últimas líneas
-del bucle de salidas son el truco: se renombra la salida original a `<nombre>_fp16`, se reescribe
-quién la produce y se cuelga el `Cast` que escribe el nombre público.
+El respaldo hace lo mismo a mano. El truco está en el último bucle: renombra cada salida a
+`<nombre>_fp16` y cuelga detrás un `Cast` que escribe el nombre público en float32.
 
 ```python title="src/rukh/export/quantize.py"
 def quantize_int8(path: Path, out: Path | None = None) -> QuantizeResult:
@@ -677,8 +644,8 @@ def quantize_int8(path: Path, out: Path | None = None) -> QuantizeResult:
 
 <Src file="src/rukh/export/quantize.py" tag="p2" lines="118-137" />
 
-La cuantización dinámica a int8: 256 niveles y una escala por tensor. El error relativo por peso
-ronda el 0,4 %, acumulado a lo largo de doce capas, y ya verás lo que eso le hace a las decisiones.
+La cuantización dinámica a int8: 256 niveles y una escala por tensor. El error por peso ronda el
+0,4 %, se acumula a lo largo de doce capas, y enseguida verás qué les hace a las decisiones.
 
 ## `parity.py`: ¿elige la misma jugada?
 
@@ -702,15 +669,13 @@ reported alongside the number.
 
 <Src file="src/rukh/export/parity.py" tag="p2" lines="1-15" />
 
-**El criterio es la jugada, no los logits**, y el matiz importa: elegir una jugada depende del
-_orden_ de los logits, no de su valor, así que un error numérico grande puede dejar casi todas las
-decisiones intactas y uno pequeño puede voltear justo las que estaban ajustadas. Se publican los dos
-números porque ninguno solo dice lo que pasó.
+**El criterio es la jugada.** Elegir depende del orden de los logits, no de su valor: un error
+numérico grande puede dejar casi todo intacto y uno pequeño voltear justo las decisiones ajustadas.
+Por eso se publican los dos números.
 
-Y el segundo párrafo decide sobre qué se mide: las posiciones son las **mil de validación**, las mismas de la legalidad y la exactitud. Un paseo aleatorio legal visita
-posiciones a las que ningún humano llega, así que estar de acuerdo en ellas dice poco del fichero que
-la demo va a cargar. El paseo aleatorio se queda como respaldo, y **cuál de los dos se usó se publica
-al lado del número**.
+Las posiciones son las mil de validación, las mismas de la legalidad y la exactitud. Un paseo
+aleatorio visita posiciones a las que ningún humano llega; se queda como respaldo, y la fuente
+usada se publica al lado del número.
 
 ```python title="src/rukh/export/parity.py"
 from __future__ import annotations
@@ -754,9 +719,8 @@ class ParityResult(BaseModel):
 
 <Src file="src/rukh/export/parity.py" tag="p2" lines="41-50" />
 
-`mismatches` guarda los índices de las primeras veinte posiciones en las que la jugada cambió. No
-entra en ninguna tabla: está ahí para que, cuando una paridad salga mal, se pueda ir a mirar **qué
-posiciones** fallaron en vez de volver a ejecutarlo todo con prints.
+`mismatches` guarda las primeras veinte posiciones donde la jugada cambió, para ir a mirarlas
+cuando una paridad salga mal sin reejecutarlo todo con prints.
 
 ```python title="src/rukh/export/parity.py"
 def random_prefixes(
@@ -837,10 +801,8 @@ def parity_positions(
 
 <Src file="src/rukh/export/parity.py" tag="p2" lines="100-120" />
 
-Las tres fuentes de posiciones, con la de verdad primero y el aviso escrito por si se cae al paseo
-aleatorio. Fíjate en que `validation_prefixes` reutiliza `sample_positions` de `eval.legality`: la
-paridad se mide sobre exactamente los mismos prefijos que la legalidad, con el mismo recorte y la
-misma semilla.
+`validation_prefixes` reutiliza `sample_positions` de `eval.legality`: la paridad se mide sobre los
+mismos prefijos que la legalidad, con el mismo recorte y la misma semilla.
 
 ```python title="src/rukh/export/parity.py"
 def _session(onnx_path: Path):  # type: ignore[no-untyped-def]
@@ -890,13 +852,9 @@ def parity(
 
 <Src file="src/rukh/export/parity.py" tag="p2" lines="130-162" />
 
-La comparación. PyTorch y ONNX reciben **el mismo array de enteros**, y las dos salidas se suben a
-`float64` antes de restarlas para que la diferencia máxima no dependa de la precisión en la que
-casualmente venía cada una. El acuerdo se cuenta comparando los dos `argmax`; la diferencia máxima
-se acumula sobre todos los logits de todas las posiciones.
-
-Y el envoltorio del lado de PyTorch es `LastStepLogits`, el mismo que se exportó. Comparar el
-modelo completo contra el grafo del último paso compararía dos cosas distintas.
+Los dos lados reciben el mismo array y sus salidas se suben a `float64` antes de restarlas, para
+que la diferencia no dependa de la precisión de cada una. Del lado de PyTorch va `LastStepLogits`,
+el mismo envoltorio que se exportó; si no, compararías dos cosas distintas.
 
 ```python title="src/rukh/export/parity.py"
 def _load(ckpt: Path) -> MoveDecoder:
@@ -1031,14 +989,10 @@ def export_all(
 
 <Src file="src/rukh/export/__init__.py" tag="p2" lines="61-106" />
 
-`export_all` es el comando entero: exportar, cuantizar y comprobar todo lo que ha producido. Dos
-detalles que solo se descubren exportando de verdad:
-
-- **Los metadatos se vuelven a escribir en los ficheros cuantizados.** El comentario lo dice: la
-  demo carga el fp16 o el int8, no el fp32, y ninguno de los dos conversores promete conservar los
-  `metadata_props` de su entrada.
-- **Las posiciones de paridad se sacan una vez** y se usan para los tres ficheros. Comparar fp16 e
-  int8 sobre muestras distintas haría que sus dos cifras no se pudieran poner en la misma tabla.
+`export_all` es el comando entero. Dos detalles: los metadatos se reescriben en los ficheros
+cuantizados, porque la demo carga esos y los conversores no prometen conservarlos; y las posiciones
+de paridad se sacan una sola vez para los tres ficheros, o sus cifras no se podrían comparar en la
+misma tabla.
 
 ```python title="src/rukh/export/__init__.py"
 __all__ = [
@@ -1160,8 +1114,8 @@ def export_cmd(
 <Src file="src/rukh/cli.py" tag="p2" lines="499-576" />
 
 <Callout kind="ejecuta" title="Exporta `tiny` primero">
-  `tiny` tiene siete veces menos parámetros que `small` y se exporta enseguida: es la forma barata de ver pasar todo
-  el camino antes de exportar `small`. Cambia la carpeta por la de tu ejecución.
+  `tiny` tiene siete veces menos parámetros que `small` y se exporta enseguida: es la forma barata
+  de recorrer el camino entero. Cambia la carpeta por la de tu ejecución.
 
 ```sh
 uv run rukh export --ckpt checkpoints/tiny-<fecha>/best.pt --out artifacts/onnx/tiny --fp16 --int8 --check-parity --positions 200
@@ -1169,13 +1123,12 @@ ls artifacts/onnx/tiny
 uv run python -c "from rukh.export import read_metadata; print(read_metadata('artifacts/onnx/tiny/model-int8.onnx'))"
 ```
 
-Mira tres cosas en la salida de la primera: `exporter: dynamo` (si sale `legacy`, la línea
-`warning:` dice por qué), `sequence dynamic=True (verified)` y tres líneas `parity`. Si el mes de
-validación está en `data/uci/year=2025/month=02/`, dicen `on 200 validation positions`; si no,
-`random-walk` y un aviso. En la carpeta tienen que quedar `model.onnx`, `model-fp16.onnx` y
-`model-int8.onnx`, sin ningún `.onnx.data` al lado. Y la última orden imprime los metadatos `rukh_*`
-del fichero int8, entre ellos `'rukh_block': '200'` y `'rukh_vocab_size': '2030'`: sobreviven a la
-cuantización porque `export_all` los vuelve a escribir.
+En la salida busca `exporter: dynamo` (si sale `legacy`, la línea `warning:` dice por qué),
+`sequence dynamic=True (verified)` y tres líneas `parity`, que dicen `on 200 validation positions`
+si tienes el mes de validación en `data/uci/year=2025/month=02/` (si no, `random-walk` y un aviso).
+En la carpeta quedan `model.onnx`, `model-fp16.onnx` y `model-int8.onnx`, sin `.onnx.data`. La
+última orden imprime los metadatos del int8, entre ellos `'rukh_block': '200'` y
+`'rukh_vocab_size': '2030'`.
 
 </Callout>
 
@@ -1197,189 +1150,145 @@ parity fp16: 0.9980 on 1000 validation positions (max |delta logits| 0.01404)
 parity int8: 0.9540 on 1000 validation positions (max |delta logits| 1.75)
 ```
 
-Salió por el exportador **dynamo**, el eje de secuencia está **verificado** —no declarado— y las
-posiciones fueron las de **validación**, no un paseo aleatorio. Las tres cosas se leen en la salida
-porque las tres podían haber salido de otra manera.
-
-Y aquí el listón no se cumple: **el 99,9 % no lo pasa ninguna de las dos cuantizaciones**.
+Dynamo, eje verificado y posiciones de validación: las tres cosas se imprimen porque podían haber
+salido de otra manera. Y el listón del hito (≥ 99,9 % de paridad de jugada) no lo pasa ninguna de
+las dos cuantizaciones.
 
 <div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
 
-| Fichero | Tamaño       | Paridad de jugada | Max \|Δ logits\| | ¿Pasa el ≥ 99,9 %? |
-| ------- | ------------ | ----------------- | ---------------- | ------------------ |
-| fp32    | **156,7 MB** | 100 %             | 2,551e-05        | sí                 |
-| fp16    | **78,8 MB**  | 99,80 %           | 0,01404          | **no**             |
-| int8    | **43,5 MB**  | 95,40 %           | 1,75             | **no**             |
+| Fichero | Tamaño   | Paridad de jugada | Max \|Δ logits\| | ¿Pasa el ≥ 99,9 %? |
+| ------- | -------- | ----------------- | ---------------- | ------------------ |
+| fp32    | 156,7 MB | 100 %             | 2,551e-05        | sí                 |
+| fp16    | 78,8 MB  | 99,80 %           | 0,01404          | no                 |
+| int8    | 43,5 MB  | 95,40 %           | 1,75             | no                 |
 
 </div>
 
-fp16 se queda a una décima de punto del listón: elige otra jugada en 2 de cada 1 000 posiciones
-cuando el 99,9 % admitía una, y sus logits se mueven una centésima. Eso es prácticamente el mismo
-modelo, y como se sirve por WebGPU es el que juega en la demo cuando el navegador puede.
+fp16 se queda a una décima del listón: cambia la jugada en 2 de cada 1 000 posiciones y sus logits
+se mueven una centésima. Es prácticamente el mismo modelo, y es el que juega en la demo cuando hay
+WebGPU.
 
-int8 es otra cosa. Cambia la jugada en **46 de cada 1 000 posiciones** y mueve los logits hasta
-1,75, que es un margen del tamaño de la diferencia habitual entre la primera y la segunda jugada.
-Un 95,40 % de paridad no es «casi el mismo modelo»: es un modelo **medible y distinto**, un 4,6 % de
-sus decisiones cambiadas, y no se ha medido cuánto Elo cuesta esa diferencia. Y es precisamente el
-fichero que descarga un móvil, porque es el respaldo en WASM cuando no hay WebGPU: los 43,5 MB
-frente a los 78,8 del fp16 son la razón de que exista. Así que quien juegue desde un teléfono
-antiguo está jugando contra una variante del modelo que la tabla única no mide.
+int8 cambia la jugada en **46 de cada 1 000 posiciones** y mueve los logits hasta 1,75, del tamaño
+de la distancia habitual entre la primera y la segunda jugada. Es un modelo medible y distinto, y
+nadie ha medido cuánto Elo cuesta. Encima es el que descarga un móvil sin WebGPU, así que quien
+juegue desde un teléfono antiguo se enfrenta a una variante que la tabla única no mide. Medir su
+Elo por separado queda para un hito posterior.
 
-Es la misma foto guardada en JPEG a dos calidades. A calidad 95 el fichero pesa la mitad y nadie
-distingue la copia del original salvo con una lupa sobre un borde: eso es fp16. A calidad 40 pesa
-un cuarto, de lejos sigue siendo la misma foto y de cerca los bloques se ven; y si lo que había
-que leer en ella era un texto pequeño —una posición con dos jugadas casi empatadas—, ahí es donde
-se pierde: eso es int8. Cuánto se pierde no se sabe mirando el tamaño del fichero; hay que mirar
-la foto, y aquí, jugar las partidas. Es la misma cuenta que haces al elegir entre un LLM cuantizado
-a 8 o a 4 bits para tu portátil: el tamaño se lee en el fichero; lo que cuesta, solo midiendo con
-tu propia tarea.
-
-Lo honesto es dejarlo escrito así y no redondear: el listón del hito era ≥ 99,9 % de paridad de
-jugada para las tres variantes, fp32 lo cumple, fp16 se queda a 99,80 % e int8 a 95,40 %. Medir
-el Elo del int8 con su propia tirada de partidas es trabajo para un hito posterior.
+Piensa en una foto guardada en JPEG a dos calidades. A calidad 95 pesa la mitad y nadie distingue la
+copia sin una lupa: eso es fp16. A calidad 40 pesa un cuarto y de lejos sigue siendo la misma foto,
+pero si había que leer un texto pequeño (una posición con dos jugadas casi empatadas), ahí se
+pierde: eso es int8. Cuánto se pierde no lo dice el tamaño; hay que mirar la foto, y aquí, jugar las
+partidas. Es la cuenta que haces al elegir un LLM cuantizado a 8 o a 4 bits para tu portátil.
 
 <Callout kind="hoy" title="Juega contra el modelo que acabas de exportar">
-  Este es el momento: ya tienes un `.onnx` tuyo en `artifacts/onnx/small/`. Abre
-  [la demo](https://rukh.borjaglez.com/), busca **«Tu propio modelo»** en el panel de la derecha y
-  elige el fichero. En segundos estás jugando contra lo que entrenaste tú.
+  Ya tienes un `.onnx` tuyo en `artifacts/onnx/small/`. Abre [la demo](https://rukh.borjaglez.com/),
+  busca «Tu propio modelo» en el panel de la derecha y elige el fichero.
 
-Empieza por `model-int8.onnx`: 43 MB cargan rápido. Cuando quieras el modelo de verdad, el que
-mide la tabla, usa `model.onnx` (157 MB) o `model-fp16.onnx` (79 MB). Y ahí tienes el
-experimento que esta sección acaba de argumentar en una tabla: **carga el int8, juega diez
-jugadas, carga el fp32 y repite desde la misma apertura**. El 4,6 % de decisiones distintas
-deja de ser un número y se convierte en una jugada que ves cambiar.
+Empieza por `model-int8.onnx`, que carga rápido. Luego haz el experimento de la tabla: carga el
+int8, juega diez jugadas, carga `model.onnx` y repite desde la misma apertura. El 4,6 % deja de ser
+un número y se convierte en una jugada que ves cambiar.
 
-El fichero no se sube a ninguna parte —lo lee tu navegador y se olvida al recargar—, así que
-puedes probar con checkpoints a medio entrenar sin publicar nada.
+El fichero no se sube a ninguna parte (lo lee tu navegador y se olvida al recargar), así que puedes
+probar checkpoints a medio entrenar sin publicar nada.
 
 </Callout>
 
 <Exercise n="01" title="¿Por qué int8 cambia los logits y no la jugada?">
-  Mira la salida de la exportación: la diferencia máxima de logits del fichero int8 es más de cien
-  veces la del fp16 (1,75 frente a 0,01404), y sin embargo su paridad de jugada sigue siendo del
-  95,40 %, no del 5 %. Explica por qué el desastre en los logits se traduce en un desperfecto
-  moderado en las jugadas, y di en qué tipo de posición esperarías que int8 falle.
+  La diferencia máxima de logits del int8 es más de cien veces la del fp16 (1,75 frente a 0,01404),
+  y aun así su paridad de jugada es del 95,40 %. Explica por qué un desastre en los logits se queda
+  en un desperfecto moderado en las jugadas, y en qué posiciones esperarías que int8 falle.
 
   <Solution>
-    La cuantización dinámica a int8 representa cada matriz con 256 niveles y una escala por tensor:
-    el error relativo por peso es del orden del 0,4 %, y ese error se acumula a lo largo de doce
-    capas. Los logits resultantes se desplazan de forma perceptible. Pero elegir una jugada no
-    depende del valor de los logits sino de su **orden**, y en la mayoría de posiciones la
-    diferencia entre el primero y el segundo es mucho mayor que el ruido introducido. fp16, con 10
-    bits de mantisa y el mismo rango relativo en toda la escala, introduce un error unas cien veces
-    menor.
+    Int8 representa cada matriz con 256 niveles y una escala por tensor: un error del 0,4 % por
+    peso que se acumula en doce capas y desplaza los logits de forma visible. Pero elegir depende
+    del orden de los logits, y en la mayoría de posiciones la distancia entre el primero y el
+    segundo es mucho mayor que ese ruido. fp16, con 10 bits de mantisa, mete un error unas cien
+    veces menor.
 
-Int8 falla justo donde el margen es pequeño: posiciones en las que dos o tres jugadas están
-casi empatadas —aperturas muy conocidas con varias continuaciones estándar, finales simples
-donde varias jugadas mantienen la evaluación— y también en las posiciones donde el modelo está
-poco seguro en general. Ahí las dos jugadas suelen ser igual de razonables, así que el efecto
-sobre la fuerza es probablemente menor de lo que sugiere un 4,6 % de decisiones cambiadas. Pero
-fíjate en el «probablemente»: nadie lo ha medido, y esa discrepancia no se reparte
-uniformemente. Por eso la paridad se mide sobre posiciones de partidas reales y no sobre ruido,
-y por eso el 95,40 % se publica como un incumplimiento del listón y no como una nota al pie.
+Int8 falla donde el margen es pequeño: dos o tres jugadas casi empatadas (aperturas con varias
+continuaciones estándar, finales simples donde varias jugadas mantienen la evaluación) o posiciones
+en las que el modelo duda en general. Ahí las jugadas suelen ser igual de razonables, así que el
+efecto sobre la fuerza probablemente es menor que un 4,6 %. Pero es un «probablemente» que nadie ha
+medido, y por eso el 95,40 % se publica como incumplimiento del listón y no como nota al pie.
 
   </Solution>
 </Exercise>
 
 ## Ver el entrenamiento: TrainingReplay
 
-La isla de abajo recorre los checkpoints de la tirada real: un paso del deslizador, un `step-*.pt`.
-El gráfico dibuja la pérdida de entrenamiento y la de validación contra el eje izquierdo y el top-1
-de siguiente jugada contra el derecho, con una línea vertical en el checkpoint seleccionado; debajo
-están sus números exactos, incluidas la legalidad sin máscara por argmax, medida en los veinte
-checkpoints, y el Elo estimado, que en esta tirada no se midió en ninguno. Lo que no se midió sale
-como un guion, y su línea deja un hueco en vez de bajar a cero. El JSON lo produce
-`labs/m2/replay_export.py`, en la lección 10.
+La isla recorre los checkpoints de la tirada real: un paso del deslizador, un `step-*.pt`. El
+gráfico dibuja las dos pérdidas contra el eje izquierdo y el top-1 contra el derecho; debajo van
+los números del checkpoint elegido, con la legalidad sin máscara y el Elo estimado, que en esta
+tirada no se midió (sale un guion). El JSON lo produce `labs/m2/replay_export.py`, en la lección 10.
 
 Tres cosas que mirar, en este orden:
 
-1. **Dónde se separan las dos pérdidas.** Mientras van juntas, el modelo generaliza: lo que aprende
-   del entrenamiento le sirve para partidas que no ha visto. El punto donde la de validación se
-   aplana mientras la otra sigue bajando es el principio del sobreajuste, y es el que decide cuál
-   es el `best.pt`.
-2. **Cuánto compra la segunda mitad del entrenamiento.** Lleva el deslizador al paso 10 000 y
-   compara con el 20 000. Esa diferencia de top-1 es lo que valieron veinte minutos de GPU, y es el
-   número con el que se decide si la tirada siguiente dura más pasos o cambia otra cosa.
-3. **Cuándo despega la legalidad.** Mira solo esa fila mientras llevas el deslizador del paso 1 000
-   al 8 000: **88,0 % → 99,0 %**. Y luego sigue hasta el final y comprueba que ya no pasa nada.
+1. **Dónde se separan las dos pérdidas.** Mientras van juntas, el modelo generaliza. Donde la de
+   validación se aplana y la otra sigue bajando empieza el sobreajuste, y eso decide el `best.pt`.
+2. Cuánto compra la segunda mitad. Compara el paso 10 000 con el 20 000: esa diferencia de top-1 es
+   lo que valieron veinte minutos de GPU.
+3. Cuándo despega la legalidad. Del paso 1 000 al 8 000 pasa de 88,0 % a 99,0 %; sigue hasta el
+   final y comprueba que ya no se mueve.
 
 <TrainingReplay client:visible />
 
-Casi todo el descenso ocurre pronto. De la pérdida de validación de **2,6279** en el paso 1 000 a la
-de **1,5197** en el 20 000, 0,85 caen en los primeros 5 000 pasos y solo 0,26 en los 15 000
-restantes; el top-1 sube **+12,2 puntos** en los primeros 5 000 pasos y **+5,6** en los siguientes,
-y la segunda mitad entera, del paso 10 000 al 20 000, compró **2,4 puntos**.
+Casi todo el descenso ocurre pronto. De la pérdida de validación de 2,6279 en el paso 1 000 a la de
+1,5197 en el 20 000, 0,85 caen en los primeros 5 000 pasos y solo 0,26 en los 15 000 restantes. El
+top-1 sube 12,2 puntos en los primeros 5 000 pasos, 5,6 en los siguientes, y la segunda mitad
+entera (del 10 000 al 20 000) compró 2,4.
 
-El hueco entre las dos pérdidas no es el que uno espera. En los pasos 1 000 y 2 000 la validación va
-**por debajo** de la de entrenamiento, por el motivo del segundo ejercicio de la lección 3. Se
-cruzan en el paso 3 000 y desde ahí el hueco crece sin parar: **+0,021** en el 10 000, **+0,046** en
-el 15 000 y **+0,060** en el 20 000, un 4 % de la pérdida. Hay sobreajuste y se ve, pero la
-validación **no se ha aplanado**: en los últimos mil pasos todavía baja y el top-1 todavía sube. Por
-eso el `best.pt` de esta tirada es el último checkpoint. La lectura obvia es que faltaba entrenar
-más; la última lección del módulo la pone a prueba y encuentra otra causa para ese hueco que crece
-mientras el top-1 se aplana.
+En los pasos 1 000 y 2 000 la validación va por debajo de la de entrenamiento, por el motivo del
+segundo ejercicio de la lección 3. Se cruzan en el 3 000 y desde ahí el hueco crece: +0,021 en el
+10 000, +0,046 en el 15 000 y +0,060 en el 20 000, un 4 % de la pérdida. Hay sobreajuste, pero la
+validación todavía baja en los últimos mil pasos, así que el `best.pt` es el último checkpoint. La
+lectura obvia es que faltaba entrenar más; la última lección del módulo la pone a prueba y
+encuentra otra causa.
 
-La fila de la legalidad es la que hace de este módulo el de ver emerger el juego. El modelo no tiene
-tablero, no tiene reglas y no sabe qué es un alfil: solo ve secuencias de cuatro caracteres. En el
-paso 1 000 propone una jugada imposible en el **12 %** de las posiciones; en el paso 8 000 respeta
-las reglas en el **99,0 %**. Y ahí se para: del paso 8 000 al 20 000 la legalidad pasa de 99,0 % a
-99,25 %, una posición de 400, mientras la pérdida de validación todavía baja de **1,6727** a
-**1,5197** y el top-1 sube de **47,78 %** a **51,20 %**. **La legalidad satura mucho antes que la
-pérdida.**
+La fila de la legalidad es donde se ve emerger el juego. El modelo no tiene tablero ni reglas:
+solo ve secuencias de símbolos. En el paso 1 000 propone una jugada imposible en el 12 % de las
+posiciones; en el 8 000 respeta las reglas en el 99,0 %. Y ahí se para: hasta el 20 000 solo gana
+una posición de 400 (99,25 %), mientras la pérdida de validación baja de 1,6727 a 1,5197 y el top-1
+sube de 47,78 % a 51,20 %. **La legalidad satura mucho antes que la pérdida.**
 
-Cuidado con leer de más la parte plana. Cada punto se midió sobre **400 posiciones**, así que una
-posición vale un cuarto de punto y el ruido de muestreo ronda **±1 punto**: el 99,75 % del paso
-15 000 y el 99,25 % del 20 000 son 399 y 397 posiciones legales, dos posiciones de diferencia.
-Quien concluya de ahí que el checkpoint 15 000 sabe más reglas que el final está leyendo ruido. Lo
+No leas de más la parte plana. Cada punto se midió sobre 400 posiciones, así que el ruido ronda
+±1 punto: el 99,75 % del paso 15 000 y el 99,25 % del 20 000 son 399 y 397 posiciones legales. Lo
 que significa algo es el tramo de subida.
 
-Y de ahí sale el argumento más importante de la sección: **legalidad y fuerza son cosas distintas**.
-En el paso 8 000 el modelo ya cumple las reglas casi perfectamente y juega bastante peor que en el
-20 000: misma legalidad dentro del ruido, una pérdida de validación un **10 %** más alta y **3,4
-puntos** menos de top-1. Saber que un alfil va en diagonal no es saber adónde conviene moverlo. En
-un LLM pasa igual: aprende pronto a escribir frases gramaticales y JSON bien formado, y mucho
-después a decir cosas correctas con ellos. Por eso el listón del ≥ 99 % es un requisito de entrada y
-no una medida de calidad, y por eso la fila de la tabla única trae además top-1, puzles y Elo.
-
-Falta el Elo por checkpoint, que sale como un guion en los veinte: `--with-elo` juega partidas
-contra Stockfish en cada uno y cuesta una noche de cómputo. Sin él se sabe cuánta imitación compró
-cada tramo de pasos, pero no cuánta fuerza.
+De ahí sale lo más importante de la sección: **legalidad y fuerza son cosas distintas**. En el paso
+8 000 el modelo ya cumple las reglas y juega peor que en el 20 000, con una pérdida un 10 % más alta
+y 3,4 puntos menos de top-1. Saber que un alfil va en diagonal no es saber adónde conviene moverlo.
+Un LLM aprende pronto a escribir frases gramaticales y JSON bien formado, y mucho después a decir
+cosas correctas con ellos. Por eso el ≥ 99 % es un requisito de entrada y la tabla única trae además
+top-1, puzles y Elo. El Elo por checkpoint (`--with-elo`) cuesta una noche de partidas y no se midió:
+se sabe cuánta imitación compró cada tramo, no cuánta fuerza.
 
 ## Ver la atención: AttentionMap
 
 Abajo está la matriz de una cabeza de una capa sobre una partida corta (el mate de Légal, trece
-jugadas más los tokens de control). Cada **fila** es una jugada que mira; cada **columna**, una
-jugada mirada. La mitad superior derecha está siempre vacía: es la máscara causal, que ahora
-puedes ver en lugar de creértela. El color es relativo al máximo de la cabeza seleccionada, así que
-comparar intensidades entre cabezas distintas no significa nada; comparar dentro de una, sí. El
-valor exacto de cada celda está en su título y en el resumen de arriba, que dice las tres jugadas a
-las que más mira la fila que elijas.
+jugadas más los tokens de control). Cada fila es una jugada que mira; cada columna, una jugada
+mirada. La mitad superior derecha está vacía: es la máscara causal, que ahora puedes ver en lugar
+de creértela. El color es relativo al máximo de la cabeza elegida, así que solo tiene sentido
+comparar dentro de una cabeza.
 
 Qué buscar mientras cambias de capa y de cabeza:
 
-- **La subdiagonal encendida.** La casilla inmediatamente a la izquierda de la diagonal es «la
-  jugada anterior»; la diagonal misma es cada jugada mirándose a sí. Suele haber alguna cabeza
-  dedicada a la anterior, porque es el vecino más informativo de una secuencia. En este modelo la
-  hay, una sola, y no en la capa en la que la buscarías; la isla abre en ella (capa 9, cabeza 4).
-- **Columnas verticales.** Una columna entera encendida es una jugada a la que mira todo el mundo.
-  El `<bos>` del principio suele comportarse así en varias cabezas y, en los Transformers de texto,
-  se conoce como sumidero de atención: la cabeza no tiene nada que mirar y vuelca su peso en el
-  primer token, que es su forma de decir «no aporto nada aquí». Es lo que hace alguien en una
-  reunión cuando la pregunta no va con él: mira al techo. El `<bos>` es el techo de la sala, y una
-  columna encendida ahí no es un hallazgo: es el estado de reposo.
-- **Bloques y saltos.** Lo interesante son las celdas lejos de la diagonal: la jugada 12 mirando a
-  la 5, que es cuando se movió la pieza que ahora se captura. Es lo más cerca que se está de ver el
-  modelo «razonando» sobre el tablero, y también lo más fácil de sobreinterpretar.
-- **Diferencias entre capas.** Se suele contar que las primeras capas tienen patrones locales, las
-  del medio los más estructurados y las últimas los más difusos. Es una expectativa razonable que
-  conviene comprobar antes de repetirla: en este modelo la mitad no se cumple.
+- **La subdiagonal encendida.** Justo a la izquierda de la diagonal está «la jugada anterior», el
+  vecino más informativo de una secuencia. Suele haber alguna cabeza dedicada a ella; en este
+  modelo hay una sola, y la isla abre en ella (capa 9, cabeza 4).
+- **Columnas verticales.** Una columna entera encendida es un token al que mira todo el mundo. En
+  los Transformers de texto se llama sumidero de atención: la cabeza no tiene nada útil que mirar y
+  vuelca su peso en el primer token. Es quien, en una reunión, mira al techo cuando la pregunta no
+  va con él; una columna encendida en `<bos>` es el estado de reposo, no un hallazgo.
+- **Saltos lejos de la diagonal.** La jugada 12 mirando a la 5, cuando se movió la pieza que ahora
+  se captura. Es lo más cerca que se está de ver al modelo «razonar» sobre el tablero, y lo más
+  fácil de sobreinterpretar.
+- **Diferencias entre capas.** Se suele contar que las primeras capas son locales, las del medio
+  estructuradas y las últimas difusas. Compruébalo antes de repetirlo: aquí la mitad no se cumple.
 
 <AttentionMap client:visible layer={9} head={4} />
 
-**Lo que hay de verdad en este `attention.json`.** La tabla no sale de mirar el mapa a ojo, sino de
-leer las 96 matrices de 16 × 16 con un script, porque mirar colores es la forma más rápida de
-contarse una película. Salen cuatro cosas: una limpia, una que contradice la lista de arriba, una que
-la matiza y una que hay que dejar sin concluir.
+La tabla sale de leer las 96 matrices de 16 × 16 con un script, no de mirar colores, que es la
+forma más rápida de contarse una película.
 
 <div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
 
@@ -1392,120 +1301,95 @@ la matiza y una que hay que dejar sin concluir.
 
 </div>
 
-- **Lo limpio.** Hay **una** cabeza de jugada anterior y es inequívoca: L9H4 pone de media **0,80**
-  sobre la subdiagonal, con un 1,000 en cuatro filas seguidas, frente a un máximo de 0,65 en las
-  otras noventa y cinco. Las únicas filas en las que se sale del guion son las tres primeras jugadas
-  negras, que se miran a sí mismas o a la jugada negra anterior; no sé por qué, y es mejor dejarlo
-  escrito así que inventar una explicación.
-- **Lo que contradice.** La capa 0 no tiene patrones locales: no tiene ninguno. Sus ocho cabezas son
-  casi uniformes (divergencia frente a la uniforme de 0,23 a 0,34, cuando la media del modelo es
-  0,72). La primera capa reparte, y ya está.
-- **Lo que matiza.** Las capas 10 y 11 sí vuelven a ser difusas y vuelcan la masa en los tokens de
-  control, pero el sumidero no es solo el `<bos>`: `<b1800>`, el último token de control antes de la
-  primera jugada, se lleva casi lo mismo (0,226 frente a 0,229 de media), y L3H7 se dedica a él en
+- **Lo limpio.** L9H4 es la cabeza de jugada anterior: 0,80 de media en la subdiagonal, frente a un
+  máximo de 0,65 en las otras noventa y cinco. Solo se sale del guion en las tres primeras jugadas
+  negras, y no sé por qué; mejor dejarlo escrito que inventar una explicación.
+- **Lo que contradice.** La capa 0 no tiene patrones locales: sus ocho cabezas son casi uniformes.
+  La primera capa reparte, y ya está.
+- **Lo que matiza.** Las capas 10 y 11 sí son difusas, pero el sumidero se reparte entre `<bos>` y
+  `<b1800>`, el último token de control antes de la primera jugada, y L3H7 se dedica a este en
   exclusiva.
-- **Lo que queda sin concluir.** L5H5 pone 0,999 sobre `d7d6` justo en la fila de `f3e5`, el
-  caballo capturando en e5 después de que ese `d7d6` dejara de defender el peón. Tentador. Pero la
-  misma cabeza tiene su máximo en `d7d6` en tres filas distintas, y L1H3 lo tiene en `e7e5` en ocho:
-  eso se parece más a «esta cabeza se ha enganchado a una columna» que a «esta cabeza busca la pieza
-  que se captura», y con **una** partida de 16 tokens no hay forma de distinguirlo. Haría falta un
-  centenar de partidas y una estadística; la isla es un instrumento de depuración, no un
-  experimento.
+- **Lo que queda sin concluir.** L5H5 pone 0,999 sobre `d7d6` justo en la fila de `f3e5`, el caballo
+  que captura en e5 después de que ese `d7d6` dejara de defender el peón. Tentador, pero la misma
+  cabeza tiene su máximo en `d7d6` en tres filas, y L1H3 en `e7e5` en ocho: se parece más a una
+  cabeza enganchada a una columna. Con una partida de 16 tokens no se puede distinguir; haría falta
+  un centenar y una estadística.
 
 <Callout kind="roto" title="Lo que un mapa de atención no demuestra">
-  Es tentador señalar una celda encendida y decir «aquí el modelo se da cuenta de que el caballo
-  está clavado». No lo sabes. Los pesos de atención dicen de dónde se copió información, no qué
-  información era ni para qué se usó; la interpretabilidad moderna es bastante escéptica con la
-  atención como explicación, porque hay modelos con atenciones muy distintas y el mismo
-  comportamiento. Pasa igual con los mapas de atención que acompañan a un LLM de texto para
-  «explicar» una respuesta. Un mapa es una pista y un instrumento de depuración excelente (una
-  cabeza que mira siempre al mismo sitio suele estar muerta), no una prueba. La prueba necesita
-  intervenir: cambiar algo y ver si el comportamiento cambia. De eso va la sección siguiente.
+  Es tentador señalar una celda encendida y decir «aquí el modelo ve que el caballo está clavado».
+  No lo sabes. Los pesos de atención dicen de dónde se copió información, no qué era ni para qué se
+  usó, y hay modelos con atenciones muy distintas y el mismo comportamiento. Vale igual para los
+  mapas de atención que «explican» la respuesta de un LLM de texto. Un mapa es una pista y un buen
+  instrumento de depuración (una cabeza que mira siempre al mismo sitio suele estar muerta); la
+  prueba exige intervenir: cambiar algo y ver si el comportamiento cambia. De eso va la sección
+  siguiente.
 </Callout>
 
 ## Por qué el modelo «aprende el tablero» sin verlo
 
-El hecho que sostiene este módulo es raro cuando te paras a pensarlo. El modelo nunca ha visto un
-tablero. No tiene casillas, ni piezas, ni reglas; tiene 2 030 símbolos y seis millones de
-secuencias. Y acaba proponiendo jugadas legales el 99,4 % de las veces, lo que exige saber dónde está
-cada pieza después de cuarenta movimientos, incluida la torre que no se mueve desde la jugada 3.
-Esa información no está en el token actual: está repartida por toda la historia y hay que
-reconstruirla.
+El modelo nunca ha visto un tablero. Tiene 2 030 símbolos y seis millones de secuencias, y aun así
+propone jugadas legales el 99,4 % de las veces, lo que exige saber dónde está cada pieza después de
+cuarenta movimientos, incluida la torre que no se mueve desde la jugada 3. Esa información no está
+en el token actual: hay que reconstruirla de toda la historia.
 
-La lectura obligatoria del módulo es el trabajo de **Adam Karvonen**, _Chess-GPT's Internal World
-Model_ (2024). Es corto, es claro y es la referencia que usa el curso para calibrar expectativas: un
-nanoGPT de 50 millones de parámetros, entrenado sobre 16 millones de partidas de Lichess en PGN **a
-nivel de carácter**, alcanzó alrededor de 1300 de Elo con un 99,8 % de jugadas legales en un día de
-GPU. Léelo en
-[adamkarvonen.github.io](https://adamkarvonen.github.io/machine_learning/2024/01/03/chess-world-models.html);
-el código y los modelos están publicados con licencia MIT.
+La lectura obligatoria del módulo es _Chess-GPT's Internal World Model_ (2024), de Adam Karvonen,
+[en su web](https://adamkarvonen.github.io/machine_learning/2024/01/03/chess-world-models.html),
+con código y modelos bajo licencia MIT. Un nanoGPT de 50 millones de parámetros, entrenado con 16
+millones de partidas en PGN carácter a carácter, llegó a unos 1300 de Elo con un 99,8 % de jugadas
+legales en un día de GPU. `small` mide 1359 y 99,4 % con 5,9 millones de partidas, 42 minutos y un
+modelo un 22 % más pequeño. Son del mismo orden y con escaleras distintas: sirve para calibrar, no
+para ganar.
 
-Conviene poner esa cifra al lado de la nuestra sin maquillarla: 1300 de Elo y 99,8 % de legalidad,
-frente a los **1359 y 99,4 %** que mide `small`. Karvonen usó 16 millones de partidas y un día de
-GPU; nosotros, 5,9 millones y 42 minutos, con un modelo un 22 % más pequeño. Son del mismo orden, y
-medidos contra escaleras distintas, así que la comparación sirve para calibrar, no para ganar.
+**Qué se demostró.** El método son las <Term id="probe-lineal">sondas lineales</Term>: se congela el
+modelo, se toman las activaciones de una capa intermedia y se entrena una regresión lineal (una
+matriz, sin capas ocultas) para predecir qué pieza hay en cada una de las 64 casillas. Acierta casi
+siempre: el tablero está en las activaciones de forma linealmente legible, aunque nadie se lo
+enseñara.
 
-**Qué se demostró.** El método son las <Term id="probe-lineal">sondas lineales</Term>. Se congela el
-modelo, se toman las activaciones de una capa intermedia en una posición concreta de la secuencia, y
-se entrena **una regresión lineal** —una matriz, sin capas ocultas— para predecir el estado del
-tablero, casilla a casilla, a partir de esas activaciones. La sonda acierta qué pieza hay en cada una
-de las 64 casillas con una exactitud altísima: **el estado del tablero está presente en las
-activaciones de forma linealmente legible**, aunque nadie se lo enseñara y aunque la entrada sean
-caracteres de texto. Se entrenaron también sondas para la fuerza estimada de los jugadores, con
-resultados análogos.
+Una sonda lineal es como una nota final ponderada: tanto por el examen, tanto por las prácticas,
+sumado. No calcula nada por su cuenta. Si con una suma ponderada de las activaciones ya sale «hay un
+caballo en f3», el tablero estaba escrito en ellas. Una sonda con capas ocultas podría estar
+calculándolo ella, y no demostraría nada sobre el modelo.
 
-Una sonda lineal es una nota final ponderada: tanto por el examen, tanto por las prácticas, tanto
-por la asistencia, sumado. No calcula nada por su cuenta. Si con una suma ponderada de las
-activaciones ya sale «hay un caballo en f3», es que el tablero no estaba escondido en ellas, estaba
-escrito. Una sonda con capas ocultas podría estar calculándolo ella, y no demostraría nada sobre el
-modelo.
+La segunda parte convierte la correlación en algo más fuerte. Karvonen interviene: empuja las
+activaciones en la dirección que la sonda asocia a «hay una pieza en esta casilla», como si la
+borrase del tablero interno, y las jugadas del modelo cambian de forma coherente con el tablero
+editado. La representación no solo está ahí: el modelo la usa.
 
-Y hay una segunda parte, que convierte una correlación en algo más fuerte. Karvonen **interviene**:
-toma la dirección que la sonda asocia a «hay una pieza en esta casilla» y modifica las activaciones
-del modelo a lo largo de esa dirección, como si borrase una pieza del tablero interno. Las jugadas
-que el modelo propone después cambian de forma coherente con el tablero editado. La representación
-no solo está ahí: el modelo **la usa**.
+Qué no se demostró, que importa más para tu criterio:
 
-**Qué no se demostró**, y esto importa más para tu criterio:
-
-- Que el modelo tenga reglas. Que pueda reconstruir el tablero no implica que represente «el alfil se
-  mueve en diagonal»; puede haber aprendido las regularidades que el tablero produce sin la regla
-  que las genera. La segunda generaliza a posiciones raras y la primera no.
-- Que busque o calcule. No hay nada parecido a una exploración de variantes: hay una única pasada
-  hacia delante con un número fijo de operaciones. Ese es, seguramente, el techo de este enfoque, y
-  es el motivo de que el modelo de DeepMind que llegó a 2895 de Elo sin búsqueda (Ruoss et al., 2024) necesitara 270 millones de parámetros y diez millones de partidas anotadas por Stockfish.
-- Que **cualquier** representación interna sea recuperable. Una sonda lineal encuentra lo que es
-  linealmente legible; que no encuentres algo no significa que no esté. El resultado negativo de una
-  sonda no es un resultado.
-- Nada sobre nuestra tokenización. Karvonen usó PGN por carácter; Rukh usa una jugada por token. Es
-  razonable esperar un comportamiento parecido o mejor, pero **es una hipótesis hasta que la midas**,
-  y por eso M3 monta sondas lineales sobre nuestro propio encoder en vez de citar el artículo.
-- Y una trampa lógica: el estado del tablero es una función determinista de la lista de jugadas, así
-  que la información **está** necesariamente en la entrada. Lo sorprendente no es que esté, sino que
-  el modelo la haya destilado en una forma explícita y lineal; esa es la frontera entre «memoriza la
-  secuencia» y «modela el dominio».
+- Que el modelo tenga reglas. Puede haber aprendido las regularidades que produce el tablero sin la
+  regla que las genera, y solo la regla generaliza a posiciones raras.
+- Que busque o calcule. Hay una única pasada hacia delante con un número fijo de operaciones. Ese es
+  seguramente el techo del enfoque, y el motivo de que el modelo de DeepMind que llegó a 2895 sin
+  búsqueda (Ruoss et al., 2024) necesitara 270 millones de parámetros y diez millones de partidas
+  anotadas por Stockfish.
+- Que cualquier representación sea recuperable. Una sonda encuentra lo linealmente legible; que no
+  encuentre algo no significa que no esté.
+- Nada sobre nuestra tokenización (una jugada por token, no PGN por carácter). Es una hipótesis
+  hasta que la midas, y por eso M3 monta sondas sobre nuestro propio encoder.
+- Y una trampa lógica: el tablero es función determinista de la lista de jugadas, así que la
+  información está por fuerza en la entrada. Lo sorprendente es que el modelo la haya destilado en
+  forma explícita y lineal: esa es la frontera entre memorizar la secuencia y modelar el dominio.
 
 <Callout kind="mundo-real" title="Por qué esto es la discusión de los LLM en miniatura">
-  «¿Los modelos de lenguaje entienden o solo predicen la siguiente palabra?» es una pregunta que en
-  texto no se puede responder, porque no hay un estado del mundo con el que contrastar las
-  activaciones. En ajedrez sí lo hay: el tablero es objetivo, pequeño y verificable. Por eso este
-  dominio se ha convertido en un banco de pruebas de interpretabilidad, y por eso el curso está
-  construido sobre él. Cuando en A1 discutas si un LLM «sabe» algo, tendrás una intuición anclada en
-  un experimento que has hecho tú, no en una opinión de internet.
+  «¿Los modelos de lenguaje entienden o solo predicen la siguiente palabra?» En texto es difícil de
+  responder, porque no hay un estado del mundo con el que contrastar las activaciones. En ajedrez
+  sí: el tablero es objetivo, pequeño y verificable, y por eso este dominio se ha convertido en un
+  banco de pruebas de interpretabilidad. Cuando en A1 discutas si un LLM «sabe» algo, tendrás una
+  intuición anclada en un experimento tuyo.
 </Callout>
 
 ## Qué has aprendido
 
-Cómo sale el modelo de PyTorch y llega al navegador, y las cuatro comprobaciones que hacen que eso
-sea una afirmación y no una esperanza: el grafo que devuelve solo el último paso, el eje dinámico
-comprobado ejecutando, los metadatos que viajan dentro del fichero y la paridad medida sobre
-posiciones reales.
+Cómo sale el modelo de PyTorch hacia el navegador, y las comprobaciones que lo convierten en una
+afirmación en vez de una esperanza: el grafo del último paso, el eje dinámico comprobado ejecutando,
+los metadatos dentro del fichero y la paridad sobre posiciones reales.
 
-**Cómo se mide**: `uv run rukh export --ckpt checkpoints/small-<fecha>/best.pt --out artifacts/onnx/small
---fp16 --int8 --check-parity` imprime las tres paridades. Medido: **100 %** en fp32, **99,80 %** en
-fp16 y **95,40 %** en int8, con el listón del hito en 99,9 % para los tres. Dos de los tres no lo
-pasan, y está escrito así.
+`uv run rukh export … --fp16 --int8 --check-parity` imprime las tres paridades: 100 % en fp32,
+99,80 % en fp16 y 95,40 % en int8, con el listón en 99,9 %. Dos de los tres no lo pasan, y está
+escrito así. Lo que te llevas a cualquier despliegue: el tamaño de un modelo cuantizado se lee en el
+fichero; lo que cuesta, solo midiendo con tu tarea.
 
-Lo siguiente es el navegador: el worker que posee la sesión de ONNX Runtime, el contrato que el
-fichero tiene que cumplir antes de que se le deje jugar, y la barra de progreso que se mueve de
-verdad.
+Lo siguiente es el navegador: el worker que posee la sesión de ONNX Runtime y el contrato que el
+fichero tiene que cumplir antes de dejarle jugar.

@@ -6,7 +6,7 @@ description:
   completa como criterio, y la caché SQLite que hace que repetir una suite sea casi gratis.'
 module: m2
 order: 5
-duration: 220
+duration: 200
 level: medio
 status: vigente
 updated: '2026-09-23'
@@ -23,18 +23,14 @@ keywords:
 ## Qué vas a construir
 
 La mitad barata del harness de evaluación: `legality.py`, `accuracy.py`, `puzzles.py` y `cache.py`,
-que producen cuatro de las columnas de la tabla única sin jugar una sola partida. Y una idea que
-vale más que las cuatro, y que te llevarás a cualquier evaluación de un LLM: **una métrica no vale
-nada hasta que sabes qué pregunta responde**, y dos métricas que responden preguntas distintas no
-se pueden publicar como una.
-
-Un modelo sin números es una anécdota. `rukh eval --model <ckpt> --suite full` produce una fila
-completa; esta lección es de dónde salen las cuatro primeras casillas de esa fila.
+que producen cuatro columnas de la tabla única sin jugar una sola partida. Y una idea que te llevarás
+a cualquier evaluación de un LLM: **una métrica no vale nada hasta que sabes qué pregunta
+responde**, y dos métricas que responden preguntas distintas no se pueden publicar como una.
 
 ## `legality.py`: la métrica de comprensión
 
-Es el fichero más importante del harness, porque contiene la única pregunta del módulo que no tiene
-una respuesta cómoda.
+El fichero más importante del harness, porque contiene la única pregunta del módulo que no tiene una
+respuesta cómoda.
 
 ```python title="src/rukh/eval/legality.py"
 """Legality without the mask: the honest "does it understand chess" metric.
@@ -61,15 +57,10 @@ reuses the same ``Position`` objects (it only needs the human move on top).
 
 <Src file="src/rukh/eval/legality.py" tag="p2" lines="1-20" />
 
-Lee el docstring entero: es la definición de las dos métricas, escrita donde no se puede perder. El
-argumento está en la lección 4 y aquí se convierte en código: **argmax** es una propiedad de los
-pesos y es el listón del hito; **sampled** es lo que vive un jugador con la máscara apagada y es
-siempre la menor de las dos. Publicar solo una sería quedarse con la que conviene.
-
-El último párrafo explica por qué el muestreador de prefijos de validación vive aquí y no en un
-fichero de utilidades: es la legalidad la que lo define, y `accuracy` reutiliza los mismos objetos
-`Position` porque solo necesita añadirles la jugada humana encima. Dos métricas medidas sobre las
-mismas posiciones se pueden comparar; medidas sobre dos muestras distintas, no.
+El docstring es la definición de las dos métricas, escrita donde no se puede perder: **argmax** es
+una propiedad de los pesos y el listón del hito; **sampled** es lo que vive un jugador con la máscara
+apagada, y siempre sale menor. El muestreador de prefijos vive aquí porque `accuracy` reutiliza los
+mismos objetos `Position`: dos métricas medidas sobre las mismas posiciones se pueden comparar.
 
 ```python title="src/rukh/eval/legality.py"
 from __future__ import annotations
@@ -120,19 +111,15 @@ class Position(BaseModel):
 
 <Src file="src/rukh/eval/legality.py" tag="p2" lines="47-62" />
 
-`Position` es el objeto central del harness y cada campo tiene un motivo:
+`Position` es el objeto central del harness:
 
-- **`moves`** guarda el prefijo en UCI en vez de un FEN, así que el tablero se reconstruye
-  reproduciendo la partida. Es más caro y es lo correcto: el modelo no razona sobre posiciones sino
-  sobre secuencias, y un FEN no permitiría reconstruir el prompt.
-- **`history`** son los ids **ya recortados**, cabecera incluida. Recortar aquí y no en cada métrica
-  es lo que garantiza que legalidad, exactitud y paridad ONNX le enseñan al modelo exactamente el
-  mismo prompt.
-- **`elo`** es la puntuación **del bando que mueve**, no la de las blancas. Es el corte con el que
-  `accuracy` reparte las posiciones en tramos, y confundirlo metería la mitad de las posiciones en
-  el tramo equivocado.
-- **`target`** es `None` al final de la partida, y eso hace que la exactitud pueda saltarse esas
-  posiciones sin inventarse una respuesta correcta.
+- `moves` guarda el prefijo en UCI y no un FEN, porque el modelo razona sobre secuencias y un FEN no
+  permitiría reconstruir el prompt.
+- `history` son los ids ya recortados, cabecera incluida, para que legalidad, exactitud y paridad
+  ONNX le enseñen al modelo el mismo prompt.
+- **`elo` es el del bando que mueve**, no el de las blancas; confundirlo metería la mitad de las
+  posiciones en el tramo equivocado.
+- `target` es `None` al final de la partida, y la exactitud se salta esas posiciones.
 
 ```python title="src/rukh/eval/legality.py"
 def board_of(position: Position) -> chess.Board:
@@ -184,11 +171,8 @@ def position_at(
 
 <Src file="src/rukh/eval/legality.py" tag="p2" lines="82-106" />
 
-`position_at` construye el prompt **exactamente como lo construyó el entrenamiento**: cabecera de
-tres tokens y después las jugadas. El `tok.vocab.get(uci, tok.unk_id)` es la red de seguridad para
-una jugada que no estuviera en el vocabulario —con la enumeración de M1 no puede pasar—, y el
-recorte se delega en `prompt_ids`, que es la función de la lección anterior: un recorte por la
-izquierda a secas le quitaría el condicionamiento por Elo a todos los prefijos largos.
+`position_at` construye el prompt como el entrenamiento, y el recorte se delega en `prompt_ids`, la
+función de la lección anterior que conserva la cabecera.
 
 ```python title="src/rukh/eval/legality.py"
 def sample_positions(
@@ -239,23 +223,17 @@ def sample_positions(
 
 <Src file="src/rukh/eval/legality.py" tag="p2" lines="109-152" />
 
-Cómo se eligen las mil posiciones, y las tres decisiones que hay dentro:
+Tres decisiones al elegir las mil posiciones:
 
-1. **Una posición por partida.** Sacar diez prefijos de la misma partida daría diez medidas
-   correlacionadas contadas como diez independientes, y el intervalo de confianza de la tasa sería
-   más estrecho de lo que le corresponde. Es la encuesta en la que preguntas diez veces a la misma
-   persona: tienes diez respuestas y una sola opinión.
-2. **El <Term id="ply">ply</Term> se sortea a lo largo de toda la partida** (`rng.randrange(MIN_PLY, len(moves))`), no
-   entre las primeras jugadas. Las posiciones de apertura son fáciles —casi cualquier desarrollo
-   razonable es legal— y los finales difíciles —pocas jugadas legales y muy parecidas—, así que un
-   muestreo cargado hacia el principio publicaría una legalidad que nadie vive. Una legalidad global
-   del 95 % puede esconder un 99 % en apertura y un 70 % en finales.
-3. **Solo se leen las primeras `pool` filas** del parquet. Un mes de validación son millones de
-   partidas y el harness nunca necesita más de unas decenas de miles; cuáles de ellas y a qué ply lo
-   decide `seed`, así que la muestra es reproducible.
-
-El `rng.shuffle(order)` antes del bucle es lo que impide que «las primeras 50 000 filas» se
-convierta en «las primeras 1 000»: se barajan los índices y se recorren en ese orden.
+1. **Una posición por partida.** Diez prefijos de la misma partida serían diez medidas
+   correlacionadas contadas como independientes, y el intervalo saldría más estrecho de lo que le
+   corresponde. Es la encuesta en la que preguntas diez veces a la misma persona: diez respuestas y
+   una sola opinión.
+2. El <Term id="ply">ply</Term> se sortea a lo largo de toda la partida, no entre las primeras
+   jugadas. La apertura es fácil y los finales difíciles, y una legalidad global del 95 % puede
+   esconder un 99 % en apertura y un 70 % en finales.
+3. Solo se leen las primeras `pool` filas del parquet, barajadas con `seed`, así que la muestra es
+   reproducible.
 
 ```python title="src/rukh/eval/legality.py"
 class LegalityResult(BaseModel):
@@ -274,9 +252,8 @@ class LegalityResult(BaseModel):
 
 <Src file="src/rukh/eval/legality.py" tag="p2" lines="155-166" />
 
-El resultado lleva **su definición dentro**: el modo y, cuando procede, la temperatura y el top-k
-con los que se sacó. Un número sin sus supuestos es propaganda, y aquí los supuestos viajan pegados
-al número hasta el informe y hasta la model card.
+El resultado lleva su definición dentro (el modo y, si procede, la temperatura y el top-k), y esos
+supuestos viajan pegados al número hasta la model card.
 
 ```python title="src/rukh/eval/legality.py"
 def legality(
@@ -320,31 +297,25 @@ def legality(
 
 <Src file="src/rukh/eval/legality.py" tag="p2" lines="169-205" />
 
-La medida, con cuatro decisiones:
+Cuatro decisiones:
 
-- **`mode="argmax"` fuerza `temperature=0` y `top_k=None` sobre la configuración que reciba.** No
-  pide que el llamante se acuerde: la definición del titular no puede depender de qué había en el
-  YAML.
-- **`mask_illegal=False` siempre**, en los dos modos. Es el punto entero de la métrica.
-- **Las posiciones sin jugada legal no se cuentan**, ni en el numerador ni en el denominador. El
-  `counted` es el número de posiciones realmente preguntadas, y por eso `LegalityResult.positions`
-  puede ser menor que las que le pasaste.
-- **Un solo generador para todo el bucle.** Se construye una vez, en el dispositivo del modelo, y
-  avanza a lo largo de las mil posiciones: eso hace la tirada muestreada reproducible sin que cada
-  posición tenga su propia semilla.
+- **`mode="argmax"` fuerza `temperature=0` y `top_k=None`**: la definición del titular no puede
+  depender de qué había en el YAML.
+- `mask_illegal=False` siempre, en los dos modos. Es el punto entero de la métrica.
+- Las posiciones sin jugada legal no se cuentan, así que `positions` puede ser menor que las que le
+  pasaste.
+- Un solo generador para todo el bucle hace reproducible la tirada muestreada.
 
-Lo que **no** hace es medir los dos modos en la misma pasada. El harness llama a `legality` dos
-veces con las **mismas** `positions`, que es lo que hace que los dos números se puedan restar; lo
-que cuesta es una segunda pasada hacia delante por posición, y a mil posiciones eso son segundos.
+El harness llama a `legality` dos veces con las mismas posiciones, para que los dos números se
+puedan restar.
 
 <Transfer
   concept="Una métrica viaja con su definición"
   where="El pass@1 de un benchmark de código: con decodificación greedy o muestreando a temperatura 0,8 salen cifras distintas, y una tabla que las mezcla compara cosas que no se pueden comparar."
 >
   Casi todas las métricas de un LLM dependen de cómo se decodificó: greedy o muestreando, con qué
-  temperatura, con qué restricciones. `LegalityResult` lleva esos supuestos dentro del propio
-  resultado para que no se pierdan por el camino hasta la tabla. Cuando leas una cifra de un
-  benchmark, busca esas tres cosas antes de creértela; cuando publiques una, escríbelas al lado.
+  temperatura, con qué restricciones. Cuando leas una cifra de un benchmark, busca esas tres cosas
+  antes de creértela; cuando publiques una, escríbelas al lado.
 </Transfer>
 
 ```python title="tests/unit/test_legality.py"
@@ -384,10 +355,8 @@ GAME = "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6"
 
 <Src file="tests/unit/test_legality.py" tag="p2" lines="1-32" />
 
-Ese `importlib.import_module` del principio no es un capricho. `rukh.eval` reexporta `legality`, así
-que `from rukh.eval import legality` da la **función**; para sustituir `pick_move` dentro del módulo
-hace falta el objeto módulo, y pedirlo explícitamente con su nombre es más claro que confiar en qué
-devuelve un `import` según desde dónde se mire.
+`rukh.eval` reexporta la función `legality`, así que para sustituir `pick_move` dentro del módulo el
+test pide el objeto módulo por su nombre con `importlib`.
 
 ```python title="tests/unit/test_legality.py"
 @pytest.fixture(scope="module")
@@ -420,9 +389,8 @@ def games(tmp_path: Path) -> Path:
 
 <Src file="tests/unit/test_legality.py" tag="p2" lines="35-60" />
 
-Un parquet de tres partidas escrito en un directorio temporal: el harness se prueba entero sin
-descargar nada. La tercera partida tiene una sola jugada, y está ahí a propósito para el test de
-más abajo.
+Un parquet de tres partidas en un directorio temporal: el harness se prueba entero sin descargar
+nada.
 
 ```python title="tests/unit/test_legality.py"
 def test_position_at_keeps_the_prefix_the_history_and_the_human_move(tok: UciTokenizer) -> None:
@@ -457,14 +425,9 @@ def test_a_short_history_is_left_alone(tok: UciTokenizer) -> None:
 
 <Src file="tests/unit/test_legality.py" tag="p2" lines="63-90" />
 
-Los cuatro del prompt. El tercero es el que vale: con `block=5`, el historial recortado tiene que
-seguir empezando por la cabecera y quedarse con las **dos últimas** jugadas. El comentario lo dice:
-«un `history[-block:]` a secas lo habría tirado». Es el mismo contrato que fija
-`test_the_prompt_keeps_the_header_when_it_has_to_be_cropped` en el muestreador, comprobado aquí
-desde el otro extremo.
-
-Y el segundo fija la regla del Elo: en el ply 3 mueven las negras, así que la posición se archiva
-bajo 1950 y no bajo 1850.
+El tercero es el que vale: con `block=5`, el historial recortado sigue empezando por la cabecera y se
+queda con las dos últimas jugadas. El segundo fija la regla del Elo: en el ply 3 mueven las negras,
+así que la posición va bajo 1950 y no bajo 1850.
 
 ```python title="tests/unit/test_legality.py"
 def test_legality_is_measured_twice_with_different_definitions(
@@ -487,10 +450,8 @@ def test_an_unknown_legality_mode_is_an_error(tok: UciTokenizer, model: MoveDeco
 
 <Src file="tests/unit/test_legality.py" tag="p2" lines="93-108" />
 
-El test de las dos definiciones no comprueba las tasas —con un modelo de juguete no significan
-nada—, comprueba que **cada resultado lleva su propia definición**: el de argmax con `temperature`
-y `top_k` a `None`, el muestreado con 0,6 y 20. Y que el argmax es determinista, llamándolo dos
-veces.
+Con un modelo de juguete las tasas no significan nada, así que el test comprueba que cada resultado
+lleva su definición y que el argmax es determinista.
 
 ```python title="tests/unit/test_legality.py"
 def test_board_of_replays_the_prefix(tok: UciTokenizer) -> None:
@@ -553,11 +514,9 @@ def test_legality_asks_the_model_without_the_mask(
 
 <Src file="tests/unit/test_legality.py" tag="p2" lines="137-163" />
 
-Los dos con `monkeypatch` son los que prueban la lógica sin el modelo. El primero guioniza cuatro
-respuestas —`True, False, True, True`— y exige que la tasa sea 0,75: es la aritmética de la métrica,
-aislada de la red. El segundo captura el `cfg` con el que se llama a `pick_move` y comprueba que
-`mask_illegal` llegó en `False`. Ese test de una línea es el que impide que alguien «arregle» la
-legalidad poniéndole la máscara y la suba al 100 %.
+Los dos con `monkeypatch` prueban la lógica sin el modelo: cuatro respuestas guionizadas tienen que
+dar 0,75, y el `cfg` capturado tiene que llegar con `mask_illegal=False`. Ese test de una línea
+impide que alguien «arregle» la legalidad poniéndole la máscara y la suba al 100 %.
 
 ```python title="tests/unit/test_legality.py"
 def test_legality_of_a_real_toy_model_is_a_rate(tok: UciTokenizer, model: MoveDecoder) -> None:
@@ -583,9 +542,8 @@ def test_legality_without_positions_is_zero(tok: UciTokenizer, model: MoveDecode
 uv run pytest -m unit -q tests/unit/test_legality.py
 ```
 
-Catorce tests en verde, en CPU y sin descargar nada: las partidas salen de un parquet de tres filas
-escrito en el directorio temporal. Si falla `test_legality_asks_the_model_without_the_mask`, alguien
-le ha puesto la máscara a la métrica.
+Catorce tests en verde, en CPU y sin descargar nada. Si falla
+`test_legality_asks_the_model_without_the_mask`, alguien le ha puesto la máscara a la métrica.
 
 </Callout>
 
@@ -620,12 +578,9 @@ TOP_K = 3
 
 <Src file="src/rukh/eval/accuracy.py" tag="p2" lines="1-24" />
 
-**Los logits crudos, no los enmascarados**, y el docstring dice por qué: la pregunta es «¿habría
-jugado el modelo lo que jugó el humano?», y esconder los tokens ilegales la halagaría. Un modelo que
-acierta el 51 % con la máscara puesta y el 40 % sin ella no acierta el 51 %.
-
-Los tramos son de 200 puntos desde 1800, que es el suelo del corpus `rukh-games-1800` de M1, con
-sendos cajones de sastre por abajo y por arriba.
+**Los logits crudos, no los enmascarados**: la pregunta es «¿habría jugado el modelo lo que jugó el
+humano?», y esconder los ilegales la halagaría. Los tramos son de 200 puntos desde 1800, el suelo del
+corpus de M1.
 
 ```python title="src/rukh/eval/accuracy.py"
 def elo_band(elo: int) -> str:
@@ -717,22 +672,13 @@ def accuracy(
 
 <Src file="src/rukh/eval/accuracy.py" tag="p2" lines="68-102" />
 
-Lo que hay que entender de la métrica no está en el código sino en su techo:
-**el 100 % no es alcanzable ni deseable**. En muchas posiciones hay tres jugadas razonables y el
-humano eligió una; acertar siempre significaría haber memorizado el corpus. La expectativa con la
-que se entra a la evaluación es un top-1 del 35-45 % contra jugadores de club —una horquilla de
-andar por casa, sin fuente detrás, así que trátala como hipótesis— y la cifra que vale es la que
-salga de `rukh eval`.
+El techo de esta métrica no es el 100 %: en muchas posiciones hay tres jugadas razonables y el humano
+eligió una, así que acertar siempre significaría haber memorizado el corpus. El desglose por tramo
+es lo que hace posible el condicionamiento por Elo de M4: si el modelo predice mejor a los 1800 que a
+los 2400, ha aprendido el nivel medio de sus datos, y condicionar tiene algo que mover.
 
-El desglose por tramo es lo que hace posible el Elo-conditioning de M4: si el modelo predice mejor a
-los 1800 que a los 2400, es que ha aprendido a imitar el nivel medio de sus datos, y entonces
-condicionar por nivel tiene algo que mover.
-
-Dos detalles del código. Las posiciones cuyo `target` es `None` o no está en el vocabulario se
-**saltan sin contarse**, así que `positions` es el número de comparaciones reales y no el de
-posiciones que le pasaste. Y el global se calcula sumando los aciertos de todos los tramos y
-dividiendo por el total, **no** promediando las tasas de los tramos: un tramo con cuatro posiciones
-no puede pesar lo mismo que uno con quinientas.
+El global suma los aciertos de todos los tramos y divide por el total, sin promediar tasas: un tramo
+con cuatro posiciones no puede pesar lo mismo que uno con quinientas.
 
 ```python title="tests/unit/test_accuracy.py"
 """Tests for rukh.eval.accuracy: Elo bands and top-1/top-3 agreement with the human move."""
@@ -780,13 +726,10 @@ class RankedModel:
 
 <Src file="tests/unit/test_accuracy.py" tag="p2" lines="1-41" />
 
-`RankedModel` es un modelo falso mínimo que devuelve los logits que tú le digas, en el
-orden que tú le digas. Es la forma de probar una métrica: con el modelo real, un test de exactitud
-solo puede comprobar que el número está entre 0 y 1.
-
-Fíjate en el comentario de `self.cfg = TOY`: el impostor necesita una configuración porque la
-métrica recorta el prompt al bloque del modelo. Un falso tiene que implementar la superficie
-completa que su llamante usa, no la que uno cree que usa.
+`RankedModel` es un modelo falso que devuelve los logits que tú le digas: con el modelo real, un
+test de exactitud solo podría comprobar que el número está entre 0 y 1. Necesita un `cfg` porque la
+métrica recorta el prompt al bloque del modelo: **un falso tiene que implementar la superficie que su
+llamante usa**, no la que uno cree que usa.
 
 ```python title="tests/unit/test_accuracy.py"
 @pytest.mark.parametrize(
@@ -819,9 +762,8 @@ def test_top1_and_top3_see_the_ranking(tok: UciTokenizer) -> None:
 
 <Src file="tests/unit/test_accuracy.py" tag="p2" lines="44-69" />
 
-Ocho fronteras de tramo parametrizadas —incluidas las dos que importan, 1799/1800 y 2599/2600— y los
-tres casos del ranking: acierto en la primera, acierto en la tercera y fallo. Que el segundo dé
-`(0.0, 1.0)` es la definición ejecutable de la diferencia entre top-1 y top-3.
+Fronteras de tramo parametrizadas y los tres casos del ranking; que el segundo dé `(0.0, 1.0)` es la
+definición ejecutable de la diferencia entre top-1 y top-3.
 
 ```python title="tests/unit/test_accuracy.py"
 def test_positions_are_filed_under_the_band_of_the_side_to_move(tok: UciTokenizer) -> None:
@@ -862,10 +804,8 @@ def test_accuracy_runs_on_the_real_decoder(tok: UciTokenizer) -> None:
 
 <Src file="tests/unit/test_accuracy.py" tag="p2" lines="72-105" />
 
-El del reparto por tramos es el más fino del fichero: dos posiciones de la misma partida con
-jugadores de fuerza distinta, una con cada bando en juego, y el resultado tiene que caer en **dos
-tramos diferentes** con aciertos distintos. Si la métrica archivara por el Elo de las blancas, las
-dos irían al mismo sitio y el test fallaría.
+Dos posiciones de la misma partida, una con cada bando en juego, tienen que caer en tramos
+distintos. Si la métrica archivara por el Elo de las blancas, el test fallaría.
 
 ## `puzzles.py`: el criterio duro
 
@@ -887,24 +827,15 @@ number has to be read with, not a bug.
 
 <Src file="src/rukh/eval/puzzles.py" tag="p2" lines="1-13" />
 
-El docstring dice dos cosas, y las dos hay que leerlas despacio.
+El **criterio**: un puzle de Lichess es un FEN y una lista de jugadas alternadas. Las del rival se
+empujan sin preguntar y las del modelo tiene que acertarlas; un fallo termina el intento. Contar un
+puzle solo con la línea entera correcta mide encontrar la jugada que gana, no parecerse a un humano.
 
-La primera es el **criterio**: un puzle de Lichess es un FEN más una lista de jugadas alternadas, y
-la del índice par es la del rival —forzada, se empuja sin preguntar— mientras que la del índice
-impar la tiene que acertar el modelo. Un fallo termina el intento. Contar un puzle como resuelto
-solo cuando la línea entera es correcta es una métrica dura a propósito: mide encontrar **la** jugada
-que gana, no parecerse a un humano.
-
-La segunda es una limitación declarada. **El modelo solo ve las jugadas del puzle**, nunca la
-partida de la que salió esa posición, porque un modelo de secuencias de jugadas no puede recibir un
-FEN. La cabecera es un par de Elo fijo, así que el prompt parece el principio de una partida entre
-dos jugadores de 1800 que empieza en una posición que en realidad lleva treinta jugadas jugadas. El
-docstring lo llama por su nombre: «es un handicap con el que hay que leer el número, no un error».
-
-Con este prompt el porcentaje de puzles resueltos sale bajo, y bajo es creíble para un modelo
-pequeño: justo lo que hace peligrosa a una métrica, porque de un número que parece razonable nadie
-tira del hilo. Que la limitación esté escrita en el docstring es lo que permite preguntarse cuánto
-cuesta; la lección siguiente lo mide.
+Y una limitación declarada: el modelo solo ve las jugadas del puzle, nunca la partida de la que
+salió, porque no puede recibir un FEN. La cabecera es un par de Elo fijo, así que el prompt parece el
+principio de una partida que en realidad lleva treinta jugadas. El número que sale es bajo, y bajo es
+creíble para un modelo pequeño: justo lo que hace peligrosa a una métrica, porque nadie tira del hilo
+de un número razonable. La lección siguiente mide cuánto cuesta.
 
 ```python title="src/rukh/eval/puzzles.py"
 from __future__ import annotations
@@ -950,9 +881,7 @@ class MoveSource(Protocol):
 
 <Src file="src/rukh/eval/puzzles.py" tag="p2" lines="35-50" />
 
-`MoveSource` es otro `Protocol`: cualquier cosa que conteste una jugada para un tablero y un
-historial. Eso es lo que permite que los tests guionicen las respuestas sin construir un modelo, y
-lo que hace que `run_puzzles` no sepa si detrás hay una red o una lista.
+`MoveSource` es otro `Protocol`: los tests guionizan respuestas sin construir un modelo.
 
 ```python title="src/rukh/eval/puzzles.py"
 def model_source(
@@ -971,10 +900,9 @@ def model_source(
 
 <Src file="src/rukh/eval/puzzles.py" tag="p2" lines="53-64" />
 
-El muestreador de puzles es **enmascarado y a temperatura 0**: argmax entre las jugadas legales. Es
-una elección deliberada y distinta de la de legalidad: aquí no se pregunta si el modelo conoce las
-reglas, se pregunta si encuentra la jugada que gana, y dejar que la temperatura le haga fallar una
-línea correcta mediría el muestreador.
+El muestreador de puzles es enmascarado y a temperatura 0. Aquí no se pregunta si el modelo conoce
+las reglas, sino si encuentra la jugada que gana, y dejar que la temperatura le haga fallar mediría
+el muestreador.
 
 ```python title="src/rukh/eval/puzzles.py"
 class PuzzleAttempt(BaseModel):
@@ -994,10 +922,8 @@ class PuzzleAttempt(BaseModel):
 
 <Src file="src/rukh/eval/puzzles.py" tag="p2" lines="67-79" />
 
-`correct` —cuántas jugadas del modelo fueron correctas antes del primer fallo— es lo que distingue
-un puzle casi resuelto de uno fallado en la primera. No entra en la tasa publicada, y está ahí porque
-el día que alguien quiera saber si el modelo falla al principio o al final de las líneas, el dato ya
-está medido.
+`correct`, las jugadas acertadas antes del primer fallo, no entra en la tasa, pero deja medido si el
+modelo falla al principio o al final de las líneas.
 
 ```python title="src/rukh/eval/puzzles.py"
 def solve_puzzle(
@@ -1033,17 +959,10 @@ def solve_puzzle(
 
 <Src file="src/rukh/eval/puzzles.py" tag="p2" lines="82-110" />
 
-El bucle de un puzle. La jugada del rival (índice par) se empuja sin preguntar; la del modelo
-(índice impar) se compara **como cadena UCI** y un fallo rompe el bucle. Fíjate en el `break`: el
-tablero se queda a medias y no se sigue, porque una línea táctica que se desvía deja de tener
-sentido a partir de ahí.
-
-`solved=correct == len(expected) and bool(expected)` tiene ese `and bool(expected)` por un caso
-degenerado: un puzle con una sola jugada —la del rival— no le pide nada al modelo, y contarlo como
-resuelto sería regalar una casilla de la tabla.
-
-Y el historial crece con **todas** las jugadas, las del rival incluidas: el prompt es la línea
-entera, como en una partida.
+La jugada del modelo se compara como cadena UCI, y el `break` corta la línea en el primer fallo,
+porque una línea táctica desviada deja de tener sentido. El `and bool(expected)` evita contar como
+resuelto un puzle que no le pide nada al modelo. Y el historial crece con todas las jugadas, las del
+rival incluidas.
 
 ```python title="src/rukh/eval/puzzles.py"
 class BandPuzzles(BaseModel):
@@ -1157,14 +1076,10 @@ def load_puzzles(path: Path, per_band: int, seed: int = 0, split: str = "test") 
 
 <Src file="src/rukh/eval/puzzles.py" tag="p2" lines="183-210" />
 
-La carga muestrea **por banda**, no del conjunto entero: `per_band` puzles de cada una de las tres
-dificultades. Muestrear del total daría la mezcla que tenga el parquet, y la métrica por banda —que
-es la que enseña la pendiente por dificultad, y por tanto la que indica que la métrica mide algo
-real— saldría con tamaños dispares.
-
-El `split == "test"` es la partición que M1 dejó hecha con un hash del identificador del puzle. Que
-la evaluación lea `test` y no el conjunto entero es lo que impide que un futuro entrenamiento con
-puzles se evalúe sobre lo que ha visto.
+La carga muestrea por banda de dificultad: del total saldría la mezcla del parquet, y la pendiente
+por dificultad, la señal de que la métrica mide algo real, tendría tamaños dispares. Y lee la
+partición `test` que M1 hizo con un hash del identificador, para que un futuro entrenamiento con
+puzles no se evalúe sobre lo que ha visto.
 
 ## `cache.py`: repetir una suite sin volver a jugarla
 
@@ -1186,14 +1101,10 @@ played under the old settings and report them as the new ones.
 
 <Src file="src/rukh/eval/cache.py" tag="p2" lines="1-13" />
 
-Los puzles y las partidas contra Stockfish son la parte cara del harness: una suite completa son
-cientos de partidas y miles de puzles. La caché guarda cada ítem terminado, así que repetir la suite
-tras un fallo —o después de añadir un escalón— solo paga lo que falta.
-
-Y el párrafo que hace que la caché sea correcta y no solo rápida: **la clave son los pesos y los
-ajustes que cambian lo que un ítem significa**. Sin ellos, bajar la temperatura reutilizaría en
-silencio partidas jugadas con la anterior y las publicaría como nuevas. Es el error clásico de una
-caché: acertar la clave es todo el diseño.
+Los puzles y las partidas son la parte cara: la caché guarda cada ítem terminado, y repetir la suite
+tras un fallo solo paga lo que falta. Pero es correcta solo porque **la clave son los pesos y los
+ajustes que cambian lo que un ítem significa**; sin ellos, bajar la temperatura reutilizaría en
+silencio partidas jugadas con la anterior. En una caché, acertar la clave es todo el diseño.
 
 ```python title="src/rukh/eval/cache.py"
 from __future__ import annotations
@@ -1240,10 +1151,8 @@ def file_sha(path: Path) -> str:
 
 <Src file="src/rukh/eval/cache.py" tag="p2" lines="39-51" />
 
-`config_sha` serializa con `sort_keys=True` para que el orden del diccionario no cambie el hash, y
-con `default=str` para que un valor que no sea JSON no reviente la evaluación entera. `file_sha` lee
-por trozos de un megabyte porque un checkpoint de `medium` son 460 MB y leerlo entero en memoria
-para hacerle un hash es un gasto gratuito.
+`sort_keys=True` hace que el orden del diccionario no cambie el hash; `file_sha` lee por trozos
+porque un checkpoint de `medium` son 460 MB.
 
 ```python title="src/rukh/eval/cache.py"
 class EvalCache:
@@ -1273,13 +1182,9 @@ class EvalCache:
 
 <Src file="src/rukh/eval/cache.py" tag="p2" lines="54-76" />
 
-`enabled=False` construye una caché que **no abre la base**: `self._conn` se queda en `None` y las
-cuatro operaciones se convierten en no-ops. Es la forma limpia de implementar `--no-cache`, mucho
-mejor que llenar el harness de `if cache is not None`.
-
-Y la clave combinada corta los dos hashes a 16 caracteres. 16 hexadecimales son 64 bits: de sobra
-para no colisionar entre las decenas de combinaciones de un proyecto, y corto para que una fila de
-la base se lea a simple vista.
+`enabled=False` no abre la base y convierte las operaciones en no-ops: una forma limpia de
+implementar `--no-cache` sin llenar el harness de `if`. La clave corta cada hash a 16 caracteres, 64
+bits, de sobra para no colisionar.
 
 ```python title="src/rukh/eval/cache.py"
     def get(self, suite: str, item_id: str) -> dict[str, Any] | None:
@@ -1344,10 +1249,8 @@ la base se lea a simple vista.
 
 <Src file="src/rukh/eval/cache.py" tag="p2" lines="113-127" />
 
-`INSERT OR REPLACE` en vez de `INSERT`: reevaluar un ítem que ya estaba sobrescribe en vez de
-fallar. Y el `commit` por escritura es deliberadamente conservador: una suite que se corta a las dos
-horas tiene que conservar todo lo que llevaba hecho, y a un puzle por transacción SQLite no es el
-cuello de botella de nada.
+`INSERT OR REPLACE` sobrescribe en vez de fallar, y el `commit` por escritura hace que una suite
+cortada a las dos horas conserve todo lo hecho.
 
 ```python title="tests/unit/test_cache.py"
 """Tests for rukh.eval.cache: keying by weights, isolation and skipping finished work."""
@@ -1425,9 +1328,7 @@ def test_a_disabled_cache_never_reads_or_writes(tmp_path: Path) -> None:
 
 <Src file="tests/unit/test_cache.py" tag="p2" lines="43-68" />
 
-Los tres primeros: ida y vuelta, aislamiento por pesos —dos SHA distintos no comparten nada, y el
-primero sigue viendo lo suyo después— y la caché desactivada, que ni lee lo que ya estaba ni escribe
-lo nuevo.
+Ida y vuelta, aislamiento por pesos y la caché desactivada, que ni lee ni escribe.
 
 ```python title="tests/unit/test_cache.py"
         assert check.get("puzzles", "p2") is None
@@ -1457,10 +1358,8 @@ def test_without_a_cache_the_puzzle_is_replayed(tok: UciTokenizer) -> None:
 
 <Src file="tests/unit/test_cache.py" tag="p2" lines="70-92" />
 
-Y aquí está el test que prueba que la caché **sirve para algo**: `CountingSource` cuenta cuántas
-veces se le pidió una jugada, se resuelve el puzle dos veces con la misma caché y el contador se
-queda en 1. El de al lado comprueba lo contrario sin caché: dos llamadas. Medir el ahorro en vez de
-suponerlo.
+El test que prueba que la caché sirve para algo: `CountingSource` cuenta las jugadas pedidas, el
+mismo puzle se resuelve dos veces y el contador se queda en 1. Medir el ahorro en vez de suponerlo.
 
 ```python title="tests/unit/test_cache.py"
 def test_different_settings_do_not_share_results(tmp_path: Path) -> None:
@@ -1485,10 +1384,9 @@ def test_the_config_hash_ignores_key_order_and_reads_every_field() -> None:
 
 <Src file="tests/unit/test_cache.py" tag="p2" lines="96-113" />
 
-El de los ajustes es el que protege la corrección. Dos configuraciones que solo se diferencian en el
-tiempo por jugada del motor producen hashes distintos, la segunda no ve las partidas de la primera,
-y la primera las sigue viendo cuando se vuelve a ella. Sin esa propiedad, bajar `elo_move_time` para
-una prueba rápida y volver a subirlo contaminaría la tabla publicada.
+El que protege la corrección: dos configuraciones que solo difieren en el tiempo por jugada no
+comparten partidas. Sin eso, bajar `elo_move_time` para una prueba y volver a subirlo contaminaría la
+tabla publicada.
 
 ```python title="tests/unit/test_cache.py"
 def test_the_weights_sha_is_still_what_the_report_shows(tmp_path: Path) -> None:
@@ -1510,9 +1408,7 @@ def test_file_sha_identifies_the_weights(tmp_path: Path) -> None:
 
 <Src file="tests/unit/test_cache.py" tag="p2" lines="117-131" />
 
-Y los dos últimos: que `model_sha` siga siendo el SHA de los pesos —el que sale impreso en el
-informe— aunque la clave interna lleve el de la configuración pegado, y que el hash de fichero
-dependa del contenido y no del nombre.
+Y que `model_sha` siga siendo el de los pesos, y que el hash dependa del contenido y no del nombre.
 
 <Callout kind="ejecuta" title="Exactitud, puzles y caché">
   Con las cuatro piezas escritas, pasa sus tests juntos:
@@ -1521,18 +1417,15 @@ dependa del contenido y no del nombre.
 uv run pytest -m unit -q tests/unit/test_accuracy.py tests/unit/test_cache.py tests/unit/test_eval_puzzles.py
 ```
 
-Los de exactitud son trece (las ocho fronteras de tramo parametrizadas y cinco más) y los de la
-caché, diez. [`tests/unit/test_eval_puzzles.py`](https://github.com/borja-glez/rukh/blob/p2/tests/unit/test_eval_puzzles.py)
-fija el criterio duro de los puzles con fuentes de jugadas guionizadas: que un puzle solo cuenta
-resuelto con la línea entera, que las respuestas del rival se empujan sin preguntar y que
-`correct` registra hasta dónde llegó. Todo en CPU y en segundos.
+Los de exactitud son trece y los de la caché, diez.
+[`tests/unit/test_eval_puzzles.py`](https://github.com/borja-glez/rukh/blob/p2/tests/unit/test_eval_puzzles.py)
+fija el criterio de los puzles con fuentes guionizadas. Todo en CPU y en segundos.
 
 </Callout>
 
 ## Un cambio en el pipeline: `data/db.py`
 
-M2 toca un fichero de M1, y vale la pena porque es un error de memoria de los que no se ven venir.
-Entre el docstring de la conexión y la configuración se añade esto:
+M2 toca un fichero de M1 por un error de memoria de los que no se ven venir:
 
 ```python title="src/rukh/data/db.py"
 It also turns off ``preserve_insertion_order``. With it on (the default) a ``COPY`` of a large
@@ -1563,16 +1456,11 @@ about the order of the games, so the buffering buys nothing and costs the machin
 
 <Src file="src/rukh/data/db.py" tag="p2" lines="55-58" />
 
-Una línea nueva en `connect` y un campo nuevo en la configuración, y detrás hay 20 GB. Con
-`preserve_insertion_order` encendido —que es el valor por defecto de DuckDB— un `COPY` de un escaneo
-grande **almacena el resultado entero** para que las filas de salida conserven el orden de las de
-entrada; la primera lectura de verdad de un mes de partidas creció a 20 GB de memoria residente para
-un fichero de 2,5 GB. A nadie de este proyecto le importa el orden de las partidas, así que ese
-búfer no compra nada y cuesta la máquina.
-
-Lo que la lección deja es el patrón: un valor por defecto razonable de una biblioteca puede ser
-carísimo en tu caso concreto, y el sitio donde se anota no es un comentario en el código que lo
-sufrió sino la configuración que lo controla.
+Una línea y un campo, y detrás hay 20 GB. Con `preserve_insertion_order` encendido, el valor por
+defecto de DuckDB, un `COPY` de un escaneo grande almacena el resultado entero para conservar el
+orden de las filas: la primera lectura de un mes de partidas llegó a 20 GB de memoria para un
+fichero de 2,5 GB. A nadie le importa aquí el orden, así que ese búfer no compra nada. Un valor por
+defecto razonable puede ser carísimo en tu caso, y se anota en la configuración que lo controla.
 
 <Callout kind="ejecuta" title="La conexión sale con el ajuste apagado">
   `tests/unit/test_db.py` gana una aserción: además de la memoria y los hilos, lee
@@ -1583,8 +1471,7 @@ uv run pytest -m unit -q tests/unit/test_db.py
 uv run pytest -m unit -q
 ```
 
-La primera, en verde con el campo nuevo; la segunda, todo lo que llevas escrito hasta ahora, que
-tiene que seguir en verde sin red ni GPU.
+La primera, en verde con el campo nuevo; la segunda, todo lo escrito hasta ahora, sin red ni GPU.
 
 </Callout>
 
@@ -1595,17 +1482,13 @@ tiene que seguir en verde sin red ni GPU.
   top-1 con el mismo cambio?
 
   <Solution>
-    La legalidad **sube**, y bastante: en apertura hay veinte o treinta jugadas legales muy
-    parecidas entre sí, casi todas aparecen en el corpus a diario, y el modelo las tiene
-    sobreentrenadas. Es el sesgo que el docstring de `sample_positions` existe para
-    evitar; la cifra que salga no es comparable con el 99,4 % publicado.
+    La legalidad sube: en apertura las jugadas legales aparecen a diario en el corpus y el modelo
+    las tiene sobreentrenadas. La cifra no es comparable con el 99,4 % publicado.
 
-El top-1 también sube, y por un motivo distinto que conviene separar: en apertura las partidas
-humanas son mucho más repetitivas —hay unas pocas decenas de líneas principales— así que
-«adivinar lo que jugó el humano» es más fácil. Los dos efectos apuntan en la misma dirección, y esa
-coincidencia es justo lo que hace que un muestreo sesgado parezca un modelo mejor en todas las
-columnas a la vez. Si alguna vez ves subir todas las métricas de golpe sin haber tocado el modelo,
-mira primero la muestra.
+El top-1 también sube, por otro motivo: en apertura las partidas humanas son repetitivas, así que
+adivinar lo que jugó el humano es más fácil. Los dos efectos apuntan al mismo lado, y eso hace que un
+muestreo sesgado parezca un modelo mejor en todas las columnas a la vez. **Si suben todas las
+métricas de golpe sin tocar el modelo, mira primero la muestra.**
 
   </Solution>
 </Exercise>
@@ -1613,13 +1496,10 @@ mira primero la muestra.
 ## Qué has aprendido
 
 Las tres métricas que se miden sobre posiciones, con sus supuestos pegados al número: la legalidad
-en sus dos definiciones y sobre las mismas posiciones, la exactitud por tramo de Elo sobre logits
-crudos, y los puzles con la línea completa como criterio y su handicap declarado. Y una caché cuya
-clave incluye todo lo que cambia el significado de lo que guarda.
+en sus dos definiciones, la exactitud por tramo sobre logits crudos y los puzles con la línea
+completa y su handicap declarado. Y una caché cuya clave incluye todo lo que cambia el significado de
+lo que guarda.
 
-**Cómo se mide**: `uv run pytest -m unit -q tests/unit/test_legality.py tests/unit/test_accuracy.py
-tests/unit/test_cache.py tests/unit/test_eval_puzzles.py` en verde. Las cifras de `small` llegan en
-la lección siguiente, que es la que ensambla estas cuatro piezas con las partidas contra Stockfish.
-
-Lo siguiente es la parte cara: ajustar un Elo a partir de partidas jugadas, ponerle un intervalo de
-confianza honesto y comprobar que la escalera de rivales contra la que se mide mide lo que dice.
+Los tests de las cuatro piezas en verde. Las cifras de `small` llegan en la lección siguiente, que
+ensambla estas piezas con las partidas contra Stockfish: ajustar un Elo, ponerle un intervalo
+honesto y comprobar la escalera de rivales contra la que se mide.
