@@ -5,7 +5,7 @@ description: 'De partidas a posiciones: el FEN de cuatro campos que sirve de cla
   evaluadas que Lichess publica. Con el módulo de puntuación que ordena las líneas.'
 module: m1
 order: 4
-duration: 135
+duration: 115
 level: medio
 status: vigente
 updated: 2026-09-23
@@ -25,16 +25,12 @@ artifacts:
 ## Qué vas a construir
 
 Hasta aquí el pipeline ha tratado las partidas como cadenas. Este paso las abre: recorre 300 000
-partidas jugada a jugada sobre un tablero, se queda con cada **posición**, las deduplica contando
-cuántas veces se ha visto cada una, y después cruza el resultado con las 395 millones de posiciones
-que Lichess publica ya evaluadas por <Term id="stockfish">Stockfish</Term>.
+partidas jugada a jugada, se queda con cada **posición**, las deduplica contando cuántas veces se vio
+cada una y cruza el resultado con las 395 millones de posiciones que Lichess publica evaluadas por <Term id="stockfish">Stockfish</Term>.
 
-Ese cruce es contra 42 GB de parquet remoto, y no vamos a descargarlos. La técnica —empujar el
-filtro al origen y traer solo las filas que coinciden— es una de las más rentables que hay, y aquí
-es una sola consulta SQL con dos detalles que la hacen resumible entre sesiones.
-
-Lo que sale es el dataset del que salen otras dos cosas del curso: las etiquetas del encoder de M3 y,
-gratis, los pares de preferencia para el DPO de M5. Son tres ficheros.
+Ese cruce es contra 42 GB de parquet remoto que no vamos a descargar: se empuja el filtro al origen y
+solo viajan las filas que coinciden. De aquí salen las etiquetas del encoder de M3 y, gratis, los
+pares de preferencia para el DPO de M5. Son tres ficheros.
 
 ## `positions.py`: de partidas a posiciones
 
@@ -84,21 +80,17 @@ POSITION_SCHEMA = pa.schema(
 
 <Src file="src/rukh/data/positions.py" tag="p1" lines="1-41" />
 
-El docstring de arriba define **`fen4`**, que es el concepto de toda la lección. Un <Term id="fen">FEN</Term> completo tiene seis campos: las piezas, el turno, los enroques, la casilla
-al paso, el contador de la regla de las cincuenta jugadas y el número de jugada. Los dos últimos son
-**contadores**, no posición: la misma configuración de piezas alcanzada en la jugada 20 de una
-partida y en la 24 de otra tiene el mismo tablero y distinto FEN completo.
+El docstring define **`fen4`**, el concepto de toda la lección. Un <Term id="fen">FEN</Term>
+completo tiene seis campos: piezas, turno, enroques, casilla al paso, el contador de la regla de las
+cincuenta jugadas y el número de jugada. Los dos últimos son contadores, no posición: el mismo
+tablero en la jugada 20 de una partida y en la 24 de otra tiene distinto FEN completo.
 
-Quitarlos hace dos cosas a la vez. La primera es que dos partidas que llegan a la misma posición
-colapsan en una fila, con `n_seen` diciendo cuántas veces se vio: de las ~23 millones de posiciones
-que salen de 300 000 partidas quedan bastantes menos distintas, y el ahorro es todo el coste del
-paso siguiente. La segunda es que `fen4` **es la clave con la que Lichess publica sus evaluaciones**,
-así que sin esta normalización el join del paso siguiente no existiría.
+Quitarlos colapsa en una fila las partidas que llegan a la misma posición, con `n_seen` contando
+cuántas veces se vio, y el ahorro es todo el coste del paso siguiente. Además, `fen4` es la clave con
+la que Lichess publica sus evaluaciones: sin esta normalización no habría join.
 
-Las dos constantes de fase (`OPENING_MAX_PLY = 10`, `MIDDLEGAME_MIN_PIECES = 14`) son convenciones
-del proyecto, no verdades del ajedrez, y por eso acaban escritas en el manifiesto. Lo único que se
-les pide es que sean las mismas en todo el curso: el equilibrado por fase de los pares de preferencia
-y las tablas por fase de M3 y M5 dependen de que "final" signifique lo mismo en los tres sitios.
+Las constantes de fase son convenciones del proyecto, por eso van al manifiesto. Lo que se les pide
+es que "final" signifique lo mismo en los pares de preferencia y en las tablas por fase de M3 y M5.
 
 ```python title="src/rukh/data/positions.py"
 class PositionsConfig(BaseConfig):
@@ -115,10 +107,8 @@ class PositionsConfig(BaseConfig):
 
 <Src file="src/rukh/data/positions.py" tag="p1" lines="44-53" />
 
-`n_games: 300000` de los casi tres millones que tiene enero. No hacen falta más: las posiciones de
-apertura se repiten muchísimo, así que multiplicar las partidas por diez no multiplica por diez las
-posiciones distintas, y lo que interesa del dataset es la cobertura del catálogo de Lichess, no el
-tamaño.
+300 000 de los casi tres millones de partidas de enero bastan: las posiciones de apertura se
+repiten tanto que diez veces más partidas no dan diez veces más posiciones distintas.
 
 ```python title="src/rukh/data/positions.py"
 def fen4(board: object) -> str:
@@ -143,38 +133,27 @@ def phase(ply: int, n_pieces: int) -> str:
 
 <Src file="src/rukh/data/positions.py" tag="p1" lines="56-73" />
 
-La línea que hay que leer dos veces es la del `ep` de `fen4`.
-
-`board.has_legal_en_passant()` en vez de `board.ep_square`. La diferencia: `ep_square` está puesto
-siempre que el último movimiento fue un peón dos casillas, aunque **ninguna captura al paso sea
-legal** (porque no hay peón enemigo al lado, o porque capturar dejaría al rey en jaque).
+La línea que hay que leer dos veces es la del `ep`. `board.ep_square` está puesto siempre que el
+último movimiento fue un peón dos casillas, aunque ninguna captura al paso sea legal;
 `has_legal_en_passant()` solo es cierto cuando la captura se puede hacer de verdad.
 
 <Callout kind="roto" title="La cobertura que baja unos puntos y nadie sabe por qué">
-  La convención de las evaluaciones publicadas por Lichess es la segunda: la casilla al paso se
-  escribe solo cuando la captura es legal. Un `fen4` construido de la forma obvia coincide con el de
-  Lichess **en casi todas las posiciones** y discrepa exactamente en las que tienen un peón recién
-  avanzado dos casillas sin nadie que lo pueda capturar, que son muchas más de las que uno diría: le
-  pasa a `e2e4` en la primera jugada de cada partida.
+  Lichess escribe la casilla al paso solo cuando la captura es legal. Un `fen4` construido con
+  `ep_square` coincide con el suyo en casi todas las posiciones y discrepa en las que tienen un peón
+  recién avanzado dos casillas sin nadie que lo capture, que son muchas: le pasa a `e2e4` en la
+  primera jugada de cada partida.
 
-El síntoma es que el `SEMI JOIN` del paso siguiente se las salta en silencio y la cobertura sale unos
-puntos más baja, sin ningún error, sin ninguna traza, sin nada que apunte a la causa. Es el modo de
-fallo más caro que hay en un pipeline de datos: **una clave que casi casa**. Pasa igual al cruzar
-por un correo con mayúsculas distintas, por una URL con o sin barra final o por un nombre de producto
-con un espacio de más. Cuando cruces por una clave construida, la comprobación barata es coger veinte
-filas del origen ajeno y verificar que tu clave coincide con la suya carácter a carácter; hay un
-test de esta lección que hace eso.
+El `SEMI JOIN` se salta esas posiciones en silencio y la cobertura sale unos puntos más baja, sin
+error ni traza. Es el fallo más caro de un pipeline de datos: **una clave que casi casa**. Pasa igual
+al cruzar por un correo con mayúsculas distintas o por una URL con o sin barra final. Cuando cruces
+por una clave construida, coge veinte filas del origen ajeno y comprueba que tu clave coincide con la
+suya carácter a carácter; un test de esta lección hace eso.
 
 </Callout>
 
-`board.castling_xfen()` y no `castling_shredder_fen()`: el primero es la notación estándar (`KQkq`),
-el segundo la de Chess960. Y la función construye la cadena a mano en vez de cortar
-`board.fen().split()[:4]`, que daría lo mismo: formatear el FEN completo para tirar dos campos son
-dos concatenaciones por posición, y esto corre veintitrés millones de veces.
-
-`phase` es un `if` de tres ramas. `chess.popcount(board.occupied)` cuenta las piezas del tablero con
-una operación sobre el bitboard, que es la forma barata: `len(board.piece_map())` construiría un
-diccionario de hasta 32 entradas por posición.
+La cadena se construye a mano en vez de cortar `board.fen().split()[:4]` porque esto corre
+veintitrés millones de veces, y por lo mismo las piezas se cuentan con `chess.popcount` sobre el
+bitboard y no construyendo un diccionario por posición.
 
 ```python title="src/rukh/data/positions.py"
 def walk_game(game_id: int, uci: str, result: str) -> Iterator[tuple[str, int, int, str, str, str]]:
@@ -204,18 +183,10 @@ def walk_rows(rows: list[tuple[int, str, str]]) -> dict[str, list[object]]:
 
 <Src file="src/rukh/data/positions.py" tag="p1" lines="76-98" />
 
-`walk_game` es un generador y no una lista, así que una partida de 300 <Term id="ply">plies</Term> nunca está entera en
-memoria. Y `walk_rows` es, otra vez, una función **a nivel de módulo**: es el punto de entrada del
-pool de `spawn` de la lección 2, con la misma restricción.
-
-Fíjate en que `walk_rows` construye un diccionario de columnas y no una lista de filas. Es lo que
-espera pyarrow: un `pa.table({"fen4": [...], "ply": [...]})` con una lista por columna es
-directamente la representación en memoria de Arrow, mientras que una lista de diccionarios habría que
-transponerla.
-
-La columna `seq` se excluye aquí (`if name != "seq"`) y se añade al escribir. No puede calcularla el
-worker: `seq` es la posición global dentro de la concatenación de todos los lotes, y un worker no
-sabe cuántos lotes le precedieron.
+`walk_rows` es otra vez una función de módulo, el punto de entrada del pool de `spawn`, y construye
+un diccionario de columnas porque esa es la forma que Arrow guarda en memoria. La columna `seq` (la
+posición global de cada fila) no la puede calcular el worker, que no sabe cuántos lotes le
+precedieron: se añade al escribir.
 
 ```python title="src/rukh/data/positions.py"
 def iter_games(games: Path, n_games: int) -> Iterator[list[tuple[int, str, str]]]:
@@ -239,13 +210,8 @@ def iter_games(games: Path, n_games: int) -> Iterator[list[tuple[int, str, str]]
 
 <Src file="src/rukh/data/positions.py" tag="p1" lines="101-117" />
 
-`iter_games` lee solo tres columnas de las diez del parquet. Eso no es cosmética: el parquet es
-columnar, así que pedir tres columnas lee tres columnas del disco y no toca las otras siete. El
-`movetext` no está en esta tabla, pero `uci` sí, y es la columna gorda.
-
-El `remaining` implementa el `n_games` sin leer de más: en cuanto se llega al tope, `return` corta el
-generador y los grupos de filas siguientes no se leen. El `[:remaining]` del último lote lo deja
-exacto.
+`iter_games` pide tres columnas de las diez, y como el parquet es columnar solo lee esas tres del
+disco. Al llegar a `n_games`, el `return` corta el generador y no se lee un grupo de filas más.
 
 ```python title="src/rukh/data/positions.py"
 def write_parts(games: Path, parts_dir: Path, cfg: PositionsConfig) -> int:
@@ -269,14 +235,12 @@ def _write_parts(parts_dir: Path, results: Iterator[dict[str, list[object]]], se
 
 <Src file="src/rukh/data/positions.py" tag="p1" lines="120-136" />
 
-`write_parts` borra los `part-*.parquet` viejos antes de empezar. Es la línea que hace que volver a
-ejecutar el paso con otro `n_games` no mezcle resultados de dos ejecuciones: sin ella, una ejecución corta
-después de una larga dejaría los trozos sobrantes de la larga y la deduplicación los leería.
+`write_parts` borra los trozos viejos antes de empezar, para que una ejecución corta después de una
+larga no herede los sobrantes.
 
-Escribir en trozos y deduplicar después, en vez de deduplicar sobre la marcha, es la decisión
-central. Un diccionario en memoria con veintitrés millones de FEN de sesenta caracteres son varios
-gigas en el proceso padre, y además serializa todo el paso en un solo hilo. Escribir a disco y dejar
-que DuckDB agrupe es gratis en memoria y usa todos los núcleos.
+La decisión central es escribir en trozos y deduplicar después. Deduplicar sobre la marcha pediría un
+diccionario con veintitrés millones de FEN en el proceso padre, varios gigas en un solo hilo; dejar
+que DuckDB agrupe desde disco no gasta memoria y usa todos los núcleos.
 
 ```python title="src/rukh/data/positions.py"
 def dedupe(
@@ -311,18 +275,10 @@ def dedupe(
 
 <Src file="src/rukh/data/positions.py" tag="p1" lines="139-166" />
 
-`arg_min(game_id, seq)` es la función que hace legible esta consulta: "el `game_id` de la fila con el
-`seq` más pequeño del grupo". Sin ella habría que hacer una subconsulta con `row_number()` y quedarse
-con la primera, que es el mismo SQL, bastante más largo.
-
-La promesa es **"la primera aparición gana"**: la posición después de `1.e4` la vieron cien mil
-partidas, y las columnas `game_id`, `ply`, `last_move` y `result` que se guardan son las de la
-primera que pasó por allí. Es arbitrario y es honesto: lo que importa de esa fila es el FEN, y el
-`n_seen` dice cuántas eran.
-
-`ORDER BY min(seq)` antes del `LIMIT` es lo que hace que el tope de `max_positions` sea
-**determinista**: se quedan las primeras posiciones vistas, no las que el motor tenga a mano. Sin el
-`ORDER BY`, dos ejecuciones con el mismo tope darían dos conjuntos distintos.
+`arg_min(game_id, seq)` es "el `game_id` de la fila con el `seq` más pequeño del grupo": la primera
+aparición gana. La posición tras `1.e4` la vieron cien mil partidas, y se guardan los datos de la
+primera; lo que importa es el FEN, y `n_seen` dice cuántas eran. El `ORDER BY min(seq)` antes del
+`LIMIT` hace determinista el tope: sin él, dos ejecuciones darían dos conjuntos distintos.
 
 ```python title="src/rukh/data/positions.py"
 def month_parquet(uci_dir: Path, month: str) -> Path:
@@ -358,17 +314,14 @@ def run(cfg: PositionsConfig) -> Manifest:
 
 <Src file="src/rukh/data/positions.py" tag="p1" lines="169-197" />
 
-Los dos contadores del manifiesto son `positions` (todas, con repeticiones) y `distinct` (las filas
-del fichero). Su cociente es la tasa de repetición del corpus, que es exactamente el dato que
-justifica que este paso exista.
+El cociente entre los dos contadores, `positions` y `distinct`, es la tasa de repetición del corpus.
 
 ## `scoring.py`: una sola convención para ordenar líneas
 
-Antes del join hace falta un módulo pequeño y fácil de subestimar. Las evaluaciones de Lichess vienen
-en formato <Term id="multi-pv">multi-PV</Term>: para una misma posición hay **varias filas**, una por
-línea analizada, y hay que decidir cuál es la mejor. Esa decisión la toman dos consumidores distintos
-—la consolidación de `evals.py`, en SQL, y la construcción de pares de la lección siguiente, en
-Python— y tienen que tomarla igual.
+Las evaluaciones de Lichess vienen en formato <Term id="multi-pv">multi-PV</Term>: varias filas por
+posición, una por línea analizada, y hay que decidir cuál es la mejor. Esa decisión la toman dos
+consumidores, la consolidación de `evals.py` en SQL y los pares de la lección siguiente en Python, y
+tienen que tomarla igual.
 
 ```python title="src/rukh/data/scoring.py"
 """One scoring convention for every multi-PV consumer (consolidation and DPO pairs).
@@ -401,21 +354,14 @@ RANK_ORDER_SQL = (
 
 <Src file="src/rukh/data/scoring.py" tag="p1" lines="1-26" />
 
-El docstring dice las dos convenciones. `cp` y `mate` vienen **desde el punto de vista de las
-blancas**, siempre, juegue quien juegue: un `cp: -300` significa que las negras van tres peones por
-delante, esté en su turno o en el del rival. Y un mate en `n` se convierte en un número comparable con
-`MATE_SCORE - mate`, de modo que un mate en 1 (9 999) vale más que un mate en 5 (9 995), y ambos más
-que cualquier ventaja material.
+Dos convenciones. `cp` y `mate` vienen siempre desde el punto de vista de las blancas: un
+`cp: -300` es ventaja de tres peones para las negras, mueva quien mueva. Y un mate en `n` vale
+`MATE_SCORE - mate`, así que un mate en 1 (9 999) supera a uno en 5 (9 995) y ambos a cualquier
+ventaja material. Es 10 000 y no infinito para que la columna siga siendo entera.
 
-Que la constante sea 10 000 y no `float('inf')` tiene un motivo: la columna es entera, y un infinito
-obligaría a flotantes en todo el dataset por un caso que se resuelve con un número grande. Diez mil
-centipeones son cien peones; ninguna evaluación legítima llega ahí.
-
-`SCORE_WHITE_SQL` y `RANK_ORDER_SQL` son **cadenas de SQL que viven en el mismo fichero que las
-funciones de Python equivalentes**, y eso es lo único raro del módulo. La alternativa, el `CASE` en
-`evals.py` y el `sorted(key=...)` en `pairs.py`, deja dos implementaciones de la misma regla en dos
-lenguajes y en dos ficheros distintos, sin nada que avise cuando una cambie. Juntas, al menos se
-leen a la vez.
+Lo raro del módulo es que las cadenas de SQL viven junto a sus equivalentes en Python. Con el `CASE`
+en `evals.py` y el `sorted` en `pairs.py`, la misma regla quedaría en dos lenguajes y dos ficheros,
+sin nada que avise cuando una cambie.
 
 ```python title="src/rukh/data/scoring.py"
 def mover_sign(turn: str) -> int:
@@ -451,33 +397,23 @@ def line_rank_key(
 
 <Src file="src/rukh/data/scoring.py" tag="p1" lines="29-57" />
 
-`line_rank_key` reproduce `RANK_ORDER_SQL` término a término, y las dos listas hay que leerlas en
-paralelo:
+`line_rank_key` reproduce `RANK_ORDER_SQL` término a término:
 
-1. **Mate a favor del que mueve**, primero. `sign * mate > 0` es "el mate es para el bando que le
-   toca": para las blancas (`sign = +1`) un `mate` positivo; para las negras (`sign = -1`) uno
-   negativo. En la clave de Python va como `not mates_for_mover` porque el orden es ascendente y
-   `False < True`.
-2. **Profundidad**, de mayor a menor. Una línea analizada a profundidad 40 es más fiable que una a 12,
-   **aunque prometa menos**. El comentario del código explica el `-1`: DuckDB pone los `NULL` al
-   final en un orden descendente, así que una profundidad desconocida tiene que quedar por debajo de
-   cualquier conocida, y `-(-1) = 1` la manda al final de la clave ascendente.
-3. **La puntuación desde el que mueve**, de mayor a menor.
-4. **La cadena de la jugada**, como desempate.
+1. Mate a favor del que mueve, primero (`sign * mate > 0`). En Python va como `not mates_for_mover`
+   porque el orden es ascendente y `False < True`.
+2. Profundidad, de mayor a menor: una línea a profundidad 40 es más fiable que una a 12 aunque
+   prometa menos. El `-1` imita a DuckDB, que pone los `NULL` al final.
+3. La puntuación desde el que mueve, de mayor a menor.
+4. La cadena de la jugada, como desempate.
 
-Ese cuarto término parece decoración y no lo es. Sin un orden
-**total**, dos líneas que empaten en las tres primeras claves quedan en el orden que el motor tenga a
-bien, y dos ejecuciones del mismo fichero pueden elegir "mejor línea" distinta. El dataset deja de ser
-reproducible y nadie se entera hasta que dos números no cuadran.
+El cuarto término da un orden total. Sin él, dos líneas empatadas quedan como el motor quiera, y dos
+ejecuciones pueden elegir distinta "mejor línea" sin que nadie se entere.
 
 <Transfer concept="Una regla de negocio, una implementación" where="Cualquier sistema donde la misma decisión se toma en dos sitios: la puntuación de un reranker en SQL y en el servicio, el filtro de un dashboard y el del informe nocturno, la validación del cliente y la del servidor.">
-  La versión ideal es una sola implementación. Cuando no se puede —porque una mitad corre en el motor
-  de datos y la otra en el lenguaje de aplicación— la versión realista es **ponerlas en el mismo
-  fichero, una debajo de otra, con un test que las compare sobre los mismos casos**.
-
-Lo que no vale es lo que parece más limpio: la regla en SQL donde se usa el SQL y en Python donde se
-usa Python. Se separan en la primera modificación urgente, y el síntoma no es un error sino dos
-conjuntos que discrepan en el 0,3 % de las filas.
+  Lo ideal es una sola implementación. Cuando una mitad corre en el motor de datos y la otra en la
+  aplicación, lo realista es ponerlas en el mismo fichero, una debajo de otra, con un test que las
+  compare sobre los mismos casos. Repartidas cada una junto a su uso, se separan en la primera
+  modificación urgente, y el síntoma es que dos conjuntos discrepan en el 0,3 % de las filas.
 
 </Transfer>
 
@@ -524,10 +460,8 @@ class EvalsConfig(BaseConfig):
 
 <Src file="src/rukh/data/evals.py" tag="p1" lines="1-36" />
 
-`n_files: 20` son los veinte ficheros en los que Lichess reparte las 395 millones de posiciones
-evaluadas, unos 42 GB en total. `remote_pattern` es una plantilla con `hf://`, el esquema de sistema
-de ficheros de Hugging Face que DuckDB entiende: una URL que se lee como si fuera un fichero local y
-que soporta lecturas parciales.
+`remote_pattern` usa `hf://`, el esquema de Hugging Face que DuckDB lee como un fichero local, con
+lecturas parciales.
 
 ```python title="src/rukh/data/evals.py"
 def parse_files(spec: str, n_files: int) -> list[int]:
@@ -559,13 +493,9 @@ def part_path(out_dir: Path, index: int) -> Path:
 
 <Src file="src/rukh/data/evals.py" tag="p1" lines="39-63" />
 
-`parse_files` existe para la opción `--files` de la CLI, y su valor está en la última comprobación:
-un índice fuera de rango es un `ValueError` **antes** de lanzar nada, no una URL que devuelve 404 a
-los diez minutos. El `set` intermedio absorbe los solapes (`0-5,3` son seis ficheros, no siete) y el
-`sorted` final los deja en orden para que el progreso sea legible.
-
-`_source` está aislada en una función de una línea por el mismo motivo que `_download` en `elite.py`:
-es lo único que toca la red, y un test la sustituye por una que devuelve una ruta local.
+`parse_files` sirve a `--files`: un índice fuera de rango da un `ValueError` antes de lanzar nada,
+no un 404 a los diez minutos. `_source` aísla la red, como `_download` en `elite.py`, para que el
+test la sustituya por una ruta local.
 
 ```python title="src/rukh/data/evals.py"
 def fetch_part(cfg: EvalsConfig, index: int, positions: Path, out_dir: Path) -> tuple[Path, bool]:
@@ -593,38 +523,26 @@ def fetch_part(cfg: EvalsConfig, index: int, positions: Path, out_dir: Path) -> 
 
 <Src file="src/rukh/data/evals.py" tag="p1" lines="66-86" />
 
-Esta consulta es la lección. Léela de dentro afuera.
+Esta consulta es la lección. Un **`SEMI JOIN`** devuelve las filas de la izquierda que tienen alguna
+coincidencia a la derecha, sin traer columnas de la derecha ni duplicar filas: "de este fichero
+remoto, dame las evaluaciones cuyo FEN tenemos".
 
-`SEMI JOIN` es el corazón. A diferencia de un `JOIN` normal, un semi join devuelve las filas de la izquierda
-**que tienen alguna coincidencia a la derecha**, sin traer ninguna columna de la derecha y sin
-duplicar filas cuando hay varias coincidencias. Aquí eso significa "de este fichero remoto, dame las
-evaluaciones cuyo FEN tenemos".
+Lo barato es lo que el motor hace con eso. Un parquet está partido en grupos de filas, y cada grupo
+guarda el mínimo y el máximo de cada columna. DuckDB lee primero solo la columna `fen`, descarta los
+grupos que no pueden contener ninguna coincidencia (el <Term id="predicate-pushdown">predicado empujado al origen</Term>) y solo entonces baja las filas que quedan. Es como
+buscar en un archivo de cajas etiquetadas "de la A a la F": no abres las que no pueden tener lo que
+buscas.
 
-Y lo que lo hace barato es lo que el motor hace con eso. Un parquet está partido en grupos de filas,
-y cada grupo lleva en su cabecera el mínimo y el máximo de cada columna. DuckDB lee primero **solo la
-columna `fen`** de cada grupo —proyección—, descarta los grupos que no pueden contener ninguna
-coincidencia —<Term id="predicate-pushdown">predicado empujado al origen</Term>— y solo entonces
-descarga las filas que quedan. Por la red viajan la columna `fen` y las filas que casan, no los
-42 GB enteros.
-
-Las dos líneas de la resumibilidad son igual de importantes y más fáciles de pasar por alto:
-
-- `if target.is_file(): return target, False`. Una parte ya escrita no se vuelve a pedir. Veinte
-  ficheros a varios minutos cada uno es algo que se deja corriendo entre sesiones, y reanudar tiene
-  que costar cero.
-- `tmp = target.with_suffix(".parquet.tmp")` … `tmp.replace(target)`. Se escribe a un temporal y se
-  renombra al terminar. El renombrado es atómico en el mismo sistema de ficheros, así que **el
-  nombre definitivo solo existe si la parte está completa**. Sin esto, cortar la ejecución con
-  Ctrl-C a mitad de la parte 7 dejaría un parquet truncado con el nombre bueno, y la ejecución
-  siguiente lo daría por hecho.
+Dos líneas lo hacen resumible. Una parte ya escrita no se vuelve a pedir, y cada parte se escribe a
+un `.tmp` que se renombra al terminar. El renombrado es atómico, así que el nombre definitivo solo
+existe si la parte está completa: un Ctrl-C a mitad de la parte 7 no deja un parquet truncado que la
+siguiente ejecución dé por hecho.
 
 <Callout kind="hoy" title="Así se hace hoy: el predicado va al origen, no los datos a ti">
-  Hace unos años, cruzar tus claves con 42 GB de datos ajenos significaba descargar los 42 GB. Hoy
-  el patrón es el contrario: formato columnar con estadísticas por bloque, un motor que empuja el
-  predicado y la proyección al fichero, y materializar solo lo que sobrevive. Funciona igual contra
-  un bucket de S3, un lago en Delta o los parquet de Hugging Face, y saber usarlo es una de las
-  habilidades más rentables de un ingeniero de datos o de ML. Si tu primer impulso es descargar el
-  dataset, pregúntate antes qué fracción vas a mirar.
+  Formato columnar con estadísticas por bloque, un motor que empuja predicado y proyección al
+  fichero, y materializar solo lo que sobrevive. Funciona igual contra un bucket de S3, un lago en
+  Delta o los parquet de Hugging Face. Si tu primer impulso es descargar el dataset, pregúntate
+  antes qué fracción vas a mirar.
 </Callout>
 
 ```python title="src/rukh/data/evals.py"
@@ -692,34 +610,17 @@ def consolidate(
 
 <Src file="src/rukh/data/evals.py" tag="p1" lines="89-148" />
 
-La consolidación son tres sentencias y merece leerlas por separado.
+La consolidación son tres sentencias. La primera crea `lines`: una fila por línea analizada, con su
+primera jugada, el bando que mueve leído del propio FEN y la puntuación de `scoring.py`. La segunda
+numera las líneas de cada FEN en el orden de `scoring.py`, así que `rk = 1` es la mejor.
 
-La primera crea `lines`: una fila por línea analizada, con la jugada extraída del campo `line`
-(`split_part(line, ' ', 1)`: la línea es una secuencia de jugadas y nos quedamos con la primera), el
-`sign` del bando que mueve leído **del propio FEN** (`split_part(fen, ' ', 2) = 'w'`) y la puntuación
-desde las blancas calculada con la expresión de `scoring.py`. El `WHERE line IS NOT NULL AND line <>
-''` descarta las filas sin línea, que existen.
+La tercera escribe el fichero: despliega la mejor línea en columnas (`best_move`, `cp`, `mate`...) y
+agrupa todas las líneas en una columna `pvs`, de mejor a peor. Esa columna ya está descargada, no
+cuesta casi nada y contiene un dataset entero de preferencias. El `JOIN` con nuestras posiciones
+añade `game_id`, `ply`, `phase` y demás, que M3 y la lección siguiente necesitan.
 
-La segunda crea `ranked`: la misma tabla con un `row_number()` por FEN en el orden de `scoring.py`.
-Después de esto, `rk = 1` es la mejor línea de cada posición.
-
-La tercera escribe el fichero, y hace **dos** cosas con `ranked`. Por un lado se queda con la mejor
-línea (`JOIN ranked b ON … b.rk = 1`) y la despliega en columnas (`best_move`, `cp`, `mate`, `depth`,
-`knodes`). Por otro agrupa todas las líneas de cada FEN en una columna `pvs` con
-`list(struct_pack(...) ORDER BY rk)`: una lista de estructuras, en orden de mejor a peor.
-
-Esa columna `pvs` es el motivo de que exista la lección siguiente. Guardar las líneas peores no cuesta
-casi nada, porque ya están descargadas, y contiene un dataset entero de preferencias que de otro modo
-habría que generar ejecutando Stockfish millones de veces.
-
-Y fíjate en el `JOIN` con las posiciones locales: el fichero final no es solo la evaluación, lleva
-también `game_id`, `ply`, `last_move`, `result`, `phase` y `n_seen` de nuestro parquet. Es lo que
-permite que M3 etiquete posiciones con su fase y que la lección siguiente reconstruya el prefijo de
-jugadas que llevó a cada par.
-
-Los tres conteos del final (`positions`, `evaluated`, `lines`) son los que producen la
-`coverage` del manifiesto: qué fracción de nuestras posiciones tiene evaluación. Es el número que hay
-que mirar después de la primera ejecución, y el que baja si el `fen4` no casa.
+Los conteos dan la `coverage` del manifiesto, la fracción de nuestras posiciones con evaluación. Es
+el número que hay que mirar tras la primera ejecución, y el que baja si el `fen4` no casa.
 
 ```python title="src/rukh/data/evals.py"
 def run(cfg: EvalsConfig, files: str | None = None) -> Manifest:
@@ -759,13 +660,9 @@ def run(cfg: EvalsConfig, files: str | None = None) -> Manifest:
 
 <Src file="src/rukh/data/evals.py" tag="p1" lines="151-183" />
 
-`files_present` y `files_fetched_now` se registran por separado a propósito: el primero dice con qué
-partes se construyó el fichero, el segundo cuáles se descargaron en esta ejecución. En un paso
-resumible que se ejecuta en cuatro sesiones, solo el primero describe el resultado.
-
-`best_line` guarda en el manifiesto la **frase** que describe el criterio de ordenación
-(`BEST_LINE_DOC`), y `mate_score` la constante. Igual que la fórmula del tramo de Elo: el día que la
-convención cambie, los manifiestos viejos siguen diciendo cuál era la suya.
+`files_present` dice con qué partes se construyó el fichero y `files_fetched_now`, cuáles se bajaron
+en esta ejecución; en un paso que se completa en cuatro sesiones, solo el primero describe el
+resultado. El criterio de ordenación y `MATE_SCORE` van también al manifiesto.
 
 ## Los tests
 
@@ -828,20 +725,11 @@ def test_walk_game_rows() -> None:
 
 <Src file="tests/unit/test_positions.py" tag="p1" lines="1-54" />
 
-El primer test es el de la caja de arriba, escrito. Juega `e2e4 a7a6 e4e5 d7d5` —con lo que las
-negras acaban de avanzar el peón de d dos casillas y **la captura al paso es legal**— y comprueba
-que el `fen4` termina en `d6`. Después juega la captura y comprueba que el campo vuelve a `-`. Y la
-línea `assert board.fen().split()[4:] == ["0", "3"]` no prueba nada del código: está para dejar
-escrito **qué** son los dos campos que se tiran.
-
-El segundo es la comprobación barata de la que hablaba la caja, hecha del revés: recorre una
-siciliana entera y exige que `fen4(board)` sea idéntico a los cuatro primeros campos del FEN que
-formatea python-chess, **posición a posición**. Si las dos construcciones discrepan en algún caso —el
-enroque, el al paso, una promoción—, el test lo dice con la posición exacta. El `endgame` del final
-es una posición con al paso legal y sin enroques, el caso que más se parece al que rompía.
-
-`test_phase_thresholds` comprueba los dos umbrales por sus dos lados (10/11, 14/13), que es la única
-forma de probar un umbral.
+El primer test juega hasta una captura al paso legal y comprueba que el `fen4` termina en `d6`, y
+que vuelve a `-` tras capturar. El segundo es la comprobación barata de la caja: recorre una
+siciliana y exige que `fen4` coincida, posición a posición, con los cuatro primeros campos del FEN
+de python-chess. `test_phase_thresholds` prueba cada umbral por sus dos lados (10/11, 14/13), que es
+la única forma de probar un umbral.
 
 ```python title="tests/unit/test_positions.py"
 def _stage_uci(rukh_home: Path, repo_root: Path) -> None:
@@ -891,16 +779,11 @@ def test_run_respects_caps(rukh_home: Path, repo_root: Path) -> None:
 
 <Src file="tests/unit/test_positions.py" tag="p1" lines="57-99" />
 
-`test_run_dedupes_with_counts` es el test del contrato. Tres cosas dentro merecen mirarse. La primera:
-el total esperado no está escrito a mano, se calcula sumando la columna `n_plies` de la fixture, lo
-cual es una afirmación fuerte —**una posición por ply, ni una más ni una menos**— que sobrevive a que
-la fixture cambie. La segunda: `manifest.counts["distinct"] == frame.height < total` encadena dos
-comparaciones en una, y dice a la vez que el manifiesto no miente y que la deduplicación hizo algo.
-La tercera: busca la posición después de `1.e4` y exige que aparezca **una sola vez** con `n_seen >
-1` y con el `ply` y la jugada de la primera aparición, que es la promesa de los `arg_min`.
-
-`test_run_respects_caps` tiene el `assert manifest.counts["positions"] == 33 + 7`, escrito como suma
-a propósito: son dos partidas de la fixture con 33 y 7 plies. Un `40` pelado no diría de dónde sale.
+`test_run_dedupes_with_counts` calcula el total esperado sumando `n_plies` de la fixture (una
+posición por ply, ni una más), comprueba en una comparación encadenada que el manifiesto no miente y
+que la deduplicación hizo algo, y exige que la posición tras `1.e4` aparezca una vez con los datos de
+la primera aparición. El `33 + 7` de `test_run_respects_caps` va como suma para que se vea de dónde
+sale: dos partidas de 33 y 7 plies.
 
 ```python title="tests/unit/test_positions.py"
 def test_cli_positions(rukh_home: Path, repo_root: Path) -> None:
@@ -947,10 +830,7 @@ def test_score_mover_flips_for_black() -> None:
 
 <Src file="tests/unit/test_scoring.py" tag="p1" lines="1-28" />
 
-Los dos primeros de `test_scoring` fijan la convención con todos sus casos: `cp` a secas, mate a favor
-y en contra, mate corto contra mate largo, el mate ganando a una ventaja enorme de material
-(`score_white(999, 2)`), y el `None` cuando no hay ni una cosa ni otra. El de `score_mover` comprueba
-la línea que más veces se escribe mal en todo el proyecto,
+Los dos primeros fijan la convención con todos sus casos. El que más se escribe mal es
 `score_mover(None, -2, "b") == MATE_SCORE - 2`: **un mate en 2 para las negras, visto desde las
 negras, es una ventaja**.
 
@@ -984,12 +864,10 @@ def test_line_rank_key_rejects_an_unscored_line() -> None:
 
 <Src file="tests/unit/test_scoring.py" tag="p1" lines="31-55" />
 
-Y este es el test del orden: cinco líneas con nombre, ordenadas con la clave de
-verdad, y aserciones sobre la **lista de nombres** resultante. Se lee como una frase: primero el mate
-más rápido, luego el mate más lento; después la profundidad manda sobre la puntuación, así que las
-dos líneas de profundidad 40 van antes que la de 12 aunque la de 12 prometa +900. Y el último bloque
-cambia el turno a negras y comprueba que `getting_mated` —un mate en −3, es decir, mate **para las
-negras**— pasa a ser la mejor línea.
+El test del orden ordena cinco líneas con nombre y comprueba la lista de nombres, que se lee como
+una frase: primero el mate más rápido, luego el más lento, y después la profundidad manda aunque la
+línea de profundidad 12 prometa +900. Con turno de negras, `getting_mated` (mate para las negras)
+pasa a ser la mejor.
 
 <Callout kind="ejecuta" title="Descomenta los dos pasos y pasa sus tests">
   Con `positions.py`, `scoring.py` y `evals.py` escritos, vuelve a `pipeline.py` y
@@ -1056,9 +934,9 @@ antes de la ejecución de tres horas.
 
 ## Qué has aprendido
 
-Cómo se convierte un corpus de partidas en un catálogo de posiciones con una clave que casa con la de
-un tercero, y cómo se cruza ese catálogo con cuarenta y dos gigabytes que nunca se descargan. Y una
-regla de ordenación escrita una sola vez, en dos lenguajes, en el mismo fichero.
+Has convertido un corpus de partidas en un catálogo de posiciones con una clave que casa con la de
+un tercero, y lo has cruzado con 42 GB que nunca se descargan. Y has escrito una regla de ordenación
+en dos lenguajes, en el mismo fichero y con un test que las compara.
 
 **Cómo se mide**: `uv run rukh data positions` deja `data/positions/positions.parquet` con un
 manifiesto que dice cuántas posiciones se recorrieron y cuántas distintas quedaron;
@@ -1066,6 +944,6 @@ manifiesto que dice cuántas posiciones se recorrieron y cuántas distintas qued
 que es el número a vigilar. `uv run pytest -m unit -q tests/unit/test_positions.py
 tests/unit/test_scoring.py tests/unit/test_evals.py` pasa en verde.
 
-Lo siguiente sale casi gratis de lo que acabas de construir: la columna `pvs` tiene, para cada
-posición, la jugada buena y la mala con su diferencia en <Term id="centipeon">centipeones</Term>. Eso
-es un par de preferencia, y hay decenas de miles.
+Lo siguiente sale casi gratis: la columna `pvs` tiene, para cada posición, la jugada buena y la mala
+con su diferencia en <Term id="centipeon">centipeones</Term>. Eso es un par de preferencia, y hay
+decenas de miles.

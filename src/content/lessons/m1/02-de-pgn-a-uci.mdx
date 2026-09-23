@@ -6,7 +6,7 @@ description:
   conexión de DuckDB que no llena el disco del sistema.'
 module: m1
 order: 2
-duration: 150
+duration: 130
 level: base
 status: vigente
 updated: 2026-09-23
@@ -29,18 +29,17 @@ artifacts:
 El primer paso del pipeline: `rukh data uci`. Entra el <Term id="parquet">parquet</Term> que M0
 descargó, con las jugadas escritas como en los libros y llenas de comentarios de reloj, y sale un
 parquet por mes con una columna `uci` que un tokenizador puede leer sin saber nada de ajedrez. En
-medio hay seis millones de partidas que se reproducen jugada a jugada sobre un tablero de verdad,
-un proceso de trabajo por núcleo (menos uno, que se queda para el sistema) y una conexión de <Term id="duckdb">DuckDB</Term> configurada para que no te llene el disco del sistema.
+medio, seis millones de partidas se reproducen jugada a jugada sobre un tablero de verdad, en un
+proceso por núcleo, con una conexión de <Term id="duckdb">DuckDB</Term> configurada para que no te
+llene el disco del sistema.
 
 Son tres ficheros: `src/rukh/data/uci.py` (la conversión), `src/rukh/data/parallel.py` (el reparto
-entre procesos) y `src/rukh/data/db.py` (la conexión). Y después los dos ficheros de test que fijan
-el contrato: uno comprueba que el enroque y la promoción salen bien, y el otro que el pool no se
-traga un mes entero en memoria antes de escribir la primera fila.
+entre procesos) y `src/rukh/data/db.py` (la conexión), más dos ficheros de test que fijan el
+contrato.
 
 ## `uci.py`: el fichero que convierte
 
-Empieza por la cabecera, que es donde están los esquemas y las seis expresiones regulares de la
-limpieza.
+Empieza por la cabecera: los esquemas y las seis expresiones regulares de la limpieza.
 
 ```python title="src/rukh/data/uci.py"
 """SAN movetext to UCI: cleaning, legality check and ply filter, one parquet per month.
@@ -106,27 +105,24 @@ _ANNOTATION_RE = re.compile(r"[!?]+$")
 
 <Src file="src/rukh/data/uci.py" tag="p1" lines="1-59" />
 
-El `OUT_SCHEMA` se declara a mano en vez de dejar que pyarrow lo deduzca, y eso tiene dos
-consecuencias. La primera son los tipos: `n_plies`, `white_elo` y `black_elo` son `int16` porque
-ninguno pasa de 32 767, y ahorrar seis bytes por columna en seis millones de filas se nota en un
-fichero que se lee entero en cada época. La segunda es que **el orden de las columnas es parte del
-contrato**: el paso `tokenize` lee por nombre, pero un test comprueba la lista completa, así que
-añadir una columna en medio falla en la CI y no tres módulos después.
+El `OUT_SCHEMA` se declara a mano en vez de dejar que pyarrow lo deduzca. Así los tipos son los
+justos (`int16` para plies y Elo, que no pasan de 32 767) y **el orden de las columnas es parte del
+contrato**: un test comprueba la lista completa, y añadir una columna en medio falla en la CI y no
+tres módulos después.
 
-`RESULTS` tiene tres valores y no cuatro. Las partidas sin resultado (`*`, abandonadas sin
-reclamar) se descartan antes de tocar el tablero: el tokenizador necesita un token de resultado al
-final de la secuencia, y no hay ninguno para "no se sabe".
+`RESULTS` tiene tres valores y no cuatro. Las partidas sin resultado (`*`) se descartan antes de
+tocar el tablero, porque el tokenizador necesita un token de resultado al final y no hay ninguno para
+"no se sabe".
 
-Las regexes merecen una mirada porque cada una corresponde a una parte del `movetext` de Lichess,
-que es más sucio de lo que parece:
+Cada regex corresponde a una parte del `movetext` de Lichess, que es más sucio de lo que parece:
 
 ```text
 1. e4 { [%eval 0.3] [%clk 0:05:00] } e5 { [%clk 0:05:00] } 2. Nf3 $1 1... Nc6 1/2-1/2
 ```
 
-Hay comentarios entre llaves con la evaluación y el reloj, anotaciones numéricas (`$1`), números de
-jugada en dos formas (`2.` y `1...`), el resultado al final y, en partidas exportadas de un
-análisis, variantes entre paréntesis.
+Comentarios entre llaves con la evaluación y el reloj, anotaciones numéricas (`$1`), números de
+jugada en dos formas (`2.` y `1...`), el resultado y, en partidas exportadas de un análisis,
+variantes entre paréntesis.
 
 ```python title="src/rukh/data/uci.py"
 class UciConfig(BaseConfig):
@@ -141,10 +137,8 @@ class UciConfig(BaseConfig):
 
 <Src file="src/rukh/data/uci.py" tag="p1" lines="62-69" />
 
-Una configuración de cinco campos, con `extra="forbid"` heredado de `BaseConfig`: los dos
-directorios, los dos límites de longitud y el tamaño del pool. `workers: 0` significa "uno menos que
-los núcleos", y lo resuelve `resolve_workers` más abajo; el valor por defecto no es un número fijo
-porque la misma configuración corre en un portátil de cuatro núcleos y en la máquina de referencia.
+`workers: 0` significa "uno menos que los núcleos" (lo resuelve `resolve_workers` más abajo), para
+que la misma configuración valga en un portátil de cuatro núcleos y en la máquina de referencia.
 
 ### Limpiar, reproducir, identificar
 
@@ -186,50 +180,30 @@ def game_id(site: str) -> int:
 
 <Src file="src/rukh/data/uci.py" tag="p1" lines="72-104" />
 
-Tres funciones y tres decisiones.
+El `while` de `clean_movetext` está porque los paréntesis anidan. `_VARIATION_RE` solo casa los
+paréntesis que no contienen otros, así que en `(1. e4 e5 (1... c5))` la primera pasada se lleva el
+de dentro y la segunda el de fuera. Con una sola quedaría un paréntesis huérfano y `parse_san`
+moriría en él.
 
-El `while` de `clean_movetext` está porque **los paréntesis anidan**. Una variante dentro de otra
-(`(1. e4 e5 (1... c5))`) no la borra una expresión regular no recursiva: `_VARIATION_RE` casa solo
-los paréntesis que no contienen otros, así que la primera pasada se lleva los de dentro y la segunda
-los de fuera. Con una sola pasada quedaría `(1. e4 e5 )` en el texto y `parse_san` moriría en el
-primer paréntesis huérfano.
+El orden de las sustituciones importa: los comentarios se quitan antes que nada porque dentro llevan
+cosas que se parecen a otras partes del movetext. `[%eval 0.3]` contiene un `0.` que
+`_MOVE_NUMBER_RE` tomaría por un número de jugada.
 
-El orden de las sustituciones tampoco es libre, y la que manda es la primera: los comentarios se
-quitan **antes que nada** porque dentro llevan cosas que se parecen a otras partes del movetext.
-`[%eval 0.3]` contiene un `0.` que `_MOVE_NUMBER_RE` tomaría por un número de jugada, y un comentario
-escrito por una persona puede llevar paréntesis que `_VARIATION_RE` confundiría con una variante.
-Sin los comentarios, lo que queda ya tiene la forma que las demás expresiones esperan.
+`san_to_uci` reproduce la partida sobre un `chess.Board()` de verdad en vez de traducir cadenas.
+`Nf3` no dice de qué casilla viene el caballo; solo la posición de ese instante lo sabe. `O-O` es
+`e1g1` (el movimiento del rey) y `e8=Q+` es `e7e8q`. Una traducción con expresiones regulares produce
+ficheros que parecen bien hasta que el modelo emite jugadas imposibles.
 
-`san_to_uci` reproduce la partida sobre un `chess.Board()` de verdad en vez de traducir cadenas, y
-eso es lo que hace correcta la conversión. `Nf3` no dice de qué casilla viene el
-caballo; solo la posición de ese instante lo sabe. `O-O` se escribe `e1g1` en UCI, que es el
-movimiento del rey; `e8=Q+` es `e7e8q`, con la pieza en minúscula y sin el `+`. Nada de eso se puede
-hacer con expresiones regulares, y una implementación que lo intente produce ficheros que parecen
-bien hasta que el modelo emite jugadas imposibles.
+`_ANNOTATION_RE` se aplica jugada a jugada: `Bb5!?` es una jugada legal con una opinión pegada. Y la
+función devuelve `None` en vez de lanzar porque corre dentro de un pool, y una excepción por una
+partida corrupta se llevaría por delante el lote de veinte mil en el que iba.
 
-El `_ANNOTATION_RE` se aplica **dentro del bucle**, jugada a jugada, y no en la limpieza general:
-`Bb5!?` es una jugada legal con una opinión pegada, no una jugada distinta, y quitar los signos de
-toda la cadena de golpe correría el riesgo de tocar algo que no es una anotación.
-
-Y devuelve `None` en vez de lanzar. Es deliberado y tiene un motivo operativo: esto corre dentro de
-un pool de procesos, y una excepción por una partida corrupta se llevaría por delante el lote de
-veinte mil en el que iba.
-
-`game_id` parece contabilidad y no lo es. El id de una partida son los primeros ocho bytes de
-`sha256(Site)` interpretados como entero de 64 bits con signo. Podría ser `hash(site)`, y sería un
-error: el `hash()` de Python está sembrado al azar en cada proceso desde 3.3, así que dos workers del
-mismo pool darían ids distintos para la misma partida, y dos ejecuciones darían dos resultados
-distintos. Todo lo que después se muestree o se reparta por este id (el muestreo por tramos de Elo
-de la lección siguiente, sin ir más lejos) necesita que sea estable. Vale para cualquier pipeline:
-un identificador derivado se calcula con una función determinista, nunca con la que el lenguaje usa
-para sus diccionarios.
-
-<Callout kind="teoria" title="`signed=True` no es un descuido">
-  El id puede ser negativo, y está bien: el tipo de la columna es `int64` de Arrow, que es con
-  signo, y guardar el mismo número sin signo obligaría a un `uint64` que ni parquet ni polars
-  manejan igual de bien. Lo único que se le pide a un id es que sea estable y que no choque; el
-  signo no interviene en ninguna de las dos cosas.
-</Callout>
+El id de una partida son los primeros ocho bytes de `sha256(Site)` como entero de 64 bits con signo
+(con signo porque la columna es `int64` de Arrow). Podría ser `hash(site)`, y sería un error: el
+`hash()` de Python se siembra al azar en cada proceso, así que dos workers darían ids distintos para
+la misma partida. Todo lo que después se muestree por este id necesita que sea estable. En cualquier
+pipeline, un identificador derivado se calcula con una función determinista, nunca con la que el
+lenguaje usa para sus diccionarios.
 
 ### El lote: de filas crudas a columnas
 
@@ -273,39 +247,29 @@ def convert_rows(
 
 <Src file="src/rukh/data/uci.py" tag="p1" lines="107-141" />
 
-Aquí está el filtro que M0 dejó pendiente. En M0 la consulta de DuckDB filtraba por Elo, por ritmo
-y por terminación, pero **no** por longitud, y el manifiesto lo anotaba como
-`min_plies_deferred`. El motivo es que contar <Term id="ply">plies</Term> exige haber parseado el
-`movetext`, y eso no se hace en SQL. Se hace aquí, con la partida ya reproducida.
+Aquí se aplica el filtro de longitud que M0 dejó pendiente (`min_plies_deferred` en su
+manifiesto): contar <Term id="ply">plies</Term> exige parsear el `movetext`, y eso no se hace en SQL.
 
-Los cinco contadores van al manifiesto: `rows` leídas, `kept` conservadas,
-`illegal` descartadas por una jugada imposible, `short` por debajo de `min_plies`, `long` por
-encima de `max_plies`. Suman exactamente las leídas, así que cualquier fila que desaparezca tiene
-una casilla que lo explica. En la ejecución de referencia, de 6 000 000 de partidas quedaron
-5 896 388, con 103 251 cortas, 361 largas y **cero ilegales**, que es el número que había que
-mirar: Lichess valida las partidas al guardarlas, así que un solo ilegal habría significado que la
-limpieza del `movetext` estaba rompiendo algo.
+Los cinco contadores van al manifiesto y son excluyentes (cuenta el primer motivo que aparece), así
+que suman las filas leídas y cualquier fila que desaparezca tiene una casilla que lo explica. En la
+ejecución de referencia, de 6 000 000 de partidas quedaron 5 896 388, con 103 251 cortas, 361 largas
+y **cero ilegales**. Ese cero es el número que había que mirar: Lichess valida las partidas al
+guardarlas, así que un solo ilegal habría delatado una limpieza que rompe algo.
 
-Fíjate en el orden del `if`: una partida ilegal se cuenta como ilegal aunque además fuera corta. Los
-contadores son excluyentes por construcción, con el primer motivo que aparece, y eso es lo que
-permite sumarlos.
-
-La función está **a nivel de módulo** a propósito, y el docstring lo dice. Es la restricción que
-gobierna todo este fichero y conviene entenderla una vez.
+La función está a nivel de módulo a propósito, y es la restricción que gobierna todo el fichero.
 
 <Callout kind="roto" title="`spawn` no serializa un `lambda`, ni un método, ni una clausura">
   En Linux, `multiprocessing` arranca los procesos con `fork`: el hijo hereda la memoria del padre y
-  cualquier función vale como punto de entrada. En Windows y en macOS moderno arranca con `spawn`:
-  el hijo es un intérprete nuevo que **reimporta el módulo** y recibe la función por
-  `pickle`, es decir, por su nombre completo. Una función definida dentro de otra, un `lambda` o un
-  método de una instancia no tienen nombre importable y fallan con
-  `AttributeError: Can't pickle local object`.
+  cualquier función vale como punto de entrada. En Windows y en macOS arranca con `spawn`: el hijo
+  es un intérprete nuevo que **reimporta el módulo** y recibe la función por `pickle`, es decir, por
+  su nombre completo. Una función anidada, un `lambda` o un método de instancia no tienen nombre
+  importable y fallan con `AttributeError: Can't pickle local object`.
 
 Por eso `convert_rows` y `convert_batch` están al nivel del módulo y reciben sus parámetros en la
-tupla del trabajo en vez de capturarlos. Es la clase de restricción que no se descubre leyendo:
-se descubre cuando el código que funcionaba en la CI de Linux no arranca en la máquina de
-desarrollo. Te la vas a encontrar en cualquier trabajo en paralelo con Python, sea un pipeline de
-datos, un servidor con workers o un agente que lanza herramientas en procesos aparte.
+tupla del trabajo. Esta restricción no se descubre leyendo: aparece cuando el código que funcionaba
+en la CI de Linux no arranca en otra máquina. Te la encontrarás en cualquier trabajo en paralelo con
+Python, sea un pipeline de datos, un servidor con workers o un agente que lanza herramientas en
+procesos aparte.
 
 </Callout>
 
@@ -340,17 +304,10 @@ def convert_batch(args: tuple[list[dict[str, object]], int, int]) -> dict[str, o
 
 <Src file="src/rukh/data/uci.py" tag="p1" lines="144-169" />
 
-`_parse_elo` devuelve `None` en vez de un cero o un `-1` cuando falta el Elo. La columna es un
-`int16` **anulable**, y eso es lo correcto: un cero sería un Elo, y el muestreo por tramos de M4
-crearía un tramo `<w0600>` lleno de partidas sin dato. Un `None` se propaga como nulo hasta que
-alguien decide qué hacer con él.
-
-`_parse_date` importa `datetime` dentro de la función porque es la única parte del fichero que lo
-necesita, el mismo criterio de importaciones locales que la CLI de M0. El `replace(".", "-")` está porque Lichess escribe
-`2025.01.01` y `date.fromisoformat` quiere guiones.
-
-`convert_batch` es una línea de desempaquetado y existe solo para tener **un punto de entrada con
-nombre** que acepte un único argumento, que es lo que `apply_async` sabe mandar.
+`_parse_elo` devuelve `None` cuando falta el Elo, no un cero: un cero sería un Elo, y el muestreo
+por tramos de M4 crearía un tramo `<w0600>` lleno de partidas sin dato. El `replace(".", "-")` de
+`_parse_date` está porque Lichess escribe `2025.01.01`. `convert_batch` solo desempaqueta: existe
+para tener un punto de entrada con nombre y un único argumento, que es lo que `apply_async` manda.
 
 ### Leer, repartir, escribir
 
@@ -384,17 +341,13 @@ def convert_month(src: Path, dst: Path, cfg: UciConfig) -> dict[str, int]:
 
 <Src file="src/rukh/data/uci.py" tag="p1" lines="172-196" />
 
-`iter_batches` lee el parquet por grupos de 20 000 filas con `iter_batches` de pyarrow, no con un
-`read_table`. Un mes son unos 2,9 millones de partidas con su `movetext` completo: leerlo entero son
-varios gigas en RAM antes de convertir la primera. Y la intersección `[c for c in RAW_COLUMNS if c
-in reader.schema_arrow.names]` con el `row.setdefault(name, None)` de después es lo que hace que el
-paso funcione tanto con el parquet que escribió `fetch` (que tiene la columna `month`) como con uno
-descargado de Lichess sin ella.
+`iter_batches` lee el parquet por grupos de 20 000 filas en vez de con un `read_table`: un mes
+entero con su `movetext` son varios gigas en RAM antes de convertir la primera partida. El
+`setdefault` rellena las columnas que falten, para que el paso lea tanto el parquet de `fetch` (con
+`month`) como uno bajado de Lichess sin ella.
 
-`convert_month` monta el generador de trabajos y se lo da a `run_batches`. Fíjate en que
-`jobs` es un **generador**, no una lista: los lotes se construyen a medida que el pool los pide, y
-eso es lo que hace falta para que la cadena entera funcione con memoria acotada. Que se cumpla o no
-depende del fichero siguiente.
+En `convert_month`, `jobs` es un generador: los lotes se construyen a medida que el pool los pide.
+Que eso baste para acotar la memoria depende del fichero siguiente.
 
 ```python title="src/rukh/data/uci.py"
 def write_results(
@@ -429,14 +382,9 @@ def sha256_file(path: Path) -> str:
 
 <Src file="src/rukh/data/uci.py" tag="p1" lines="199-226" />
 
-`write_results` consume los resultados en orden y escribe cada lote en el `ParquetWriter` abierto.
-El `if columns["game_id"]` evita escribir un grupo de filas vacío: un lote donde ninguna partida
-pasó los filtros existe, y pyarrow escribiría un grupo de cero filas que después hay que saltar al
-leer.
-
-`month_dirs` saca el mes del nombre del directorio (`year=2025/month=01`) y no de una columna.
-Es lo mismo que hacía la consulta de M0 con `hive_partitioning = false`: la ruta es el dato, y
-partirla a mano deja claro de dónde sale en vez de dejar que una librería la interprete.
+El `if columns["game_id"]` de `write_results` evita escribir un grupo de cero filas cuando ninguna
+partida del lote pasó los filtros. `month_dirs` saca el mes de la ruta (`year=2025/month=01`),
+como hacía M0 con `hive_partitioning = false`.
 
 ```python title="src/rukh/data/uci.py"
 def run(cfg: UciConfig) -> Manifest:
@@ -486,32 +434,26 @@ def run(cfg: UciConfig) -> Manifest:
 
 <Src file="src/rukh/data/uci.py" tag="p1" lines="229-271" />
 
-El `run` final es fontanería con una idea dentro: **el manifiesto nuevo se cuelga del viejo**. Si
-`data/raw/manifest.json` existe, sus filtros entran en el manifiesto de `data/uci/` bajo la clave
-`raw`, y el nombre del dataset de origen se hereda en vez de escribirse a mano. Así, el manifiesto
-del último paso de la cadena lleva dentro la <Term id="manifiesto">procedencia</Term> completa: de
-qué volcado de Lichess salió, con qué filtros se descargó, con qué filtros se convirtió y el sha256
-de cada fichero resultante. Es lo que después va, literal, a la <Term id="model-card">dataset card</Term> de Hugging
-Face, y es lo que permite decir "este modelo se entrenó con estas partidas exactamente".
+El `run` final tiene una idea dentro: **el manifiesto nuevo se cuelga del viejo**. Los filtros de
+`data/raw/manifest.json` entran en el de `data/uci/` bajo la clave `raw`, y el nombre del dataset de
+origen se hereda. Así el último manifiesto de la cadena lleva la <Term id="manifiesto">procedencia</Term> completa: de qué volcado salió, con qué filtros se descargó y se
+convirtió, y el sha256 de cada fichero. Es lo que irá a la <Term id="model-card">dataset card</Term>
+de Hugging Face. `sha256_file`, por su parte, lee en trozos de 1 MiB para no cargar un parquet de
+480 MB entero.
 
-`sha256_file` lee en trozos de 1 MiB con `iter(lambda: fh.read(1 << 20), b"")`, el idioma de
-Python para "llama a esto hasta que devuelva el centinela". Un `read()` entero de un parquet de
-480 MB es memoria que no hace falta gastar.
-
-<Transfer concept="Procedencia encadenada" where="Cualquier cadena de transformaciones cuyo resultado alguien va a usar para decidir: un ETL, un índice vectorial, un conjunto de evaluación.">
-  La regla es que **cada paso registra sus filtros y los del paso anterior**. Cuesta una clave en un
-  JSON y responde la única pregunta que importa cuando un número no cuadra: qué había dentro.
-
-El modo de fallo que evita es concreto. Sin procedencia encadenada, dentro de tres meses tendrás un
-parquet de seis millones de filas y no sabrás si el filtro de Elo era 1800 o 2000, ni si el mes de
-validación es el que crees. Y lo descubrirás cuando dos resultados discrepen, que es el momento en
-que el coste de averiguarlo se multiplica.
-
+<Transfer
+  concept="Procedencia encadenada"
+  where="Cualquier cadena de transformaciones cuyo resultado alguien va a usar para decidir: un ETL, un índice vectorial, un conjunto de evaluación."
+>
+  Que cada paso registre sus filtros y los del anterior cuesta una clave en un JSON. Sin eso, dentro
+  de tres meses tendrás un parquet de seis millones de filas y no sabrás si el filtro de Elo era
+  1800 o 2000, y lo descubrirás cuando dos resultados discrepen, que es cuando averiguarlo sale más
+  caro.
 </Transfer>
 
 ## `parallel.py`: el pool que no se adelanta
 
-Este fichero existe por un fallo concreto, y se entiende mejor sabiendo cuál.
+Este fichero existe por un fallo concreto: el pool de la biblioteca estándar se adelanta.
 
 ```python title="src/rukh/data/parallel.py"
 """Bounded fan-out over a ``spawn`` process pool.
@@ -546,9 +488,8 @@ class Pool(Protocol):
 
 <Src file="src/rukh/data/parallel.py" tag="p1" lines="1-28" />
 
-Los dos `Protocol` son lo que permite que el test de más abajo pruebe la lógica de la cola con un pool falso que ejecuta los trabajos en el sitio, sin lanzar un solo
-proceso. `imap_bounded` solo necesita dos métodos del pool de verdad, y declararlos así los deja por
-escrito.
+Los dos `Protocol` declaran los únicos dos métodos del pool que hacen falta, y así el test puede
+probar la cola con un pool falso, sin lanzar un solo proceso.
 
 ```python title="src/rukh/data/parallel.py"
 def imap_bounded[J, R](
@@ -571,28 +512,21 @@ def imap_bounded[J, R](
 
 <Src file="src/rukh/data/parallel.py" tag="p1" lines="31-46" />
 
-Este bloque es la razón de ser del fichero. `Pool.imap` de la biblioteca estándar
-**vacía su iterable de entrada tan rápido como puede**: no espera a que haya un worker libre, va
-encolando. Con un generador que produce lotes de 20 000 partidas, eso significa que el mes entero se
-materializa en memoria antes de que vuelva el primer resultado, y el proceso muere por falta de RAM
-mucho antes de escribir una fila.
+`Pool.imap` vacía su iterable de entrada tan rápido como puede, sin esperar a que haya un worker
+libre. Con un generador de lotes de 20 000 partidas, el mes entero acaba en memoria antes de que
+vuelva el primer resultado, y el proceso muere mucho antes de escribir una fila.
 
-`imap_bounded` invierte quién manda. Se encola un trabajo, y **en cuanto hay `max_in_flight`
-pendientes se espera al más antiguo** con `popleft().get()`. Ese `get()` bloquea, el bucle `for job
-in jobs` no avanza mientras bloquea, y el generador de lotes deja de producir. El alimentador va al
-ritmo del escritor.
+`imap_bounded` invierte quién manda: en cuanto hay `max_in_flight` trabajos pendientes, espera al más
+antiguo con `popleft().get()`. Mientras ese `get()` bloquea, el `for` no avanza y el generador deja
+de producir. El alimentador va al ritmo del escritor.
 
 <Callout kind="teoria" title="Contrapresión, y por qué `2 * workers`">
-  El nombre general de esto es _backpressure_: el consumidor lento frena al productor rápido en vez
-  de acumular trabajo entre los dos. El límite lo pone `run_batches` en `2 * workers`, y el factor
-  dos es el compromiso: con `max_in_flight = workers` cada vez que un worker acaba se queda parado
-  hasta que el escritor consume su resultado, así que la mitad del tiempo hay núcleos ociosos; con
-  un límite grande vuelve el problema de la memoria. Dos lotes por worker —uno calculándose, uno
-  esperando— mantiene el pool lleno con un techo de memoria fijo y conocido.
+  El nombre general es _backpressure_: el consumidor lento frena al productor rápido en vez de
+  acumular trabajo entre los dos. `run_batches` pone el límite en `2 * workers`. Con uno por worker,
+  cada worker que acaba se queda parado hasta que el escritor consume su resultado; con un límite
+  grande vuelve el problema de la memoria. Dos lotes por worker, uno calculándose y otro esperando,
+  mantienen el pool lleno con un techo de memoria conocido.
 </Callout>
-
-La `deque` y no una lista: `popleft()` de una lista es O(n) porque desplaza todo lo demás. Con
-ciento cincuenta lotes en vuelo da igual, pero es el tipo correcto y no cuesta nada.
 
 ```python title="src/rukh/data/parallel.py"
 def run_batches[J, R](func: Callable[[J], R], jobs: Iterable[J], workers: int) -> Iterator[R]:
@@ -611,16 +545,12 @@ def run_batches[J, R](func: Callable[[J], R], jobs: Iterable[J], workers: int) -
 
 <Src file="src/rukh/data/parallel.py" tag="p1" lines="49-60" />
 
-`workers <= 1` no crea pool: hace `map` y devuelve. Más que una optimización, es lo que hace
-posibles los tests. Un test que lance un pool de `spawn` en Windows paga varios segundos de arranque de
-intérprete por caso, y los tests `unit` de este proyecto tienen que tardar segundos en total; con
-`workers=1` la ruta serie corre en milisegundos y prueba la conversión. Que la ruta paralela también
-funciona lo comprueba un test aparte, uno solo.
+Con `workers <= 1` no hay pool, solo `map`. Es lo que hace rápidos los tests: un pool de `spawn`
+en Windows paga segundos de arranque por caso, y la ruta serie prueba la conversión en milisegundos.
+La ruta paralela la comprueba un único test aparte.
 
-`ctx = multiprocessing.get_context("spawn")` fija el método de arranque **explícitamente**, en vez
-de heredar el de la plataforma. Así el código se comporta igual en Linux y en Windows, y una función
-que no se puede serializar falla en la CI y no en la máquina de desarrollo del único que usa
-Windows.
+`get_context("spawn")` fija el método de arranque en todas las plataformas, así que una función que
+no se puede serializar falla también en la CI de Linux.
 
 ## `db.py`: una conexión configurada, no la de fábrica
 
@@ -661,8 +591,8 @@ class DuckDbConfig(BaseConfig):
 
 <Src file="src/rukh/data/db.py" tag="p1" lines="1-32" />
 
-Lo que parece una línea (`duckdb.connect()`) ocupa un fichero entero, y el docstring dice por
-qué: tres ajustes, cada uno contra un fallo concreto.
+Lo que parece una línea (`duckdb.connect()`) ocupa un fichero: tres ajustes, cada uno contra un
+fallo concreto.
 
 ```python title="src/rukh/data/db.py"
 def temp_directory() -> Path:
@@ -686,33 +616,26 @@ def connect(cfg: DuckDbConfig | None = None) -> duckdb.DuckDBPyConnection:
 
 <Src file="src/rukh/data/db.py" tag="p1" lines="35-51" />
 
-`temp_directory` es el importante. Cuando una consulta no cabe en memoria, DuckDB **vuelca a disco**,
-y por defecto vuelca al directorio temporal del sistema: en Windows, el `AppData\Local\Temp` del
-usuario, que suele estar en el SSD del sistema y suele ser el disco pequeño. El <Term id="semi-join">semi join</Term> de las evaluaciones puede volcar decenas de gigas. Si el
-volcado va a `<data>/duckdb-tmp` (en el mismo disco que los datos, y en el `.gitignore`), el que se
-llena, si se llena, es el disco donde ya has decidido que caben los datos.
+`temp_directory` es el importante. Cuando una consulta no cabe en memoria, DuckDB vuelca a disco, y
+por defecto al temporal del sistema: en Windows, `AppData\Local\Temp`, que suele estar en el disco
+pequeño. El <Term id="semi-join">semi join</Term> de las evaluaciones puede volcar decenas de gigas.
+Con el volcado en `<data>/duckdb-tmp`, el que se llena, si se llena, es el disco donde ya decidiste
+que caben los datos.
 
-`memory_limit` por defecto en 32 GB de los 64 de la máquina de referencia: la otra mitad es para los
-procesos de trabajo del pool de `parallel.py`, que corren a la vez. Sin límite, DuckDB toma como
-presupuesto el 80 % de la RAM del sistema y los dos se pelean.
-
-Y los tres ajustes se pasan **con parámetros** (`con.execute("SET memory_limit = ?", [...])`) en vez
-de interpolar el valor en la cadena. Aquí el valor viene de un YAML del propio repositorio, así que
-no hay un atacante; el motivo es que un `memory_limit` con un espacio de más escrito por
-interpolación da un error de sintaxis de SQL en vez de un error sobre el valor.
+`memory_limit` deja 32 de los 64 GB de la máquina de referencia para los procesos del pool, que
+corren a la vez; sin límite, DuckDB se reserva el 80 % de la RAM y los dos se pelean. Los valores se
+pasan con parámetros (`SET memory_limit = ?`) para que un valor mal escrito dé un error sobre el
+valor y no uno de sintaxis SQL.
 
 <Callout kind="mundo-real" title="El ajuste que nadie configura">
-  De los tres, el que se olvida siempre es el directorio de volcado, porque el síntoma no menciona
-  la base de datos: un `No space left on device` (o un Windows que avisa de que el disco del sistema
-  está lleno) a la hora y media de una consulta, con el disco de datos medio vacío. Cualquier motor
-  que procese más de lo que le cabe en RAM tiene un ajuste equivalente —`spark.local.dir`, `TMPDIR`,
-  `sort_buffer_size`—, y ponerlo donde están los datos es gratis.
+  El que se olvida siempre es el directorio de volcado, porque el síntoma no menciona la base de
+  datos: un `No space left on device` a la hora y media de una consulta, con el disco de datos medio
+  vacío. Cualquier motor que procese más de lo que le cabe en RAM tiene un ajuste equivalente
+  (`spark.local.dir`, `TMPDIR`, `sort_buffer_size`), y ponerlo donde están los datos es gratis.
 </Callout>
 
-Ese directorio se añade al `.gitignore` en el mismo hito, junto a `.tmp/`, y los dos van **sin barra
-inicial** a diferencia de `/data/`: un volcado de DuckDB puede aparecer en cualquier subdirectorio
-desde el que se lance una consulta, y un parquet temporal de treinta gigas que se cuela en `git
-status` es la clase de susto que se evita con dos líneas.
+Ese directorio va al `.gitignore` sin barra inicial, a diferencia de `/data/`, porque un volcado de
+DuckDB puede aparecer en cualquier subdirectorio desde el que se lance una consulta.
 
 ```text title=".gitignore"
 # Project data and runs (never in git)
@@ -726,9 +649,9 @@ duckdb-tmp/
 
 <Src file=".gitignore" tag="p1" lines="13-19" />
 
-`DuckDbConfig` vive aquí y no en cada paso porque **todos los pasos lo comparten**: es una sección
-del `pipeline.yaml` que cada paso hereda, y eso lo monta la lección siguiente. El campo `duckdb` de
-`FetchConfig` es el único cambio que M1 le hace al `fetch.py` de M0:
+`DuckDbConfig` vive aquí porque todos los pasos lo comparten: es una sección del `pipeline.yaml`
+que cada paso hereda (lo monta la lección siguiente). El campo `duckdb` de `FetchConfig` es el único
+cambio que M1 le hace al `fetch.py` de M0:
 
 ```python title="src/rukh/data/fetch.py"
 class FetchConfig(BaseConfig):
@@ -748,17 +671,16 @@ class FetchConfig(BaseConfig):
 
 <Src file="src/rukh/data/fetch.py" tag="p1" lines="26-38" />
 
-La última línea de la clase es la nueva; en `p0` acababa en `limit`. Con eso, el `run` de `fetch`
-pasa de `duckdb.connect()` a `connect(cfg.duckdb)` y la descarga de M0 hereda los tres ajustes. No
-hace falta repetir la descarga: los datos ya están en disco.
+La última línea es la nueva. Con ella, el `run` de `fetch` pasa de `duckdb.connect()` a
+`connect(cfg.duckdb)` y hereda los tres ajustes. No hace falta repetir la descarga.
 
 Si en M0 aplicaste el parche contra el `HTTP 429`, borra sus líneas al hacer este cambio, porque
 `connect` ya fija los hilos. Solo si tuvieras que relanzar la descarga, pon `threads: 3` bajo
 `duckdb:` en el YAML y conserva el resto del parche (todo menos `SET threads`) justo después de
 `con = connect(cfg.duckdb)`.
 
-La otra línea que cambia es la que construye los filtros del manifiesto: `duckdb` se excluye porque
-es configuración de la máquina, no un filtro de los datos, y no pinta nada en una dataset card.
+La otra línea que cambia excluye `duckdb` de los filtros del manifiesto: es configuración de la
+máquina, no de los datos.
 
 ```python title="src/rukh/data/fetch.py"
     filters = cfg.model_dump(exclude={"dataset", "months", "out_dir", "min_plies", "duckdb"})
@@ -778,10 +700,9 @@ def resolve(rel: str | Path) -> Path:
 
 <Src file="src/rukh/paths.py" tag="p1" lines="41-44" />
 
-Es el traductor entre el YAML y el disco: `out_dir: data/uci` en la configuración se convierte en
-una ruta absoluta bajo `root()`, que es lo que `RUKH_HOME` mueve. Todas las rutas de todas las
-configuraciones del pipeline pasan por aquí, y por eso un test puede apuntar el proyecto entero a un
-directorio temporal con una variable de entorno.
+Convierte `out_dir: data/uci` en una ruta absoluta bajo `root()`, que es lo que `RUKH_HOME`
+mueve. Todas las rutas del pipeline pasan por aquí, y por eso un test puede apuntar el proyecto
+entero a un directorio temporal con una variable de entorno.
 
 <Callout kind="ejecuta" title="La conexión, configurada">
   Con `db.py` y el `resolve` de `paths.py` escritos, abre una conexión y pregúntale a DuckDB qué
@@ -799,8 +720,8 @@ DuckDB (unos 29,8 GiB para los 32 GB por defecto) y los hilos, tantos como núcl
 
 ## Los tests: el contrato de la conversión
 
-`tests/unit/test_uci.py` es de los tests más útiles del repositorio: cada una de las cinco partidas
-que tiene arriba está elegida para cubrir un caso que rompe implementaciones.
+En `tests/unit/test_uci.py`, cada una de las cinco partidas de arriba cubre un caso que rompe
+implementaciones.
 
 ```python title="tests/unit/test_uci.py"
 """Tests for rukh.data.uci: movetext cleaning, SAN to UCI, ply filters and month conversion."""
@@ -847,13 +768,11 @@ CASTLES = (
 
 <Src file="tests/unit/test_uci.py" tag="p1" lines="1-40" />
 
-Las constantes son el valor del fichero. `LICHESS` es una española con comentarios de reloj y de
-evaluación, para que la limpieza tenga algo que limpiar. `ILLEGAL` lleva su motivo en un comentario
-(`3...Nxe4`: el caballo de c6 no puede ir ahí) porque un test que descarta una partida sin decir por
-qué es imposible de mantener. `PROMO` promociona con captura en `bxa8=Q`, que en UCI es `b7a8q`.
-`CASTLES` enroca por el flanco de dama **por los dos bandos**, que es el caso que una traducción por
-cadenas siempre falla (`O-O-O` es `e1c1`, no `e1a1`). Y `SHORT` es un mate del pastor de siete
-plies, para el filtro de longitud.
+`LICHESS` trae comentarios de reloj y de evaluación para que la limpieza tenga trabajo. `ILLEGAL`
+lleva su motivo en un comentario, porque un test que descarta una partida sin decir por qué es
+imposible de mantener. `PROMO` promociona con captura (`b7a8q`). `CASTLES` enroca largo por los dos
+bandos, el caso que una traducción por cadenas siempre falla (`O-O-O` es `e1c1`, no `e1a1`). `SHORT`
+es un mate del pastor, para el filtro de longitud.
 
 ```python title="tests/unit/test_uci.py"
 def test_clean_movetext_strips_comments_numbers_and_result() -> None:
@@ -891,20 +810,13 @@ def test_game_id_is_stable_int64() -> None:
 
 <Src file="tests/unit/test_uci.py" tag="p1" lines="43-73" />
 
-El tercer `assert` de `test_clean_movetext_strips_comments_numbers_and_result` es el de la variante
-anidada, y el cuarto comprueba que la cadena vacía no revienta. En
-`test_san_to_uci_castling_and_promotion`, los índices (`split()[8]`, `split()[15]`) son posiciones
-concretas de la partida: el noveno medio-movimiento es `5. O-O` y el decimosexto `8... O-O`. Es
-menos legible que buscar la jugada en la lista y es a propósito: si la conversión se desplazara una
-jugada, buscar `"e1g1"` seguiría encontrándolo y el test pasaría.
+Los índices de `test_san_to_uci_castling_and_promotion` (`split()[8]`, `split()[15]`) son
+posiciones concretas: el noveno medio movimiento es `5. O-O`. Buscar `"e1g1"` en la lista sería más
+legible, pero seguiría pasando si la conversión se desplazara una jugada.
 
-`test_san_to_uci_rejects_illegal_or_garbage` cubre los tres modos de fallo por separado: una jugada
-que solo sería legal en otra posición (`Nxe4`), una cadena que no es una jugada (`Zz9`) y una jugada
-bien escrita pero imposible desde la posición inicial (`1. e5`: ningún peón blanco llega a e5 de un
-salto). Los tres dan `None`, no una excepción.
-
-`test_game_id_is_stable_int64` comprueba las tres propiedades de un id: determinista, dentro del
-rango de `int64` con signo, y distinto para entradas distintas.
+`test_san_to_uci_rejects_illegal_or_garbage` separa los tres modos de fallo: una jugada legal solo en
+otra posición (`Nxe4`), una cadena que no es jugada (`Zz9`) y una bien escrita pero imposible desde
+la posición inicial (`1. e5`).
 
 ```python title="tests/unit/test_uci.py"
 def _raw_rows() -> list[dict[str, object]]:
@@ -942,11 +854,9 @@ def test_convert_rows_counts() -> None:
 
 <Src file="tests/unit/test_uci.py" tag="p1" lines="76-106" />
 
-El `_raw_rows()` de cinco filas se reutiliza en cuatro tests, y `test_convert_rows_counts`
-comprueba los contadores de las tres formas: los cinco casos tal cual (4 conservadas, 1 ilegal), con
-una partida corta añadida y con un `max_plies` absurdo que descarta las cuatro. El
-`_raw_rows()[0] | {"movetext": SHORT}` es la unión de diccionarios de 3.9: la misma fila con un
-campo cambiado.
+`test_convert_rows_counts` comprueba los contadores con los cinco casos tal cual, con una partida
+corta añadida (`_raw_rows()[0] | {"movetext": SHORT}`, la misma fila con un campo cambiado) y con un
+`max_plies` absurdo que descarta las cuatro.
 
 ```python title="tests/unit/test_uci.py"
 def _write_raw(path: Path) -> None:
@@ -994,15 +904,10 @@ def test_convert_month_with_two_workers(tmp_path: Path) -> None:
 
 <Src file="tests/unit/test_uci.py" tag="p1" lines="109-149" />
 
-Este es el test que fija el esquema. Comprueba la lista de columnas **en orden**, los tipos de
-cuatro de ellas, el orden de las filas que sobreviven y que la fecha se parseó. Que un test
-enumere las diez columnas parece frágil, y es lo que se quiere: el esquema de este parquet lo
-leen cuatro pasos del pipeline y dos módulos posteriores, así que cambiarlo tiene que costar tocar
-un test y pensar un momento.
-
-`test_convert_month_with_two_workers` es el único que lanza un pool de verdad, y su docstring dice
-para qué: comprobar que la ruta de `spawn` funciona, es decir, que todos los puntos de entrada se
-pueden serializar. Es el test que falla si alguien convierte `convert_batch` en un `lambda`.
+Este es el test que fija el esquema: las diez columnas en orden y los tipos. Parece frágil, y es lo
+que se quiere: el parquet lo leen cuatro pasos y dos módulos posteriores, así que cambiarlo tiene que
+costar tocar un test y pensar un momento. `test_convert_month_with_two_workers` lanza un pool de
+verdad y es el que falla si alguien convierte `convert_batch` en un `lambda`.
 
 ```python title="tests/unit/test_uci.py"
 def test_run_writes_months_and_manifest(rukh_home: Path) -> None:
@@ -1035,11 +940,9 @@ def test_cli_data_uci(rukh_home: Path) -> None:
 
 <Src file="tests/unit/test_uci.py" tag="p1" lines="152-177" />
 
-Los dos últimos usan la fixture `rukh_home` de M0, la que apunta `RUKH_HOME` a un directorio
-temporal: escriben un `data/raw/` falso con dos meses y comprueban que `run` produce los dos
-parquets, el manifiesto en disco y los conteos. El último invoca la CLI de verdad con
-`CliRunner` y `--json`, y parsea la salida: es lo que garantiza que la orden existe, que acepta
-`--config` y que su JSON es el del manifiesto.
+Los dos últimos usan la fixture `rukh_home` de M0 para escribir un `data/raw/` falso en un
+directorio temporal. El último invoca la CLI de verdad con `CliRunner` y `--json`: garantiza que la
+orden existe, que acepta `--config` y que devuelve el manifiesto.
 
 ## El test del pool: cómo se prueba la contrapresión
 
@@ -1099,11 +1002,9 @@ def test_imap_bounded_keeps_the_queue_short() -> None:
 
 <Src file="tests/unit/test_parallel.py" tag="p1" lines="1-51" />
 
-`_FakePool` ejecuta el trabajo en el momento de enviarlo, así que el resultado está listo cuando
-`get()` se llama y **lo único que queda bajo prueba es el tamaño de la cola**. El truco está en
-`_counted`: el generador apunta en `seen` cada valor que produce, así que comparar `len(seen)` con
-`len(produced)` dentro del bucle mide exactamente cuánto se ha adelantado el alimentador. La
-aserción `<= 4` es la promesa del fichero, comprobada en cada iteración y no al final.
+`_FakePool` ejecuta el trabajo al enviarlo, así que lo único bajo prueba es el tamaño de la cola.
+El truco está en `_counted`: el generador apunta cada valor que produce, y comparar `len(seen)` con
+`len(produced)` dentro del bucle mide cuánto se ha adelantado el alimentador en cada iteración.
 
 ```python title="tests/unit/test_parallel.py"
 def _row(movetext: str) -> dict[str, object]:
@@ -1144,11 +1045,9 @@ def test_run_batches_is_serial_with_one_worker() -> None:
 
 <Src file="tests/unit/test_parallel.py" tag="p1" lines="54-87" />
 
-Y este lanza el pool de `spawn` de verdad con dos procesos y comprueba la misma propiedad sobre
-él, con un margen de uno (`2 * workers + 1`) porque el trabajo que se está enviando cuenta. Es el
-único test del fichero que cuesta segundos, y paga: la aserción que importa —que doce lotes no se
-materialicen los doce— no se puede comprobar con un pool falso, porque con uno falso el orden es
-trivialmente correcto.
+Y este comprueba lo mismo sobre un pool de `spawn` real con dos procesos, con margen de uno porque
+el trabajo que se está enviando cuenta. Cuesta segundos, y paga: que doce lotes no se materialicen
+los doce no se puede comprobar con un pool falso, donde el orden es trivialmente correcto.
 
 <Callout kind="ejecuta" title="Los tests de la conversión y del pool">
   Con los tres ficheros y sus dos tests escritos, pasa los dos ficheros. El último test de
@@ -1207,10 +1106,9 @@ usa: un test verde sobre código muerto es lo que el segundo test existe para ev
 
 ## Qué has aprendido
 
-El primer paso del pipeline, entero: qué tiene dentro el `movetext` de Lichess y en qué orden hay que
-quitárselo, por qué la conversión a UCI pasa por un tablero de verdad y no por expresiones
-regulares, por qué el id de una partida es un hash y no un `hash()`, y qué hay que hacer para que un
-pool de procesos no se trague un mes en memoria antes de escribir una fila.
+Has escrito el primer paso del pipeline: la limpieza del `movetext` en el orden correcto, la
+conversión a UCI sobre un tablero de verdad, un id estable que no depende de `hash()` y un pool de
+procesos que no se traga un mes en memoria antes de escribir una fila.
 
 **Cómo se mide**: `uv run rukh data uci` deja `data/uci/year=2025/month=01/games.parquet` y su
 gemelo de febrero, con 2 949 514 y 2 946 874 partidas, y un `manifest.json` cuyos contadores suman
@@ -1218,6 +1116,5 @@ las seis millones leídas con cero ilegales. `uv run pytest -m unit -q tests/uni
 tests/unit/test_parallel.py` pasa los doce casos en menos de diez segundos, el último en cuanto
 escribas la CLI y el `pipeline.py` en la lección siguiente.
 
-Lo siguiente es el orquestador. Nueve pasos como este, cada uno con su configuración, comparten un
-único fichero YAML y una única sección de DuckDB, y la CLI gana ocho órdenes nuevas que se parecen
-tanto entre sí que conviene ver por qué.
+Lo siguiente es el orquestador: nueve pasos como este comparten un único YAML y una sección de
+DuckDB, y la CLI gana ocho órdenes nuevas.

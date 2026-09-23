@@ -6,7 +6,7 @@ description:
   fixture de paridad que el navegador va a reproducir.'
 module: m1
 order: 7
-duration: 150
+duration: 130
 level: medio
 status: vigente
 updated: 2026-09-23
@@ -25,23 +25,19 @@ artifacts:
 
 ## Qué vas a construir
 
-El puente entre los vocabularios de la lección anterior y la GPU de M2. En la analogía del
-aprendiz, es ordenar la biblioteca para que pueda leer deprisa. Tres piezas:
+El puente entre los vocabularios de la lección anterior y la GPU de M2, en tres piezas:
 
-Un **empaquetador** que codifica seis millones de partidas y las escribe seguidas en un único array
-de `uint16` de 480 MB, con un índice aparte que dice dónde empieza cada una. Ni las partidas ni el
-flujo completo pasan nunca por memoria a la vez.
+- Un **empaquetador** que escribe seis millones de partidas codificadas en un único array de
+  `uint16` de 480 MB, con un índice aparte de dónde empieza cada una, sin tenerlas nunca todas en
+  memoria.
+- Un **dataset** que sirve ventanas de 200 tokens desde ese array con <Term id="memmap">memmap</Term>,
+  alineadas al `<bos>` de una partida y con el objetivo `y` desplazado una posición: el contrato que
+  consume el decoder de M2.
+- Un **orquestador**, el de `rukh data tokenize`, con la fixture de paridad que el navegador tendrá
+  que reproducir id a id.
 
-Un **dataset** que sirve ventanas de 200 tokens desde ese array con <Term id="memmap">memmap</Term>,
-siempre alineadas al `<bos>` de una partida, con el objetivo `y` desplazado una posición. Es el
-contrato exacto que el decoder de M2 consume.
-
-Y un **orquestador**, el que está detrás de `rukh data tokenize`, con la fixture de paridad que el
-tokenizador del navegador tendrá que reproducir id a id.
-
-Son cuatro ficheros, y lo que enseñan sirve para cualquier corpus que no cabe en memoria, sea de
-partidas, de texto o de fragmentos para un RAG: escribir en flujo, indexar aparte y leer con
-memmap.
+Escribir en flujo, indexar aparte y leer con memmap sirve para cualquier corpus que no cabe en
+memoria, sea de partidas, de texto o de fragmentos para un RAG.
 
 ## `pack.py`: tres codificadores con la misma forma
 
@@ -82,13 +78,8 @@ COPY_TOKENS = (64 << 20) // 2  # 64 MiB of uint16 per copy into the memmap
 
 <Src file="src/rukh/tokenize/pack.py" tag="p1" lines="1-32" />
 
-`COPY_TOKENS = (64 << 20) // 2` son 64 MiB expresados en número de `uint16`, con el comentario al
-lado explicando la división por dos. Es el tamaño del trozo con el que el fichero crudo se copia al
-memmap, y aparece al final del fichero.
-
-El flujo se guarda en `uint16`: dos bytes por token, suficiente para 65 536 ids y por tanto para los
-tres vocabularios (2 030, 35 y 4 096). Con `int32` el fichero pesaría el doble para no guardar nada
-más.
+El flujo va en `uint16`: dos bytes por token dan para 65 536 ids, de sobra para los tres
+vocabularios. Con `int32` el fichero pesaría el doble sin guardar nada más.
 
 ```python title="src/rukh/tokenize/pack.py"
 class GameEncoder(Protocol):
@@ -110,10 +101,8 @@ class GameEncoder(Protocol):
 
 <Src file="src/rukh/tokenize/pack.py" tag="p1" lines="35-49" />
 
-`GameEncoder` es un `Protocol`, no una clase base: los tres codificadores de abajo no heredan de nada
-y aun así encajan, porque tienen los métodos y los atributos. Es tipado estructural, y aquí sirve
-para algo concreto: `pack_month` no importa ninguno de los tres, así que empaquetar con UCI no
-arrastra la librería `tokenizers` que necesita el BPE.
+`GameEncoder` es un `Protocol`: los tres codificadores encajan sin heredar de nada porque tienen los
+métodos. Así `pack_month` no importa ninguno, y empaquetar con UCI no arrastra `tokenizers`.
 
 ```python title="src/rukh/tokenize/pack.py"
 class UciGameEncoder:
@@ -167,15 +156,9 @@ class SanGameEncoder:
 
 <Src file="src/rukh/tokenize/pack.py" tag="p1" lines="75-95" />
 
-Los dos primeros son envoltorios finos, y la diferencia interesante está en `SanGameEncoder`: su
-`encode_game` **ignora los dos Elo**. No es un descuido, es la consecuencia de que el alfabeto de 32
-símbolos no tenga tokens de Elo, y el docstring lo dice. Este esquema no se puede condicionar, y esa
-limitación aparece aquí, en la firma que sí los recibe y no los usa.
-
-También se ve el orden real de la conversión: `uci_to_san(uci)` reconstruye el SAN desde el UCI
-guardado, `san_text(...)` le pega el resultado, y el tokenizador codifica esa cadena. Tres pasos por
-partida, con un tablero de `python-chess` en medio, y por eso el esquema SAN tarda hora y media en
-empaquetarse mientras los otros dos tardan minutos.
+El `encode_game` de `SanGameEncoder` recibe los dos Elo y los ignora: es la limitación del alfabeto
+sin tokens de Elo, visible en la firma. Reconstruir el SAN pide un tablero por partida, y por eso
+este esquema tarda hora y media en empaquetarse y los otros dos, minutos.
 
 ```python title="src/rukh/tokenize/pack.py"
 class BpeGameEncoder:
@@ -213,15 +196,10 @@ class BpeGameEncoder:
 
 <Src file="src/rukh/tokenize/pack.py" tag="p1" lines="98-128" />
 
-El `BpeGameEncoder` tiene la comprobación más útil de los tres, en su constructor: recorre los ocho
-tokens especiales y exige que el BPE les haya dado **los mismos ids que el vocabulario UCI**. Si
-alguien entrenase un BPE sin pasarle `special_tokens`, `<pad>` no sería el 0, el relleno del loader
-metería un token cualquiera en cada hueco y la pérdida con `ignore_index=0` estaría ignorando la
-jugada que ocupe ese id. Con la comprobación, el pack falla al construirse.
-
-Y la forma de la secuencia BPE es `[<bos>, ids del texto pegado, <resultado>, <eos>]`: tres tokens de
-encuadre en vez de los cinco del UCI, porque tampoco hay tokens de Elo. Ese `+3` reaparece en las
-estadísticas.
+El constructor de `BpeGameEncoder` exige que los ocho especiales tengan los mismos ids que en el UCI.
+Con un BPE entrenado sin `special_tokens`, `<pad>` no sería el 0 y `ignore_index=0` estaría ignorando
+la jugada que ocupe ese id; con la comprobación, el pack falla al construirse. La secuencia BPE lleva
+tres tokens de encuadre en vez de cinco, porque tampoco hay Elo.
 
 ```python title="src/rukh/tokenize/pack.py"
 class PackInfo(BaseModel):
@@ -255,15 +233,10 @@ def make_encoder(scheme: str, bpe: Tokenizer | None = None) -> GameEncoder:
 
 <Src file="src/rukh/tokenize/pack.py" tag="p1" lines="131-157" />
 
-`PackInfo` es el contenido de `meta.json`, y el campo que importa es `vocab_hash`. Más que
-documentar, sirve para que el bucle de entrenamiento de M2 **rechace** un pack cuyo vocabulario no
-es el del modelo. Sin él, entrenar con un `data/tokens/uci/` regenerado después de
-tocar la enumeración funcionaría perfectamente, sobre ids que significan otra cosa, y la pérdida
-bajaría igual.
-
-`make_encoder` es un despachador de tres ramas con un `raise` al final. La rama del BPE exige el
-tokenizador entrenado, porque a diferencia de los otros dos este esquema **no se puede construir
-solo**.
+El campo que importa de `PackInfo` es `vocab_hash`: permite que el entrenamiento de M2 rechace un
+pack cuyo vocabulario no es el del modelo. Sin él, entrenar sobre un pack de otra enumeración
+funcionaría, con ids que significan otra cosa, y la pérdida bajaría igual. En `make_encoder`, solo
+la rama del BPE pide algo: el tokenizador entrenado.
 
 ```python title="src/rukh/tokenize/pack.py"
 def pack_month(games: Path, encoder: GameEncoder, out: Path) -> PackInfo:
@@ -321,33 +294,20 @@ def pack_month(games: Path, encoder: GameEncoder, out: Path) -> PackInfo:
 
 <Src file="src/rukh/tokenize/pack.py" tag="p1" lines="160-210" />
 
-`pack_month` es la lección del fichero. Léela por la memoria.
+`pack_month` es la lección del fichero, y se lee por la memoria. `open_memmap` necesita la forma
+final del array, y la longitud del flujo no se conoce hasta codificar la última partida. Acumularlo
+todo serían varios gigas y recorrer el parquet dos veces, codificar seis millones de partidas dos
+veces. La salida es **escribir los ids a un fichero crudo mientras se cuentan**; al acabar,
+`n_tokens` es exacto, se crea el memmap y se copia.
 
-La primera guarda es la comprobación del `uint16`: un vocabulario de más de 65 536 entradas no cabe,
-y hay que saberlo antes de escribir 480 MB, no después.
-
-Después vienen **dos pasadas y un fichero temporal**, que es la parte que hay que entender. El
-problema es que `np.lib.format.open_memmap` necesita saber la **forma final** del array para crearlo,
-y la longitud total del flujo no se conoce hasta haber codificado la última partida. Las opciones
-eran tres: acumular todo en memoria (varios gigas), recorrer el parquet dos veces (codificar seis
-millones de partidas dos veces) o **escribir los ids a un fichero crudo mientras se cuentan**, que es
-lo que hace. Cuando el bucle acaba, `n_tokens` es exacto, se crea el memmap y se copia.
-
-El `max_len=1 << 30` —mil millones— es la segunda decisión: **el pack guarda las partidas enteras**.
-El corte a 200 tokens lo hace el loader, no el empaquetador. Así, cambiar la ventana de contexto en
-M2 no obliga a volver a tokenizar seis millones de partidas, y el mismo pack sirve para probar 200,
-512 y 1 024.
-
-`starts` se acumula en una lista de Python y se escribe al final con `np.save`. Es el único objeto que
-crece en memoria: un entero de 64 bits por partida, 24 MB para tres millones. Sus desplazamientos son
-absolutos sobre el flujo entero, así que no se pueden saber hasta que el flujo está completo.
+El `max_len=1 << 30` hace que el pack guarde las partidas enteras: el corte a 200 lo hace el loader.
+Así, cambiar la ventana de contexto en M2 no obliga a volver a tokenizar. Lo único que crece en
+memoria es `starts`, un entero por partida (24 MB para tres millones).
 
 <Callout kind="teoria" title="Por qué `del tokens` antes del `unlink`">
-  `tokens.flush()` vuelca las páginas sucias al disco y `del tokens` suelta la referencia al memmap,
-  que es lo que hace que el fichero se cierre. En Windows, un fichero mapeado no se puede borrar ni
-  renombrar mientras alguien lo tenga abierto, y `raw_path.unlink()` está justo después. Es una de
-  esas líneas que en Linux sobran y que sin ella el paso falla en la máquina de referencia con un
-  `PermissionError` que no menciona los memmaps.
+  `del tokens` suelta la referencia al memmap y cierra el fichero. En Windows, un fichero mapeado no
+  se puede borrar mientras esté abierto, y sin esa línea el `unlink` de después falla con un
+  `PermissionError` que no menciona los memmaps. En Linux sobraría.
 </Callout>
 
 ```python title="src/rukh/tokenize/pack.py"
@@ -365,10 +325,8 @@ def _copy_raw(raw_path: Path, tokens: np.ndarray, n_tokens: int) -> None:
 
 <Src file="src/rukh/tokenize/pack.py" tag="p1" lines="213-222" />
 
-La copia va en trozos de 64 MiB con `np.fromfile(raw, count=...)`, que lee **desde la posición actual
-del fichero**: el bucle avanza solo. El `if not len(chunk)` es la guarda contra un fichero crudo más
-corto de lo que dice el contador, que solo puede pasar si algo se escribió mal; y lanza un `OSError`
-con las dos cifras en el mensaje, que es lo que hace falta para diagnosticarlo.
+La copia va en trozos de 64 MiB, y si el fichero crudo es más corto de lo que dice el contador,
+lanza un error con las dos cifras en el mensaje.
 
 ```python title="src/rukh/tokenize/pack.py"
 def read_pack_info(directory: Path) -> PackInfo:
@@ -394,9 +352,8 @@ def pack_scheme(cfg: TokenizeConfig, scheme: str, bpe: Tokenizer | None = None) 
 
 <Src file="src/rukh/tokenize/pack.py" tag="p1" lines="225-243" />
 
-`pack_scheme` empaqueta los dos meses en `data/tokens/<esquema>/train/` y `.../val/`. Enero entrena,
-febrero valida; es la partición temporal de la primera lección del módulo, aquí convertida en dos
-directorios.
+`pack_scheme` convierte la partición temporal de la primera lección en dos directorios: enero en
+`train/` y febrero en `val/`.
 
 ## `loader.py`: el contrato con el decoder
 
@@ -418,9 +375,8 @@ IGNORE_INDEX = 0  # ``<pad>`` in every scheme; the loss must use ``ignore_index=
 
 <Src file="src/rukh/tokenize/loader.py" tag="p1" lines="1-13" />
 
-`IGNORE_INDEX = 0` con su comentario. Vale porque `<pad>` es el id 0 **en los tres esquemas**, y eso
-lo garantiza la comprobación del `BpeGameEncoder`. La pérdida del decoder de
-M2 se construye con `ignore_index=0` y esta constante es de dónde sale el número.
+`IGNORE_INDEX = 0` vale en los tres esquemas gracias a la comprobación del `BpeGameEncoder`, y es
+de donde sale el `ignore_index` de la pérdida de M2.
 
 ```python title="src/rukh/tokenize/loader.py"
 class PackedDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -469,31 +425,20 @@ class PackedDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
 <Src file="src/rukh/tokenize/loader.py" tag="p1" lines="16-57" />
 
-`PackedDataset` es el contrato entre los datos y el modelo, y cada decisión tiene su motivo.
+`PackedDataset` es el contrato entre los datos y el modelo. Con `mmap_mode="r"`, `np.load` no lee
+el fichero: lo mapea, y el sistema operativo trae las páginas cuando se tocan. Los 480 MB no ocupan
+memoria del proceso y varios workers comparten las mismas páginas, el libro de consulta de la
+biblioteca de la primera lección.
 
-`mmap_mode="r"` en `tokens.npy`: `np.load` **no lee el fichero**. Lo mapea en el espacio de
-direcciones del proceso y el sistema operativo trae las páginas cuando se tocan. Un fichero de 480 MB
-(o de 2,5 GB, el del esquema SAN) no ocupa memoria del proceso, y varios lectores comparten las
-mismas páginas físicas: el libro de consulta de la biblioteca de la primera lección. `starts.npy`, en
-cambio, se carga entero con un `np.load` normal; es un `int64` por partida, 24 MB con tres millones.
+`__len__` cuenta partidas, así que barajar es barajar partidas. Con `start_at_game=False` el mismo
+dataset corta bloques sin alinear, la variante de nanoGPT, para poder medirla en M2 en vez de
+discutirla.
 
-`__len__` devuelve el número de **partidas**, no de tokens: un ejemplo por partida y época. Barajar es
-barajar índices de partida. Con `start_at_game=False` el mismo dataset corta el flujo en bloques
-consecutivos sin alinear (la alternativa descartada, la de nanoGPT), y está ahí para poder medirla
-en M2 en vez de argumentar sobre ella.
-
-`window` pide `block + 1` tokens porque el objetivo es la entrada desplazada: `y[t]` es el token que
-viene después de `x[t]`. De ahí sale `y[:-1] == x[1:]`, que es una de las aserciones del test. El
-relleno con `<pad>` solo ocurre **en la última partida del flujo**, cuando no quedan 201 tokens por
-delante; en todo lo demás la ventana está llena de jugadas reales.
-
-`y[-1] = self.pad_id` pone la última posición a relleno a propósito: su objetivo de verdad estaría
-fuera de la ventana, y es más honesto no entrenarla que inventarla.
-
-El `dtype=np.int64` de la ventana y el `.copy()` de `__getitem__` son dos detalles con causa. Se
-guarda en `uint16` para que el fichero sea pequeño y se convierte a `int64` al salir porque es lo que
-`nn.Embedding` y la entropía cruzada esperan como índices. Y el `.copy()` es obligatorio: un trozo de
-memmap es de solo lectura, y `torch.from_numpy` quiere memoria escribible.
+`window` pide `block + 1` tokens porque `y[t]` es el token que viene después de `x[t]`. Solo la
+última partida del flujo necesita relleno. `y[-1]` va a `<pad>` porque su objetivo real está fuera
+de la ventana, y es más honesto no entrenarlo que inventarlo. El paso a `int64` es lo que esperan
+`nn.Embedding` y la entropía cruzada, y el `.copy()` es obligatorio porque un trozo de memmap es de
+solo lectura.
 
 ```python title="src/rukh/tokenize/loader.py"
 def make_loader(
@@ -520,18 +465,11 @@ def make_loader(
 
 <Src file="src/rukh/tokenize/loader.py" tag="p1" lines="60-79" />
 
-`drop_last=True` descarta el último lote incompleto, y lo que gana no son las pocas ventanas que
-tira: gana que **todos los lotes tengan la misma forma**. Un lote corto cambia el tamaño efectivo de
-ese paso y, con `torch.compile`, dispara una recompilación para una forma que aparece una vez por
-época.
-
-El `torch.Generator` sembrado con `seed` es lo **único** que decide el orden. Dos loaders con la
-misma <Term id="semilla">semilla</Term> devuelven los mismos lotes en el mismo orden, y esa
-reproducibilidad está comprobada por un test.
-
-`persistent_workers=workers > 0` evita que los procesos de trabajo se creen y se destruyan en cada
-época. Con `spawn`, arrancar cuatro intérpretes cuesta segundos, y multiplicado por las épocas de un
-entrenamiento es tiempo de GPU parada.
+`drop_last=True` hace que todos los lotes tengan la misma forma: con `torch.compile`, un lote corto
+dispararía una recompilación una vez por época. El `torch.Generator` sembrado es lo único que decide
+el orden, así que la misma <Term id="semilla">semilla</Term> da los mismos lotes. Y
+`persistent_workers` evita arrancar intérpretes nuevos en cada época, que con `spawn` cuesta
+segundos de GPU parada.
 
 ## `run.py`: lo que hace `rukh data tokenize`
 
@@ -602,14 +540,10 @@ def export_artifacts(cfg: TokenizeConfig, bpe: Tokenizer | None) -> list[Path]:
 
 <Src file="src/rukh/tokenize/run.py" tag="p1" lines="34-59" />
 
-`_ensure_bpe` tiene la política del BPE en dos líneas: si se pide el esquema `bpe` se **reentrena**;
-si solo hace falta uno (para las estadísticas o para añadir `bpe_ids` a la fixture) se carga el que
-haya, y se entrena solo si no existe. De ahí sale el orden en que se lanzan los comandos, que no es
-arbitrario: primero `--scheme bpe`, para que `bpe.json` exista, y al final el `uci` con
-`--export-fixture`, para que la fixture pueda incluir los ids BPE.
-
-`export_artifacts` escribe los dos ficheros que salen del repositorio: `vocab.json` y
-`fixtures/games.json`. Son los que `rukh-lab` y `rukh-web` copian.
+`_ensure_bpe`: con `--scheme bpe` se reentrena; si solo hace falta uno (estadísticas, `bpe_ids` de la
+fixture) se carga el que haya. De ahí el orden de los comandos: primero `--scheme bpe` y al final el
+`uci` con `--export-fixture`. `export_artifacts` escribe los dos ficheros que copian `rukh-lab` y
+`rukh-web`.
 
 ```python title="src/rukh/tokenize/run.py"
 def _summary(lengths: list[int], max_len: int) -> dict[str, float]:
@@ -662,38 +596,30 @@ def compute_stats(cfg: TokenizeConfig, games: Path, bpe: Tokenizer) -> dict[str,
 
 <Src file="src/rukh/tokenize/run.py" tag="p1" lines="62-107" />
 
-Aquí está la tabla de estadísticas del módulo, y el docstring explica lo único que podría falsearla:
-**cada esquema cuenta los tokens que su codificador emite de verdad**, incluidos los de encuadre, que
-son cinco en UCI, tres en BPE y dos en SAN. El `+ 3` de la línea del BPE es eso, escrito.
-
-Si cada esquema contara solo las jugadas, la comparación seguiría saliendo parecida; contando el
-encuadre, la comparación es la que el entrenamiento va a pagar. Es la diferencia entre medir el
-tokenizador y medir el coste.
-
-`_summary` devuelve media, mediana, p95 y el porcentaje que cabe en `max_len`. Las cuatro juntas
-dicen cosas distintas: la media es el coste de una época, el p95 es la ventana de contexto que
-necesitas para no truncar casi nada, y el porcentaje es la cobertura del bloque que usa el loader.
+Aquí sale la tabla de estadísticas del módulo. Cada esquema cuenta los tokens que su codificador
+emite de verdad, encuadre incluido (el `+ 3` del BPE), porque eso es lo que va a pagar el
+entrenamiento. La media es el coste de una época, el p95 la ventana que necesitas para no truncar
+casi nada y el porcentaje, lo que cubre el bloque del loader.
 
 Lo que salió medido sobre las primeras 20 000 partidas de enero:
 
 <TokenizerStats />
 
-**UCI fijo**: media 80,64 tokens por partida, p50 76, p95 139 y **99,8 %** por debajo de 200.
-**SAN por carácter**: media 422,44, p50 393, p95 754 y solo el **7,77 %** cabe en 200.
-**BPE de 4 096**: media 68,05, p50 62, p95 129 y **99,84 %** por debajo de 200.
+- UCI fijo: media 80,64 tokens por partida, p50 76, p95 139 y el 99,8 % por debajo de 200.
+- SAN por carácter: media 422,44, p50 393, p95 754 y solo el 7,77 % cabe en 200.
+- BPE de 4 096: media 68,05, p50 62, p95 129 y el 99,84 % por debajo de 200.
 
-Ese 5,2× entre UCI y SAN es el mismo factor que aparece sobre el corpus entero (240 068 954 tokens
-contra 1 258 749 609 para las mismas 2 949 514 partidas de enero), y no se paga en disco sino en
-tiempo de GPU: con el presupuesto fijo de M2 —20 000 pasos × 51 200 tokens— el esquema UCI hace algo
-más de cuatro épocas sobre enero y el SAN no llega a completar una. Y como el coste de la atención
-crece con el cuadrado de la longitud, igualar las épocas no costaría 5,2 veces más sino unas 27.
+El 5,2× entre UCI y SAN se repite sobre el corpus entero (240 068 954 tokens contra 1 258 749 609
+para las mismas 2 949 514 partidas de enero), y se paga en tiempo de GPU: con el presupuesto fijo de
+M2, 20 000 pasos × 51 200 tokens, UCI hace algo más de cuatro épocas sobre enero y SAN no completa
+una. Como la atención crece con el cuadrado de la longitud, igualar las épocas costaría unas 27 veces
+más, no 5,2.
 
 <Callout kind="teoria" title="Lo que la tabla no puede decir">
-  Ninguna estadística del tokenizador dice cuál tokenización **juega** mejor. Solo dice cuánto
-  cuesta cada una y qué tiene que aprender el modelo por su cuenta. La respuesta a "cuál es mejor"
-  la da la tabla única en M2, entrenando el mismo decoder sobre las tres con el mismo presupuesto.
-  Lo que sí sabes ya es que, si dos tokenizaciones jugaran igual, la de secuencias más cortas es la
-  que querrías: entrena más rápido y cabe en el navegador con menos memoria.
+  Ninguna estadística del tokenizador dice cuál juega mejor; solo cuánto cuesta cada una. Eso lo
+  decide la tabla única en M2, entrenando el mismo decoder sobre las tres con el mismo presupuesto.
+  Lo que sí sabes ya es que, a igualdad de juego, querrías las secuencias más cortas: entrenan más
+  rápido y caben en el navegador con menos memoria.
 </Callout>
 
 ```python title="src/rukh/tokenize/run.py"
@@ -707,8 +633,8 @@ def write_stats(cfg: TokenizeConfig, games: Path, bpe: Tokenizer) -> Path:
 
 <Src file="src/rukh/tokenize/run.py" tag="p1" lines="110-115" />
 
-Otra vez `newline="\n"` y un `indent` fijo: este JSON lo copia `pnpm sync:data` al sitio del curso, y
-un fichero que cambia de saltos de línea según el sistema produce un diff en cada máquina.
+Otra vez `newline="\n"`: este JSON lo copia `pnpm sync:data` al sitio del curso, y con saltos de
+línea distintos por sistema habría un diff en cada máquina.
 
 ```python title="src/rukh/tokenize/run.py"
 def run(
@@ -762,14 +688,9 @@ def run(
 
 <Src file="src/rukh/tokenize/run.py" tag="p1" lines="118-164" />
 
-El `run` es un árbol de decisiones sobre cuatro banderas, y conviene leerlo como una tabla. La
-primera mitad decide si hace falta un BPE y de dónde sale; la segunda ejecuta lo pedido en el orden
-correcto —estadísticas, empaquetado, fixture— y va acumulando rutas en `written`. El `vocab_size` que
-devuelve depende del esquema, porque es lo que la CLI imprime.
-
-Fíjate en el `elif (export_fixture or pack) and _bpe_path(cfg).is_file()`: si se pide la fixture o un
-pack de otro esquema **y hay un BPE por ahí**, se carga. Es lo que hace que la fixture lleve
-`bpe_ids` sin tener que pedirlo, y lo que hace que el orden de los tres comandos importe.
+La primera mitad de `run` decide si hace falta un BPE y de dónde sale; la segunda ejecuta lo pedido
+en orden (estadísticas, empaquetado, fixture). El `elif` carga el BPE si existe aunque no se pida, y
+por eso la fixture lleva `bpe_ids` y el orden de los comandos importa.
 
 ```python title="src/rukh/cli.py"
 @data_app.command("tokenize")
@@ -821,9 +742,8 @@ def data_tokenize(
 
 <Src file="src/rukh/cli.py" tag="p1" lines="141-185" />
 
-La orden es la más cargada de la CLI —cinco opciones— y es la única del grupo `data` que no imprime
-un manifiesto. Su comprobación del esquema se hace **antes** de cargar la configuración y sale con
-código 2, el de "mal uso" de typer, en vez de dejar que el `ValueError` de `run` produzca una traza.
+Es la única orden del grupo `data` que no imprime un manifiesto, y comprueba el esquema antes de
+cargar la configuración para salir con el código 2 de typer en vez de una traza.
 
 ## `fixture.py`: veinte partidas que el navegador tendrá que reproducir
 
@@ -892,15 +812,10 @@ def read_pgn_games(path: Path) -> list[dict[str, object]]:
 
 <Src file="src/rukh/tokenize/fixture.py" tag="p1" lines="20-57" />
 
-`read_pgn_games` **lanza** en dos sitios: si `python-chess` registró un error al parsear (`game.errors`)
-y si alguna jugada no es legal. Es lo contrario del `return None` de `san_to_uci`, y la asimetría
-tiene sentido: allí se procesaban seis millones de partidas de origen desconocido y una mala no podía
-tumbar el lote; aquí son veinte partidas versionadas en el repositorio, y una mala significa que la
-fixture está corrupta. Una fixture de paridad corrupta es peor que no tener fixture, porque las dos
-implementaciones coincidirían en reproducir la corrupción.
-
-El `id` sale de la cabecera `Site` con un respaldo `game-N`. Es la clave con la que el test de
-TypeScript empareja sus resultados con los de Python.
+`read_pgn_games` lanza ante un error o una jugada ilegal, al revés que `san_to_uci`. Allí una partida
+mala entre seis millones no podía tumbar el lote; aquí son veinte partidas versionadas, y una mala
+significa una fixture corrupta, que es peor que ninguna: las dos implementaciones coincidirían en
+reproducir la corrupción. El `id` es la clave con la que TypeScript empareja sus resultados.
 
 ```python title="src/rukh/tokenize/fixture.py"
 def build_fixture(
@@ -937,13 +852,9 @@ def write_fixture(entries: list[dict[str, object]], path: Path) -> None:
 
 <Src file="src/rukh/tokenize/fixture.py" tag="p1" lines="60-89" />
 
-`build_fixture` codifica cada partida con los tres esquemas, y los dos últimos son **opcionales**:
-`san_ids` solo si se le pasa el tokenizador de caracteres, `bpe_ids` solo si hay BPE. Así la fixture
-se puede generar en una máquina sin `tokenizers` instalado, con menos campos, y el consumidor
-comprueba los que haya.
-
-`write_fixture` repite las tres garantías de determinismo de `UciTokenizer.export`: `indent=0`,
-`ensure_ascii=True` y `newline="\n"`. Ese fichero se compara byte a byte entre tres repositorios.
+`san_ids` y `bpe_ids` son opcionales, para poder generar la fixture sin `tokenizers` instalado.
+`write_fixture` repite el determinismo de `UciTokenizer.export`, porque el fichero se compara byte a
+byte entre tres repositorios.
 
 <Callout kind="ejecuta" title="La enumeración y el BPE, fijados por sus tests">
   Con `fixture.py` escrito ya se pueden pasar los dos ficheros de test de la lección anterior. Los
@@ -997,9 +908,8 @@ def pack_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 <Src file="tests/unit/test_loader.py" tag="p1" lines="1-23" />
 
-La fixture del módulo empaqueta las veinte partidas del `games.parquet` de test una sola vez para los
-cinco casos. Y empaqueta de verdad, con `pack_month` y `UciGameEncoder`: los tests del loader corren
-sobre un pack real, no sobre arrays fabricados, así que prueban las dos piezas juntas.
+La fixture empaqueta de verdad, con `pack_month`, así que los tests del loader prueban las dos
+piezas juntas sobre un pack real.
 
 ```python title="tests/unit/test_loader.py"
 def test_items_are_bos_aligned_windows(pack_dir: Path) -> None:
@@ -1037,20 +947,10 @@ def test_contiguous_blocks(pack_dir: Path) -> None:
 
 <Src file="tests/unit/test_loader.py" tag="p1" lines="26-56" />
 
-`test_items_are_bos_aligned_windows` recorre las veinte partidas y comprueba, en cada una, las cinco
-promesas del contrato: la forma, el tipo, que **empieza en `<bos>`**, que `y[:-1] == x[1:]` y que la
-última posición de `y` es relleno. Esas cinco aserciones son lo que el bucle de entrenamiento de M2
-da por hecho.
-
-`test_last_window_is_padded` es el caso del final del flujo, y está montado con cuidado: usa un bloque
-de 400 —más grande que lo que queda— calcula cuántos tokens hay de verdad desde el último `<bos>`
-(`tail`), y comprueba que la posición `tail - 1` es el `<eos>` de la última partida y que **todo lo
-que viene después es relleno**. Es la única forma de probar el `np.concatenate` sin escribir el
-número a mano.
-
-`test_contiguous_blocks` prueba la otra rama, la de los bloques sin alinear, comparando el segundo
-bloque con `tokens[64:128]` leído directamente del fichero. Y comprueba que pedir un índice de más
-lanza `IndexError` en vez de devolver basura.
+El primer test comprueba en cada partida las cinco promesas que el entrenamiento de M2 da por hechas:
+forma, tipo, `<bos>` al principio, `y[:-1] == x[1:]` y relleno al final. `test_last_window_is_padded`
+usa un bloque mayor que lo que queda, calcula cuántos tokens reales hay desde el último `<bos>` y
+comprueba que después del `<eos>` todo es relleno, sin escribir el número a mano.
 
 ```python title="tests/unit/test_loader.py"
 def test_same_seed_same_batches(pack_dir: Path) -> None:
@@ -1078,13 +978,10 @@ def test_thousand_samples_in_range(pack_dir: Path) -> None:
 
 <Src file="tests/unit/test_loader.py" tag="p1" lines="59-79" />
 
-`test_same_seed_same_batches` es la afirmación de reproducibilidad, y está escrita con las dos
-mitades: misma semilla, mismos lotes; semilla distinta, **algún** lote distinto. La segunda mitad es
-la que detectaría un `make_loader` que ignorase el generador.
-
-Y `test_thousand_samples_in_range` es un test de propiedad: mil ventanas al azar, y todas con ids
-dentro de `[0, 2030)`. No prueba ningún caso concreto; prueba que no hay ninguno malo. Es el test que
-atraparía un desbordamiento del `uint16` o un desplazamiento de índice en el `window`.
+La reproducibilidad va otra vez con sus dos mitades, porque la segunda (semilla distinta, algún lote
+distinto) es la que detectaría un generador ignorado. `test_thousand_samples_in_range` es un test de
+propiedad: no prueba un caso concreto, sino que ninguna de mil ventanas al azar se sale del
+vocabulario.
 
 <Callout kind="ejecuta" title="Los tokens, empaquetados">
   La orden `rukh data tokenize` ya funciona entera. Lanza los tres comandos en su orden (las
@@ -1118,10 +1015,9 @@ enero.
   `<pad>` y compárala con la de `PackedDataset`. ¿Cuántos tokens "útiles" por lote sirve cada uno?
 
 <Solution>
-  Con la media medida arriba (80,64 tokens por partida, encuadre incluido; la mediana es 76), una
-  partida por fila deja unos 119 `<pad>` por ejemplo: **el 60 % del lote es relleno** (la figura 03
-  de la primera lección del módulo lo dibuja). `ignore_index`
-  lo descarta de la pérdida, pero la atención ya lo ha calculado.
+  Con la media medida arriba (80,64 tokens por partida), una partida por fila deja unos 119 `<pad>`
+  por ejemplo: **el 60 % del lote es relleno** (lo dibuja la figura 03 de la primera lección).
+  `ignore_index` lo descarta de la pérdida, pero la atención ya lo ha calculado.
 
 `PackedDataset` mide 0,005 —medio por ciento— en un lote de 64 × 200 sobre el pack de enero, porque
 el relleno solo aparece en la última ventana del flujo. Son unas 2,5 veces más posiciones
@@ -1134,12 +1030,11 @@ Para medirlo tú: `(yb == 0).float().mean().item()` sobre el primer lote de cada
 
 ## Qué has aprendido
 
-Cómo se escriben seis millones de partidas en un fichero que cabe en 480 MB sin que nada pase por
-memoria, y cómo se sirven desde él lotes `(x, y)` que la GPU puede consumir sin gastar la mitad del
-cálculo en relleno. Y el detalle que hace que todo esto sea comprobable: un hash del vocabulario en
-el `meta.json`, para que un pack viejo no se mezcle nunca con un tokenizador nuevo.
+Has escrito seis millones de partidas en un fichero de 480 MB sin tenerlas en memoria, y sirves
+desde él lotes `(x, y)` que no gastan la mitad del cálculo en relleno. El hash del vocabulario en
+`meta.json` impide que un pack viejo se mezcle con un tokenizador nuevo.
 
-**Cómo se mide**: los tres comandos, **en este orden**, dejan los tres packs y los artefactos:
+**Cómo se mide**: los tres comandos, en este orden, dejan los tres packs y los artefactos:
 
 ```bash title="Terminal"
 uv run rukh data tokenize --scheme bpe --pack
@@ -1151,5 +1046,5 @@ El último imprime `vocab_size: 2030` y la lista de lo escrito. El pack de enero
 tiene 2 949 514 partidas y 240 068 954 tokens; el de febrero, 2 946 874 y 238 657 571.
 `uv run pytest -m unit -q tests/unit/test_pack.py tests/unit/test_loader.py` pasa en verde.
 
-Lo siguiente es sacar todo esto del disco duro: las cards, los manifiestos y las órdenes que suben
-seis datasets y un tokenizador a Hugging Face.
+Lo siguiente es sacar todo esto del disco: las cards y la orden que sube seis datasets y un
+tokenizador a Hugging Face.
