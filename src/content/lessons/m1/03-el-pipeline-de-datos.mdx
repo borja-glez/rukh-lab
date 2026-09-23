@@ -9,7 +9,7 @@ order: 3
 duration: 150
 level: base
 status: vigente
-updated: 2026-09-22
+updated: 2026-09-23
 keywords:
   - pipeline
   - pydantic
@@ -29,7 +29,9 @@ Nueve pasos de datos, cada uno con su configuración, sus rutas, sus contadores 
 cada uno llevara su propio fichero YAML y su propia opción `--config`, tendrías nueve ficheros que
 repiten `data/uci` y nueve sitios donde cambiar el límite de memoria de <Term id="duckdb">DuckDB</Term>.
 Esta lección es el pegamento: **un solo `pipeline.yaml`**, un modelo pydantic que lo valida entero, y
-ocho órdenes de la CLI que se parecen tanto entre sí que conviene ver por qué.
+ocho órdenes de la CLI que se parecen tanto entre sí que conviene ver por qué. Es el mismo problema
+que tiene cualquier sistema con muchas piezas configurables, de un ETL a un agente con diez
+herramientas: una sola fuente de configuración, validada al cargar.
 
 Y con el pegamento vienen dos pasos completos, los dos que solo dependen de lo que ya sabes: `elite`,
 que descarga la base Elite de Lichess en zip y la convierte con el mismo `convert_rows` de la lección
@@ -62,13 +64,13 @@ from rukh.data.uci import UciConfig
 
 <Src file="src/rukh/data/pipeline.py" tag="p1" lines="1-19" />
 
-Diez importaciones de configuración, una por paso. Es el único fichero del paquete que conoce a
-todos, y eso es deliberado: los pasos no se conocen entre sí. `uci.py` no sabe que existe
+Nueve importaciones de configuración, una por paso más la de DuckDB. Es el único fichero del
+paquete que conoce a todos, y eso es deliberado: los pasos no se conocen entre sí. `uci.py` no sabe que existe
 `elo_bins.py`; solo `pipeline.py` sabe que los dos están en el mismo YAML. Si mañana un paso
 desaparece, se borra una línea aquí y una sección del YAML.
 
-<Callout kind="hoy" title="Escríbelo entero, pero comenta lo que todavía no existe">
-  De esas diez configuraciones, hoy existen las de `db`, `uci`, `elite` y `elo_bins` (las dos
+<Callout kind="guia" title="Escríbelo entero, pero comenta lo que todavía no existe">
+  De esas nueve configuraciones, hoy existen las de `db`, `uci`, `elite` y `elo_bins` (las dos
   últimas las escribes más abajo, en esta misma lección). Las de `positions`, `evals`, `puzzles`,
   `pairs` y `publish` llegan después, y mientras falten, todo lo que carga `pipeline.py` —las
   órdenes de `rukh data`, `test_db.py`— se cae con un `ModuleNotFoundError`. Para que la CLI
@@ -183,7 +185,7 @@ que alguien lo puso a propósito y se respeta.
   y lo sobrescribe con el global. La alternativa —preguntarle a pydantic qué campos venían de verdad
   en el documento, con `model_fields_set`— existe, y se descartó porque el caso que arregla no
   existe: nadie escribe explícitamente el valor por defecto para que sea distinto del global. Cuando
-  una comprobación es más complicada que el fallo que evita, la comprobación es el fallo.
+  una comprobación es más complicada que el fallo que evita, sobra.
 </Callout>
 
 `setattr(self, name, step.model_copy(update=...))` y no `step.duckdb = self.duckdb` porque los
@@ -325,9 +327,10 @@ limit: 3000000
 
 <Src file="configs/data/lichess-2025-01-02.yaml" tag="p1" lines="1-10" />
 
-`limit: 3000000` donde M0 tenía `limit: null`. Es la decisión D-017 del registro de ejecución, y sale
-de una cuenta: los filtros de M0 dejan pasar el 18 % de las partidas, un mes de Lichess son unos cien
-millones, así que sin tope quedarían unos dieciocho millones por mes. Con el tope, y como los
+`limit: 3000000` donde M0 tenía `limit: null`. Sale de una cuenta: los filtros de M0 dejan pasar el
+18 % de las partidas (medido sobre un fichero del 1 de enero: 251 618 de 1 394 617), un mes de
+Lichess son unos cien millones, así que sin tope quedarían unos dieciocho millones por mes, muy por
+encima de los tres a seis millones en total que pedía el diseño. Con el tope, y como los
 ficheros del mes están en orden cronológico, se cogen los primeros doce ficheros —unos cinco días de
 enero y otros cinco de febrero— y salen seis millones en total. El manifiesto lo registra como
 recorte temporal, que es lo honesto: no es una muestra aleatoria del mes, son los primeros días.
@@ -397,7 +400,7 @@ es la opción que se usa para depurar (`--workers 1` hace la conversión en seri
 principal, donde un `breakpoint()` funciona).
 
 Fíjate en los dos `import` dentro de la función, la regla de M0: `cli.py` solo importa `typer` al
-nivel del módulo. Aquí importa de verdad, porque `rukh.data.pipeline` arrastra los diez módulos de
+nivel del módulo. Aquí importa de verdad, porque `rukh.data.pipeline` arrastra los nueve módulos de
 configuración y con ellos pyarrow, polars y duckdb. Con las importaciones arriba, `rukh --help`
 tardaría segundos.
 
@@ -903,20 +906,24 @@ BY hash(game_id) + {seed})`. Ordenar por un hash del id es un muestreo determini
 de verdad, pero es impredecible respecto a cualquier propiedad de la partida y **da lo mismo cada
 vez que se ejecuta**. El de fuera se queda con las primeras `n_per_bin` de cada tramo.
 
-<Callout kind="roto" title="`hash(game_id + seed)` desbordaba, `hash(game_id) + seed` no">
-  El docstring lo dice en dos líneas y merece desarrollarlo, porque es un fallo que solo aparece con
-  datos reales. `game_id` es un entero con signo de 64 bits que ocupa todo el rango, y en el
-  `BIGINT` de DuckDB sumarle 42 a un id cercano a 2⁶³−1 **desborda**: la consulta muere con un error
-  de conversión a mitad de un fichero de tres millones de filas.
+<Callout kind="roto" title="Un id que ocupa todo su rango no admite aritmética">
+  El docstring lo dice en dos líneas y merece desarrollarlo. `game_id` sale de un hash, así que es
+  un entero con signo de 64 bits repartido por todo el rango. En el `BIGINT` de DuckDB, sumarle 42 a
+  un id cercano a 2⁶³−1 **desborda**, y la consulta entera muere con
+  `Overflow in addition of INT64`. Con ids repartidos al azar es rarísimo, y eso lo hace peligroso:
+  con `hash(game_id + seed)`, el test de más abajo, que usa ids en los cuatro extremos del `int64`,
+  falla siempre.
 
-Sumar la semilla **después** del hash no arregla el desbordamiento por magia: lo que cambia es que
-`hash()` de DuckDB devuelve un `UBIGINT` cuya aritmética envuelve en vez de abortar. El efecto de la
-semilla es el mismo —desplazar el orden— y el error desaparece.
+Sumar la semilla **después** del hash quita la dependencia de los ids, pero no el tipo de riesgo:
+`hash()` de DuckDB devuelve un `UBIGINT` que también ocupa todo su rango, y DuckDB lanza el mismo
+error de desbordamiento con un `UBIGINT` que con un `BIGINT`. La probabilidad queda en 42 entre 2⁶⁴
+por fila, que en la práctica es cero, y los ids extremos del test dejan de importar porque su hash
+cae en cualquier sitio. La forma que no desborda nunca es no sumar: `hash(game_id, 42)` mete la
+semilla dentro del hash, igual que `puzzles.py` la mete dentro de su `blake2b(seed:id)`.
 
-La lección transferible no es sobre DuckDB. Es que **un identificador que usa todo el rango de su
-tipo no admite aritmética**, y que los ids con forma de hash son exactamente eso. Si tienes que
-combinarlos con algo, hazlo dentro de una función que envuelva, o convierte a texto y concatena.
-Hay un test específico para este caso, más abajo, con ids en los cuatro extremos del `int64`.
+Lo que te llevas vale fuera de DuckDB: **un identificador que usa todo el rango de su tipo no admite
+aritmética**, y los ids con forma de hash lo son. Si tienes que combinarlo con algo, hazlo dentro de
+la función de hash o concatenando texto, nunca sumando.
 
 </Callout>
 
@@ -1030,7 +1037,7 @@ def test_run_is_deterministic(rukh_home: Path, repo_root: Path) -> None:
 Y aquí está el test del desbordamiento, con su docstring diciendo qué vigila. Fabrica una columna
 `game_id` con los cuatro valores extremos del `int64` repetidos, y lo único que comprueba es que la
 consulta **termina**: `sum(manifest.counts.values()) > 0`. Un test que solo comprueba que algo no
-revienta parece pobre, y es exactamente lo que hace falta aquí, porque el fallo era una excepción.
+revienta parece pobre, y es lo que hace falta aquí, porque el fallo era una excepción.
 
 El último comprueba el determinismo de la forma correcta: ejecutar dos veces con la misma semilla y
 exigir que los dos parquets sean iguales. No "parecidos", ni "del mismo tamaño": `first.equals(second)`.

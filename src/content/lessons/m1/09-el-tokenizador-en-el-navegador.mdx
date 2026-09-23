@@ -9,7 +9,7 @@ order: 9
 duration: 125
 level: medio
 status: vigente
-updated: 2026-09-22
+updated: 2026-09-23
 keywords:
   - TypeScript
   - paridad
@@ -34,10 +34,11 @@ Los mismos tres tokenizadores, otra vez, en TypeScript. Corren en el navegador d
 el modelo, no comparten una sola línea con los de Python, y tienen que producir **exactamente los
 mismos ids**.
 
-Es la parte del módulo que más incomoda al escribirla, porque duplicar código está mal en cualquier
-otra situación. Aquí no hay alternativa, y merece la pena entender por qué antes de mirar el código:
-es la misma situación en la que acaba cualquiera que sirva un modelo en un sitio distinto de donde lo
-entrenó.
+Es la parte del módulo que más incomoda al escribirla, porque duplicar código está mal en casi
+cualquier otra situación. Aquí no hay alternativa, y merece la pena entender por qué antes de mirar
+el código: es la misma situación en la que acaba cualquiera que sirva un modelo en un sitio distinto
+de donde lo entrenó, sea un LLM en un móvil, un clasificador en el navegador o un modelo exportado a
+otro runtime.
 
 Cuatro ficheros en `rukh-web`, más el test que los ata a la fixture de Python.
 
@@ -186,10 +187,11 @@ diferencia de forma y no de significado: las tres condiciones —misma columna, 
 diagonal, o salto de caballo— son las mismas.
 
 `eloBin` hace `Math.min(Math.max(elo, 600), 3299)` y después `Math.floor(x / 100) * 100`. En Python la
-misma línea usa `//`, la división entera. **Aquí no se puede usar `Math.trunc`**: para números
-positivos coinciden, pero `Math.floor` es lo que corresponde a `//` de Python, que redondea hacia
-abajo. Con Elos siempre positivos da igual, y escribirlo con `floor` es lo correcto de todas formas:
-es la clase de equivalencia que hay que resolver mirando, no probando.
+misma línea usa `//`, la división entera, que redondea hacia abajo también con negativos. Su
+equivalente exacto en JavaScript es `Math.floor`, no `Math.trunc`: con números positivos coinciden y
+con negativos no. Aquí el Elo ya viene recortado a 600 o más, así que las dos darían lo mismo, pero
+`floor` es la traducción fiel, y es la clase de equivalencia que hay que resolver mirando el código,
+porque ningún test con datos normales la distinguiría.
 
 El `padStart(4, '0')` reproduce el `{elo:04d}` de Python. Sin él, `<w600>` en vez de `<w0600>`, y los
 54 tokens de Elo dejarían de coincidir.
@@ -347,7 +349,7 @@ export class SanCharTokenizer {
 
 <Src file="src/lib/chess-lm/san-chars.ts" repo="rukh-web" tag="9be992c" lines="1-18" />
 
-El alfabeto es la misma cadena de 32 caracteres, copiada literalmente, **en el mismo orden**. No hay
+El alfabeto es la misma cadena de 32 caracteres, copiada carácter a carácter, **en el mismo orden**. No hay
 nada más que copiar: el orden de esa cadena es el vocabulario.
 
 El constructor acepta alfabeto y especiales como parámetros, otra vez para poder construirlo desde un
@@ -436,7 +438,7 @@ const SUPPORTED_PRE_TOKENIZERS = ['WhitespaceSplit'];
 
 El formato que escribe `Tokenizer.save()` de Hugging Face es un JSON con muchas opciones, y la
 mayoría cambian cómo se codifica. Un cargador que las ignore produce ids distintos **sin avisar**, que
-es exactamente el modo de fallo que este módulo entero intenta evitar.
+es el modo de fallo que este módulo entero intenta evitar.
 
 La decisión del fichero es no implementar las que no se usan y **rechazar** un fichero que las
 declare. Las interfaces de arriba son el subconjunto soportado, escrito como tipos.
@@ -659,7 +661,8 @@ cambiarlo a `<=` daría otra segmentación en los casos de empate.
 Con `e2e4e7e5`: si `e2e4` se aprendió en la fusión 900 y `e4e7` en la 300, aplicar de izquierda a
 derecha produciría `e2e4` primero y dejaría `e7e5` detrás; aplicar por rango produce `e4e7` primero y
 la segmentación entera cambia. **El orden es el modelo**, y por eso el bucle busca el mínimo global
-en cada vuelta en vez de recorrer una sola vez.
+en cada vuelta en vez de recorrer una sola vez. La figura 01 de la primera lección del módulo lo
+dibuja con las fusiones reales del BPE entrenado.
 
 El síntoma, si se hace mal, es que las veinte partidas de la fixture dan ids distintos en unas cuantas
 posiciones. Sin la fixture, el síntoma sería un modelo que juega peor en el navegador que en las
@@ -831,16 +834,17 @@ describe('parity with Python', () => {
 
 <Src file="tests/parity.test.ts" repo="rukh-web" tag="9be992c" lines="51-87" />
 
-Cuatro comprobaciones, y entre las cuatro cierran el contrato.
+Cinco comprobaciones, y entre las cinco cierran el contrato.
 
 La primera es la más fuerte: `expect(vocab.tokens).toEqual(buildVocab())`. Los 2 030 tokens del
 fichero que Python exportó, contra los 2 030 que la enumeración de TypeScript construye, **en orden**.
 Un solo token desplazado y el test dice cuál.
 
-Las tres siguientes recorren las veinte partidas y comparan los ids de cada esquema, con el índice de
-la partida en el mensaje del `expect` (`game ${i}`) para que el fallo diga cuál. La del BPE lleva un
-comentario recordando por qué se quitan los espacios: es la decisión de `bpe_text`, y sin ella una
-partida sería veinte "palabras" y no una.
+La segunda solo comprueba que la fixture tiene sus veinte partidas. Las tres últimas las recorren y
+comparan los ids de cada esquema, con el índice de la partida en el mensaje del `expect`
+(`game ${i}`) para que el fallo diga cuál. La del BPE lleva un comentario recordando por qué se
+quitan los espacios: es la decisión de `bpe_text`, y sin ella cada jugada sería una "palabra"
+distinta en vez de ser la partida entera una sola.
 
 Fíjate en lo que este test **no** hace: no entrena nada, no descarga nada y no compara con Python en
 tiempo real. Compara con un fichero que Python escribió y que está versionado en los dos repositorios.
@@ -866,16 +870,16 @@ mirar.
 
 <Callout kind="mundo-real" title="Tres copias del mismo fichero">
   Los artefactos del tokenizador viven en `rukh/artifacts/tokenizer/`, y `rukh-web` y `rukh-lab`
-  tienen cada uno su copia, sincronizada con su propio script. Tres copias del mismo JSON es
-  exactamente lo que no debería hacerse, y es lo que permite que la demo funcione sin red y que el
-  curso se construya sin clonar el repositorio de ML.
+  tienen cada uno su copia, sincronizada con su propio script. Tres copias del mismo JSON es lo que
+  en principio no debería hacerse, y es lo que permite que la demo funcione sin red y que el curso se
+  construya sin clonar el repositorio de ML.
 
 La defensa es doble: cada web tiene su propio test de paridad contra su copia, y además hay un test
 de hash que compara las copias entre sí. Los dos hacen falta: el hash detecta que dos copias
 divergieron, pero no que las dos divergieron a la vez del original; la paridad detecta eso.
 
-Cuando tengas que duplicar un artefacto, duplica también la comprobación. Una copia sin test es una
-bomba de relojería con la mecha del tamaño de tu memoria.
+Cuando tengas que duplicar un artefacto, duplica también la comprobación: una copia sin test solo
+sigue siendo igual mientras alguien se acuerde de sincronizarla.
 
 </Callout>
 
@@ -906,7 +910,7 @@ Cuatro PGN que conviene probar:
    que abarca en su título. Es el `mergeWord` de arriba, hecho visible.
 
 Y un PGN inválido (borra una jugada a la mitad, o escribe `Nf9`) muestra el error en vez de tokens:
-es exactamente lo que hace `san_to_uci` en Python al devolver `None`.
+es lo que hace `san_to_uci` en Python al devolver `None`.
 
 <Exercise n="01" title="Rompe la paridad de dos formas distintas">
   En una copia de `rukh-web`, quita el `padStart(4, '0')` de `eloBin` (deja `String(bin)`) y ejecuta
@@ -940,7 +944,7 @@ hay que montar para que esa duplicación no se convierta en una divergencia sile
 enumeración que no depende de datos, un artefacto exportado desde el lado autoritativo, y un test en
 cada copia que lo reproduce token a token.
 
-**Cómo se mide**: `pnpm test` en `rukh-web` pasa las cuatro comprobaciones de paridad sobre las veinte
+**Cómo se mide**: `pnpm test` en `rukh-web` pasa las cinco comprobaciones de paridad sobre las veinte
 partidas; `buildVocab().length === 2030` y `vocab.tokens` coincide uno a uno con la enumeración.
 
 Lo siguiente cierra el módulo: los tres labs, con las salidas reales de la ejecución de referencia y

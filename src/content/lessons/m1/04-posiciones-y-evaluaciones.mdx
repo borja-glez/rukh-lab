@@ -8,7 +8,7 @@ order: 4
 duration: 135
 level: medio
 status: vigente
-updated: 2026-09-22
+updated: 2026-09-23
 keywords:
   - FEN
   - Stockfish
@@ -84,8 +84,7 @@ POSITION_SCHEMA = pa.schema(
 
 <Src file="src/rukh/data/positions.py" tag="p1" lines="1-41" />
 
-El docstring de arriba define **`fen4`**, que es el concepto de toda la lección. Un <Term id="fen">FEN</Term> completo
-tiene seis campos: las piezas, el turno, los enroques, la casilla
+El docstring de arriba define **`fen4`**, que es el concepto de toda la lección. Un <Term id="fen">FEN</Term> completo tiene seis campos: las piezas, el turno, los enroques, la casilla
 al paso, el contador de la regla de las cincuenta jugadas y el número de jugada. Los dos últimos son
 **contadores**, no posición: la misma configuración de piezas alcanzada en la jugada 20 de una
 partida y en la 24 de otra tiene el mismo tablero y distinto FEN completo.
@@ -160,9 +159,11 @@ legal** (porque no hay peón enemigo al lado, o porque capturar dejaría al rey 
 
 El síntoma es que el `SEMI JOIN` del paso siguiente se las salta en silencio y la cobertura sale unos
 puntos más baja, sin ningún error, sin ninguna traza, sin nada que apunte a la causa. Es el modo de
-fallo más caro que hay en un pipeline de datos: **una clave que casi casa**. Cuando cruces por una
-clave construida, la comprobación barata es coger veinte filas del origen ajeno y verificar que tu
-clave coincide con la suya carácter a carácter; hay un test de esta lección que hace exactamente eso.
+fallo más caro que hay en un pipeline de datos: **una clave que casi casa**. Pasa igual al cruzar
+por un correo con mayúsculas distintas, por una URL con o sin barra final o por un nombre de producto
+con un espacio de más. Cuando cruces por una clave construida, la comprobación barata es coger veinte
+filas del origen ajeno y verificar que tu clave coincide con la suya carácter a carácter; hay un
+test de esta lección que hace eso.
 
 </Callout>
 
@@ -411,10 +412,10 @@ obligaría a flotantes en todo el dataset por un caso que se resuelve con un nú
 centipeones son cien peones; ninguna evaluación legítima llega ahí.
 
 `SCORE_WHITE_SQL` y `RANK_ORDER_SQL` son **cadenas de SQL que viven en el mismo fichero que las
-funciones de Python equivalentes**, y eso es lo único raro del módulo. La alternativa —el `CASE` en
-`evals.py` y el `sorted(key=...)` en `pairs.py`— es la que había y es la que se descartó: son dos
-implementaciones de la misma regla en dos lenguajes y en dos ficheros distintos, y nada
-que avise cuando una cambie. Juntas, al menos se leen a la vez.
+funciones de Python equivalentes**, y eso es lo único raro del módulo. La alternativa, el `CASE` en
+`evals.py` y el `sorted(key=...)` en `pairs.py`, deja dos implementaciones de la misma regla en dos
+lenguajes y en dos ficheros distintos, sin nada que avise cuando una cambie. Juntas, al menos se
+leen a la vez.
 
 ```python title="src/rukh/data/scoring.py"
 def mover_sign(turn: str) -> int:
@@ -464,7 +465,7 @@ paralelo:
 3. **La puntuación desde el que mueve**, de mayor a menor.
 4. **La cadena de la jugada**, como desempate.
 
-Ese cuarto término no es decoración, y es la clase de detalle que se descubre tarde. Sin un orden
+Ese cuarto término parece decoración y no lo es. Sin un orden
 **total**, dos líneas que empaten en las tres primeras claves quedan en el orden que el motor tenga a
 bien, y dos ejecuciones del mismo fichero pueden elegir "mejor línea" distinta. El dataset deja de ser
 reproducible y nadie se entera hasta que dos números no cuadran.
@@ -594,7 +595,7 @@ def fetch_part(cfg: EvalsConfig, index: int, positions: Path, out_dir: Path) -> 
 
 Esta consulta es la lección. Léela de dentro afuera.
 
-`SEMI JOIN` es el corazón. No es un `JOIN` normal: un semi join devuelve las filas de la izquierda
+`SEMI JOIN` es el corazón. A diferencia de un `JOIN` normal, un semi join devuelve las filas de la izquierda
 **que tienen alguna coincidencia a la derecha**, sin traer ninguna columna de la derecha y sin
 duplicar filas cuando hay varias coincidencias. Aquí eso significa "de este fichero remoto, dame las
 evaluaciones cuyo FEN tenemos".
@@ -603,7 +604,8 @@ Y lo que lo hace barato es lo que el motor hace con eso. Un parquet está partid
 y cada grupo lleva en su cabecera el mínimo y el máximo de cada columna. DuckDB lee primero **solo la
 columna `fen`** de cada grupo —proyección—, descarta los grupos que no pueden contener ninguna
 coincidencia —<Term id="predicate-pushdown">predicado empujado al origen</Term>— y solo entonces
-descarga las filas que quedan. De 42 GB viajan por la red unos pocos cientos de megas.
+descarga las filas que quedan. Por la red viajan la columna `fen` y las filas que casan, no los
+42 GB enteros.
 
 Las dos líneas de la resumibilidad son igual de importantes y más fáciles de pasar por alto:
 
@@ -621,8 +623,8 @@ Las dos líneas de la resumibilidad son igual de importantes y más fáciles de 
   el patrón es el contrario: formato columnar con estadísticas por bloque, un motor que empuja el
   predicado y la proyección al fichero, y materializar solo lo que sobrevive. Funciona igual contra
   un bucket de S3, un lago en Delta o los parquet de Hugging Face, y saber usarlo es una de las
-  habilidades más rentables de un ingeniero de datos o de ML. La regla corta: **si tu primer impulso
-  es descargar el dataset, pregúntate qué fracción vas a mirar.**
+  habilidades más rentables de un ingeniero de datos o de ML. Si tu primer impulso es descargar el
+  dataset, pregúntate antes qué fracción vas a mirar.
 </Callout>
 
 ```python title="src/rukh/data/evals.py"
@@ -707,8 +709,8 @@ línea (`JOIN ranked b ON … b.rk = 1`) y la despliega en columnas (`best_move`
 `list(struct_pack(...) ORDER BY rk)`: una lista de estructuras, en orden de mejor a peor.
 
 Esa columna `pvs` es el motivo de que exista la lección siguiente. Guardar las líneas peores no cuesta
-casi nada —ya están descargadas— y contiene un dataset entero de preferencias que si no habría que
-generar ejecutando Stockfish millones de veces.
+casi nada, porque ya están descargadas, y contiene un dataset entero de preferencias que de otro modo
+habría que generar ejecutando Stockfish millones de veces.
 
 Y fíjate en el `JOIN` con las posiciones locales: el fichero final no es solo la evaluación, lleva
 también `game_id`, `ply`, `last_move`, `result`, `phase` y `n_seen` de nuestro parquet. Es lo que
@@ -717,7 +719,7 @@ jugadas que llevó a cada par.
 
 Los tres conteos del final (`positions`, `evaluated`, `lines`) son los que producen la
 `coverage` del manifiesto: qué fracción de nuestras posiciones tiene evaluación. Es el número que hay
-que mirar después de la primera ejecución, y el que se hunde si el `fen4` no casa.
+que mirar después de la primera ejecución, y el que baja si el `fen4` no casa.
 
 ```python title="src/rukh/data/evals.py"
 def run(cfg: EvalsConfig, files: str | None = None) -> Manifest:
@@ -826,13 +828,13 @@ def test_walk_game_rows() -> None:
 
 <Src file="tests/unit/test_positions.py" tag="p1" lines="1-54" />
 
-El primer test es el del callout de arriba, escrito. Juega `e2e4 a7a6 e4e5 d7d5` —con lo que las
+El primer test es el de la caja de arriba, escrito. Juega `e2e4 a7a6 e4e5 d7d5` —con lo que las
 negras acaban de avanzar el peón de d dos casillas y **la captura al paso es legal**— y comprueba
 que el `fen4` termina en `d6`. Después juega la captura y comprueba que el campo vuelve a `-`. Y la
 línea `assert board.fen().split()[4:] == ["0", "3"]` no prueba nada del código: está para dejar
 escrito **qué** son los dos campos que se tiran.
 
-El segundo es la comprobación barata de la que hablaba el callout, hecha del revés: recorre una
+El segundo es la comprobación barata de la que hablaba la caja, hecha del revés: recorre una
 siciliana entera y exige que `fen4(board)` sea idéntico a los cuatro primeros campos del FEN que
 formatea python-chess, **posición a posición**. Si las dos construcciones discrepan en algún caso —el
 enroque, el al paso, una promoción—, el test lo dice con la posición exacta. El `endgame` del final
@@ -948,9 +950,9 @@ def test_score_mover_flips_for_black() -> None:
 Los dos primeros de `test_scoring` fijan la convención con todos sus casos: `cp` a secas, mate a favor
 y en contra, mate corto contra mate largo, el mate ganando a una ventaja enorme de material
 (`score_white(999, 2)`), y el `None` cuando no hay ni una cosa ni otra. El de `score_mover` comprueba
-la línea que más veces se escribe mal en todo el proyecto: `score_mover(None, -2, "b") == MATE_SCORE
-
-- 2`, es decir, **un mate en 2 para las negras, visto desde las negras, es una ventaja**.
+la línea que más veces se escribe mal en todo el proyecto,
+`score_mover(None, -2, "b") == MATE_SCORE - 2`: **un mate en 2 para las negras, visto desde las
+negras, es una ventaja**.
 
 ```python title="tests/unit/test_scoring.py"
 def test_line_rank_key_orders_mate_then_depth_then_cp() -> None:
@@ -982,7 +984,7 @@ def test_line_rank_key_rejects_an_unscored_line() -> None:
 
 <Src file="tests/unit/test_scoring.py" tag="p1" lines="31-55" />
 
-Y este es el test del orden, montado como toca: cinco líneas con nombre, ordenadas con la clave de
+Y este es el test del orden: cinco líneas con nombre, ordenadas con la clave de
 verdad, y aserciones sobre la **lista de nombres** resultante. Se lee como una frase: primero el mate
 más rápido, luego el mate más lento; después la profundidad manda sobre la puntuación, así que las
 dos líneas de profundidad 40 van antes que la de 12 aunque la de 12 prometa +900. Y el último bloque

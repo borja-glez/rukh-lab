@@ -9,7 +9,7 @@ order: 7
 duration: 150
 level: medio
 status: vigente
-updated: 2026-09-22
+updated: 2026-09-23
 keywords:
   - memmap
   - dataloader
@@ -25,7 +25,8 @@ artifacts:
 
 ## Qué vas a construir
 
-El puente entre los vocabularios de la lección anterior y la GPU de M2. Tres piezas:
+El puente entre los vocabularios de la lección anterior y la GPU de M2. En la analogía del
+aprendiz, es ordenar la biblioteca para que pueda leer deprisa. Tres piezas:
 
 Un **empaquetador** que codifica seis millones de partidas y las escribe seguidas en un único array
 de `uint16` de 480 MB, con un índice aparte que dice dónde empieza cada una. Ni las partidas ni el
@@ -38,7 +39,9 @@ contrato exacto que el decoder de M2 consume.
 Y un **orquestador**, el que está detrás de `rukh data tokenize`, con la fixture de paridad que el
 tokenizador del navegador tendrá que reproducir id a id.
 
-Son cuatro ficheros.
+Son cuatro ficheros, y lo que enseñan sirve para cualquier corpus que no cabe en memoria, sea de
+partidas, de texto o de fragmentos para un RAG: escribir en flujo, indexar aparte y leer con
+memmap.
 
 ## `pack.py`: tres codificadores con la misma forma
 
@@ -252,9 +255,9 @@ def make_encoder(scheme: str, bpe: Tokenizer | None = None) -> GameEncoder:
 
 <Src file="src/rukh/tokenize/pack.py" tag="p1" lines="131-157" />
 
-`PackInfo` es el contenido de `meta.json`, y el campo que importa es `vocab_hash`. No es
-documentación: es lo que permite que el bucle de entrenamiento de M2 **rechace** un pack cuyo
-vocabulario no es el del modelo. Sin él, entrenar con un `data/tokens/uci/` regenerado después de
+`PackInfo` es el contenido de `meta.json`, y el campo que importa es `vocab_hash`. Más que
+documentar, sirve para que el bucle de entrenamiento de M2 **rechace** un pack cuyo vocabulario no
+es el del modelo. Sin él, entrenar con un `data/tokens/uci/` regenerado después de
 tocar la enumeración funcionaría perfectamente, sobre ids que significan otra cosa, y la pérdida
 bajaría igual.
 
@@ -416,7 +419,7 @@ IGNORE_INDEX = 0  # ``<pad>`` in every scheme; the loss must use ``ignore_index=
 <Src file="src/rukh/tokenize/loader.py" tag="p1" lines="1-13" />
 
 `IGNORE_INDEX = 0` con su comentario. Vale porque `<pad>` es el id 0 **en los tres esquemas**, y eso
-no es casualidad: es lo que la comprobación del `BpeGameEncoder` garantiza. La pérdida del decoder de
+lo garantiza la comprobación del `BpeGameEncoder`. La pérdida del decoder de
 M2 se construye con `ignore_index=0` y esta constante es de dónde sale el número.
 
 ```python title="src/rukh/tokenize/loader.py"
@@ -470,14 +473,14 @@ class PackedDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
 `mmap_mode="r"` en `tokens.npy`: `np.load` **no lee el fichero**. Lo mapea en el espacio de
 direcciones del proceso y el sistema operativo trae las páginas cuando se tocan. Un fichero de 480 MB
-—o de 2,5 GB, el del esquema SAN— no ocupa memoria del proceso, y varios lectores comparten las
-mismas páginas físicas. Es el libro de consulta de la biblioteca: nadie se lo lleva fotocopiado
-entero, cada lector abre la página que necesita.
+(o de 2,5 GB, el del esquema SAN) no ocupa memoria del proceso, y varios lectores comparten las
+mismas páginas físicas: el libro de consulta de la biblioteca de la primera lección. `starts.npy`, en
+cambio, se carga entero con un `np.load` normal; es un `int64` por partida, 24 MB con tres millones.
 
 `__len__` devuelve el número de **partidas**, no de tokens: un ejemplo por partida y época. Barajar es
 barajar índices de partida. Con `start_at_game=False` el mismo dataset corta el flujo en bloques
-consecutivos sin alinear —la alternativa descartada en D-019, la de nanoGPT— y está ahí para poder
-medirla en M2 en vez de argumentar sobre ella.
+consecutivos sin alinear (la alternativa descartada, la de nanoGPT), y está ahí para poder medirla
+en M2 en vez de argumentar sobre ella.
 
 `window` pide `block + 1` tokens porque el objetivo es la entrada desplazada: `y[t]` es el token que
 viene después de `x[t]`. De ahí sale `y[:-1] == x[1:]`, que es una de las aserciones del test. El
@@ -491,28 +494,6 @@ El `dtype=np.int64` de la ventana y el `.copy()` de `__getitem__` son dos detall
 guarda en `uint16` para que el fichero sea pequeño y se convierte a `int64` al salir porque es lo que
 `nn.Embedding` y la entropía cruzada esperan como índices. Y el `.copy()` es obligatorio: un trozo de
 memmap es de solo lectura, y `torch.from_numpy` quiere memoria escribible.
-
-<Callout kind="roto" title="Lo que este dataset todavía no sabe hacer (y que M4 tuvo que arreglar)">
-  Fíjate en una asimetría: `tokens.npy` se carga con `mmap_mode="r"` y `starts.npy` **no**. El índice
-  de partidas es un array normal en memoria: un `int64` por partida.
-
-Con esta versión, funciona. Con 12,5 millones de partidas son 95 MB, y en Windows los workers del
-`DataLoader` arrancan con `spawn`, así que el objeto del dataset se serializa entero **una vez por
-worker**: 95 MB por worker, y pasa. Con 18,9 millones de partidas son 145 MB y la <Term id="tuberia">tubería</Term> se corta
-antes del primer paso con un `UnpicklingError: pickle data was truncated` que no menciona los datos
-por ningún lado.
-
-El arreglo llega en M4 y son tres métodos (`_open`, `__getstate__`, `__setstate__`): el estado que
-viaja al worker no lleva los arrays, y cada worker los vuelve a mapear desde los mismos ficheros. 145
-MB por worker pasan a medio kilobyte.
-
-Lo transferible no es el arreglo, es el modo de fallo: **lo que optimizaste no es lo que creció**.
-Memmapear el array grande dio el problema por resuelto mientras la estructura pequeña de al lado
-escalaba igual de linealmente. Pasa idéntico con un índice vectorial memmapeado y un diccionario de
-identificadores por worker, o con un agente cuyo esquema de herramientas es minúsculo y cuyo historial
-de resultados se reserializa en cada paso.
-
-</Callout>
 
 ```python title="src/rukh/tokenize/loader.py"
 def make_loader(
@@ -545,8 +526,8 @@ ese paso y, con `torch.compile`, dispara una recompilación para una forma que a
 época.
 
 El `torch.Generator` sembrado con `seed` es lo **único** que decide el orden. Dos loaders con la
-misma <Term id="semilla">semilla</Term> devuelven los mismos lotes en el mismo orden, y eso es una afirmación de
-reproducibilidad del proyecto, comprobada por un test y no una esperanza.
+misma <Term id="semilla">semilla</Term> devuelven los mismos lotes en el mismo orden, y esa
+reproducibilidad está comprobada por un test.
 
 `persistent_workers=workers > 0` evita que los procesos de trabajo se creen y se destruyan en cada
 época. Con `spawn`, arrancar cuatro intérpretes cuesta segundos, y multiplicado por las épocas de un
@@ -1058,8 +1039,8 @@ def test_contiguous_blocks(pack_dir: Path) -> None:
 
 `test_items_are_bos_aligned_windows` recorre las veinte partidas y comprueba, en cada una, las cinco
 promesas del contrato: la forma, el tipo, que **empieza en `<bos>`**, que `y[:-1] == x[1:]` y que la
-última posición de `y` es relleno. Esas cinco aserciones son literalmente lo que el bucle de
-entrenamiento de M2 da por hecho.
+última posición de `y` es relleno. Esas cinco aserciones son lo que el bucle de entrenamiento de M2
+da por hecho.
 
 `test_last_window_is_padded` es el caso del final del flujo, y está montado con cuidado: usa un bloque
 de 400 —más grande que lo que queda— calcula cuántos tokens hay de verdad desde el último `<bos>`
@@ -1138,7 +1119,8 @@ enero.
 
 <Solution>
   Con la media medida arriba (80,64 tokens por partida, encuadre incluido; la mediana es 76), una
-  partida por fila deja unos 119 `<pad>` por ejemplo: **el 60 % del lote es relleno**. `ignore_index`
+  partida por fila deja unos 119 `<pad>` por ejemplo: **el 60 % del lote es relleno** (la figura 03
+  de la primera lección del módulo lo dibuja). `ignore_index`
   lo descarta de la pérdida, pero la atención ya lo ha calculado.
 
 `PackedDataset` mide 0,005 —medio por ciento— en un lote de 64 × 200 sobre el pack de enero, porque
