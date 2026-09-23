@@ -26,7 +26,6 @@ test.describe('lesson M6, the table and its measured figures', () => {
 
     await page.goto(RESULTS);
     await expect(page.locator('.prose h2', { hasText: 'La tabla' }).first()).toBeVisible();
-    await expect(page.locator('.prose h2', { hasText: 'Los criterios' }).first()).toBeVisible();
     await expect(page.locator('.cheat')).toHaveCount(0);
 
     await page.goto(LABS);

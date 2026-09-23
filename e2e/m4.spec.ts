@@ -2,15 +2,17 @@ import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 /**
- * M4 is ten lessons, and its five animated figures are spread over three of them: the hole in the
- * Elo axis and the two LoRA figures with the theory, the shrinking interval with the results, the
- * adapter swap with the labs. The code lessons in between carry no figure, so this spec walks the
- * three that do plus the one the cheatsheet hangs off.
+ * M4 is ten lessons, and its five animated figures are spread over four of them: the two LoRA
+ * figures with the theory, the hole in the Elo axis where the corpus is rebuilt, the adapter swap
+ * where the adapter is exported, the shrinking interval with the results. Each figure sits in the
+ * lesson that makes its argument, so this spec walks those four plus the one the cheatsheet hangs
+ * off.
  */
 const PARTS = {
-  '/curso/m4/01-fine-tuning/': ['fig--axis', 'fig--lora', 'fig--spectrum'],
+  '/curso/m4/01-fine-tuning/': ['fig--lora', 'fig--spectrum'],
+  '/curso/m4/02-tokens-de-elo/': ['fig--axis'],
+  '/curso/m4/06-adaptadores-y-publicacion/': ['fig--swap'],
   '/curso/m4/09-lo-que-salio/': ['fig--shrink'],
-  '/curso/m4/10-labs-de-afinado/': ['fig--swap'],
 } as const;
 const THEORY = '/curso/m4/01-fine-tuning/';
 const RESULTS = '/curso/m4/09-lo-que-salio/';
@@ -31,11 +33,11 @@ test.describe('lesson M4 and its animated figures', () => {
     await page.goto(THEORY);
     await expect(page.getByRole('heading', { level: 1 })).toContainText('Fine-tuning');
     await expect(page.locator('.prose h2').first()).toHaveText('Qué vas a construir');
-    await expect(page.locator('.prose h2', { hasText: 'El agujero' }).first()).toBeVisible();
     await expect(page.locator('.cheat')).toHaveCount(0);
 
     await page.locator('.lesson__nav-link--next').click();
     await expect(page).toHaveURL(/\/curso\/m4\/02-tokens-de-elo\/$/);
+    await expect(page.locator('.prose h2', { hasText: 'El agujero' }).first()).toBeVisible();
     await expect(page.locator('.cheat')).toHaveCount(0);
 
     await page.goto(RESULTS);
