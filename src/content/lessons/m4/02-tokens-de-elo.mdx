@@ -1,17 +1,18 @@
 ---
 title: 'Los tokens de Elo y el corpus que faltaba'
 description:
-  'El código que arregla la mitad baja del eje: el max_elo que faltaba en fetch.py, un descargador
+  'Los doce tokens de Elo por debajo de 1800 que nunca recibieron un gradiente, y el código que
+  arregla la mitad baja del eje: el max_elo que faltaba en fetch.py, un descargador
   que baja cada shard entero en vez de leerlo en remoto, el muestreo plano de elo_bins.py, las
   rebanadas de partidas que hacen que un mes alimente los dos splits, y el afinado que empieza desde
   unos pesos sin heredar el optimizador.'
 module: m4
 order: 2
-duration: 175
+duration: 180
 runtime: 35
 level: medio
 status: vigente
-updated: '2026-09-22'
+updated: '2026-09-23'
 keywords:
   - Elo
   - condicionamiento
@@ -28,29 +29,87 @@ artifacts:
     label: chorcat/rukh-medium-masters
 ---
 
+import EloAxis from '../../../components/figures/EloAxis.astro';
+
 Lección 2 de 10 del módulo «Fine-tuning e instrucción». Viene de «Fine-tuning: qué es y cuántas
 maneras hay» y sigue en «LoRA escrita a mano». Es la primera lección de código del módulo y la que
-hay que hacer antes que ninguna otra: hasta que el corpus está arreglado, las siete siguientes miden
-un eje que solo existe a medias.
+hay que hacer antes que ninguna otra: mientras el corpus no esté arreglado, todo lo que se mida
+después se mide sobre un eje que solo existe a medias.
 
 ## Qué vas a construir
 
-La mitad baja de la escala de Elo, desde cero: un segundo corpus que se diferencia del primero solo
-en el rango de fuerza, un muestreo que lo aplana banda a banda, y un afinado que arranca desde unos
-pesos ya entrenados sin heredar nada más. Son seis ficheros de `rukh` y dos configuraciones, y al
-terminar tendrás `data/elo-bins-v2/games.parquet` con 1 219 423 partidas repartidas a partes iguales
-entre nueve bandas y un `medium-elo` entrenado sobre ellas.
+Antes de afinar para que el modelo juegue «como alguien de 1500» hay que arreglar un agujero: la mitad
+baja de la escala de Elo no se había entrenado nunca. La lección empieza por cómo se ve ese agujero y
+sigue con la reparación, desde cero: un segundo corpus que se diferencia del primero solo en el rango
+de fuerza, un muestreo que lo aplana banda a banda y un afinado que arranca desde unos pesos ya
+entrenados sin heredar nada más. Al terminar tendrás `data/elo-bins-v2/games.parquet`, con
+1 219 423 partidas repartidas entre nueve bandas, y un `medium-elo` entrenado sobre ellas.
 
-Por el camino salen tres decisiones que no se deducen del código y que conviene tener claras antes
-de leerlo: por qué el tope de Elo se aplica a **los dos** jugadores, por qué un mes se descarga
-shard a shard en vez de leerse en remoto, y por qué `--resume` y un afinado son cosas opuestas
-aunque las dos empiecen en un checkpoint.
+Por el camino salen tres decisiones que no se deducen del código: por qué el tope de Elo se aplica a
+**los dos** jugadores, por qué un mes se descarga shard a shard en vez de leerse en remoto, y por qué
+`--resume` y un afinado son cosas opuestas aunque los dos empiecen en un checkpoint.
+
+## El agujero: doce tokens que nunca recibieron un gradiente
+
+El vocabulario de Rukh tiene, desde M1, veintisiete tokens de Elo por bando: `<w0600>`, `<w0700>`, …,
+`<w3200>`, y sus gemelos `<b….>`. Cada partida de entrenamiento empieza con tres tokens,
+`<bos> <wXXXX> <bXXXX>`, y a partir de ahí las jugadas. El modelo aprende qué sigue a cada cabecera
+porque la ha visto seguida de partidas de gente con esa fuerza, y eso es lo que permite pedirle «juega
+como alguien de 1500».
+
+Hasta este módulo, pedirle al modelo que jugara a 2600 no lo hacía mejor, y eso se había leído como
+«imitar a un fuerte no compra táctica». Era verdad, pero no toda la verdad. Lo que faltaba estaba en
+las diez líneas con las que se descargó todo el corpus del proyecto en M1:
+
+{/* prettier-ignore */}
+```yaml title="configs/data/lichess-2025-01-02.yaml"
+# Two recent months of rated standard games, filtered remotely (see docs/spec/01-datos.md).
+dataset: Lichess/standard-chess-games
+months: ["2025-01", "2025-02"]
+min_elo: 1800
+min_base_seconds: 180
+terminations: ["Normal", "Time forfeit"]
+min_plies: 20
+exclude_variants: true
+out_dir: data/raw
+limit: 3000000
+```
+
+<Src file="configs/data/lichess-2025-01-02.yaml" tag="p4" lines="1-10" />
+
+La cuarta línea. `min_elo: 1800` se aplica a **los dos** jugadores, y es el filtro con el que se
+descargó todo: los 5,9 millones de partidas del corpus base, los 13,1 millones de la Elite Database,
+los 19 millones de `tokens-v4` con los que se entrenó el modelo que juega en la demo. Todo de 1800
+para arriba.
+
+Así que los doce tokens por debajo de 1800, de `<w0600>` a `<w1700>`, **nunca recibieron un
+gradiente**. Su embedding sigue donde lo dejó la inicialización: un vector aleatorio de media cero y
+desviación 0,02, sin relación con nada. Pedirle al modelo «juega como 1500» no era pedirle que jugara
+peor, era ponerle ruido delante.
+
+Es el botón de un ascensor que lleva a un piso que no existe: está en el panel, se ilumina al pulsarlo
+y el ascensor no va a ninguna parte.
+
+<EloAxis />
+
+Un fallo así no se ve. No hay excepción, ni aviso, ni test que falle: el token existe en el
+vocabulario, el tokenizador lo emite sin quejarse y el modelo produce una distribución perfectamente
+normal sobre jugadas legales. Solo que la distribución no cambia como uno esperaría, y eso se
+confunde con facilidad con «el condicionamiento no funciona». Lo destapó contar cuántas veces aparece
+cada cabecera en el corpus antes de volver a entrenar, no leer el modelo; es el lab 1 del módulo.
+
+<Callout kind="mundo-real" title="Antes de culpar al mecanismo, cuenta los ejemplos">
+  Antes de concluir que un mecanismo no funciona, comprueba que ha recibido datos. Un token que no
+  aparece nunca en el entrenamiento es un token que no existe, aunque tenga una fila en la tabla de
+  embeddings. Pasa igual en un LLM cuando se añaden tokens especiales al vocabulario (un rol nuevo
+  en la plantilla de chat, una etiqueta de herramienta) y el afinado no incluye ejemplos que los
+  usen, o en un clasificador con una clase que el conjunto de entrenamiento no trae.
+</Callout>
 
 ## El filtro que faltaba
 
 La configuración de la reparación es la de M1 con otro rango de Elo, otra carpeta de salida y otro
-tope de partidas, y los tres cambios están explicados dentro del propio fichero. Va entera porque
-cada línea es una decisión:
+tope de partidas. Va entera porque cada línea es una decisión:
 
 {/* prettier-ignore */}
 ```yaml title="configs/data/lichess-low.yaml"
@@ -82,16 +141,16 @@ cache_dir: data/hf-cache
 
 <Src file="configs/data/lichess-low.yaml" tag="p4" lines="1-24" />
 
-Lo que cambia respecto a `lichess-2025-01-02.yaml` —el fichero de la lección anterior— son cuatro
+Lo que cambia respecto a `lichess-2025-01-02.yaml`, el fichero de arriba, son cuatro
 claves: `min_elo` baja a 1000, aparece un `max_elo` de 1799, `out_dir` va a `data/raw-low` y `limit`
 sube a 1 200 000. Todo lo demás es idéntico **a propósito**: mismos 180 segundos de tiempo base,
 mismas terminaciones, sin variantes, mismo mínimo de 20 <Term id="ply">plies</Term> diferido a la conversión. Las dos
 mitades del eje tienen que diferenciarse en la fuerza y en nada más, porque cualquier otra diferencia
 acabaría atribuida a la fuerza cuando se midan.
 
-El `out_dir` propio no es orden: es lo que impide que `data/uci` cambie de significado en silencio.
-`data/uci` es el corpus con el que se entrenó todo lo publicado, y mezclarle una banda más débil
-convertiría esa frase en falsa sin que nada fallara.
+El `out_dir` propio impide que `data/uci` cambie de significado en silencio. `data/uci` es el corpus
+con el que se entrenó todo lo publicado, y mezclarle una banda más débil convertiría esa frase en
+falsa sin que nada fallara.
 
 <Callout kind="teoria" title="Por qué el techo va sobre los dos jugadores">
   `max_elo: 1799` se aplica a las blancas **y** a las negras, igual que `min_elo`. Una partida de un
@@ -104,8 +163,8 @@ convertiría esa frase en falsa sin que nada fallara.
 ## `fetch.py`: el descargador que sobrevivió al anfitrión
 
 El fichero ya existía desde M1 y este hito lo cambia en dos sitios: el filtro gana un tope y la
-descarga cambia de estrategia. La segunda mitad es la interesante, y empieza en el docstring del
-módulo, que es donde este proyecto guarda las razones:
+descarga cambia de estrategia. La segunda es la interesante, y empieza en el docstring del módulo,
+que es donde este proyecto guarda las razones:
 
 ```python title="src/rukh/data/fetch.py"
 The months are read **shard by shard, downloaded first**, not streamed over ``hf://``. Streaming
@@ -124,17 +183,15 @@ result -- for a slice of the rating range that is the difference between 8 shard
 
 <Src file="src/rukh/data/fetch.py" tag="p4" lines="9-20" />
 
-Estos doce párrafos de docstring son un epitafio. El diseño original —DuckDB leyendo el parquet
-remoto por `hf://`, con <Term id="predicate-pushdown">empuje de predicados</Term> para que solo
-crucen la red las filas que pasan el filtro— es el diseño elegante y es el que hay que intentar primero. Dejó de funcionar por una razón que no tiene nada que ver con SQL: un mes son 72 <Term id="shard">shards</Term>
-de un gigabyte, leerlos en remoto son miles de peticiones de rango contra un mismo anfitrión, y el
-anfitrión contesta `HTTP 429`. Después viene la parte cara: el cliente reintenta con espera
-creciente, y lo que se mide ya no es ancho de banda sino paciencia. Cincuenta minutos a 0,02 MB/s
-con cero bytes escritos, frente a 14,8 MB/s descargando el mismo shard de una pieza.
-
-Es la diferencia entre pedirle a un bibliotecario cuatro mil páginas sueltas de setenta y dos libros
-y pedirle los tres libros que contienen lo que buscas. La primera petición es más precisa y la
-segunda es la que termina.
+El docstring cuenta por qué cambió la estrategia. El diseño original, DuckDB leyendo el parquet
+remoto por `hf://` con <Term id="predicate-pushdown">empuje de predicados</Term> para que solo crucen
+la red las filas que pasan el filtro, es el elegante y el que hay que intentar primero. Dejó de
+funcionar por algo que no tiene nada que ver con SQL: un mes son 72 <Term id="shard">shards</Term> de
+un gigabyte, leerlos en remoto son miles de peticiones de rango contra un mismo servidor, y el
+servidor contesta `HTTP 429`. El cliente reintenta con espera creciente y lo que se mide ya no es
+ancho de banda sino paciencia: cincuenta minutos a 0,02 MB/s con cero bytes escritos, frente a
+14,8 MB/s descargando el mismo shard de una pieza. Pedir pocos ficheros grandes termina; pedir miles
+de trozos pequeños, no.
 
 ### La otra mitad de la respuesta al `429`
 
@@ -152,9 +209,10 @@ raised from three attempts to eight because a 429 is a "wait", not a "no".
 
 <Src file="src/rukh/data/db.py" tag="p4" lines="14-18" />
 
-El párrafo que el hito le añadió al docstring dice la frase que resume la corrección: **un `429` es
-un «espera», no un «no»**. Un cliente que lo trata como un fallo definitivo tira minutos de trabajo
-sin dejar nada parcial de lo que reanudar.
+El párrafo que el hito añadió al docstring resume la corrección: **un `429` es un «espera», no un
+«no»**. Un cliente que lo trata como un fallo definitivo tira minutos de trabajo sin dejar nada
+parcial de lo que reanudar. Vale igual para cualquier API con cuota, incluidas las de los LLM, que
+contestan con este mismo código cuando te pasas de peticiones por minuto.
 
 ```python title="src/rukh/data/db.py"
 class DuckDbConfig(BaseConfig):
@@ -346,8 +404,8 @@ aspiración; con dos copias del predicado, la del ensayo se queda atrás en la p
 nadie lo nota, porque las dos siguen siendo SQL válido.
 
 `conditions.insert(1, …)` y no `append` para que el techo quede pegado al suelo en el texto que se
-imprime. Es cosmética, y es la clase de cosmética que se agradece cuando lo que hay que leer es una
-condición de cinco líneas en un log.
+imprime. Es cosmética, y se agradece cuando lo que hay que leer es una condición de cinco líneas en
+un log.
 
 ### Un shard a la vez
 
@@ -473,7 +531,7 @@ def _fetch_month(con: Any, cfg: FetchConfig, month: str, target: Path) -> int:
 
 <Src file="src/rukh/data/fetch.py" tag="p4" lines="246-291" />
 
-Esto es el hito entero, en cuanto a descarga. Cuatro decisiones dentro:
+Aquí está toda la descarga nueva, con cuatro decisiones dentro:
 
 **Las partes se quedan en disco hasta que el mes termina.** Un mes interrumpido reanuda por el shard
 en el que se quedó, porque `part-00007.parquet` ya existe y no hay que volver a bajar nada. La
@@ -573,8 +631,8 @@ Diez minutos la descarga, cinco la conversión. Lo que sale:
 ## `elo_bins.py`: aplanar el eje
 
 Con las dos mitades en disco, el corpus del afinado se construye **plano**: el mismo número de
-partidas por banda de 200 Elo, de 1000 a 2600. El fichero que lo hace pasó de 90 líneas a 158 en
-este hito, y las dos cosas que ganó son las dos que hacían falta.
+partidas por banda de 200 Elo, de 1000 a 2600. El fichero que lo hace gana en este hito las dos
+cosas que hacían falta.
 
 ```python title="src/rukh/data/elo_bins.py"
 """Elo-balanced sample: up to ``n_per_bin`` games per band of the average rating.
@@ -600,9 +658,8 @@ teaches it what each header *means*, which is what conditioning needs.
 
 <Src file="src/rukh/data/elo_bins.py" tag="p4" lines="1-19" />
 
-El docstring cuenta el diagnóstico completo, y su último párrafo es la idea del módulo dicha en tres
-líneas: un corpus con la forma real le enseña al modelo que `<w1500>` es **raro**, que no es lo mismo
-que enseñarle qué **significa**.
+El docstring cuenta el diagnóstico completo. Por qué el corpus tiene que ser plano, y no tener la
+forma de Lichess, se explica al final de la lección.
 
 ```python title="src/rukh/data/elo_bins.py"
 class EloBinsConfig(BaseConfig):
@@ -885,10 +942,10 @@ tokenize:
 
 <Src file="configs/data/pipeline-masters.yaml" tag="p4" lines="1-19" />
 
-Nueve de sus diecinueve líneas son el comentario que justifica las otras diez. Las partidas de élite
-ya forman parte de `tokens-v4`, mezcladas con el corpus de 1800+; este pack no tiene nada más
-dentro, y esa es toda la intervención. El pronóstico que se pone a prueba —sube el Elo, baja la
-diversidad— no se puede leer sobre un corpus donde los maestros son un ingrediente entre varios.
+El comentario justifica todo lo demás. Las partidas de élite ya forman parte de `tokens-v4`,
+mezcladas con el corpus de 1800+; este pack no tiene nada más dentro, y esa es toda la intervención.
+El pronóstico que se pone a prueba (sube el Elo, baja la diversidad) no se puede leer sobre un corpus
+donde los maestros son un ingrediente entre varios.
 
 Y otro fichero de `fetch`, el del mes de más que se descargó para ampliar el corpus de 1800+, porque
 enseña una decisión que el de la banda baja no tiene:
@@ -1067,15 +1124,12 @@ plural, `val_games`, `extra_train_parquets` y `val_remainder_trains`.
 
 <Src file="src/rukh/data/pipeline.py" tag="p4" lines="32-43" />
 
-<Callout kind="roto" title="Un docstring de campo que se quedó huérfano">
-  Mira la última línea del bloque: `"""Games of ``val_month`` held out; the rest of it trains. 0 =
-  the whole month validates."""` está **después** del docstring de `val_remainder_trains`, no
-  después de `val_games`, que es a quien describe. Python no se queja —es una cadena suelta, una
-  expresión sin efecto— y pydantic no la recoge, así que `val_games` se queda sin descripción en el
-  esquema y el texto no aparece en ninguna parte. Es un error real del repositorio en el tag `p4` y
-  está aquí a propósito: un docstring de atributo es sintaxis por convención, no por el lenguaje, y
-  moverlo una línea lo convierte en nada sin que ninguna herramienta lo note.
-</Callout>
+Fíjate en la última línea del bloque. El docstring que describe `val_games` quedó **después** del de
+`val_remainder_trains`, no debajo de su campo. Python no se queja (es una cadena suelta, una
+expresión sin efecto) y pydantic no la recoge, así que `val_games` se queda sin descripción en el
+esquema. Es un error real del repositorio en el tag `p4`, y enseña algo: un docstring de atributo es
+una convención, no sintaxis del lenguaje, y moverlo una línea lo convierte en nada sin que ninguna
+herramienta lo note.
 
 ```python title="src/rukh/tokenize/pack.py"
 def split_sources(cfg: TokenizeConfig) -> dict[str, list[GameSlice]]:
@@ -1113,26 +1167,19 @@ def split_sources(cfg: TokenizeConfig) -> dict[str, list[GameSlice]]:
 
 <Src file="src/rukh/tokenize/pack.py" tag="p4" lines="285-315" />
 
-Aquí está la clave que este módulo añadió y por la que casi se estropea el experimento.
+Aquí está la clave que este módulo añadió, y por la que casi se estropea el experimento.
 
 El empaquetador tenía una regla razonable: el mes de validación se parte en dos, sus primeras
-`val_games` partidas validan y **el resto se suma al entrenamiento**. Es lo que recuperó 238 millones
-de tokens en el hito anterior, porque una evaluación lee cincuenta lotes y no un mes entero.
+`val_games` partidas validan y **el resto se suma al entrenamiento**. En el preentrenamiento eso
+recuperó 238 millones de tokens, porque una evaluación lee cincuenta lotes y no un mes entero.
 
 Sobre un corpus cuya forma **es** el experimento, esa misma regla añade 2,85 millones de partidas de
-1800+ encima del reparto plano y lo deshace sin decir nada. De ahí `val_remainder_trains`, y de ahí
-que esté en `false` en `pipeline-low.yaml`: el conjunto de validación sigue siendo exactamente el
-mismo con el que se miden todas las demás ejecuciones —para que las pérdidas sean comparables— y el de
-entrenamiento es el corpus equilibrado y nada más.
-
-<Callout kind="roto" title="Una optimización correcta que rompe el experimento de al lado">
-  Nadie escribió mal `val_remainder_trains`. La regla que añadía el resto del mes de validación al
-  entrenamiento era **la correcta** cuando se escribió, y sigue siéndolo para un preentrenamiento:
-  deja de desperdiciar el 97 % de un mes. Lo que la vuelve dañina es un corpus nuevo cuya propiedad
-  interesante es su **forma**, porque la optimización la destruye antes de que nadie la mida. La
-  regla que deja: una opción por defecto que mejora el caso normal tiene que poder apagarse, y lo
-  que decide si hay que apagarla no es el código, es qué afirma el experimento.
-</Callout>
+1800+ encima del reparto plano y lo deshace sin decir nada. De ahí `val_remainder_trains`, en `false`
+en `pipeline-low.yaml`: la validación sigue siendo el mismo conjunto con el que se miden todas las
+demás ejecuciones, para que las pérdidas sean comparables, y el entrenamiento es el corpus
+equilibrado y nada más. Nadie escribió mal la regla; lo que la volvió dañina fue un corpus nuevo cuya
+propiedad interesante era su forma. Una opción por defecto que mejora el caso normal tiene que poder
+apagarse, y lo que decide si se apaga es lo que el experimento afirma.
 
 ```python title="src/rukh/tokenize/pack.py"
 def pack_scheme(cfg: TokenizeConfig, scheme: str, bpe: Tokenizer | None = None) -> list[Path]:
@@ -1219,6 +1266,10 @@ estaba en disco.
 Y `starts` pasa a abrirse también con `mmap_mode="r"`, igual que `tokens`. Lo que antes eran 145 MB
 residentes por worker ahora son páginas compartidas del mismo fichero.
 
+Fíjate en la forma del fallo. En M2 se mapeó `tokens`, el array grande, que era el que preocupaba; el
+que rompió fue `starts`, el índice pequeño, que crece con el número de partidas igual que el grande.
+Lo que optimizaste no es lo que creció.
+
 <Callout kind="ejecuta" title="El dataset viaja sin sus arrays">
   Los tests del cargador incluyen el de esta corrección:
 
@@ -1237,16 +1288,19 @@ con los arrays mapeados otra vez, lee exactamente las mismas ventanas.
   where="Cualquier cosa que cruce un proceso, una cola de mensajes o una petición HTTP: un identificador y una ruta común pesan menos que el objeto, y el destinatario ya sabe llegar."
 >
   Un objeto que cruza un proceso no tiene por qué llevarse los datos consigo si los dos lados pueden
-  llegar a ellos. Mandar la **ruta** en vez del contenido es la misma idea que un enlace en un
-  correo en lugar de un adjunto de cien megas, y en multiprocessing tiene un beneficio extra: el
-  sistema operativo comparte las páginas del fichero mapeado entre todos los procesos, así que ocho
-  workers no cuestan ocho copias.
+  llegar a ellos. Mandar la **ruta** en vez del contenido es como poner un enlace en un correo en
+  lugar de un adjunto de cien megas, y en multiprocessing tiene un beneficio extra: el sistema
+  operativo comparte las páginas del fichero mapeado entre todos los procesos, así que ocho workers
+  no cuestan ocho copias. Y cuando algo escala, mira también lo que va pegado a lo grande: el
+  diccionario de identificadores que acompaña a un índice vectorial en cada worker, o el historial
+  de un agente que se vuelve a serializar en cada paso, crecen igual que lo que ya habías
+  optimizado.
 </Transfer>
 
 ## Empezar desde unos pesos, sin heredar nada más
 
 Falta la última pieza, y es del bucle de entrenamiento. Afinar necesita empezar desde un checkpoint,
-y el bucle ya sabía hacerlo: `--resume`. Pero `--resume` es exactamente lo contrario de lo que quiere
+y el bucle ya sabía hacerlo con `--resume`. Pero `--resume` hace justo lo contrario de lo que quiere
 un afinado.
 
 ```python title="src/rukh/train/loop.py"
@@ -1326,7 +1380,7 @@ entonces la mitad de las veces se elegiría la que el usuario no quería, sin av
 La segunda está en el comentario: los pesos se cargan **antes** de poner los adaptadores de LoRA,
 porque el checkpoint conoce los nombres de módulo de un decoder normal y envolver los renombra. El
 orden importa y no se deduce leyendo cualquiera de las dos funciones por separado, que es
-exactamente cuándo hace falta un comentario.
+cuándo hace falta un comentario.
 
 ```python title="src/rukh/train/loop.py"
 def _warn_if_best_is_not_the_result(
@@ -1361,21 +1415,21 @@ def _warn_if_best_is_not_the_result(
 
 <Src file="src/rukh/train/loop.py" tag="p4" lines="305-332" />
 
-Y esto es un aviso que este afinado obligó a escribir. `best.pt` significa «la pérdida de validación
-más baja», y la validación mide imitación de juego de 1800+. En un preentrenamiento eso **es** el
+Y un aviso que este afinado obligó a escribir. `best.pt` significa «la pérdida de validación más
+baja», y la validación mide imitación de juego de 1800+. En un preentrenamiento eso **es** el
 objetivo y las dos cosas coinciden. En un afinado que cambia de corpus a propósito, la pérdida de
-validación sube desde el principio, así que `best.pt` se queda congelado en el paso 200 —un modelo
-casi sin tocar— y cualquiera que lo evaluara después estaría midiendo los pesos equivocados con
-números perfectamente plausibles.
+validación sube desde el principio, así que `best.pt` se queda congelado en el paso 200, un modelo
+casi sin tocar.
 
-La función no arregla nada: **lo dice**. Solo avisa cuando hay un `init_from` (si no, `best.pt` sí
-es el resultado) y cuando el paso de `best.pt` está por debajo de `max_steps`.
+La función no arregla nada: **lo dice**. Solo avisa cuando hay un `init_from` (si no, `best.pt` sí es
+el resultado) y cuando el paso de `best.pt` está por debajo de `max_steps`.
 
 <Callout kind="roto" title="`best.pt` no es el resultado de un afinado">
   El resultado de un afinado es su **último** checkpoint, `step-3800.pt`, y ahora el bucle lo
-  escribe en el log en vez de dejarlo a la intuición de quien lo lea. Es la clase de error que no
-  produce ninguna excepción: el fichero existe, se carga, juega, y da un Elo razonable. El de un
-  modelo que no ha aprendido lo que creías.
+  escribe en el log en vez de dejarlo a la intuición de quien lo lea. El error no produce ninguna
+  excepción: el fichero existe, se carga, juega y da un Elo razonable, el de un modelo que no ha
+  aprendido lo que creías. Con un LLM pasa lo mismo si afinas con `load_best_model_at_end` y una
+  métrica de validación sobre la distribución vieja: el «mejor» modelo es el que menos se ha movido.
 </Callout>
 
 <Exercise n="01" title="¿Por qué best.pt es exactamente el paso 200, y no el 0 ni el 3 800?">
@@ -1449,12 +1503,10 @@ log_every: 10
 
 <Src file="configs/train/medium-elo.yaml" tag="p4" lines="1-41" />
 
-Diecisiete líneas de comentario para veinticuatro de configuración, y están bien gastadas: cada
-párrafo contesta una pregunta que alguien se haría al leer el YAML.
-
-De dónde parte, y por qué no del modelo con DPO. Por qué el corpus es plano. Y por qué 3 800 pasos
-a 1e-4 y no más: el riesgo aquí no es quedarse corto con el corpus nuevo, es **olvidar** el juego
-fuerte que costaron 1 680 millones de tokens.
+Los comentarios contestan las preguntas que alguien se haría al leer el YAML: de dónde parte y por
+qué no del modelo con DPO, por qué el corpus es plano, y por qué 3 800 pasos a 1e-4 y no más. El
+riesgo aquí no es quedarse corto con el corpus nuevo, es **olvidar** el juego fuerte que costaron
+1 680 millones de tokens.
 
 La segunda configuración es la misma con el corpus cambiado; estas son sus catorce primeras
 líneas:
@@ -1486,14 +1538,17 @@ el pack de élite es 0,16 de una <Term id="epoca">época</Term>, así que cada m
 
 ## Por qué el corpus de afinado es plano y el mundo no
 
-El corpus plano no es lo que hay en Lichess ni de lejos, y es a propósito. Un corpus con la forma
-real le enseña al modelo que `<w1500>` es **raro**, que no es lo mismo que enseñarle qué
-**significa**. La frecuencia de una condición y su contenido son dos cosas distintas, y aquí solo
-interesa la segunda: el modelo tiene que saber qué viene después de cada token de Elo, no con qué
-probabilidad aparece. Un diccionario le dedica la misma entrada a «casa» que a «abstruso» aunque la
-primera se use mil veces más, porque lo que se le pide al diccionario es qué significa cada palabra,
-no cuántas veces sale. El corpus plano es ese diccionario: una entrada del mismo tamaño para cada
-cabecera.
+El corpus plano no se parece a Lichess, y es a propósito. Un corpus con la forma real le enseña al
+modelo que `<w1500>` es **raro**, que no es lo mismo que enseñarle qué **significa**. La frecuencia
+de una condición y su contenido son dos cosas distintas, y aquí solo interesa la segunda. Un
+diccionario le dedica una entrada a «casa» y otra a «abstruso» aunque la primera se use mil veces
+más, porque lo que se le pide es qué significa cada palabra, no cuántas veces sale. El corpus plano
+es ese diccionario: una entrada del mismo tamaño para cada cabecera.
+
+Pasa lo mismo cuando se prepara un conjunto de instrucciones para afinar un LLM: si el 90 % de los
+ejemplos son de un tipo de tarea, el modelo aprende sobre todo que esa tarea es la frecuente. Por
+eso los conjuntos de <Term id="sft">SFT</Term> se equilibran por tarea, igual que este se equilibra
+por banda.
 
 | Banda |   Partidas |
 | ----- | ---------: |
@@ -1579,17 +1634,17 @@ El afinado son 3 800 pasos y **19,5 minutos**; el de maestros, con `pipeline-mas
 
 ## Qué has aprendido
 
-El corpus del módulo, construido desde el filtro hasta el checkpoint. Un `max_elo` que se aplica a
-los dos jugadores porque una partida desigual no pertenece a ninguna banda; un descargador que baja
-cada shard entero, lo filtra y lo borra, porque leer en remoto miles de rangos contra un anfitrión
-es una forma cara de no descargar nada; un muestreo por hash que aplana nueve bandas y publica lo
-que cada una recibió de verdad; un empaquetador que corta un mes en dos para que una validación
-comparable no le robe la forma al corpus; y un `init_from` que se lleva los pesos y deja el
-optimizador, con el aviso de que `best.pt` ya no es la respuesta.
+El corpus del módulo, del filtro al checkpoint. Un `max_elo` que se aplica a los dos jugadores,
+porque una partida desigual no pertenece a ninguna banda. Un descargador que baja cada shard entero,
+lo filtra y lo borra, porque leer en remoto miles de rangos contra un servidor es una forma cara de
+no descargar nada. Un muestreo por hash que aplana nueve bandas y publica lo que cada una recibió de
+verdad. Un empaquetador que corta un mes en dos para que una validación comparable no le robe la
+forma al corpus. Y un `init_from` que se lleva los pesos y deja el optimizador, con el aviso de que
+`best.pt` ya no es la respuesta.
 
-Se mide en dos sitios: el manifiesto de `data/elo-bins-v2/` dice cuántas partidas tiene cada banda,
-y la pérdida de validación de la ejecución dice cuánto costó el eje (1,3733 → 1,3987). Lo que el eje
-**compró** no se sabe todavía, y hace falta un barrido para saberlo.
+Se mide en dos sitios: el manifiesto de `data/elo-bins-v2/` dice cuántas partidas tiene cada banda, y
+la pérdida de validación dice cuánto costó el eje (1,3733 → 1,3987). Lo que el eje **compró** todavía
+no se sabe; hace falta un barrido para saberlo.
 
-Lo siguiente es la otra mitad del módulo: en vez de mover los 115 millones de parámetros, mover
+Lo siguiente es la otra forma de afinar: en vez de mover los 115 millones de parámetros, mover
 393 216. Sigue en «LoRA escrita a mano».

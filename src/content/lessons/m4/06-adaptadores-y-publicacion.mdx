@@ -11,7 +11,7 @@ duration: 280
 runtime: 20
 level: avanzado
 status: vigente
-updated: '2026-09-22'
+updated: '2026-09-23'
 keywords:
   - adaptador
   - ONNX
@@ -28,6 +28,8 @@ artifacts:
     label: chorcat/rukh-qwen3-pgn-qlora
 ---
 
+import AdapterSwap from '../../../components/figures/AdapterSwap.astro';
+
 Lección 6 de 10 del módulo «Fine-tuning e instrucción». Viene de «QLoRA con `transformers`» y sigue
 en «Diversidad y barridos».
 
@@ -43,9 +45,14 @@ decisión: **la corrección no se funde con los pesos**.
 
 ## Por qué el adaptador no se funde antes de exportar
 
-Fundir un adaptador y exportar el resultado es la manera obvia de servir un estilo en el navegador,
-y tira por la ventana lo único que LoRA había comprado. Un estilo son 221 MB de ONNX para `medium`;
-dos estilos, 442 MB; y el fichero de 1,6 MB deja de significar nada.
+Fundir un adaptador y exportar el resultado es la manera obvia de servir un estilo en el navegador, y
+tira por la ventana lo único que LoRA había comprado. Un estilo son 221 MB de ONNX para `medium`; dos
+estilos, 442 MB; y el fichero de 1,6 MB deja de significar nada. La alternativa es exportar el modelo
+con los factores `A` y `B` como **entradas** del grafo, igual que los tokens, y darle en cada llamada
+los del estilo que toque. Es lo que hacen los servidores de LLM que sirven cientos de adaptadores
+sobre una misma base: no funden nada, pasan los factores aparte.
+
+<AdapterSwap />
 
 ```python title="src/rukh/export/adapter.py"
 """Exporting the decoder with its LoRA factors as **inputs of the graph**.
@@ -252,24 +259,18 @@ class SliceLoraFromInputs(nn.Module):
 
 `_Slot` es una caja con dos atributos y deliberadamente **no** es un `nn.Module`: `torch.export`
 avisa de que un tensor asignado a un módulo durante el trazado debería haber sido un búfer, y un
-búfer es exactamente lo que estos no pueden ser —un búfer se hornea en el fichero, y el punto es que
+búfer es lo que estos no pueden ser —un búfer se hornea en el fichero, y el punto es que
 no lo estén—.
 
 `SliceLoraFromInputs` es la misma aritmética que `LoRALinear.forward` con **un** cambio que le
 importa a ONNX: la corrección se arma con `cat` sobre todo el ancho de salida en vez de escribirse
 en una rodaja de un tensor de ceros.
 
-<Callout
-  kind="roto"
-  title="`ScatterND` se ejecuta en CPU aunque el resto del grafo vaya por WebGPU"
->
-  La asignación por índice —`delta[..., start:stop] = ...`— exporta como un nodo `ScatterND`, y
-  onnxruntime web lo ejecuta en la CPU aunque todo lo demás vaya por el acelerador. Una
-  concatenación de multiplicaciones y ceros se queda en el acelerador. Es la clase de detalle que no
-  se puede deducir leyendo el modelo: hay que exportar, abrir el grafo y mirar qué nodos aparecen.
-  La regla que deja es que **el código que se exporta no es el código que corre**, y entre los dos
-  hay un traductor con opiniones.
-</Callout>
+La razón de ese cambio no se deduce leyendo el modelo. La asignación por índice
+(`delta[..., start:stop] = ...`) se exporta como un nodo `ScatterND`, y onnxruntime web lo ejecuta en
+la CPU aunque el resto del grafo vaya por WebGPU; una concatenación de multiplicaciones y ceros se
+queda en el acelerador. Solo se descubre exportando, abriendo el grafo y mirando qué nodos aparecen:
+el código que se exporta no es el código que corre, y entre los dos hay un traductor con opiniones.
 
 ```python title="src/rukh/export/adapter.py"
 class AdaptableDecoder(nn.Module):
@@ -427,11 +428,10 @@ def export_adaptable_onnx(
 
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="215-287" />
 
-La exportación en sí reutiliza todo lo de M2 —`_write_graph`, `verify_dynamic_seq`,
-`write_metadata`— y solo añade dos entradas y seis claves de metadatos. Esas seis son las que
-permiten que el navegador sepa qué forma tienen los tensores que debe subir sin que nadie se lo
-escriba a mano en un `.ts`: `adapter_shape_a`, `adapter_shape_b`, `adapter_module`, `adapter_r`,
-`adapter_scale`.
+La exportación reutiliza todo lo de M2 (`_write_graph`, `verify_dynamic_seq`, `write_metadata`) y
+solo añade dos entradas y seis claves de metadatos. Esas seis permiten que el navegador sepa qué
+tiene que subir sin que nadie se lo escriba a mano en un `.ts`: `adapter_inputs`, `adapter_shape_a`,
+`adapter_shape_b`, `adapter_module`, `adapter_r` y `adapter_scale`.
 
 `verify_dynamic_seq` con `zero_inputs(layout)` es importante: comprobar que el eje de la secuencia
 sigue siendo dinámico exige **ejecutar** el grafo a dos longitudes, y ejecutarlo exige darle las dos
@@ -1909,10 +1909,9 @@ def read_parity(folder: Path) -> dict[str, Any] | None:
 
 <Src file="src/rukh/publish/model.py" tag="p4" lines="267-321" />
 
-`check_eval_matches` es la guarda que este hito añadió después de que el fallo estuviera a punto de
-ocurrir **dos veces**. `read_eval` encuentra resultados por nombre de etapa, así que pasar el
-`--stage` equivocado produce una card cuyos pesos y métricas vienen de checkpoints distintos, y nada
-en la salida lo dice.
+`check_eval_matches` es una guarda contra un fallo muy fácil de cometer. `read_eval` encuentra
+resultados por nombre de etapa, así que pasar el `--stage` equivocado produce una card cuyos pesos y
+métricas vienen de checkpoints distintos, y nada en la salida lo dice.
 
 La comprobación es por `sha256` del fichero, no por los pesos: `best.pt` y un `step-*.pt` con pesos
 idénticos siguen siendo ficheros distintos y se rechazan igual. El docstring dice que esa es la

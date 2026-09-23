@@ -11,7 +11,7 @@ duration: 295
 runtime: 75
 level: avanzado
 status: vigente
-updated: '2026-09-22'
+updated: '2026-09-23'
 keywords:
   - QLoRA
   - cuantización de 4 bits
@@ -24,6 +24,8 @@ artifacts:
   - kind: adapter
     label: chorcat/rukh-qwen3-pgn-qlora
 ---
+
+import M4LabelShift from '../../../components/figures/M4LabelShift.astro';
 
 Lección 5 de 10 del módulo «Fine-tuning e instrucción». Viene de «Estilo y texto PGN» y sigue en
 «Adaptadores y publicación». Es la lección más larga del módulo: cuatro ficheros nuevos, dos suites
@@ -65,10 +67,9 @@ all, and "we implemented LoRA" would rest on the author's word.
 
 <Src file="src/rukh/models/hf.py" tag="p4" lines="1-17" />
 
-El docstring dice la decisión y su límite. El decoder es PyTorch a secas **a propósito**: leerlo no
-debería exigir conocer el framework de nadie. Pero el resto del ecosistema habla `PreTrainedModel`,
-y escribir una envoltura es barato mientras que reimplementar LoRA, DPO y GRPO no lo es. Es un
-adaptador de enchufe: no cambia el aparato, cambia la clavija.
+El docstring dice la decisión y su límite. El decoder es PyTorch a secas **a propósito**, pero el
+resto del ecosistema habla `PreTrainedModel`, y escribir una envoltura es barato mientras que
+reimplementar LoRA, DPO y GRPO no lo es.
 
 La frase que hay que retener es la del tercer párrafo: la envoltura **contiene** un `MoveDecoder`, no
 reimplementa uno. Hay una sola definición del paso hacia delante en todo el repositorio, así que el
@@ -271,7 +272,7 @@ una envoltura que implementa media interfaz es peor que una que la implementa.
 `from_decoder` envuelve **sin copiar los pesos**: los tensores son los mismos objetos, así que
 entrenar la envoltura entrena el decoder y un checkpoint tomado de cualquiera de los dos es el mismo
 checkpoint. Esa es la propiedad que hace significativa la comparación con `peft`: los dos lados
-empiezan literalmente desde los mismos números.
+empiezan desde los mismos números.
 
 ```python title="src/rukh/models/hf.py"
     def forward(
@@ -307,18 +308,26 @@ empiezan literalmente desde los mismos números.
 
 <Src file="src/rukh/models/hf.py" tag="p4" lines="161-189" />
 
-Y la tercera trampa, que es la que más caro sale: **aquí las etiquetas no se desplazan**. Casi todos
-los modelos causales de `transformers` desplazan `labels` dentro de `forward`. El flujo empaquetado
-de este proyecto ya guarda `y` un paso por delante de `x`, así que volver a desplazarlas entrenaría
-al modelo a predecir la jugada **de después de la siguiente**.
+Y la tercera trampa, la que más caro sale: **aquí las etiquetas no se desplazan**. Casi todos los
+modelos causales de `transformers` desplazan `labels` dentro de `forward`, porque esperan recibir la
+misma secuencia como entrada y como etiqueta. El flujo empaquetado de este proyecto ya guarda `y` un
+paso por delante de `x`, así que volver a desplazarlas entrenaría al modelo a predecir la jugada **de
+después de la siguiente**.
+
+<Figure
+  n="01"
+  caption="Las etiquetas son las mismas en las dos filas; lo que cambia es a cuál apunta cada posición. Arriba, cada token de la entrada se empareja con el siguiente. Abajo, un segundo desplazamiento dentro de forward empareja cada posición con el token de dos pasos más allá y deja la última sin etiqueta."
+>
+  <M4LabelShift />
+</Figure>
 
 <Callout kind="roto" title="Un desplazamiento de más no rompe nada, y ese es el problema">
-  El modelo entrenaría. La pérdida bajaría. La curva tendría buena pinta. Lo único raro sería que el
-  modelo jugara mal, y a esas alturas ya hay cinco explicaciones plausibles para eso antes de que a
-  nadie se le ocurra mirar el desplazamiento de las etiquetas. Es el mismo patrón que el
-  `val_remainder_trains` de la lección 2 y que el `best.pt` de un afinado: un fallo silencioso es
-  más caro que una excepción aunque cueste lo mismo arreglarlo, porque el coste de verdad es
-  encontrarlo.
+  El modelo entrenaría. La pérdida bajaría, porque predecir dos pasos más allá también se puede
+  aprender, y la curva tendría buena pinta. Lo único raro sería que el modelo jugara mal, y a esas
+  alturas hay cinco explicaciones plausibles antes de que a nadie se le ocurra mirar las etiquetas.
+  Es un tropiezo clásico de cualquiera que mete un modelo o un colador de datos propio en el
+  `Trainer` de `transformers`, y se evita con un test que compare contra un desplazamiento hecho a
+  mano.
 </Callout>
 
 `prepare_inputs_for_generation` recorta a la ventana de contexto y ya: no hay caché de claves y
@@ -563,12 +572,11 @@ vacío: dos modelos que no entrenan en absoluto también dan curvas idénticas.
 
 El objetivo es `attn_out` y no `q`/`v` por lo que explicaba la lección 3: `peft` no puede expresar un
 adaptador por rodaja sobre una `qkv` fusionada, así que sobre `attn.proj` —una `nn.Linear` normal, un
-solo rango que cubre toda la salida— las dos hacen literalmente lo mismo, y por eso es ahí donde la
+solo rango que cubre toda la salida— las dos hacen lo mismo, y por eso es ahí donde la
 igualdad significa algo.
 
 El `name.replace("base_model.model.decoder.", "").replace(".base_layer", "")` es fontanería: traduce
-el nombre de módulo que crea `peft` al que tiene el modelo desnudo. Es feo y es la clase de fealdad
-que se paga una vez en un test y ahorra escribir una capa de traducción en el código de producción.
+el nombre de módulo que crea `peft` al que tiene el modelo desnudo. Es feo, pero se paga una vez en un test y ahorra escribir una capa de traducción en el código de producción.
 
 Salida en la máquina de referencia (RTX 5090), a través de `labs/m4/lora_check.py`:
 
@@ -691,16 +699,17 @@ __all__ = ["QwenConfig", "QwenReport", "four_bit_config", "train_qwen"]
 El docstring es el diseño del experimento. La lista de tres puntos es la condición para que un
 número valga: mismas partidas, mismas métricas, y una sola diferencia —la representación—.
 
-Los dos últimos párrafos son decisiones de curso además de decisiones técnicas. **Este fichero es
+Los dos últimos párrafos son decisiones de curso además de técnicas. **Este fichero es
 deliberadamente código de otros**: `transformers` para el modelo, `peft` para el adaptador, `trl`
-para el bucle. El proyecto tiene su propia LoRA y su propio bucle y no los necesita aquí; lo que
-necesita es la experiencia del camino del ecosistema, que es el que un lector va a usar de verdad, y
-una ejecución comparable con las recetas publicadas de QLoRA en vez de con una variante propia.
+para el bucle y `bitsandbytes` para los cuatro bits. El proyecto tiene su propia LoRA y su propio
+bucle y aquí no los necesita; lo que necesita es recorrer el camino del ecosistema, que es el que vas
+a usar de verdad. Es la receta estándar para afinar un LLM con QLoRA: cámbiale el nombre del modelo y
+el fichero de datos y afinas un Llama o un Mistral con tus propios ejemplos.
 
-Y **cuatro bits se intenta, no se exige**. La memoria que ahorra es la razón de existir de QLoRA, y
-a 0,6 B de parámetros en una tarjeta de 32 GB no hay nada que ahorrar: lo honesto es intentarlo,
-informar de si funcionó y caer a bf16 en vez de fingir que se demostró una técnica cuando la
-dependencia no compilaba.
+Y **cuatro bits se intenta, no se exige**. La memoria que ahorra es la razón de existir de QLoRA, y a
+0,6 B de parámetros en una tarjeta de 32 GB no hay nada que ahorrar: lo honesto es intentarlo,
+informar de si funcionó y caer a bf16 si la dependencia no carga, en vez de fingir que se demostró la
+técnica.
 
 Fíjate en lo que **no** hay arriba: ni `torch`, ni `transformers`, ni `peft`, ni `trl`. Todos entran
 dentro de las funciones, porque el extra `hf` no está instalado en el entorno base y este módulo
@@ -1226,7 +1235,7 @@ como `unparseable` y la tabla diría que el modelo escribe basura cuando escribe
 
 Las tres excepciones de python-chess se traducen a los tres modos de fallo, una a una. Que la
 librería los distinga es lo que permite que este fichero sea corto: `IllegalMoveError` frente a
-`AmbiguousMoveError` frente a `InvalidMoveError` son exactamente las tres preguntas que había que
+`AmbiguousMoveError` frente a `InvalidMoveError` son las tres preguntas que había que
 contestar.
 
 ```python title="src/rukh/eval/qwen_source.py"
@@ -1533,7 +1542,7 @@ which is exactly the part that must not differ between the two.
 
 El párrafo que el hito le añadió al docstring dice la razón y el límite: **todo lo que rodea al
 jugador se queda aquí** —el rival, la terminación, la adjudicación, cómo se puntúa una partida
-cortada—, que es exactamente la parte que no puede diferir entre los dos.
+cortada—, que es la parte que no puede diferir entre los dos.
 
 ```python title="src/rukh/infer/game.py"
 class Player(Protocol):
@@ -2199,14 +2208,11 @@ uv run rukh eval qwen --adapter checkpoints/qwen3-pgn-qlora --config configs/eva
 El afinado real corre 1 500 pasos; la evaluación por la misma escalera tarda unos 40 minutos, más
 que la del decoder, porque cada jugada es una generación de texto.
 
-<Callout kind="roto" title="Y lo que QLoRA no ahorró">
-  El nombre promete memoria y a esta escala no la da. Cuatro bits sobre Qwen3-0.6B ahorraron **341
-  MB de pesos** (un 29 %) y **7 MB del pico** (un 0,4 %), porque la tabla de embeddings —el 25,9 %
-  del modelo— no se cuantiza y el pico lo marcan las activaciones y el optimizador, no los pesos
-  congelados. La ventaja de QLoRA es real cuando el modelo no cabe; a 0,6 B en una tarjeta de 32 GB
-  no hay nada que no quepa. Se intentó, se midió y se dice, que es lo que permiten los dos campos de
-  memoria de `QwenReport`.
-</Callout>
+El `run.json` contesta a la pregunta de la memoria, y a esta escala la respuesta es la que se
+esperaba: poco. Cuatro bits sobre Qwen3-0.6B ahorraron **341 MB de pesos** (un 29 %) y **7 MB del
+pico** (un 0,4 %). La tabla de embeddings, el 25,9 % del modelo, no se cuantiza, y el pico lo marcan
+las activaciones y el optimizador, no los pesos congelados. La ventaja de QLoRA aparece cuando el
+modelo no cabe, y a 0,6 B en una tarjeta de 32 GB cabe todo.
 
 ## Qué has aprendido
 

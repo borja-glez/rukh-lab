@@ -10,7 +10,7 @@ duration: 165
 runtime: 15
 level: avanzado
 status: vigente
-updated: '2026-09-22'
+updated: '2026-09-23'
 keywords:
   - LoRA
   - rango
@@ -30,9 +30,9 @@ faltaba» y sigue en «Estilo y texto PGN».
 
 ## Qué vas a construir
 
-`src/rukh/models/lora.py` entero —428 líneas— y los catorce tests que lo definen. Es el fichero más
-largo del módulo y el único que implementa una técnica publicada en vez de una decisión del
-proyecto, así que cada parte tiene una afirmación del método detrás y un test que la comprueba.
+`src/rukh/models/lora.py` entero y los catorce tests que lo definen. Es el fichero más largo del
+módulo y el único que implementa una técnica publicada en vez de una decisión del proyecto, así que
+detrás de cada parte hay una afirmación del método y un test que la comprueba.
 
 Al terminar tendrás: un envoltorio que congela un `nn.Linear` y le suma una corrección de rango
 bajo por cada rodaja de salida; una función que decide qué se entrena y —más importante— qué no; dos
@@ -71,8 +71,8 @@ module they adapt, and ``merge_lora`` folds the correction back into ``W`` and p
 
 <Src file="src/rukh/models/lora.py" tag="p4" lines="1-24" />
 
-Los dos detalles que el docstring nombra son los que separan esta implementación de la que sale en
-cualquier tutorial, y los dos vienen de cómo está escrito **este** decoder.
+Los dos detalles que nombra el docstring son los que separan esta implementación de la de cualquier
+tutorial, y los dos salen de cómo está escrito **este** decoder.
 
 El primero: la atención usa una proyección `qkv` **fusionada**. No hay un módulo `q_proj` que
 envolver; hay una sola `nn.Linear` de 768 × 2304 que produce consulta, clave y valor pegadas.
@@ -255,7 +255,7 @@ del código.
 mover el modelo al dispositivo, porque el bucle carga el checkpoint primero y cargar necesita los
 nombres de módulo de un decoder normal. Un factor creado en CPU por defecto se encontraría una
 activación de CUDA en la primera pasada y la ejecución moriría ahí. Todos los tests de este fichero
-corren en CPU, que es exactamente donde el fallo es invisible; por eso hay un test que comprueba la
+corren en CPU, donde el fallo es invisible; por eso hay un test que comprueba la
 **propiedad** —que el factor está donde el peso— en vez del dispositivo que toque.
 
 **`B` arranca en cero exacto.** Así el modelo adaptado **es** el modelo base en el paso 0. Cualquier
@@ -303,11 +303,12 @@ es contabilidad y no parte del grafo, y clona el peso base en vez de sumarle en 
 permite llamarla sin destruir el modelo.
 
 <Callout kind="teoria" title="Por qué el forward no usa `merged_weight`">
-  Sería más corto: fundir y aplicar la lineal una vez. Y sería más caro: fundir cuesta una
-  multiplicación de 768 × 8 por 8 × 768 —589 824 multiplicaciones— **por paso y por capa**, mientras
-  que calcular `B(Ax)` sobre un lote de `n` vectores cuesta dos productos por un tensor de rango 8.
-  Con `r = 8` y `d_model = 768`, la vía del rango bajo es unas cuarenta veces más barata. Es la
-  razón de ser del método: la corrección nunca se materializa como matriz mientras se entrena.
+  Sería más corto: fundir y aplicar la lineal una vez. Pero `merged_weight` corre sin gradiente, así
+  que un paso hacia delante que la usara no entrenaría nada. Y aunque se reescribiera con gradiente,
+  hay dos razones más para ir por `B(Ax)`: el dropout se aplica a la entrada del adaptador, algo que
+  un peso fundido no puede expresar, y en QLoRA la base está en 4 bits y no admite que se le sume
+  una corrección en coma flotante sin descuantizar la matriz entera en cada paso. Mientras se
+  entrena, la corrección vive siempre aparte de `W`; solo se funde al final.
 </Callout>
 
 ## Aplicar los adaptadores
@@ -547,7 +548,7 @@ todas formas no se puede reanudar dentro, porque el checkpoint lleva los pesos f
 <Src file="src/rukh/train/checkpoint.py" tag="p4" lines="103-130" />
 
 El parámetro `state` es todo lo que hizo falta cambiar en el guardado: sustituye a
-`model.state_dict()` cuando se le pasa algo. Es la clase de gancho que se agradece por lo que no
+`model.state_dict()` cuando se le pasa algo. Lo bueno de este gancho es lo que no
 hace: no hay ninguna rama `if lora` dentro de `save_checkpoint`, y el fichero que escribe no sabe
 que LoRA existe.
 
@@ -559,8 +560,7 @@ que LoRA existe.
   acaban siendo la solución correcta, y casi siempre se descubre tarde: primero se escribe la que
   muta, porque es la que hacía falta, y meses después un segundo llamante la usa sin darse cuenta de
   que le deja el objeto inservible. El nombre importa más que el código: `merge_` y `merged_` dicen
-  lo mismo con dos tiempos verbales distintos, y la diferencia es exactamente la de una acción y su
-  resultado.
+  lo mismo con dos tiempos verbales distintos, y la diferencia es la de una acción y su resultado.
 </Transfer>
 
 ## Guardar y cargar el adaptador
@@ -909,15 +909,17 @@ log_every: 10
 
 Dos comentarios del fichero son decisiones y no descripción.
 
-El de arriba: `r = 8` sobre consulta y valor no es solo la configuración del artículo, es **la más
+El de arriba: `r = 8` sobre consulta y valor es la configuración del artículo y además **la más
 pequeña que tiene alguna posibilidad**. Lo que el adaptador aprenda tiene que pasar por ocho
 dimensiones por matriz, y ese cuello es a la vez la razón de que sea barato y el techo de lo que
 puede hacer.
 
 El de `lr`: **veinte veces** la tasa del afinado completo. Solo se mueve el 0,34 % del modelo y `B`
-arranca en cero exacto, así que a 1e-4 el adaptador seguiría cerca de la identidad después de 1 500
-pasos. Es el ajuste que más sorprende de LoRA y el que más se equivoca: reutilizar la tasa del
-afinado entero produce un adaptador que «no hace nada» y parece un fallo de la implementación.
+arranca en cero, así que a 1e-4 el adaptador seguiría cerca de la identidad después de 1 500 pasos.
+Es el ajuste de LoRA que más sorprende y el que más se equivoca: reutilizar la tasa del afinado
+entero produce un adaptador que «no hace nada» y parece un fallo de la implementación. Con los LLM
+pasa igual, y las recetas habituales usan con LoRA una tasa entre diez y veinte veces más alta que
+con un afinado completo.
 
 `weight_decay: 0.0` por la misma familia de razones: penalizar la norma de `B` es empujarla hacia el
 cero del que acaba de salir.
@@ -962,9 +964,8 @@ que se construyen en la lección siguiente: lánzalos cuando la termines.
 
 ## Los catorce tests que definen qué es LoRA
 
-Escribir a mano una técnica publicada tiene un riesgo evidente: que lo escrito se parezca a la
-técnica y no lo sea. Los tests de este fichero son la definición operativa, y cada uno comprueba
-**una** afirmación del método.
+Estos tests son la definición operativa de LoRA en este repositorio: cada uno comprueba **una**
+afirmación del método, y si alguno falla, lo que has escrito es otra cosa.
 
 ```python title="tests/unit/test_lora.py"
 """Tests for rukh.models.lora: the hand-written adapters and what makes them LoRA.
@@ -1222,8 +1223,8 @@ son 39 000 parámetros y dos tercios son la tabla de embeddings, así que su pro
 real y comprueba los tres números que la lección cita: 393 216 parámetros, menos del 0,4 % del
 modelo, y 1 572 864 bytes en `float32`.
 
-Es un test de una frase de la documentación, y el proyecto tiene unos cuantos. Lo que garantiza no es
-que el código funcione, es que el día que alguien cambie el preset `medium` la card no siga diciendo
+Es un test de una frase de la documentación, y el proyecto tiene unos cuantos. No comprueba que el
+código funcione: comprueba que el día que alguien cambie el preset `medium`, la card no siga diciendo
 1,6 MB.
 
 El segundo comprueba que los gradientes llegan a los factores **y a nada más**: la tabla de
@@ -1307,10 +1308,10 @@ de `peft`— necesita la envoltura de Hugging Face y está en la lección 5.
 Una técnica publicada, escrita entera, con las dos adaptaciones que pide este decoder: una `A` y una
 `B` por rodaja de una proyección fusionada, y dos fundidos con políticas opuestas sobre el original.
 Y el formato del artefacto, que tiene tres formas porque tiene tres destinos: `ParameterList` para
-entrenar, safetensors por clave para cargar, y dos tensores apilados para un grafo.
+entrenar, safetensors por clave para cargar y dos tensores apilados para un grafo.
 
-Se mide con el número que devuelve `apply_lora` —393 216 de 115 520 000, el 0,34 %— y con los
-catorce tests, que es lo que convierte «implementamos LoRA» en una afirmación comprobable.
+Se mide con el número que devuelve `apply_lora` (393 216 de 115 120 128, el 0,34 %) y con los
+catorce tests, que son los que convierten «implementamos LoRA» en una afirmación comprobable.
 
 Lo siguiente son los datos que entrenan esos adaptadores: cómo se corta un corpus por la primera
 jugada sin que el predicado se pueda salir del SQL, y cómo se escriben las mismas partidas en el
