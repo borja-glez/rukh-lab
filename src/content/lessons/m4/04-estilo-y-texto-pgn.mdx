@@ -7,7 +7,7 @@ description:
   las dos afirmaciones y las cuatro configuraciones que los usan.'
 module: m4
 order: 4
-duration: 175
+duration: 130
 runtime: 20
 level: medio
 status: vigente
@@ -31,16 +31,12 @@ Lección 4 de 10 del módulo «Fine-tuning e instrucción». Viene de «LoRA esc
 
 ## Qué vas a construir
 
-Dos módulos de datos que no se parecen en nada y comparten una propiedad: los dos cortan el mismo
-corpus de una manera que hace comparable lo que sale.
-
+Dos módulos de datos que cortan el mismo corpus de manera que lo que sale sea comparable.
 `src/rukh/data/style.py` saca las partidas que empiezan por una jugada concreta, que es lo que un
-adaptador de estilo aprende a sonar. `src/rukh/data/pgn_text.py` escribe esas mismas partidas como
-las leería un humano —`1. e4 e5 2. Nf3`— para que un modelo general pueda afinarse con ellas y
-entrar en el mismo harness que el decoder.
-
-En cada uno hay una decisión que decide si la medición posterior significa algo: el suelo de Elo del
-corte de estilo, y el espacio que el prompt de PGN no lleva al final.
+adaptador de estilo aprende a imitar. `src/rukh/data/pgn_text.py` escribe esas mismas partidas como
+las leería un humano (`1. e4 e5 2. Nf3`) para que un modelo general pueda afinarse con ellas. En cada
+uno hay una decisión de la que depende que la medición posterior signifique algo: el suelo de Elo del
+corte de estilo y el espacio que el prompt de PGN no lleva al final.
 
 ## `style.py`: cortar sin escribir SQL en un YAML
 
@@ -80,21 +76,13 @@ __all__ = ["StyleConfig", "StyleSpec", "build_styles", "predicate_of"]
 
 <Src file="src/rukh/data/style.py" tag="p4" lines="1-31" />
 
-El docstring tiene dos mitades, y las dos son decisiones.
+El eje de estilo es la **apertura** porque es el más barato de ver: cargas un adaptador y el modelo
+abre `1. e4`; cargas el otro y abre `1. d4`. Hay un número detrás (la proporción de primeras jugadas)
+y un coste medible (el Elo del modelo adaptado frente a la base).
 
-La primera: el eje de estilo es la **apertura** porque es el eje visible más barato que hay en estos
-datos. Un adaptador solo es interesante si se le puede **ver** funcionar, y aquí se ve: cargas uno y
-el modelo abre `1. e4`; cargas el otro y abre `1. d4`. Con un número detrás (la proporción de
-primeras jugadas) y un coste medible (el Elo del modelo adaptado frente a la base). Un adaptador que
-moviera algo real pero invisible sería mejor aprendizaje automático y peor enseñanza.
-
-La segunda: el corte se define con **campos tipados** y no con una cadena de SQL en el YAML. Un
-predicado escrito en una configuración es una inyección esperando a ocurrir y, peor, no está
-documentado: nadie que lea `configs/` sabría que `eco` es una columna ni qué forma tiene.
-
-El `__all__` de cuatro nombres al final del bloque es la superficie del módulo: dos configuraciones,
-la función que corta y la que construye el predicado. Que `predicate_of` sea pública es lo que
-permite que un test compruebe el SQL sin escribir un parquet.
+Y el corte se define con **campos tipados**, no con una cadena de SQL en el YAML. Un predicado en una
+configuración es una inyección esperando a ocurrir, y además nadie que lea `configs/` sabría qué
+columnas hay ni qué forma tienen.
 
 ```python title="src/rukh/data/style.py"
 class StyleSpec(BaseConfig):
@@ -137,21 +125,11 @@ class StyleConfig(BaseConfig):
 
 <Src file="src/rukh/data/style.py" tag="p4" lines="34-69" />
 
-Cuatro campos por estilo, y el validador que impide el error que cuesta una hora: **un estilo que no
-selecciona nada**. Sin `first_move` ni `eco_prefix`, el predicado sale vacío, el `WHERE` se queda
-colgando y —según cómo se construya la consulta— o revienta el SQL o selecciona el corpus entero.
-Las dos formas de fallar son peores que el `ValueError`.
-
-`min_elo` no es decorativo, y su docstring lo dice en una línea: si las partidas de `1. d4` vinieran
-de jugadores más flojos, «el adaptador cambió la apertura» y «el adaptador lo empeoró» serían la
-misma medición y no habría manera de separarlas después.
-
-El `pattern=r"^[a-z0-9-]+$"` del nombre está porque el nombre acaba siendo un nombre de fichero
-(`e4.parquet`) y un nombre de ejecución. Un estilo llamado `../../etc` no es una inyección de SQL pero
-sí es una ruta.
-
-Y el validador de `StyleConfig` rechaza nombres duplicados: dos estilos con el mismo nombre se
-escribirían encima el uno del otro y el segundo ganaría en silencio.
+El validador impide el error que cuesta una hora: un estilo que no selecciona nada, cuyo `WHERE`
+vacío o revienta el SQL o selecciona el corpus entero. Y `min_elo` separa estilo de debilidad: si las
+partidas de `1. d4` vinieran de jugadores más flojos, «el adaptador cambió la apertura» y «el
+adaptador lo empeoró» serían la misma medición. El `pattern` del nombre está porque el nombre acaba
+siendo una ruta de fichero, y `../../etc` no es SQL pero sí es una ruta.
 
 ```python title="src/rukh/data/style.py"
 def _sql_string(value: str) -> str:
@@ -176,21 +154,11 @@ def predicate_of(spec: StyleSpec) -> str:
 
 <Src file="src/rukh/data/style.py" tag="p4" lines="72-89" />
 
-Esto es todo el lenguaje de consulta que esta configuración puede expresar. Tres condiciones
-posibles, unidas por `AND`, y ninguna manera de escribir una cuarta desde un fichero.
-
-`split_part(uci, ' ', 1) = 'e2e4'` y no `uci LIKE 'e2e4%'`: la columna `uci` son jugadas separadas
-por espacios, así que comparar el **primer token** es exacto mientras que el prefijo colaría
-`e2e4e...` si alguna vez existiera una jugada de cinco caracteres que empezara igual. Hay un test
-que lo comprueba desde el otro lado, con `d2d4` y `d2d3`.
-
-`sorted(spec.eco_prefix)` antes de unir los `OR` no cambia lo que selecciona y sí cambia el
-predicado que el manifiesto guarda: dos configuraciones con los mismos prefijos en distinto orden
-producen el mismo texto, y por tanto el mismo corpus reproducible.
-
-`_sql_string` escapa las comillas duplicándolas. Es el mecanismo de siempre y aquí es la **red de
-seguridad**, no la defensa: la defensa es que los campos sean tipados. Un test comprueba que una
-comilla en un prefijo de ECO no se sale del literal.
+Este es todo el lenguaje de consulta que la configuración puede expresar: tres condiciones unidas por
+`AND`, y ninguna manera de escribir una cuarta desde un fichero. Se compara el primer token
+(`split_part`) en vez de un prefijo con `LIKE`, que podría colar jugadas que empiezan igual. Y
+`_sql_string`, que duplica las comillas, es la red de seguridad; la defensa es que los campos sean
+tipados.
 
 ```python title="src/rukh/data/style.py"
 def build_styles(cfg: StyleConfig) -> dict[str, Manifest]:
@@ -257,21 +225,11 @@ def build_styles(cfg: StyleConfig) -> dict[str, Manifest]:
 
 <Src file="src/rukh/data/style.py" tag="p4" lines="92-151" />
 
-Un `COPY` por estilo, y tres cosas que merecen nombre.
-
-`ORDER BY hash(game_id) + seed` con `LIMIT` es el mismo muestreo determinista de `elo_bins`: la
-misma semilla da el mismo corte, y no hay que cargar las partidas en memoria para elegirlas. Un
-`LIMIT` sin `ORDER BY` daría las primeras del fichero, que en un parquet ordenado por mes son las
-del principio del mes.
-
-El `log.info` con el predicado es lo que permite leer en el log **qué se seleccionó** en vez de
-deducirlo del recuento. Es el mismo predicado que va al manifiesto, y es el que una card publicada
-tendrá que citar.
-
-Y el manifiesto guarda tres cosas en `filters`: la especificación tal cual, el predicado ya
-construido y la semilla. Con eso, una card puede decir «entrenado con las 200 000 partidas de
+`ORDER BY hash(game_id) + seed` con `LIMIT` es el mismo muestreo determinista de `elo_bins`; un
+`LIMIT` a secas daría las partidas del principio del mes. Y el manifiesto guarda el predicado ya
+construido y la semilla, así que una card puede decir «entrenado con las 200 000 partidas de
 `data/uci` que cumplen `split_part(uci, ' ', 1) = 'e2e4' AND white_elo >= 1800 AND black_elo >=
-1800`», que es una afirmación comprobable en vez de «entrenado con partidas de `1. e4`».
+1800`», una afirmación comprobable, en vez de «entrenado con partidas de `1. e4`».
 
 ### Los tests del corte
 
@@ -325,13 +283,8 @@ def _read(rukh_home: Path, name: str) -> pl.DataFrame:
 
 <Src file="tests/unit/test_style.py" tag="p4" lines="1-45" />
 
-El montaje es un mes de seis partidas escritas a mano, con tres aperturas y dos niveles de fuerza.
-Seis filas bastan porque lo que se comprueba son **predicados**, no estadística: un corte que deja
-fuera la partida de 1850 con `min_elo=1900` está bien o está mal, y no hace falta un corpus para
-verlo.
-
-Fíjate en que las seis partidas son jugables de verdad y llevan su `eco`: el esquema del parquet
-tiene que ser el mismo que el del corpus real, o el test comprobaría una consulta contra otra tabla.
+El montaje es un mes de seis partidas escritas a mano, con el mismo esquema que el corpus real. Seis
+filas bastan porque lo que se comprueba son predicados, no estadística.
 
 ```python title="tests/unit/test_style.py"
 def test_the_first_move_slice_only_holds_games_that_open_with_it(rukh_home: Path) -> None:
@@ -392,17 +345,8 @@ def test_the_manifest_records_the_predicate_a_published_adapter_has_to_state(
 
 <Src file="tests/unit/test_style.py" tag="p4" lines="48-101" />
 
-Seis tests, uno por decisión del predicado.
-
-El primero es el eje que enseña la demo. El segundo es el que evita el fallo del prefijo: `d2d4` no
-debe recoger partidas que empezaron `d2d3`, y la aserción se escribe sobre los ECO porque eso hace
-visible **qué** partidas entraron, no solo cuántas.
-
-El del suelo de Elo comprueba la frase del docstring: con `min_elo=1900` la partida de 1850 se queda
-fuera, y con ella se va la confusión entre estilo y debilidad.
-
-Y el del manifiesto comprueba que el predicado que se guarda es el que una card publicada tendrá que
-citar, literalmente, con la cadena dentro.
+Un test por decisión del predicado. El del prefijo afirma sobre los ECO, no sobre el recuento, porque
+así se ve qué partidas entraron.
 
 ```python title="tests/unit/test_style.py"
 def test_several_styles_are_cut_in_one_pass(rukh_home: Path) -> None:
@@ -461,13 +405,8 @@ def test_no_styles_is_refused(rukh_home: Path) -> None:
 
 <Src file="tests/unit/test_style.py" tag="p4" lines="104-155" />
 
-Y los siete que cierran los bordes: varios estilos en una pasada, el determinismo por semilla, las
-tres validaciones de configuración, el corte vacío, y el de la comilla.
-
-El de la comilla vale la pena leerlo dos veces. `eco_prefix=["B'2"]` no es algo que nadie vaya a
-escribir; es la forma de comprobar que, **si** alguien lo escribe, la comilla se duplica y el
-literal no se rompe. El docstring del test dice qué defiende qué: los campos tipados son
-la razón de que la configuración no pueda llevar SQL, y el escapado es el respaldo.
+Los siete que cierran los bordes incluyen el de la comilla: nadie escribirá `eco_prefix=["B'2"]`,
+pero si alguien lo hace, el literal no se rompe.
 
 <Callout kind="ejecuta" title="Los predicados del corte">
   `style.py` y sus tests ya están completos, y no necesitan el corpus: el montaje escribe su propio
@@ -487,12 +426,11 @@ comilla.
   concept="Un lenguaje de consulta pequeño en vez de uno grande"
   where="Filtros en la URL de una API, reglas de alerta en un fichero de configuración, permisos por recurso."
 >
-  La tentación, cuando un filtro se queda corto, es dejar pasar una expresión del lenguaje de abajo:
-  una cadena de SQL, un fragmento de regex, un trozo de Python en un `eval`. Es rápido de escribir y
-  caro de todo lo demás: no se puede validar, no se puede documentar, no se puede cambiar de motor y
-  no se puede publicar en un manifiesto sin publicar además cómo funciona el motor. Tres campos
-  tipados cubren el 95 % de los casos y el 5 % restante se resuelve añadiendo un cuarto campo, que
-  es el momento de pararse a pensar si de verdad hace falta.
+  Cuando un filtro se queda corto, la tentación es dejar pasar una expresión del lenguaje de abajo:
+  una cadena de SQL, una regex, un `eval`. Es rápido de escribir y caro de todo lo demás: no se
+  puede validar, documentar ni publicar en un manifiesto. Tres campos tipados cubren casi todos los
+  casos, y añadir un cuarto es el momento de pensar si de verdad hace falta. Lo mismo vale para las
+  herramientas que le das a un agente: parámetros tipados, no una cadena que se ejecuta.
 </Transfer>
 
 ## Las configuraciones de los cortes
@@ -529,13 +467,7 @@ style:
 
 <Src file="configs/data/pipeline-style.yaml" tag="p4" lines="1-26" />
 
-Los dos estilos en una sola pasada sobre el corpus, con los campos tipados de la sección anterior.
-Los diez primeros comentarios son las dos decisiones que ya conoces —la apertura como eje visible, el
-suelo de Elo para que el estilo no sea debilidad— escritas donde alguien que abra el YAML las va a
-leer.
-
-Después hacen falta dos packs de tokens, uno por corte, y son el mismo fichero con dos palabras
-cambiadas:
+Después hacen falta dos packs de tokens, uno por corte:
 
 {/* prettier-ignore */}
 ```yaml title="configs/data/pipeline-style-e4.yaml"
@@ -575,12 +507,9 @@ tokenize:
 
 <Src file="configs/data/pipeline-style-d4.yaml" tag="p4" lines="9-11" />
 
-Tres líneas de diferencia: el comentario del título, el directorio de salida y el parquet de
-entrada. `val_remainder_trains: false` está en los dos por una razón parecida a la del corpus plano:
-un adaptador entrenado sobre una sola apertura tiene que medirse contra las mismas partidas reservadas
-que todo lo demás, y rellenarle el entrenamiento con un corpus general diluiría justo la rebanada que
-define el estilo. Las dos configuraciones se ejecutan al final de la lección, cuando la orden
-`rukh data style` esté escrita.
+`val_remainder_trains: false` está en los dos por la misma razón que en el corpus plano: rellenar el
+entrenamiento con un corpus general diluiría la rebanada que define el estilo. Se ejecutan al final
+de la lección.
 
 ## `pgn_text.py`: las mismas partidas, en otro idioma
 
@@ -633,25 +562,12 @@ VAL_FILE = "val.jsonl"
 
 <Src file="src/rukh/data/pgn_text.py" tag="p4" lines="1-44" />
 
-El docstring plantea la comparación entera del módulo. Para que signifique algo, los **datos** tienen
-que ser las mismas partidas y la **métrica** el mismo harness; lo único que puede cambiar es la
-representación, y aquí cambia todo lo que puede cambiar.
-
-Las dos consecuencias que el docstring llama «la lección, no un accidente del montaje» son las que
-hay que tener delante al leer la tabla de la lección 9. Los números de jugada y la grafía
-de <Term id="san">SAN</Term> son tokens que el modelo gasta capacidad en predecir y no llevan
-ajedrez dentro; el especialista no los ve nunca. Y SAN es **contextual**: `Nf3` nombra una jugada
-distinta según dónde estén los caballos, y una cadena con pinta de legal puede ser ilegal o ambigua.
-Por eso la evaluación cuenta aparte las jugadas que no pudo interpretar en vez de meterlas en
-«ilegal».
-
-La cabecera conserva los dos tags de Elo porque eso es lo que son los tokens
-`<wXXXX> <bXXXX>` del decoder: la pregunta del condicionamiento se le puede hacer a los dos modelos,
-cada uno en su idioma.
-
-Y el bloque incluye los imports, que dicen una cosa del fichero: `chess` está arriba y `polars` no.
-Este módulo se usa desde dos sitios —el constructor del corpus y el evaluador, que llama a
-`prompt_for` en cada jugada—, y el segundo no necesita `polars` para nada.
+Ten delante las dos consecuencias del docstring al leer la tabla de la lección 9. Los números de
+jugada y la grafía de <Term id="san">SAN</Term> son tokens que el modelo gasta capacidad en predecir
+y no llevan ajedrez dentro. Y SAN es **contextual**: `Nf3` nombra una jugada distinta según dónde
+estén los caballos, así que la evaluación cuenta aparte las jugadas que no pudo interpretar. La
+cabecera conserva los dos tags de Elo, para poder hacerles a los dos modelos la pregunta del
+condicionamiento, cada uno en su idioma.
 
 ```python title="src/rukh/data/pgn_text.py"
 class PgnTextConfig(BaseConfig):
@@ -671,14 +587,9 @@ class PgnTextConfig(BaseConfig):
 
 <Src file="src/rukh/data/pgn_text.py" tag="p4" lines="47-59" />
 
-`max_plies: 120` son sesenta jugadas por bando, y el comentario dice el criterio: a partir de ahí el
-texto ocupa más contexto del que vale la pena gastar. Las partidas largas se **cortan**, no se
-descartan, y la configuración de la lección 10 explica por qué: un corpus que excluye las partidas
-largas en silencio es un corpus que enseña partidas cortas.
-
-`val_offset` existe para que la validación pueda saltarse las filas sobre las que evalúa el harness.
-Es la misma familia de precaución que el conjunto reservado de siempre, aplicada a un corpus que se
-construye aparte.
+Las partidas de más de `max_plies` se cortan en vez de descartarse: un corpus que excluye las largas
+en silencio enseña partidas cortas. `val_offset` permite que la validación se salte las filas sobre
+las que evalúa el harness.
 
 ```python title="src/rukh/data/pgn_text.py"
 def movetext(board: chess.Board, max_plies: int | None = None) -> str:
@@ -717,16 +628,9 @@ def header(white_elo: int, black_elo: int, fen: str | None = None) -> str:
 
 <Src file="src/rukh/data/pgn_text.py" tag="p4" lines="62-93" />
 
-`movetext` vuelve a jugar la partida **desde la raíz** en vez de leer la pila de jugadas, y el
-docstring dice por qué en una frase: SAN depende de la posición en la que se escribe. La misma
-jugada es `Nf3` o `Ngf3` según dónde esté el otro caballo, y solo la posición de ese momento lo
-sabe. Hay un test con las dos posiciones.
-
-El `elif not parts` es el caso raro y necesario: una partida que empieza con las negras —lo que pasa
-cuando se parte de un FEN— necesita el marcador `17...`, porque si no el texto empezaría con una
-jugada sin número y ningún lector de PGN sabría de quién es.
-
-`header` es trivial salvo por el FEN opcional, que es la mitad de la siguiente función.
+`movetext` vuelve a jugar la partida **desde la raíz**, porque la misma jugada es `Nf3` o `Ngf3`
+según dónde esté el otro caballo, y solo la posición de ese momento lo sabe. El `elif not parts`
+cubre una partida que empieza con las negras (desde un FEN), que necesita el marcador `17...`.
 
 ```python title="src/rukh/data/pgn_text.py"
 def prompt_for(board: chess.Board, white_elo: int = 1800, black_elo: int = 1800) -> str:
@@ -752,27 +656,19 @@ def prompt_for(board: chess.Board, white_elo: int = 1800, black_elo: int = 1800)
 
 <Src file="src/rukh/data/pgn_text.py" tag="p4" lines="96-114" />
 
-Dos decisiones, las dos con test.
-
-La primera: una posición que viene de un FEN —un puzle— lleva su tag `[FEN ...]`, para que al
-modelo no se le pida adivinar una historia que nunca ocurrió. Un puzle no tiene partida detrás, y
-pedirle al modelo que continúe un movetext inventado es hacerle otra pregunta.
-
-La segunda está en el comentario de las dos últimas líneas y es la que más fácilmente se publica
-mal: **el prompt nunca termina en espacio**. Un BPE escribe una jugada como `" Nc6"`, con el espacio
-pegado delante; un prompt que ya lo lleva obliga al modelo a continuar con un token que casi nunca vio
-en esa posición. El resultado sale en la tabla como un modelo peor, cuando lo que es peor es el
-prompt.
+Un puzle lleva su tag `[FEN ...]`, para no pedirle al modelo que continúe una historia que nunca
+ocurrió. Y, lo que más fácilmente se publica mal: **el prompt nunca termina en espacio**. Un BPE
+escribe una jugada como `" Nc6"`, con el espacio pegado delante; un prompt que ya lo lleva obliga al
+modelo a continuar con un token que casi nunca vio en esa posición, y en la tabla sale un modelo peor
+cuando lo que es peor es el prompt.
 
 <Callout kind="roto" title="Un espacio de más es una métrica de menos">
-  Este error habría invalidado la comparación del módulo sin dar ninguna señal. El modelo
-  contestaría, las respuestas serían jugadas plausibles, la tasa de legalidad bajaría unos puntos, y
-  la conclusión («un modelo general escribe muchas jugadas ilegales») sería la que esperábamos
-  encontrar. Un sesgo que confirma lo que buscabas es el que menos se investiga. Le pasa a cualquier
-  LLM con tokenizador BPE: un prompt que acaba en espacio, o que corta una palabra por la mitad,
-  deja al modelo en una frontera de tokens que no vio al entrenar y le empeora la respuesta. La
-  defensa aquí es un test corto que recorre los prefijos de una partida y comprueba que ninguno
-  acaba en espacio.
+  Este error habría invalidado la comparación sin dar ninguna señal: la legalidad bajaría unos
+  puntos y la conclusión («un modelo general escribe muchas jugadas ilegales») sería la que
+  esperábamos. Un sesgo que confirma lo que buscabas es el que menos se investiga. Le pasa a
+  cualquier LLM con tokenizador BPE: un prompt que acaba en espacio, o que corta una palabra por la
+  mitad, deja al modelo en una frontera de tokens que no vio al entrenar. La defensa es un test que
+  recorre los prefijos de una partida y comprueba que ninguno acaba en espacio.
 </Callout>
 
 ```python title="src/rukh/data/pgn_text.py"
@@ -799,14 +695,8 @@ def game_text(uci: str, white_elo: int, black_elo: int, result: str, max_plies: 
 
 <Src file="src/rukh/data/pgn_text.py" tag="p4" lines="117-135" />
 
-Una partida entera como muestra de entrenamiento: cabecera, movetext y resultado. Y una política que
-el docstring hace explícita: una partida que no se puede volver a jugar se **descarta**, no se
-repara. El corpus UCI se validó con python-chess en M1, así que cualquier cosa que falle aquí es un
-fallo que merece verse en los recuentos y no una fila que merezca adivinarse.
-
-El `except (ValueError, AssertionError)` captura las dos maneras en que python-chess protesta ante
-una jugada imposible, y el `if not board.move_stack` descarta la partida vacía, que es la otra forma
-de tener cero información.
+Una partida que no se puede volver a jugar se descarta, no se repara: el corpus UCI ya se validó en
+M1, así que un fallo aquí tiene que verse en los recuentos.
 
 ```python title="src/rukh/data/pgn_text.py"
 def _rows(path: Path, limit: int, offset: int = 0) -> Iterator[dict[str, object]]:
@@ -846,16 +736,10 @@ def _write_split(
 
 <Src file="src/rukh/data/pgn_text.py" tag="p4" lines="138-170" />
 
-El `import polars` va dentro de la función por lo de siempre: es una dependencia pesada que el resto
-del módulo —`movetext`, `prompt_for`, `header`— no necesita, y esas tres se usan desde el evaluador,
-que corre en otro contexto.
-
-`_write_split` devuelve `(escritas, descartadas)`, las dos, porque el manifiesto publica las dos. Un
-corpus que dice cuántas filas tiene y no cuántas perdió por el camino esconde justo el número que
-avisaría de un problema aguas arriba.
-
-`newline="\n"` explícito al abrir el fichero: en Windows, un `\n` escrito en modo texto se convierte
-en `\r\n`, y un JSONL con retornos de carro es un JSONL que algunos lectores parten mal.
+`_write_split` devuelve las filas escritas y las descartadas, porque un corpus que no dice cuántas
+perdió por el camino esconde el número que avisaría de un problema aguas arriba. Y `newline="\n"` va
+explícito porque en Windows el modo texto escribiría `\r\n`, y algunos lectores parten mal un JSONL
+así.
 
 ```python title="src/rukh/data/pgn_text.py"
 def build(cfg: PgnTextConfig) -> Manifest:
@@ -899,12 +783,8 @@ def build(cfg: PgnTextConfig) -> Manifest:
 
 <Src file="src/rukh/data/pgn_text.py" tag="p4" lines="173-209" />
 
-La comprobación de que los dos parquet existen se hace **antes** de escribir nada, y el mensaje dice
-dónde se buscó. Es medio minuto de escribir y ahorra la variante en la que el split de entrenamiento
-se escribe entero y la ejecución muere al llegar al de validación.
-
-`filters["dropped"]` lleva los dos recuentos de descartes dentro del manifiesto, y no en el log: un
-log se pierde, un manifiesto viaja con los datos.
+Que los dos parquet existan se comprueba antes de escribir nada, y los descartes van en el
+manifiesto y no en el log: un log se pierde, un manifiesto viaja con los datos.
 
 ### Los tests del formato
 
@@ -951,10 +831,7 @@ def test_san_is_disambiguated_by_the_position_it_is_written_in() -> None:
 
 <Src file="tests/unit/test_pgn_text.py" tag="p4" lines="1-38" />
 
-La Española de cinco <Term id="ply">plies</Term> como partida de prueba, y el test que justifica la decisión de diseño más
-cara del módulo: con los dos caballos capaces de llegar a la casilla, la jugada es `Nbd2` y no
-`Nd2`. Leer la pila de jugadas daría la grafía sin desambiguar, y el corpus enseñaría a escribir SAN
-ambiguo.
+La Española de cinco <Term id="ply">plies</Term> como partida de prueba, y el test que justifica la decisión más cara del módulo: con los dos caballos capaces de llegar a la casilla, la jugada es `Nbd2` y no `Nd2`.
 
 ```python title="tests/unit/test_pgn_text.py"
 def test_a_game_carries_its_ratings_and_its_result() -> None:
@@ -1013,18 +890,9 @@ def test_the_ratings_asked_for_are_the_ratings_written() -> None:
 
 <Src file="tests/unit/test_pgn_text.py" tag="p4" lines="41-92" />
 
-Nueve tests sobre la forma exacta del texto, y los cuatro del prompt son los importantes.
-
-El del espacio recorre **todos** los prefijos de la partida, del vacío al completo, porque el caso
-que falla depende de a quién le toque mover y de si ya hay movetext. Comprobar uno solo dejaría tres
-caminos sin mirar.
-
-Los dos siguientes fijan la forma en las dos situaciones: con las blancas a mover, el prompt termina
-en el número (`3.`) para que el modelo solo tenga que escribir la jugada; con las negras, termina en
-la jugada blanca.
-
-Y el del FEN comprueba las dos mitades a la vez: que el tag está y que el prompt acaba en
-`4...`, que es la forma de pedir una jugada de las negras sin una historia que no existe.
+El test del espacio recorre todos los prefijos de la partida, porque el caso que falla depende de a
+quién le toque mover y de si ya hay movetext. Con las blancas a mover, el prompt termina en el número
+(`3.`); con las negras, en la jugada blanca; desde un FEN, en `4...`.
 
 ```python title="tests/unit/test_pgn_text.py"
 def test_build_writes_both_splits_and_counts_what_it_dropped(
@@ -1071,10 +939,8 @@ def test_missing_games_say_where_they_were_looked_for(rukh_home: Path) -> None:
 
 <Src file="tests/unit/test_pgn_text.py" tag="p4" lines="95-134" />
 
-Y los tres de integración, sobre el parquet de prueba del repositorio. El primero comprueba la forma
-del JSONL —una clave, `text`, y nada más— y que el manifiesto cuadra con lo escrito, incluidos los
-cero descartes. El segundo comprueba que `val_offset` cambia de verdad lo que sale. El tercero, que
-un fichero ausente dice dónde se buscó.
+Los tres de integración comprueban la forma del JSONL y que el manifiesto cuadra con lo escrito, que
+`val_offset` cambia de verdad lo que sale y que un fichero ausente dice dónde se buscó.
 
 <Callout kind="ejecuta" title="El texto PGN, comprobado letra a letra">
   `pgn_text.py` se prueba sin descargar nada: los tests de formato construyen sus tableros y los de
@@ -1084,9 +950,8 @@ un fichero ausente dice dónde se buscó.
 uv run pytest -m unit -q tests/unit/test_pgn_text.py
 ```
 
-Catorce tests en verde. Los que no pueden fallar son el de `Nbd2`, que demuestra que el SAN se
-reconstruye desde la raíz, y el que recorre todos los prefijos de la Española comprobando que
-ningún prompt acaba en espacio.
+Catorce tests en verde. Los que no pueden fallar son el de `Nbd2` y el que comprueba que ningún
+prompt acaba en espacio.
 
 </Callout>
 
@@ -1114,14 +979,10 @@ pgn_text:
 
 <Src file="configs/data/pipeline-pgn.yaml" tag="p4" lines="1-18" />
 
-El reparto es el mismo que usa todo el proyecto: se entrena con 2025-01 y se mide sobre 2025-02, así
-que Qwen se entrena con las mismas partidas que el decoder y se evalúa sobre posiciones que ninguno
-de los dos ha visto. El `val.jsonl` existe para tener una pérdida de validación y **no** es de donde
-se lee la comparación: eso es `rukh eval qwen`, sobre las posiciones del propio harness.
-
-Cada línea de los dos JSONL es una partida con esta forma (la orden que los escribe, `rukh data
-pgn-text`, se ejecuta al final de la lección), con los dos tags de Elo que son la cabecera del
-decoder dicha en PGN:
+El reparto es el de todo el proyecto: Qwen se entrena con las mismas partidas que el decoder
+(2025-01) y se evalúa sobre posiciones que ninguno de los dos ha visto. La comparación no se lee del
+`val.jsonl` sino de `rukh eval qwen`, sobre las posiciones del propio harness. Cada línea de los
+JSONL es una partida con esta forma:
 
 ```text
 [WhiteElo "2015"] [BlackElo "2028"]
@@ -1157,10 +1018,8 @@ class PipelineConfig(BaseConfig):
 
 <Src file="src/rukh/data/pipeline.py" tag="p4" lines="51-72" />
 
-El registro de pasos: `style` entra en `DUCKDB_STEPS` —la lista de pasos que abren una conexión y
-por tanto heredan la sección `duckdb:` común— y las dos configuraciones nuevas se cuelgan de
-`PipelineConfig`. Añadir un paso al pipeline son dos líneas, y eso es lo que permite que
-`pipeline-style.yaml` solo declare lo suyo.
+Añadir un paso al pipeline son dos líneas: `style` entra en `DUCKDB_STEPS`, para heredar la sección
+`duckdb:` común, y las dos configuraciones nuevas se cuelgan de `PipelineConfig`.
 
 ## Los pares de preferencia recuerdan su partida
 
@@ -1204,15 +1063,14 @@ def build_pairs(evals: Path, min_delta_cp: int) -> pl.DataFrame:
 
 <Src file="src/rukh/data/pairs.py" tag="p4" lines="95-129" />
 
-Este cambio prepara M5: cada par de preferencia gana `game_id` y `ply`, y el comentario dice por qué es imprescindible y no una mejora
-de trazabilidad: el decoder lee una **secuencia de jugadas**, no un tablero, así que un par sin el
-prefijo que llevó hasta esa posición no le sirve de nada. `game_id` y `ply` son lo que permite unir
-un par con su partida.
+Este cambio prepara M5: cada par de preferencia gana `game_id` y `ply`. El decoder lee una secuencia
+de jugadas, no un tablero, así que un par sin el prefijo que llevó hasta esa posición no le sirve de
+nada.
 
 ## Las dos órdenes de la CLI
 
 Cada orden de `rukh` es una cáscara fina sobre la librería: parsear opciones, llamar a una función,
-imprimir. Las dos de este módulo son un buen ejemplo de qué se hace en la cáscara y qué no.
+imprimir.
 
 ```python title="src/rukh/cli.py"
 @data_app.command("pgn-text")
@@ -1255,16 +1113,9 @@ def data_style(config: PipelineOption = None, as_json: JsonOption = False) -> No
 
 <Src file="src/rukh/cli.py" tag="p4" lines="300-335" />
 
-Los `import` están **dentro** de las funciones, y esa es la regla del fichero entero: `rukh --help`
-tiene que responder sin cargar `polars`, `chess` ni `duckdb`. Con treinta órdenes, importar todo
-arriba convertiría la ayuda en dos segundos de espera.
-
-El `try/except` traduce las excepciones de la librería a un mensaje y un código de salida. Lo que se
-captura es concreto —`FileNotFoundError` y `ValueError`— y no `Exception`: un fallo que nadie previó
-tiene que salir con su traza, porque una traza es información y «error: algo pasó» no lo es.
-
-Y `data_style` imprime a mano en vez de reutilizar `_echo_manifest` porque devuelve **varios**
-manifiestos, uno por estilo. Es la única diferencia entre las dos órdenes.
+Los `import` van dentro de las funciones para que `rukh --help` responda sin cargar `polars`, `chess`
+ni `duckdb`. Y el `try/except` captura solo `FileNotFoundError` y `ValueError`: un fallo que nadie
+previó tiene que salir con su traza, porque «error: algo pasó» no es información.
 
 <Callout kind="ejecuta" title="Los dos cortes, sobre el corpus de verdad">
   Con las dos órdenes registradas ya se pueden producir los datos de los adaptadores y de Qwen.
@@ -1292,13 +1143,8 @@ aparecer las dos líneas de la lección 3: `LoRA r=8 alpha=16 on [q, v]: 393,216
 ## Qué has aprendido
 
 Dos maneras de cortar el mismo corpus, y en cada una la decisión que hace comparable el resultado.
-En el corte de estilo, campos tipados en vez de SQL —lo que permite publicar el predicado en el
-manifiesto y en la card— y un suelo de Elo que impide confundir estilo con debilidad. En el texto
-PGN, el SAN reconstruido desde la raíz porque la grafía depende de la posición, y un prompt que no
-termina en espacio porque el BPE escribe el espacio pegado a la jugada.
+En el corte de estilo, campos tipados en vez de SQL y un suelo de Elo que impide confundir estilo con
+debilidad. En el texto PGN, el SAN reconstruido desde la raíz y un prompt que no termina en espacio,
+porque el BPE escribe el espacio pegado a la jugada.
 
-Se mide con los manifiestos: `data/style/e4.manifest.json` dice cuántas partidas entraron y con qué
-predicado, y `data/pgn-text/manifest.json` dice cuántas se escribieron y cuántas se descartaron.
-
-Lo siguiente es el modelo general que lee ese texto, y la envoltura que mete el decoder en el mismo
-ecosistema para poder compararlos. Sigue en «QLoRA con `transformers`».
+Lo siguiente es el modelo general que lee ese texto. Sigue en «QLoRA con `transformers`».
