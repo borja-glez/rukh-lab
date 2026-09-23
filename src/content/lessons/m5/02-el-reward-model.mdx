@@ -5,7 +5,7 @@ description: 'Los cuatro ficheros del reward model, enteros: el modelo con su p�
   configuración que se decidió midiendo y los siete tests que fijan lo que la pérdida promete.'
 module: m5
 order: 2
-duration: 170
+duration: 155
 runtime: 5
 level: medio
 status: vigente
@@ -27,23 +27,21 @@ artifacts:
 
 Un modelo que lee una posición y contesta un número: el juez que aprende a puntuar como puntúa el
 motor. No juega ni propone jugadas, y ni <Term id="dpo">DPO</Term> ni <Term id="grpo">GRPO</Term> lo
-necesitan. Está aquí porque es la pieza que hace que PPO tenga sentido, porque es la única del módulo
-que se puede medir sola contra un listón escrito de antemano (75 % de acierto en pares no vistos), y
-porque es el contraejemplo de una recompensa verificable.
+necesitan. Está aquí porque es la pieza que hace que PPO tenga sentido, porque se puede medir sola
+contra un listón escrito de antemano (75 % de acierto en pares no vistos) y porque es el
+contraejemplo de una recompensa verificable.
 
-Es también el reward model del RLHF de un asistente, en pequeño. Allí se toma un modelo de lenguaje
-preentrenado, se le quita la cabeza que predice tokens, se le pone una capa lineal que devuelve un
-número y se entrena con la misma pérdida de Bradley-Terry sobre pares de respuestas que una persona
-comparó. Aquí el modelo preentrenado es el encoder de M3 y los pares los juzgó un motor.
+Es el reward model del RLHF de un asistente, en pequeño. Allí se toma un LLM preentrenado, se le
+quita la cabeza que predice tokens, se le pone una capa lineal que devuelve un número y se entrena
+con la misma pérdida sobre pares de respuestas que una persona comparó. Aquí el modelo preentrenado
+es el encoder de M3 y los pares los juzgó un motor.
 
-Son cuatro ficheros: el modelo, el bucle de entrenamiento, la configuración y los tests, enteros y
-tal como están en el tag `p5`. Si copias los bloques en este orden tienes el reward model del
-proyecto.
+Son cuatro ficheros —modelo, bucle, configuración y tests—, enteros y tal como están en el tag
+`p5`.
 
 ## El modelo: qué ve de entrada y por qué la cabeza no está acotada
 
-El fichero abre con un docstring largo porque las dos decisiones de diseño están ahí y no en el
-código: qué se le da de entrada y por qué la cabeza no está acotada.
+Las dos decisiones de diseño están en el docstring y no en el código.
 
 ```python title="src/rukh/models/reward.py"
 """A reward model: the encoder of M3 with one scalar head, trained on preferences.
@@ -75,17 +73,15 @@ because a learned reward is the thing GRPO's verifiable rewards are being compar
 
 <Src file="src/rukh/models/reward.py" tag="p5" lines="1-25" />
 
-La primera decisión —**la entrada es la posición _después_ de la jugada**— es lo que permite
-reutilizar el <Term id="encoder">encoder</Term> de M3 sin tocarlo. Un reward sobre pares
-`(posición, jugada)` se podría construir dándole las dos cosas, pero el encoder ya toma un <Term id="fen">FEN</Term> y la posición después de una jugada _es_ la consecuencia de esa jugada,
-que es de lo que va una recompensa. El efecto secundario es el que acaba importando:
-así puede puntuar una posición a la que se llegó por cualquier camino, que es lo que GRPO necesita
-cuando ordena ocho candidatas entre sí.
+La primera, **la entrada es la posición _después_ de la jugada**, permite reutilizar el <Term id="encoder">encoder</Term> de M3 sin tocarlo: ya toma un <Term id="fen">FEN</Term>, y la
+posición después de una jugada es su consecuencia, que es de lo que va una recompensa. De paso,
+puede puntuar una posición a la que se llegó por cualquier camino, que es lo que GRPO necesita
+cuando ordena ocho candidatas.
 
-La segunda —**la cabeza no está acotada**— cuesta más defenderla. Un `tanh` dejaría la
-escala ordenada, y de paso le pondría el mismo techo al margen entre una jugada buena y una
-catastrófica, que es justo la distinción que el modelo está aprendiendo a hacer. A la escala ya la
-contiene la propia pérdida: llevar el margen al infinito cuesta cada vez más para cada vez menos.
+La segunda, la cabeza sin acotar, cuesta más defenderla. Un `tanh` dejaría la escala ordenada, y
+también le pondría el mismo techo al margen entre una jugada buena y una catastrófica, que es la
+distinción que el modelo está aprendiendo. A la escala ya la contiene la pérdida: llevar el margen
+al infinito cuesta cada vez más para cada vez menos.
 
 ```python title="src/rukh/models/reward.py"
 from __future__ import annotations
@@ -101,8 +97,7 @@ __all__ = ["RewardModel", "preference_accuracy", "preference_loss"]
 
 <Src file="src/rukh/models/reward.py" tag="p5" lines="27-35" />
 
-Lo único que dice algo aquí es `PositionEncoder`: el reward model no es un modelo nuevo, es el de M3
-con una capa lineal encima.
+El import que cuenta es `PositionEncoder`: el reward model es el de M3 con una capa lineal encima.
 
 ```python title="src/rukh/models/reward.py"
 class RewardModel(nn.Module):
@@ -126,11 +121,10 @@ class RewardModel(nn.Module):
 
 <Src file="src/rukh/models/reward.py" tag="p5" lines="38-54" />
 
-`__init__` guarda el encoder y crea la cabeza lineal, y `forward` la aplica. `encoder.pool` es el método de M3 que reduce
-los 69 tokens de casilla a un vector —`mean` por defecto, que es la opción que M3 midió mejor— y
-el `squeeze(-1)` deja `(B,)` en vez de `(B, 1)`, porque lo que sale de aquí va directo a una
-resta y una dimensión sobrante se propaga hasta convertir un lote de 64 en una matriz de 64×64 sin
-que nada falle.
+`encoder.pool` es el método de M3 que reduce los 69 tokens de casilla a un vector (`mean`, la
+opción que M3 midió mejor). El `squeeze(-1)` deja `(B,)` en vez de `(B, 1)`: lo que sale de aquí va
+a una resta, y una dimensión sobrante convertiría por broadcasting un lote de 64 en una matriz de
+64×64 sin que nada falle.
 
 ```python title="src/rukh/models/reward.py"
 def preference_loss(chosen: Tensor, rejected: Tensor) -> Tensor:
@@ -144,14 +138,10 @@ def preference_loss(chosen: Tensor, rejected: Tensor) -> Tensor:
 
 <Src file="src/rukh/models/reward.py" tag="p5" lines="57-63" />
 
-Esta es la pérdida entera de <Term id="bradley-terry">Bradley-Terry</Term>, en una línea. La
-probabilidad de que `chosen` le gane a `rejected` es `σ(r(chosen) − r(rejected))`, así que
-maximizar la verosimilitud es minimizar `−log σ` de la diferencia. `F.logsigmoid` en vez de
-`log(sigmoid(x))` no es cosmética: la versión ingenua satura a `-inf` en cuanto el margen es
-muy negativo, que es justo donde el gradiente hace falta.
-
-Y en la fórmula está la propiedad que ordena todo lo demás: **solo aparece la diferencia**. La
-escala del modelo no significa nada, y el test de más abajo lo fija.
+La pérdida entera de <Term id="bradley-terry">Bradley-Terry</Term> cabe en una línea: maximizar la
+verosimilitud de `σ(r(chosen) − r(rejected))` es minimizar `−log σ` de la diferencia. Se usa
+`F.logsigmoid` y no `log(sigmoid(x))` porque la versión ingenua satura a `-inf` cuando el margen es
+muy negativo, que es donde el gradiente hace falta.
 
 ```python title="src/rukh/models/reward.py"
 def preference_accuracy(chosen: Tensor, rejected: Tensor) -> float:
@@ -166,16 +156,13 @@ def preference_accuracy(chosen: Tensor, rejected: Tensor) -> float:
 
 <Src file="src/rukh/models/reward.py" tag="p5" lines="66-73" />
 
-El acierto es `chosen > rejected`, no `>=`. Un empate cuenta como **fallo**. El plan del hito
-lee su listón en este número, y un modelo que puntúa dos jugadas exactamente igual no ha expresado
-ninguna preferencia: redondear eso a medio punto sería halagarlo. El `no_grad` está porque esta
-función se llama dentro del bucle de validación y no tiene por qué construir un grafo.
+El acierto es `chosen > rejected`, no `>=`: un empate cuenta como fallo, porque un modelo que
+puntúa dos jugadas igual no ha expresado ninguna preferencia.
 
 ## El bucle: de dos cadenas a dos tableros
 
-`src/rukh/train/reward.py` es el fichero largo del módulo y hace tres cosas: traduce
-los pares a posiciones, los reparte sin mentir, y mide el resultado de cuatro maneras distintas
-porque una sola engañaría.
+`src/rukh/train/reward.py` es el fichero largo del módulo: traduce los pares a posiciones, los
+reparte sin fugas y mide el resultado de varias maneras, porque una sola engañaría.
 
 ```python title="src/rukh/train/reward.py"
 """Training the reward model on preference pairs, and measuring it on pairs it never saw.
@@ -199,12 +186,11 @@ numbers are the diagnosis.
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="1-17" />
 
-Las dos frases en negrita del docstring son las dos decisiones. El reparto **por partida y no por
-par** usa la misma función pura de M3, y el motivo es una <Term id="fuga-de-datos">fuga de
-datos</Term> que no se vería: dos pares de la misma partida son dos jugadas separadas por unos
-pocos <Term id="ply">plies</Term> en la misma posición, así que un modelo que memorizó uno tiene casi todo el otro. Y la <Term id="correlacion">correlación</Term> se publica en las dos variantes, Pearson y Spearman,
-porque M3 ya midió una cabeza que acertaba el orden y erraba la escala: cuando las dos discrepan,
-la discrepancia _es_ el diagnóstico.
+El reparto por partida evita una <Term id="fuga-de-datos">fuga de datos</Term> que no se vería:
+dos pares de la misma partida son dos jugadas separadas por pocos <Term id="ply">plies</Term>, así
+que un modelo que memorizó uno tiene casi todo el otro. Y la <Term id="correlacion">correlación</Term> se publica en Pearson y en Spearman
+porque M3 ya midió una cabeza que acertaba el orden y erraba la escala: si las dos discrepan, ahí
+está el diagnóstico.
 
 ```python title="src/rukh/train/reward.py"
 from __future__ import annotations
@@ -246,8 +232,8 @@ __all__ = [
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="19-53" />
 
-`scipy` no aparece aquí: se importa dentro de `_correlations`, más abajo, porque es la única
-función que lo necesita y cargarlo cuesta casi un segundo en cada arranque de la CLI.
+`scipy` no aparece aquí: se importa dentro de `_correlations`, la única función que lo usa, porque
+cargarlo cuesta casi un segundo en cada arranque de la CLI.
 
 ```python title="src/rukh/train/reward.py"
 class RewardConfig(BaseConfig):
@@ -285,15 +271,13 @@ class RewardConfig(BaseConfig):
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="56-86" />
 
-Toda la configuración de una ejecución en un modelo de pydantic, con una clave que merece una
-explicación: `point_of_view`. Las dos opciones son la misma información y no son la misma tarea. Con
-`mover` el modelo tiene que leer del FEN quién acaba de mover y darle la vuelta al signo cada ply;
-con `white` contesta siempre la pregunta de las blancas y el giro vive en la pérdida, donde es una
-constante conocida en vez de algo que aprender. La sospecha era que lo primero costaba puntos. Se
-midió, la diferencia salió pequeña, y queda como palanca documentada en vez de como decisión.
+La clave que merece explicación es `point_of_view`. Con `mover`, el modelo tiene que leer del FEN
+quién acaba de mover y darle la vuelta al signo cada ply; con `white`, contesta siempre por las
+blancas y el giro vive en la pérdida, donde es una constante conocida. Se midieron las dos, la
+diferencia salió pequeña, y queda como palanca documentada.
 
-`encoder_ckpt: None` entrena desde cero, que es el baseline honesto que un preentrenamiento
-tiene que batir. En este caso no lo bate, y eso se ve en la lección 8.
+`encoder_ckpt: None` entrena desde cero, el baseline que un preentrenamiento tiene que batir. Aquí
+no lo bate; lo verás en la configuración.
 
 ```python title="src/rukh/train/reward.py"
 class RewardExample(BaseConfig):
@@ -321,9 +305,8 @@ class RewardBand(BaseConfig):
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="89-109" />
 
-Dos modelos de datos sin decisiones dentro, salvo `delta_cp`: la pérdida **no lo usa**
-—Bradley-Terry solo ve el orden— y está ahí porque es contra lo que se mide la correlación.
-Guardarlo en el ejemplo, y no recalcularlo al medir, es lo que impide que la métrica y el
+La pérdida no usa `delta_cp` —Bradley-Terry solo ve el orden—; está ahí porque la correlación se
+mide contra él. Guardarlo en el ejemplo, en vez de recalcularlo al medir, impide que métrica y
 entrenamiento se separen sin que nadie lo note.
 
 ```python title="src/rukh/train/reward.py"
@@ -363,13 +346,11 @@ class RewardResult(BaseConfig):
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="112-143" />
 
-El resultado de una ejecución lleva **siete** números de calidad y no uno. Merece la pena leer por
-qué está cada uno: `accuracy` es el titular y el que el plan pone en su criterio;
-`accuracy_without_mates` es la lectura justa de ese mismo listón, porque quita los pares que una
-evaluación estática no puede decidir; `bands` convierte un listón fallado en un diagnóstico; y
-las cuatro correlaciones van por parejas con y sin mates porque **en este conjunto no comparten
-signo**. Un `RewardResult` con un solo campo `accuracy` habría publicado la mitad fácil de lo que se
-midió.
+El resultado lleva siete números de calidad. `accuracy` es el titular del criterio;
+`accuracy_without_mates` es la lectura justa de ese listón, sin los pares que una evaluación
+estática no puede decidir; `bands` convierte un listón fallado en un diagnóstico; y las
+correlaciones van con y sin mates porque **en este conjunto no comparten signo**. Con un solo campo
+`accuracy` se habría publicado la mitad fácil de lo que se midió.
 
 ```python title="src/rukh/train/reward.py"
 def _position_after(prefix: str, move_uci: str) -> tuple[str, bool] | None:
@@ -395,14 +376,11 @@ def _position_after(prefix: str, move_uci: str) -> tuple[str, bool] | None:
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="146-164" />
 
-Aquí es donde un par deja de ser dos cadenas y pasa a ser dos tableros. Lo que hay que mirar es el
-`return None`: una fila que no se puede reproducir **se descarta**, no se repara. Los pares
-vienen de otra tubería, y un prefijo que python-chess no acepta significa que la fila y la
-biblioteca no están de acuerdo sobre qué partida fue esa, y adivinar cuál de las dos tiene razón es
-como un dataset se llena en silencio de posiciones que nadie jugó.
-
-El `except (ValueError, AssertionError)` es ancho a propósito: `push_uci` levanta las dos según
-por dónde falle, y las dos significan lo mismo aquí.
+Aquí un par deja de ser dos cadenas y pasa a ser dos tableros. Mira el `return None`: una fila que
+no se puede reproducir se descarta, no se repara. Si la fila y python-chess no están de acuerdo
+sobre qué partida fue, adivinar quién tiene razón es como un dataset se llena en silencio de
+posiciones que nadie jugó. El `except` recoge las dos excepciones que `push_uci` puede levantar
+según dónde falle.
 
 ```python title="src/rukh/train/reward.py"
 def encode_pairs(frame: Any, limit: int | None = None) -> list[RewardExample]:
@@ -433,13 +411,10 @@ def encode_pairs(frame: Any, limit: int | None = None) -> list[RewardExample]:
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="167-190" />
 
-`encode_pairs` acepta tanto un `DataFrame` de polars como una lista de diccionarios —ese
-`hasattr(frame, "iter_rows")`—, y eso no es generosidad de API: es lo que permite que el test de
-más abajo compruebe el descarte de filas con tres diccionarios escritos a mano, sin escribir un
-parquet.
-
-`delta_cp` se guarda en valor absoluto porque la orientación ya la lleva el par: `chosen` es la
-buena por construcción, así que el signo solo podría contradecir a las columnas.
+`encode_pairs` acepta un `DataFrame` de polars o una lista de diccionarios (el `hasattr`) para que
+el test de más abajo pruebe el descarte con tres diccionarios escritos a mano, sin parquet.
+`delta_cp` va en valor absoluto porque la orientación ya la lleva el par: `chosen` es la buena por
+construcción.
 
 ```python title="src/rukh/train/reward.py"
 def split_examples(
@@ -458,13 +433,11 @@ def split_examples(
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="193-204" />
 
-`game_split` es la misma CRC-32 pura de M3: da la misma respuesta en cualquier proceso y en
-cualquier ejecución futura, así que dos ejecuciones del mismo comando reparten igual sin guardar
-nada en disco. Reutilizarla en vez de escribir otra es a propósito. Un reparto aleatorio por par
-dejaría pares de la misma partida a los dos lados, el acierto de validación subiría sin que nada
-avisara, y el modelo estaría contestando sobre posiciones que vio unos plies antes. Es la misma fuga
-que en un clasificador de texto aparece cuando dos frases del mismo documento caen una en
-entrenamiento y otra en validación.
+`game_split` es la misma CRC-32 pura de M3: da la misma respuesta en cualquier proceso y ejecución,
+así que el reparto se repite sin guardar nada en disco. Un reparto aleatorio por par dejaría pares
+de la misma partida a los dos lados y el acierto de validación subiría sin avisar. En un
+clasificador de texto es la fuga de dos frases del mismo documento, una en entrenamiento y otra en
+validación.
 
 ```python title="src/rukh/train/reward.py"
 def batches(
@@ -489,13 +462,10 @@ def batches(
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="207-224" />
 
-Un lote es una tupla de cuatro tensores, y el tercero es el que hay que entender. `sign` vale
-+1 cuando movieron las blancas y −1 cuando movieron las negras: es la constante que convierte «cómo
-de buena es esta posición para las blancas» en «para quien movió», y por eso `point_of_view`
-puede ser una palanca sin tocar el modelo.
-
-Aquí no hay relleno ni máscara, a diferencia de DPO: todas las posiciones producen exactamente los
-mismos 69 tokens de casilla, así que el lote es rectangular por construcción.
+El tensor que hay que entender es `sign`: +1 cuando movieron las blancas, −1 cuando movieron las
+negras. Convierte «buena para las blancas» en «buena para quien movió», y por eso `point_of_view`
+es una palanca que no toca el modelo. No hay relleno ni máscara: toda posición produce los mismos
+69 tokens, así que el lote es rectangular por construcción.
 
 ```python title="src/rukh/train/reward.py"
 def margins(
@@ -513,10 +483,7 @@ def margins(
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="227-237" />
 
-Aquí vive la palanca. Con `white`, el modelo contesta siempre la misma pregunta y
-el giro es una multiplicación; con `mover`, el signo es siempre +1 porque el modelo ya tiene que
-haber deducido del tablero quién movió. Un `if` de una línea para dos tareas distintas de
-aprendizaje.
+Aquí vive la palanca: un `if` de una línea que separa dos tareas de aprendizaje distintas.
 
 ```python title="src/rukh/train/reward.py"
 @torch.no_grad()
@@ -557,15 +524,13 @@ def evaluate(
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="240-273" />
 
-La validación devuelve un diccionario con cuatro familias de números, y la clave está en las dos
-llamadas a `_correlations`: la segunda recibe las mismas listas **filtradas por `MATE_GAP`**. En
-este conjunto la correlación completa sale negativa y la de los pares sin mate,
-positiva, y publicar solo la primera sería publicar que el modelo está más seguro cuanto más
+La clave está en las dos llamadas a `_correlations`: la segunda recibe las mismas listas
+filtradas por `MATE_GAP`. En este conjunto la correlación completa sale negativa y la de los pares
+sin mate, positiva; publicar solo la primera diría que el modelo está más seguro cuanto más
 parecidas son las dos jugadas, que es lo contrario de lo que pasa.
 
-`model.eval()` al entrar y `model.train()` al salir: el decorador `@torch.no_grad()` quita el
-grafo, pero el dropout lo quita el modo, y son dos cosas distintas. Un olvido aquí mete ruido en la
-métrica y no en la pérdida, así que la curva de entrenamiento sigue pareciendo sana.
+`@torch.no_grad()` quita el grafo, pero el dropout lo quita `model.eval()`. Olvidarlo mete ruido en
+la métrica y no en la pérdida, así que la curva sigue pareciendo sana.
 
 ```python title="src/rukh/train/reward.py"
 MATE_GAP = 2000.0
@@ -597,13 +562,10 @@ def band_accuracy(scored: Sequence[float], deltas: Sequence[float]) -> list[Rewa
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="276-300" />
 
-La tabla de bandas es la pieza que convierte «no llegué al 75 %» en «sé dónde fallo».
-Las bandas son la distancia en centipeones con la que el motor separó las dos jugadas, y la de
-**mate** va aparte porque una diferencia de ±10 000 no es una distancia de evaluación: es un
-marcador de otra escala. Meterla dentro de «800+» halagaría a la banda alta
-con pares que no son evaluaciones.
-
-`band_accuracy` omite una banda vacía en vez de emitirla con cero pares, así que la tabla de la <Term id="model-card">model card</Term> no tiene filas que no se midieron.
+La tabla de bandas convierte «no llegué al 75 %» en «sé dónde fallo». Cada banda es la distancia
+en centipeones entre las dos jugadas, y la de mate va aparte porque una diferencia de ±10 000 es un
+marcador de otra escala; meterla en «800+» halagaría a la banda alta. Una banda vacía se omite, así
+que la tabla de la <Term id="model-card">model card</Term> no tiene filas sin medir.
 
 ```python title="src/rukh/train/reward.py"
 def _correlations(
@@ -636,13 +598,9 @@ def _correlations(
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="303-328" />
 
-Dos guardas antes de calcular nada: menos de tres puntos, o una de las dos series constante, y
-devuelve NaN en vez de una correlación. Una correlación de dos puntos es 1,0 siempre, y una sobre
-una serie sin varianza es una división por cero que `scipy` contesta con un aviso y un NaN, y un
-NaN que llega hasta un `run.json` acaba publicado.
-
-El `import` de `scipy` vive dentro por el arranque de la CLI, y el `suffix` es lo que permite
-llamar dos veces a la misma función y que las claves no se pisen.
+Con menos de tres puntos, o una serie constante, devuelve NaN en vez de una correlación: con dos
+puntos sale 1,0 siempre, y sin varianza es una división por cero. El `suffix` permite llamarla dos
+veces sin que las claves se pisen.
 
 ```python title="src/rukh/train/reward.py"
 def load_squares_encoder(path: Path, map_location: str = "cpu") -> PositionEncoder:
@@ -680,23 +638,21 @@ def load_squares_encoder(path: Path, map_location: str = "cpu") -> PositionEncod
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="331-361" />
 
-Aquí la guarda es lo único que importa. Un reward model come los 69 tokens de casilla de `rukh.models.squares`; un encoder
-entrenado con el esquema `moves` **acepta esos identificadores sin quejarse** —caben todos en su
-vocabulario de 2 030— mientras significan otra cosa. No falla nada, no avisa nada, y la ejecución
-produce un número perfectamente plausible a partir de una representación revuelta. Pasó: el primer
-reward model del hito sacó 72,98 % así.
+Aquí lo que importa es la guarda. Un reward model come los 69 tokens de casilla de
+`rukh.models.squares`, y un encoder entrenado con el esquema `moves` acepta esos identificadores sin
+quejarse —caben en su vocabulario de 2 030— aunque signifiquen otra cosa.
 
 <Callout kind="roto" title="El fallo que devuelve un número creíble">
-  Los peores fallos de un proyecto de aprendizaje no son los que revientan: son los que devuelven un
-  número que cae donde lo esperabas. Aquí las dos representaciones comparten rango de enteros, así
-  que el único sitio donde se puede poner la comprobación es al cargar. La regla que deja: si dos
-  cosas incompatibles tienen el mismo tipo, el tipo no te va a salvar; escribe la guarda.
+  El primer reward model del hito cargó un encoder `moves` y sacó 72,98 %. No falló nada ni avisó
+  nada: la ejecución produjo un número plausible a partir de una representación revuelta. Los peores
+  fallos son los que devuelven un número que cae donde lo esperabas. Si dos cosas incompatibles
+  tienen el mismo tipo, el tipo no te va a salvar; escribe la guarda donde se cruzan, aquí al
+  cargar.
 </Callout>
 
-El `removeprefix("encoder.")` de abajo es lo que permite cargar tanto un checkpoint del encoder
-suelto como uno de las cabezas de M3, donde el encoder está anidado. Ese segundo caso es, sobre el
-papel, el mejor punto de partida: su encoder ya estaba afinado para contestar «cómo de buena es
-esta posición». La lección 8 cuenta qué pasó al medirlo.
+El `removeprefix("encoder.")` permite cargar tanto un encoder suelto como un checkpoint de las
+cabezas de M3, donde el encoder está anidado y ya afinado para contestar «cómo de buena es esta
+posición».
 
 ```python title="src/rukh/train/reward.py"
 def build_model(cfg: RewardConfig, device: torch.device) -> tuple[RewardModel, bool]:
@@ -712,9 +668,8 @@ def build_model(cfg: RewardConfig, device: torch.device) -> tuple[RewardModel, b
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="364-372" />
 
-Aquí se decide de dónde salen los pesos, con una segunda guarda por el mismo motivo que la
-anterior: si la configuración pide un `input` que no sea `squares`, se para aquí en vez de
-entrenar cuarenta minutos sobre tokens que significan otra cosa.
+La segunda guarda es la misma idea desde cero: si la configuración pide un `input` que no es
+`squares`, se para aquí en vez de entrenar cuarenta minutos sobre tokens que significan otra cosa.
 
 ```python title="src/rukh/train/reward.py"
 def train_reward(cfg: RewardConfig) -> RewardResult:
@@ -811,20 +766,15 @@ def train_reward(cfg: RewardConfig) -> RewardResult:
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="375-464" />
 
-El bucle no tiene sorpresas, que es lo que se espera de un bucle: leer el parquet, codificar,
-repartir, iterar épocas y medir al final de cada una. Tres detalles.
+El bucle no tiene sorpresas: leer, codificar, repartir, iterar épocas y medir al final de cada una.
+Tres detalles:
 
-El primero es la guarda del reparto. Si el sorteo deja un lado vacío —pasa cuando los pares vienen
-todos de la misma partida, que es el caso de un fichero de prueba— se levanta un error que dice qué
-mirar, en vez de caer más tarde con un `mean of empty slice`.
-
-El segundo es que el modelo se guarda **con la configuración del encoder dentro**. Un checkpoint
-que no lleva su propia forma obliga a adivinarla al cargarlo, y adivinarla mal es el fallo de
-`load_squares_encoder` otra vez por el otro lado.
-
-El tercero es `run.json`: el resultado entero, con sus bandas y sus cuatro correlaciones, escrito
-junto al checkpoint. La lección 6 lo usa tal cual para escribir la model card, y por eso el
-publicador se niega a publicar un checkpoint que no lo tenga.
+- Si el reparto deja un lado vacío (pasa con un fichero de prueba de una sola partida), el error
+  dice qué mirar en vez de caer más tarde con un `mean of empty slice`.
+- El checkpoint lleva dentro la configuración del encoder. Uno que no lleva su propia forma obliga
+  a adivinarla al cargarlo, que es el fallo de `load_squares_encoder` por el otro lado.
+- `run.json` guarda el resultado entero junto al checkpoint. La lección 6 lo usa para escribir la
+  model card, y el publicador se niega a publicar un checkpoint sin él.
 
 ```python title="src/rukh/train/reward.py"
 def _clean(value: float) -> float | None:
@@ -852,10 +802,9 @@ def load_reward(path: Path | str, map_location: str | None = None) -> RewardMode
 
 <Src file="src/rukh/train/reward.py" tag="p5" lines="467-487" />
 
-Tres funciones cortas para cerrar. `_clean` cambia NaN por `None` para que el `run.json` diga «no
-medido» y no un número; en JSON estándar un NaN ni siquiera es válido. `_without_mates` recompone el acierto de las bandas que una evaluación puede
-decidir, ponderando por el número de pares de cada una. Y `load_reward` lee el checkpoint de
-vuelta, que es lo que usan el publicador y cualquiera que quiera puntuar posiciones con él.
+`_clean` cambia NaN por `None` para que el `run.json` diga «no medido» (en JSON estándar un NaN ni
+siquiera es válido). `_without_mates` recompone el acierto sin la banda de mate, ponderando por
+pares. `load_reward` lee el checkpoint de vuelta para el publicador.
 
 ## La configuración, donde tres decisiones son medidas
 
@@ -903,11 +852,10 @@ point_of_view: white
 
 <Src file="configs/train/rm.yaml" tag="p5" lines="1-35" />
 
-La segunda y la tercera se leen en la lección 8. La primera merece quedarse aquí: partir del encoder preentrenado de M3 da unos **6,5 puntos menos** que inicializar
-al azar. El encoder aprendió a rellenar jugadas enmascaradas; aquí se le pide ordenar posiciones
-por lo buenas que son. «Preentrenado» no es una propiedad de un modelo, es una **relación** entre
-lo que aprendió y lo que le vas a pedir, y cuando esa relación no existe la inicialización al azar
-gana.
+La primera decisión es la que se lleva uno: partir del encoder preentrenado de M3 da unos **6,5
+puntos menos** que inicializar al azar. Ese encoder se optimizó para otras preguntas, y aquí se le
+pide ordenar posiciones por lo buenas que son. Que un modelo esté «preentrenado» describe la
+relación entre lo que aprendió y lo que le vas a pedir; cuando esa relación no existe, el azar gana.
 
 <Transfer
   concept="Preentrenado no es una propiedad, es una relación"
@@ -920,8 +868,8 @@ gana.
 
 ## La orden
 
-La CLI añade `rukh train reward`, y su trabajo es cargar el YAML, correr y **imprimir las cuatro
-cosas juntas** que el resultado obliga a publicar.
+La CLI añade `rukh train reward`: carga el YAML, entrena e imprime juntos los números que el
+resultado obliga a publicar.
 
 ```python title="src/rukh/cli.py"
 @train_app.command("reward")
@@ -981,10 +929,9 @@ def train_reward_cmd(
 
 <Src file="src/rukh/cli.py" tag="p5" lines="900-952" />
 
-El `try`/`except` convierte los dos errores previsibles —no hay fichero, o el reparto dejó
-un lado vacío— en un mensaje y un código de salida, en vez de en una traza. Y el bucle sobre
-`result.bands` es lo que hace que el desglose esté delante del que lanzó el comando, no
-escondido en un JSON: si el titular no llega, la línea siguiente ya dice por qué.
+El `try`/`except` convierte los dos errores previsibles en un mensaje y un código de salida. El
+bucle sobre `result.bands` pone el desglose delante de quien lanzó el comando: si el titular no
+llega, la línea siguiente ya dice por qué.
 
 <Callout kind="ejecuta" title="Entrena el reward model">
   Con el modelo, el bucle, `rm.yaml` y la orden escritos, el reward model ya se entrena de punta a
@@ -1022,9 +969,8 @@ margin vs delta cp: Pearson -0.128, Spearman -0.067
 
 ## Los tests: lo que la pérdida promete
 
-`tests/unit/test_reward_model.py` está entero aquí, porque es el fichero que
-escribe el contrato: qué promete Bradley-Terry, qué no promete, y las dos cosas que el bucle de
-datos tiene que hacer bien.
+`tests/unit/test_reward_model.py` escribe el contrato: qué promete Bradley-Terry y las dos cosas que
+el bucle de datos tiene que hacer bien.
 
 ```python title="tests/unit/test_reward_model.py"
 """The reward model: what Bradley-Terry does and does not promise.
@@ -1095,16 +1041,11 @@ def test_the_model_reads_a_position_and_answers_one_number_per_row():
 
 <Src file="tests/unit/test_reward_model.py" tag="p5" lines="1-64" />
 
-Los tres primeros son la invariancia y sus consecuencias. El de arriba es el importante: desplazar
-todas las puntuaciones por una constante **no cambia la pérdida ni un decimal**. No es una propiedad
-accidental, es Bradley-Terry, y un modelo cuya respuesta cambiara al desplazarlo estaría roto de una
-forma que nadie aguas abajo notaría.
-
-El segundo fija los dos extremos: una ordenación perfecta lleva la pérdida a cero, y una moneda al
-aire cuesta `log 2 = 0,6931` por par. Ese 0,6931 es el número contra el que se lee cualquier
-curva de pérdida de preferencias: por encima, el modelo va peor que no saber nada.
-
-El tercero fija el empate como fallo, para que nadie lo «arregle» a medio punto.
+El primero es la invariancia: desplazar todas las puntuaciones por una constante no cambia la
+pérdida ni un decimal. El segundo fija los extremos: una ordenación perfecta lleva la pérdida a
+cero, y una moneda al aire cuesta `log 2 = 0,6931` por par. Ese 0,6931 es la línea contra la que se
+lee cualquier curva de pérdida de preferencias: por encima, el modelo va peor que no saber nada. El
+tercero fija el empate como fallo, para que nadie lo «arregle» a medio punto.
 
 ```python title="tests/unit/test_reward_model.py"
 def test_a_row_that_does_not_replay_is_dropped_rather_than_repaired():
@@ -1171,12 +1112,10 @@ def test_the_split_goes_by_game_so_two_pairs_of_one_game_cannot_straddle_it():
 
 <Src file="tests/unit/test_reward_model.py" tag="p5" lines="67-126" />
 
-Los dos de datos. El del descarte usa tres diccionarios escritos a mano —el segundo con una jugada
-ilegal para ese prefijo, el tercero con un prefijo que no es una partida— y comprueba que solo
-sobrevive el primero. El del reparto construye 200 partidas con tres pares cada una y comprueba dos
-cosas: que ninguna partida aparece a los dos lados, y que **las tres filas de cada partida se
-quedan juntas**. Esa segunda comprobación es la que fallaría con un reparto por par, y la que
-convierte la fuga en un test rojo en vez de en un número optimista.
+Los dos de datos. El del descarte comprueba que de tres filas escritas a mano solo sobrevive la
+que se puede reproducir. El del reparto construye 200 partidas de tres pares y comprueba que las
+tres filas de cada partida se quedan juntas: es lo que fallaría con un reparto por par, y convierte
+la fuga en un test rojo en vez de en un número optimista.
 
 ```python title="tests/unit/test_reward_model.py"
 def test_training_one_batch_moves_the_scores_apart():
@@ -1203,10 +1142,9 @@ def test_training_one_batch_moves_the_scores_apart():
 
 <Src file="tests/unit/test_reward_model.py" tag="p5" lines="129-148" />
 
-Y el último es el más pequeño posible de extremo a extremo: dos posiciones reales —`e4` y
-`f3`, que cualquiera ordena igual—, treinta pasos de AdamW, y la pérdida tiene que bajar y la
-ordenación tiene que salir bien. Con un modelo de juguete de una capa y `d_model=16` tarda menos
-de un segundo, y es lo que separa «el código importa» de «el código entrena».
+El último es el extremo a extremo más pequeño posible: `e4` contra `f3`, treinta pasos de AdamW, y
+la pérdida tiene que bajar y la ordenación salir bien. Tarda menos de un segundo y separa «el código
+importa» de «el código entrena».
 
 <Callout kind="ejecuta" title="Los siete tests del reward model">
   El fichero de tests está completo; pásalo, y el linter sobre lo que has escrito en la lección:
@@ -1254,11 +1192,10 @@ Si falla `test_the_split_goes_by_game_so_two_pairs_of_one_game_cannot_straddle_i
 
 ## Qué has aprendido
 
-Que un reward model es un encoder con una capa lineal encima —el de un asistente es un LLM con una
-capa lineal encima—, que su pérdida cabe en una línea, y que esa línea solo ve diferencias, así que
-su escala no se interpreta nunca. Que de él se publican cuatro números y no uno, porque el titular
-esconde dónde falla. Y que dos guardas pequeñas, el reparto por partida y el rechazo del encoder
-equivocado, valen más que cualquier mejora de arquitectura, porque las dos tapan fallos que
-devuelven números creíbles.
+Un reward model es un encoder con una capa lineal encima (el de un asistente, un LLM con una capa
+lineal encima). Su pérdida cabe en una línea y solo ve diferencias, así que su escala no se
+interpreta nunca. El titular esconde dónde falla, y por eso se publica con bandas y correlaciones.
+Y dos guardas pequeñas, el reparto por partida y el rechazo del encoder equivocado, tapan los
+fallos más caros: los que devuelven números creíbles.
 
 Lo siguiente es DPO: el mismo tipo de pares, sin reward model, entrenando la política directamente.

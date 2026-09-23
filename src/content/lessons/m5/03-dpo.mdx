@@ -5,7 +5,7 @@ description: 'El fichero de DPO entero —donde una completación de un token co
   hacen que los dos brazos sean comparables y la que no se puede igualar.'
 module: m5
 order: 3
-duration: 145
+duration: 130
 runtime: 40
 level: medio
 status: vigente
@@ -36,16 +36,13 @@ método la pregunta que importa: ¿cambia algo que los pares los haya escrito ot
 propuesto el propio modelo?
 
 Son dos ficheros —DPO y los pares dentro de política—, tres configuraciones cortas y las dos órdenes
-que los lanzan. `src/rukh/train/dpo.py` ya estaba en el repositorio desde `p4`, donde quedó escrito
-sin orden que lo lanzara, y llega a `p5` sin cambiar una línea; aquí se lee entero porque es donde
-por fin se usa.
+que los lanzan. `src/rukh/train/dpo.py` está en el repositorio desde `p4` sin orden que lo lanzara;
+aquí se lee entero porque es donde por fin se usa.
 
 ## DPO: con una jugada por completación, todo pasa en una posición
 
-La idea de <Term id="dpo">DPO</Term> es que no hace falta entrenar un reward model para hacer
-refuerzo sobre preferencias: el óptimo de ese refuerzo se puede escribir en función de la <Term id="politica">política</Term>
-y de una **referencia**, y entonces la política se entrena directamente sobre los pares. La
-referencia es una copia congelada de los pesos de partida, no se entrena y no se publica.
+Recuerda la idea de la lección 1: <Term id="dpo">DPO</Term> entrena la <Term id="politica">política</Term> directamente sobre los pares, sin
+reward model, frente a una **referencia** que es una copia congelada de los pesos de partida.
 
 ```python title="src/rukh/train/dpo.py"
 """Direct Preference Optimization on the decoder, over engine-scored move pairs.
@@ -64,12 +61,12 @@ log-probability of two tokens at one position, which is why this file is short.
 
 <Src file="src/rukh/train/dpo.py" tag="p5" lines="1-12" />
 
-La última frase del docstring explica el tamaño del fichero. En un modelo de lenguaje de texto, una
-completación es una respuesta entera: hay que sumar log-probabilidades a lo largo de muchos tokens,
-cuidar el relleno y decidir si se normaliza por longitud (el `DPOTrainer` de TRL hace todo eso por
-ti). Aquí la completación es **una jugada**, que es un token, así que todo colapsa a leer dos números
-de la distribución en una sola posición. La misma simplificación aparece en GRPO en la lección
-siguiente, y es lo que permite enseñar los dos algoritmos con el código entero delante.
+La última frase del docstring explica el tamaño del fichero. En un LLM de texto, una completación
+es una respuesta entera: hay que sumar log-probabilidades a lo largo de muchos tokens, cuidar el
+relleno y decidir si se normaliza por longitud (el `DPOTrainer` de TRL lo hace por ti). Aquí la
+completación es una jugada, un token, así que todo se reduce a leer dos números de la distribución
+en una posición. GRPO se beneficia de lo mismo en la lección siguiente, y por eso los dos
+algoritmos caben enteros en el curso.
 
 ```python title="src/rukh/train/dpo.py"
 from __future__ import annotations
@@ -96,7 +93,7 @@ LOGGER = logging.getLogger(__name__)
 
 <Src file="src/rukh/train/dpo.py" tag="p5" lines="14-33" />
 
-Nada que decidir aquí. `MoveDecoder` y `UciTokenizer` son los de M2, sin cambios.
+`MoveDecoder` y `UciTokenizer` son los de M2, sin cambios.
 
 ```python title="src/rukh/train/dpo.py"
 class DpoConfig(BaseConfig):
@@ -122,27 +119,24 @@ class DpoConfig(BaseConfig):
 
 <Src file="src/rukh/train/dpo.py" tag="p5" lines="36-54" />
 
-Dos palancas con su comentario. `beta` es la dureza de la correa de la lección 1. En la teoría de
-DPO, un `β` grande hace que baste con alejarse poco de la referencia para que la pérdida quede
-satisfecha, así que sujeta más; en la práctica, al arrancar, también empuja más fuerte, porque el
-gradiente de la pérdida empieza en `β/2`. El aviso del comentario («por encima de 0,5 se pierde la
-legalidad») es una advertencia de uso, no una medición: Rukh solo ha entrenado con 0,1.
+`beta` es la dureza de la correa de la lección 1: con un `β` grande basta alejarse poco de la
+referencia para que la pérdida quede satisfecha, así que sujeta más (aunque al arrancar también
+empuja más fuerte, porque el gradiente empieza en `β/2`). El aviso del comentario sobre 0,5 es una
+advertencia de uso, sin medir: Rukh solo ha entrenado con 0,1.
 
-`nll_weight`, opcional, vale 0,1 en las dos ejecuciones del hito, y es la palanca que hay que
-entender. DPO sube el **margen**, que es cuánto más prefiere la política la jugada buena de lo que la
-prefería la referencia, menos lo mismo para la mala. Un margen grande no dice que la jugada buena
-sea buena: dice que le gana a la otra. Nada impide llegar ahí hundiendo las dos y la mala un poco
-más:
+`nll_weight` vale 0,1 en las dos ejecuciones del hito, y es la palanca que hay que entender. DPO
+sube el **margen**: cuánto más prefiere la política la jugada buena de lo que la prefería la
+referencia, menos lo mismo para la mala. Un margen grande solo dice que la buena le gana a la otra,
+y nada impide llegar ahí hundiendo las dos, la mala un poco más:
 
 <Figure caption="Ejemplo ilustrativo, no una medición. El margen de DPO compara cuánto se ha movido cada jugada respecto a la referencia. A la derecha las dos bajan, la mala más deprisa, y el margen sale incluso algo mayor que a la izquierda: la pérdida no distingue los dos casos. Por eso se mira el acierto aparte, y por eso existe nll_weight.">
   <M5DpoMargin />
 </Figure>
 
-La pérdida de siguiente token sobre `chosen` —eso es `nll_weight`— ancla la política a seguir
-sabiendo jugar mientras el margen crece. Y por lo mismo la pérdida de abajo devuelve el margen y el
-acierto **por separado**: separar mucho a unos cuantos pares y cruzar a otros por el camino es una
-forma perfectamente válida de subir una media, y en la lección 8 verás a uno de los dos brazos
-hacerlo.
+`nll_weight` añade la pérdida de siguiente token sobre `chosen`, que ancla la política a seguir
+sabiendo jugar mientras el margen crece. Por lo mismo, la pérdida devuelve el margen y el acierto
+por separado: separar mucho unos pares y cruzar otros por el camino también sube la media, y en la
+lección 8 verás a uno de los brazos hacerlo.
 
 ```python title="src/rukh/train/dpo.py"
 class PreferenceBatch:
@@ -167,9 +161,8 @@ class PreferenceBatch:
 
 <Src file="src/rukh/train/dpo.py" tag="p5" lines="57-74" />
 
-Un lote de preferencias es el prompt relleno, el índice donde acaba cada prompt, y los dos tokens
-de jugada. Ese `last` es el campo que evita el error silencioso del fichero, y la razón está en
-la función siguiente.
+Un lote de preferencias es el prompt relleno, el índice donde acaba cada prompt y los dos tokens de
+jugada. Ese `last` evita el error silencioso del fichero; lo verás dos funciones más abajo.
 
 ```python title="src/rukh/train/dpo.py"
 def encode_pairs(frame: object, tok: UciTokenizer, block: int) -> list[tuple[list[int], int, int]]:
@@ -209,13 +202,10 @@ def encode_pairs(frame: object, tok: UciTokenizer, block: int) -> list[tuple[lis
 
 <Src file="src/rukh/train/dpo.py" tag="p5" lines="77-109" />
 
-Dos motivos para descartar una fila, y los dos escritos: una jugada fuera del vocabulario fijo
-—una coronación que la enumeración no lleva— y un prompt que no cabe en `block`. El segundo
-merece la frase del docstring: **recortar un prefijo no es una opción**. Cortarle el principio a
-una partida le da al modelo una posición que en esa partida no ocurrió, con una preferencia que se
-midió sobre otra cosa. Descartar y contar es honesto; recortar es fabricar datos.
-
-`chosen_id == rejected_id` también descarta: dos jugadas iguales no son una preferencia.
+Una fila se descarta si una jugada cae fuera del vocabulario fijo, si el prompt no cabe en `block`
+o si las dos jugadas son iguales. La segunda merece su frase: cortarle el principio a una partida
+le daría al modelo una posición que no ocurrió, con una preferencia medida sobre otra cosa.
+Descartar y contar es honesto; recortar es fabricar datos.
 
 ```python title="src/rukh/train/dpo.py"
 def batches(
@@ -245,15 +235,14 @@ def batches(
 
 <Src file="src/rukh/train/dpo.py" tag="p5" lines="112-134" />
 
-Cada lote se rellena hasta **su propio** prompt más largo, no hasta `block`. Y `last[i]` guarda
-dónde acaba de verdad cada prompt, que es lo que la función siguiente lee.
+Cada lote se rellena hasta su propio prompt más largo, y `last[i]` guarda dónde acaba de verdad cada
+prompt.
 
-La tentación sería leer los logits en la última columna del tensor, `[:, -1]`, como cuando todas
-las filas miden lo mismo. Aquí no miden lo mismo: en toda fila más corta que la más larga del lote,
-esa columna es **relleno**, y la pérdida se calcularía sobre lo que el modelo predice después del
-padding. Bajaría igual, porque el modelo aprende perfectamente a predecir algo a partir del relleno,
-y la curva saldría sana sin que el modelo hubiera aprendido lo que se le pedía. Es el mismo cuidado
-que exige cualquier LLM con lotes de longitudes distintas: leer la posición correcta de cada fila.
+La tentación sería leer los logits en la última columna, `[:, -1]`. En toda fila más corta que la
+más larga del lote esa columna es **relleno**, y la pérdida se calcularía sobre lo que el modelo
+predice después del padding. Bajaría igual —el modelo aprende a predecir algo a partir del
+relleno— y la curva saldría sana sin haber aprendido lo que se pedía. Cualquier LLM con lotes de
+longitudes distintas exige el mismo cuidado: leer la posición correcta de cada fila.
 
 ```python title="src/rukh/train/dpo.py"
 def move_logprobs(model: MoveDecoder, batch: PreferenceBatch) -> torch.Tensor:
@@ -265,9 +254,9 @@ def move_logprobs(model: MoveDecoder, batch: PreferenceBatch) -> torch.Tensor:
 
 <Src file="src/rukh/train/dpo.py" tag="p5" lines="137-141" />
 
-El `.float()` importa: el modelo puede correr en <Term id="bf16">bf16</Term>, y
-un `log_softmax` en media precisión sobre 2 030 clases pierde dígitos justo en la cola, que es
-donde viven las jugadas que el par quiere separar.
+El `.float()` importa: el modelo puede correr en <Term id="bf16">bf16</Term>, y un `log_softmax` en
+media precisión sobre 2 030 clases pierde dígitos en la cola, donde viven las jugadas que el par
+quiere separar.
 
 ```python title="src/rukh/train/dpo.py"
 def dpo_loss(
@@ -290,16 +279,14 @@ def dpo_loss(
 
 <Src file="src/rukh/train/dpo.py" tag="p5" lines="144-159" />
 
-Esta es la pérdida entera de DPO, así de corta porque la completación es un token. Se lee así: para
-cada par, `chosen` es cuánto ha subido la política la jugada buena **respecto a la referencia**,
-`rejected` lo mismo para la mala, y el margen es la diferencia de las dos diferencias, lo que dibuja
-la figura de arriba. `β` escala el margen antes del `logsigmoid`, y en cuanto `β · margen` es grande
-el par deja de empujar: con un `β` alto, la pérdida se da por satisfecha con menos distancia a la
-referencia.
+La pérdida entera de DPO. Para cada par, `chosen` es cuánto ha subido la política la jugada buena
+respecto a la referencia, `rejected` lo mismo para la mala, y el margen es la diferencia de las dos
+diferencias, lo que dibuja la figura de arriba. En cuanto `β · margen` es grande, el par deja de
+empujar.
 
-`accuracy` mira la política **sola**, sin la referencia. Son dos preguntas distintas: el margen dice
-cuánto se ha movido la política respecto a donde estaba; el acierto dice si la ordenación que produce
-hoy es la correcta. Se puede mover mucho y ordenar peor.
+`accuracy`, en cambio, mira la política sola. El margen dice cuánto se ha movido respecto a donde
+estaba; el acierto, si la ordenación que produce ahora es la correcta. Se puede mover mucho y
+ordenar peor.
 
 ```python title="src/rukh/train/dpo.py"
 def evaluate(
@@ -333,10 +320,9 @@ def evaluate(
 
 <Src file="src/rukh/train/dpo.py" tag="p5" lines="162-188" />
 
-La validación es el mismo cálculo en `no_grad` con el modelo en `eval`, ponderando por el
-tamaño de cada lote —el último lote casi nunca está lleno, y una media de medias lo contaría de
-más—. Y devuelve NaN en vez de cero cuando no hay nada que medir, porque un cero en una columna de
-pérdidas se lee como un resultado excelente.
+La validación pondera por el tamaño de cada lote (el último casi nunca está lleno) y devuelve NaN
+en vez de cero cuando no hay nada que medir, porque un cero en una columna de pérdidas se lee como
+un resultado excelente.
 
 ```python title="src/rukh/train/dpo.py"
 def train(cfg: DpoConfig) -> Path:
@@ -425,37 +411,28 @@ def train(cfg: DpoConfig) -> Path:
 
 <Src file="src/rukh/train/dpo.py" tag="p5" lines="191-272" />
 
-El bucle completo. Cuatro cosas que mirar.
+El bucle completo. Lo que hay que mirar:
 
-`reference = copy.deepcopy(policy).eval()` y el `requires_grad_(False)` de las tres líneas
-siguientes: la referencia se congela **dos veces**, por los gradientes y por el modo. Lo segundo es
-lo que se olvida. Una referencia que se queda en `train` sigue aplicando dropout, así que el mismo
-par daría una log-probabilidad de referencia distinta en cada paso, y `β` estaría midiendo ruido
-sin que la curva lo enseñe. Es el poste de la correa moviéndose solo.
+- La referencia se congela **dos veces**: `requires_grad_(False)` por los gradientes y `.eval()` por
+  el modo. Lo segundo es lo que se olvida. En modo `train` sigue aplicando dropout, el mismo par da
+  una log-probabilidad de referencia distinta en cada paso y `β` mide ruido sin que la curva lo
+  enseñe.
+- `nll_weight` resta la log-probabilidad media de la jugada preferida, y con peso 0 ni se calcula.
+- `clip_grad_norm_` a 1.0: un par que la política ordena muy mal produce un gradiente grande, y con
+  `lr` de 5e-6 un solo par así puede mover el modelo más que la época entera.
+- El checkpoint guarda `val_before` y `val_after`, y la lección 8 los pone en la misma tabla sin
+  volver a medir.
 
-El `nll_weight` se aplica **restando** la log-probabilidad media de la jugada preferida, que es
-la pérdida de siguiente token sobre ella con el signo puesto. Está dentro de un `if` sobre el
-propio peso: con `nll_weight: 0` no se calcula, y el término no entra en el grafo.
-
-`clip_grad_norm_` a 1.0 antes de cada paso, que en una pérdida con un `logsigmoid` dentro no es
-ceremonia: un par que la política ordena muy mal produce un gradiente grande, y con `lr` de 5e-6
-un solo par así puede mover el modelo más que la época entera.
-
-Y el checkpoint guarda `val_before` y `val_after` dentro de su propia configuración. Es lo que
-permite que la lección 8 ponga las dos columnas de cada brazo en la misma tabla sin volver a medir.
-
-Una advertencia sobre ese acierto de validación: las cuatro líneas del `cut` reparten **pares
-sueltos** con `rng.permutation(len(rows))`, justo lo que el reward model de la lección anterior
-evita con `split_examples`. Dos pares de la misma partida, a unos pocos <Term id="ply">plies</Term>, pueden caer a los dos lados,
-así que el número sale algo inflado. Sirve para comparar dos brazos que usan el mismo reparto, no
-como valor absoluto; el que decide es el enfrentamiento directo.
+Una advertencia sobre ese acierto de validación: el `cut` reparte pares sueltos con
+`rng.permutation`, justo lo que el reward model evita con `split_examples`. Dos pares de la misma
+partida, a pocos <Term id="ply">plies</Term>, pueden caer a los dos lados, así que el número sale
+algo inflado. Sirve para comparar dos brazos con el mismo reparto; el que decide es el
+enfrentamiento directo.
 
 ## Los pares que salen del propio modelo
 
-Los 13 838 pares que el proyecto trae de M1 son **fuera de política**: salen de las evaluaciones
-multi-PV de Lichess, y dicen «aquí `e4` es mejor que `h4`» tanto si el modelo iba a considerar
-alguna de las dos como si no. Un par dentro de política hace una pregunta más estrecha: _de las
-jugadas que ibas a considerar aquí, ¿cuál era la mejor y cuál la peor?_
+Los 13 838 pares de M1 son fuera de política. Este fichero construye los otros, los que preguntan
+_de las jugadas que ibas a considerar aquí, ¿cuál era la mejor y cuál la peor?_
 
 ```python title="src/rukh/data/onpolicy.py"
 """Preference pairs built from the moves the **model** would actually play.
@@ -488,22 +465,16 @@ have to come from the distribution, not from its mode -- which is the same lesso
 
 <Src file="src/rukh/data/onpolicy.py" tag="p5" lines="1-26" />
 
-Las tres decisiones en negrita son las tres formas en que esta comparación se podía volver injusta
-sin darse cuenta. Léelas como reglas de experimento, no como detalles de implementación.
+Las tres decisiones del docstring son las tres formas en que la comparación se podía volver injusta
+sin darse cuenta. Léelas como reglas de experimento:
 
-**Las posiciones son las mismas.** Mismos prefijos, mismo equilibrio por fase, mismas partidas. Lo
-único que cambia entre los dos conjuntos es de dónde salieron las dos jugadas, que es el motivo
-entero de construir el segundo.
-
-**El motor va limitado por profundidad y no por tiempo.** Un Stockfish con reloj da respuestas
-distintas en una máquina ocupada y en una libre, y un dataset tiene que poder reconstruirse. Es la
-misma conclusión que dejó la escalera en M4, por otro camino.
-
-**La temperatura es 1,0 y no la 0,3 a la que se leen todos los números publicados.** A la
-temperatura casi determinista el modelo propone su moda cuatro veces de cada cuatro y no hay nada
-que comparar. Es una tensión que no se resuelve: lo que hace estables los números publicados es lo
-mismo que impide construir un par. En un LLM pasa igual: para generar pares con el propio modelo se
-muestrea con temperatura, aunque luego se sirva casi en greedy.
+- **Las posiciones son las mismas** que las de los pares de Lichess. Lo único que cambia entre los
+  dos conjuntos es de dónde salieron las dos jugadas.
+- El motor va limitado por profundidad, no por tiempo: un Stockfish con reloj da respuestas
+  distintas en una máquina ocupada y en una libre, y un dataset tiene que poder reconstruirse.
+- La temperatura es 1,0, no la 0,3 de los números publicados. Casi en determinista, el modelo
+  propone su moda cuatro veces de cada cuatro y no hay par. En un LLM pasa igual: los pares propios
+  se generan con temperatura aunque luego se sirva casi en greedy.
 
 ```python title="src/rukh/data/onpolicy.py"
 from __future__ import annotations
@@ -556,10 +527,9 @@ class OnPolicyConfig(BaseConfig):
 
 <Src file="src/rukh/data/onpolicy.py" tag="p5" lines="54-70" />
 
-Cada campo con su motivo. `candidates: 4` es la palanca que fija el precio del conjunto, porque
-cada candidata cuesta un análisis de motor. `min_delta_cp: 100` es el umbral por debajo del cual
-las dos jugadas no son una preferencia sino ruido con signo. Y `depth` lleva su propio comentario
-citando la decisión que lo justifica.
+`candidates: 4` fija el precio del conjunto, porque cada candidata cuesta un análisis de motor.
+`min_delta_cp: 100` es el umbral por debajo del cual la diferencia entre dos jugadas es ruido con
+signo.
 
 ```python title="src/rukh/data/onpolicy.py"
 def score_move(
@@ -583,16 +553,12 @@ def score_move(
 
 <Src file="src/rukh/data/onpolicy.py" tag="p5" lines="73-89" />
 
-Aquí cabe el peor error posible de este fichero, y por eso está escrito en el docstring. Al motor se
-le pregunta por la posición **a la que lleva** la jugada, donde mueve el
-rival, así que la puntuación vuelve desde el punto de vista del rival. El `pov(not board.turn)`
-es el giro. Equivocarse ahí construye un conjunto que prefiere sistemáticamente la peor candidata
-de cada grupo, y la pérdida de DPO lo aprende sin quejarse ni una vez.
-
-El `try`/`finally` con el `pop` es la otra mitad: el bucle de arriba reutiliza un solo tablero
-para todas las candidatas, así que un `push` que se quede puesto —porque el motor levantó una
-excepción, por ejemplo— envenena todo lo que venga después. Hay un test para cada una de las dos
-cosas.
+Aquí cabe el peor error del fichero. Al motor se le pregunta por la posición a la que lleva la
+jugada, donde mueve el rival, así que la puntuación vuelve desde su punto de vista;
+`pov(not board.turn)` le da la vuelta. Equivocarse ahí construye un conjunto que prefiere siempre la peor
+candidata, y DPO lo aprende sin quejarse. El `try`/`finally` con el `pop` protege el tablero, que se
+reutiliza para todas las candidatas: un `push` que se quede puesto envenena todo lo que venga
+después. Hay un test para cada cosa.
 
 ```python title="src/rukh/data/onpolicy.py"
 def sample_candidates(
@@ -626,18 +592,10 @@ def sample_candidates(
 
 <Src file="src/rukh/data/onpolicy.py" tag="p5" lines="92-118" />
 
-El sorteo, con dos decisiones dentro.
-
-**Las propuestas ilegales se descartan, no se rescatan.** El muestreador del proyecto sabe
-enmascarar las jugadas ilegales antes de sortear, y aquí se le dice que no lo haga
-(`mask_illegal=False`) para después tirar lo que salga mal. Suena a desperdicio y no lo es: un par
-dentro de política va de ordenar las jugadas que el modelo **jugaría**, y la demo enmascara las
-ilegales antes de que lleguen al tablero. Cuántas veces propone una es otra medida, y la suite ya la
-hace.
-
-**Se sortea cuatro veces de más.** Ese `range(count * 4)` está porque los duplicados son el caso
-común y no la excepción, incluso a temperatura 1,0. Es el mismo fenómeno que en GRPO cuenta los
-grupos planos, visto desde la generación de datos.
+El sorteo, con dos decisiones dentro. Las propuestas ilegales se descartan (`mask_illegal=False` y
+después se tiran): un par dentro de política ordena jugadas que el modelo jugaría, y cuántas
+ilegales propone ya lo mide la suite. Y se sortea cuatro veces de más, `range(count * 4)`, porque los
+duplicados son lo común incluso a temperatura 1,0.
 
 ```python title="src/rukh/data/onpolicy.py"
 def _history_for(tok: UciTokenizer, prefix: str, white_elo: int, black_elo: int) -> list[int]:
@@ -651,11 +609,10 @@ def _history_for(tok: UciTokenizer, prefix: str, white_elo: int, black_elo: int)
 
 <Src file="src/rukh/data/onpolicy.py" tag="p5" lines="121-127" />
 
-Esta función importa más de lo que parece: el prompt se construye con la **misma** función que usan
-la escalera y la demo, importada de `infer.game`. Escribir aquí los tres tokens de cabecera a mano
-sería la forma más fácil de que dos mediciones del mismo modelo dejaran de ser comparables sin que
-nadie lo viera. En un asistente es el mismo peligro con la plantilla de chat: generar los pares con
-una y entrenar o servir con otra.
+El prompt se construye con la misma función que usan la escalera y la demo, importada de
+`infer.game`. Escribir aquí los tokens de cabecera a mano sería la forma más fácil de que dos
+mediciones del mismo modelo dejaran de ser comparables sin que nadie lo viera. En un asistente es
+el peligro de la plantilla de chat: generar los pares con una y servir con otra.
 
 ```python title="src/rukh/data/onpolicy.py"
 def build_on_policy(cfg: OnPolicyConfig) -> Manifest:
@@ -683,17 +640,16 @@ def build_on_policy(cfg: OnPolicyConfig) -> Manifest:
 
 <Src file="src/rukh/data/onpolicy.py" tag="p5" lines="130-150" />
 
-El recorte de `max_positions` lleva su comentario, y es el arreglo de un fallo que habría cambiado
-la comparación central del hito.
+El recorte de `max_positions` lleva su comentario porque arregla un fallo que habría cambiado la
+comparación central del hito.
 
 <Callout kind="roto" title="Un `head()` no es una muestra">
-  La primera versión recortaba con `frame.head(n)`. El fichero de pares está equilibrado por fase
-  **en bloques**, así que las primeras 40 filas son un 65 % de aperturas frente al 33 % del fichero
-  entero. Si el recorte de un brazo es casi todo aperturas y el del otro no, lo que se compara no
-  son las dos fuentes de pares: es la mezcla de fases, que desde M2 se sabe que lo mueve todo. Las
-  cuarenta primeras entradas de la guía telefónica no son una muestra de la ciudad: son cuarenta
-  apellidos que empiezan por A. Vale para cualquier dataset que llegue ordenado —por fecha, por
-  cliente, por idioma—: recortar con `head()` es elegir, no muestrear.
+  La primera versión recortaba con `frame.head(n)`. El fichero de pares está equilibrado por fase en
+  bloques, así que las primeras 40 filas son un 65 % de aperturas frente al 33 % del fichero entero.
+  Si el recorte de un brazo es casi todo aperturas y el del otro no, lo que se compara es la mezcla
+  de fases, que desde M2 se sabe que lo mueve todo. Las cuarenta primeras entradas de la guía
+  telefónica son cuarenta apellidos que empiezan por A, no una muestra de la ciudad. Con cualquier
+  dataset que llegue ordenado —por fecha, por cliente, por idioma—, recortar con `head()` es elegir.
 </Callout>
 
 ```python title="src/rukh/data/onpolicy.py"
@@ -751,16 +707,14 @@ la comparación central del hito.
 
 <Src file="src/rukh/data/onpolicy.py" tag="p5" lines="152-201" />
 
-El bucle. Los dos `continue` con contador son los dos motivos distintos por los que una posición no
-produce par, y conviene no confundirlos: menos de dos jugadas distintas es **falta de diversidad**;
-una diferencia por debajo del margen es **falta de desacuerdo**. Lo segundo no es un fallo: es el
-modelo diciendo que todo lo que consideraba ahí era más o menos igual de bueno, y fabricar una
-preferencia con eso sería enseñarle ruido.
+Los dos `continue` con contador son dos motivos distintos para no producir par: menos de dos
+jugadas distintas es falta de diversidad; una diferencia por debajo del margen es falta de
+desacuerdo. Lo segundo es el modelo diciendo que todo lo que consideraba era parecido de bueno, y
+fabricar una preferencia con eso sería enseñarle ruido.
 
-Sobre las 13 838 posiciones completas salió así: 46,1 % dio par, 27,1 % se quedó sin diversidad y
-26,8 % sin desacuerdo. Ese 27,1 % es el mismo fenómeno que GRPO cuenta como grupos planos: **la
-confianza del propio modelo se lleva un cuarto del presupuesto de motor**, y no hay forma de saber
-qué cuarto antes de pagarlo.
+Sobre las 13 838 posiciones salió así: 46,1 % dio par, 27,1 % se quedó sin diversidad y 26,8 % sin
+desacuerdo. Ese 27,1 % es lo que GRPO llama grupos planos: **la confianza del propio modelo se lleva
+un cuarto del presupuesto de motor**, y no hay forma de saber qué cuarto antes de pagarlo.
 
 ```python title="src/rukh/data/onpolicy.py"
     if not rows:
@@ -800,10 +754,9 @@ qué cuarto antes de pagarlo.
 
 <Src file="src/rukh/data/onpolicy.py" tag="p5" lines="203-235" />
 
-El manifiesto es lo que convierte una carpeta con un parquet en un dataset: guarda la configuración
-entera con la que se construyó, los dos contadores de descartes, el hash del fichero y una nota que
-dice por qué el motor va por profundidad. La lección 6 lo publica tal cual, con una excepción:
-`counts` lleva `pairs` y `positions`, y sumar las dos doblaría el tamaño del conjunto en la card.
+El manifiesto convierte una carpeta con un parquet en un dataset: la configuración entera, los
+contadores de descartes, el hash del fichero y una nota sobre la profundidad del motor. La lección 6
+lo publica tal cual.
 
 ## Las tres configuraciones, y la que solo cambia los pares
 
@@ -869,8 +822,7 @@ seed: 42
 
 <Src file="configs/train/dpo-onpolicy.yaml" tag="p5" lines="1-21" />
 
-De la otra solo hace falta enseñar lo que cambia: aparte del comentario y del `run_name` con el que
-se registra la ejecución, el resto es idéntico, carácter a carácter.
+De la otra basta con lo que cambia; aparte del comentario y del `run_name`, el resto es idéntico.
 
 {/* prettier-ignore */}
 ```yaml title="configs/train/dpo-offpolicy.yaml"
@@ -881,9 +833,8 @@ pairs: data/pairs-offpolicy-matched/pairs.parquet
 
 <Src file="configs/train/dpo-offpolicy.yaml" tag="p5" lines="1-3" />
 
-`data/pairs-offpolicy-matched/` no es el fichero original de 13 838 pares: es ese fichero
-submuestreado a **6 386** con semilla fija, para que los dos brazos vean exactamente la misma
-cantidad de datos.
+`data/pairs-offpolicy-matched/` es el fichero de 13 838 pares submuestreado a **6 386** con semilla
+fija, para que los dos brazos vean la misma cantidad de datos.
 
 <Exercise n="01" title="¿Qué medirías si no los igualaras?">
   El conjunto fuera de política tiene 13 838 pares y el de dentro 6 386. Si entrenas los dos tal
@@ -894,10 +845,10 @@ cantidad de datos.
     más pasos de optimizador sobre el mismo modelo de partida, y eso solo basta para explicar una
     diferencia. Por eso `dpo-offpolicy.yaml` apunta al conjunto submuestreado.
 
-    Hay una segunda diferencia que **no** se puede igualar y que por eso hay que declarar: los
-    pares de fuera tienen un 29 % de mates y los de dentro un 2,9 %. No es un defecto de la
-    construcción, es lo que significa «dentro de política» —una evaluación multi-PV encuentra mates
-    que el modelo nunca iba a proponer—, y lo honesto es escribirlo al lado del resultado.
+    Hay una segunda diferencia que no se puede igualar y que por eso hay que declarar: los pares de
+    fuera tienen un 29 % de mates y los de dentro un 2,9 %. Es lo que significa «dentro de
+    política» —una evaluación multi-PV encuentra mates que el modelo nunca iba a proponer—, y lo
+    honesto es escribirlo al lado del resultado.
 
   </Solution>
 </Exercise>
@@ -907,15 +858,15 @@ cantidad de datos.
   where="Comparar dos prompts de sistema, dos estrategias de troceado en un RAG, dos modelos base: si además cambia el tamaño del conjunto, el presupuesto o la temperatura, no has medido lo que creías."
 >
   Dos conjuntos de datos solo son comparables cuando lo único que difiere entre ellos es lo que
-  estás estudiando. Y cuando algo no se puede igualar —aquí, la proporción de mates— la regla no es
-  abandonar la comparación: es declararlo en la misma tabla en la que publicas el resultado, para
-  que quien la lea sepa qué parte del efecto podría ser eso.
+  estás estudiando. Cuando algo no se puede igualar —aquí, la proporción de mates—, decláralo en la
+  misma tabla en la que publicas el resultado, para que quien la lea sepa qué parte del efecto
+  podría venir de ahí.
 </Transfer>
 
 ## Las dos órdenes
 
-`rukh data onpolicy` construye el conjunto, y sus dos banderas son las dos que se quieren tocar
-sin editar un YAML: qué modelo propone y cuántas posiciones recorrer.
+`rukh data onpolicy` construye el conjunto. Sus dos banderas son lo que se quiere tocar sin editar
+un YAML: qué modelo propone y cuántas posiciones recorrer.
 
 ```python title="src/rukh/cli.py"
 @data_app.command("onpolicy")
@@ -956,9 +907,8 @@ def data_onpolicy(
 
 <Src file="src/rukh/cli.py" tag="p5" lines="280-313" />
 
-El `model_copy(update=...)` en vez de asignar sobre la configuración es lo que mantiene la
-validación de pydantic al aplicar una bandera: un `--max-positions 0` se rechaza aquí y no
-doscientas líneas más tarde.
+`model_copy(update=...)` mantiene la validación de pydantic al aplicar una bandera: un
+`--max-positions 0` se rechaza aquí y no doscientas líneas más tarde.
 
 ```python title="src/rukh/cli.py"
 @train_app.command("dpo")
@@ -991,10 +941,8 @@ def train_dpo_cmd(
 
 <Src file="src/rukh/cli.py" tag="p5" lines="819-844" />
 
-Y la de DPO, con el mismo patrón: cargar el YAML, aplicar lo que venga por bandera y correr. Fíjate
-en el diccionario por comprensión con el filtro `if v`:
-una bandera que no se pasó no llega a `model_copy`, así que no puede pisar con `None` lo que el
-fichero decía.
+La de DPO sigue el mismo patrón. El filtro `if v` del diccionario hace que una bandera que no se
+pasó no pise con `None` lo que decía el fichero.
 
 <Callout kind="ejecuta" title="Prueba el constructor de pares con 40 posiciones">
   Antes de la corrida larga (unos 35 minutos en la máquina de referencia), una de humo con
@@ -1037,10 +985,9 @@ Ninguna orden de `rukh` lo escribe en `p5`, así que ese fichero lo preparas tú
 
 ## Los tests que sostienen la comparación
 
-De `tests/unit/test_onpolicy.py` van aquí los tres tests que fijan la convención de
-puntuación, que es donde vive el fallo que no avisa; el resto comprueba que una propuesta ilegal se
-descarta y un duplicado no cuenta como segunda candidata, que `candidates: 1` y `temperature: 0` se
-rechazan, y que el prompt es el mismo que el de la escalera.
+De `tests/unit/test_onpolicy.py` van aquí los tres tests de la convención de puntuación, donde vive
+el fallo que no avisa. El resto del fichero comprueba el descarte de ilegales y duplicados, que
+`candidates: 1` y `temperature: 0` se rechazan, y que el prompt es el de la escalera.
 
 ```python title="tests/unit/test_onpolicy.py"
 def test_the_score_comes_back_for_the_side_that_played_the_move():
@@ -1081,15 +1028,12 @@ def test_a_mate_is_scored_with_the_project_convention(moves: int, expected: int)
 <Src file="tests/unit/test_onpolicy.py" tag="p5" lines="39-71" />
 
 El primero es el giro de signo: +120 para las blancas es +120 cuando movieron ellas y −120 cuando
-movió el negro. El segundo comprueba que el tablero vuelve como estaba, que es lo que el
-`try`/`finally` promete. Y el tercero, parametrizado, fija que un mate se puntúa con la
-convención del proyecto, `MATE_SCORE` menos la distancia: esa resta no es decoración, es lo que
-hace que un mate en uno sea preferible a un mate en cinco, que es una preferencia que un par
-debería poder expresar.
+movió el negro. El segundo comprueba que el tablero vuelve como estaba. El tercero fija que un mate
+se puntúa como `MATE_SCORE` menos la distancia, para que un mate en uno sea preferible a uno en
+cinco.
 
-Los tres tardan milisegundos porque el motor es un objeto falso que contesta siempre lo mismo. Un
-test que necesita a Stockfish para comprobar un signo no se ejecuta en cada guardado, y uno que no se
-ejecuta no protege nada.
+Los tres tardan milisegundos porque el motor es un objeto falso. Un test que necesita a Stockfish
+para comprobar un signo no se ejecuta en cada guardado, y uno que no se ejecuta no protege nada.
 
 <Callout kind="ejecuta" title="Los tests de los pares y de DPO">
   Con el `test_onpolicy.py` completo del tag (el enlace de debajo del bloque lleva al fichero con su
@@ -1108,13 +1052,12 @@ DPO—, todos en CPU y sin Stockfish: el motor es el objeto falso. Si falla el d
 
 ## Qué has aprendido
 
-Que DPO se salta el reward model porque su referencia es implícita: una copia congelada de los pesos
-de partida, que hay que congelar dos veces —gradientes y modo— o `β` mide ruido. Que en este
-proyecto la pérdida se reduce a dos log-probabilidades porque una jugada es un token (en un LLM
-serían dos sumas sobre las respuestas), y que devuelve el margen y el acierto por separado porque el
-primero puede subir mientras el segundo baja. Y que construir el segundo brazo de una comparación es
-sobre todo igualar todo lo demás: las mismas posiciones, el mismo motor determinista, el mismo número
-de pares, y declarar en voz alta lo único que no se pudo igualar.
+DPO se salta el reward model porque su referencia es implícita: una copia congelada de los pesos
+de partida, que hay que congelar dos veces —gradientes y modo— o `β` mide ruido. Aquí la pérdida se
+reduce a dos log-probabilidades porque una jugada es un token (en un LLM serían dos sumas sobre las
+respuestas), y devuelve margen y acierto por separado porque el primero puede subir mientras el
+segundo baja. Y construir el segundo brazo de una comparación consiste sobre todo en igualar lo
+demás —posiciones, motor, número de pares— y declarar lo único que no se pudo igualar.
 
 Lo siguiente es el otro camino: sin pares, sin reward model, y con una recompensa que se puede
 escribir y comprobar.
