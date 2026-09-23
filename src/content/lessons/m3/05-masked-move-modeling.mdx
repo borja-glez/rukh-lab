@@ -10,7 +10,7 @@ duration: 215
 runtime: 16
 level: medio
 status: vigente
-updated: 2026-09-22
+updated: 2026-09-23
 keywords:
   - masked move modeling
   - MLM
@@ -37,7 +37,9 @@ mitad ya está fuera: el enmascarado, la pérdida y el bucle de doce mil pasos.
 La frase que justifica el orden está en el docstring del primero: **una tirada solo es comparable
 con otra cuando la receta es la misma**. Si el encoder tuviera su propia planificación de la tasa de
 aprendizaje, su propio guardado de checkpoints y su propio reanudado, cualquier diferencia entre el
-decoder y el encoder podría ser la máscara o podría ser la receta, y no habría forma de saberlo.
+decoder y el encoder podría ser la máscara o podría ser la receta, y no habría forma de saberlo. Es
+la misma razón por la que un equipo que compara dos modelos de lenguaje los entrena con el mismo
+script y solo cambia la pieza que quiere medir.
 
 ## `common.py`: lo que toda tirada hace igual
 
@@ -83,9 +85,9 @@ Batch = tuple[torch.Tensor, torch.Tensor]
 
 <Src file="src/rukh/train/common.py" tag="p3" lines="1-37" />
 
-«Differ in exactly one place: how a batch becomes a loss» es el criterio con el que se decidió qué
-entra aquí y qué no. No es «lo que se repite», que llevaría a compartir cosas que casualmente
-coinciden hoy; es «lo que **tiene** que ser igual para que dos números se puedan comparar».
+«Differ in exactly one place: how a batch becomes a loss» es el criterio de lo que entra aquí: no lo
+que se repite por casualidad, sino lo que **tiene** que ser igual para que dos números se puedan
+comparar.
 
 ```python title="src/rukh/train/common.py"
 class RunConfig(BaseConfig):
@@ -129,8 +131,8 @@ class RunConfig(BaseConfig):
 
 <Src file="src/rukh/train/common.py" tag="p3" lines="40-76" />
 
-Los veintitantos campos son los mismos que tenía `TrainConfig` en M2, palabra por palabra, movidos a
-la clase base. Lo único nuevo son las dos últimas piezas.
+Los campos son los mismos que tenía `TrainConfig` en M2, palabra por palabra, movidos a la clase
+base. Lo nuevo son las dos últimas piezas.
 
 `default_name` es una **propiedad que las subclases redefinen**: el decoder devuelve su preset
 (`small`), el encoder devuelve `encoder-moves`. Es el patrón de plantilla, y sirve para que `run_dir`
@@ -177,17 +179,11 @@ hace que el afinado de la lección 6 funcione. En un `probe`, el tronco tiene `r
 así que sus parámetros **no entran en ningún grupo** y el optimizador ni siquiera reserva estado
 para ellos. Sin ese filtro, `AdamW` guardaría dos momentos por cada uno de los quince millones de
 pesos congelados —ciento veinte megabytes de nada— y, peor, el <Term id="adamw">decaimiento de
-pesos</Term> se aplicaría igualmente, porque el decaimiento desacoplado no necesita gradiente: los
-pesos «congelados» se encogerían un poquito en cada paso.
-
-<Callout kind="roto" title="Congelar sin filtrar el optimizador">
-  Es el fallo silencioso clásico del afinado por etapas. `requires_grad = False` impide que el
-  gradiente llegue, pero `AdamW` con `weight_decay > 0` multiplica cada peso de su grupo por
-  `(1 - lr · wd)` en cada paso, mire o no el gradiente. Después de cuatro mil pasos, el tronco
-  «congelado» ya no es el que se preentrenó, y el test que compara los pesos antes y después falla
-  por un motivo que nadie relaciona con el optimizador. Aquí no pasa porque `param_groups` filtra
-  por `requires_grad` **al construir el optimizador**, que es después de congelar.
-</Callout>
+pesos</Term> se aplicaría igualmente: el decaimiento desacoplado multiplica cada peso de su grupo por
+`(1 - lr · wd)` en cada paso, tenga gradiente o no, y tras cuatro mil pasos el tronco «congelado» ya
+no sería el que se preentrenó. Por eso el filtro actúa **al construir el optimizador**, que se hace
+después de congelar. La lección 6 junta esta trampa con las otras dos formas de que congelar no
+congele.
 
 La división por dimensión de `param_groups` es la regla de siempre y conviene recordarla: el
 decaimiento se aplica a las matrices (`dim >= 2`) y no a los sesgos ni a las ganancias de
@@ -212,9 +208,8 @@ def autocast_for(cfg: RunConfig, where: torch.device) -> tuple[Any, bool]:
 <Src file="src/rukh/train/common.py" tag="p3" lines="105-116" />
 
 `forever` convierte un `DataLoader` finito en un flujo infinito, porque el bucle cuenta **pasos** y
-no épocas. Que devuelva un `nullcontext` en vez de `None` cuando no hay bf16 es lo que permite que
-el bucle escriba `with autocast:` sin preguntar, que es lo que permite que el mismo bucle corra en
-CPU en los tests.
+no épocas. Que `autocast_for` devuelva un `nullcontext` en vez de `None` cuando no hay bf16 permite
+que el bucle escriba `with autocast:` sin preguntar, y que el mismo bucle corra en CPU en los tests.
 
 El par `(contexto, activado)` en vez de solo el contexto existe porque hay un sitio donde el bucle
 sí necesita saberlo: pasa `autocast if use_bf16 else None` a la evaluación, para no envolver en
@@ -259,7 +254,7 @@ def maybe_compile(
 
 <Src file="src/rukh/train/common.py" tag="p3" lines="119-152" />
 
-Esta es la función que más cambió al compartirse, y el cambio es el parámetro `probe`.
+Es la función que más cambió al compartirse, y el cambio es el parámetro `probe`.
 
 En M2 bastaba con `sample`: el `forward` del decoder acepta `(idx, targets)` y llamarlo con el mismo
 tensor dos veces produce una pérdida y, por tanto, una compilación completa de ida y vuelta. El
@@ -268,10 +263,10 @@ ocultos— y porque la llamada que el bucle hará de verdad lleva una máscara d
 `mmm.py` pasa una función que ejecuta **el paso que el bucle va a ejecutar**, con su máscara y su
 `backward`.
 
-La razón por la que eso importa está en el docstring del `probe` de `mmm.py`, y es una de esas cosas
-que solo se aprenden midiendo: compilar con `attention_mask=None` compila un grafo que el bucle
-nunca ejecuta, y en el paso 1 hay que recompilar para la forma real. La recompilación es justo el
-coste que este <Term id="sondeo-de-compilacion">sondeo</Term> existe para pagar por adelantado.
+El docstring del `probe` de `mmm.py` dice por qué importa: compilar con `attention_mask=None` compila
+un grafo que el bucle nunca ejecuta, y en el paso 1 hay que recompilar para la forma real. Esa
+recompilación es justo el coste que este <Term id="sondeo-de-compilacion">sondeo</Term> existe para
+pagar por adelantado.
 
 Y el `except Exception` con su `noqa`: una compilación que falla es un aviso y una tirada que sigue
 en modo ansioso, nunca una tirada muerta. En una máquina Windows sin MSVC eso pasa de verdad, y
@@ -313,9 +308,8 @@ def skip_batches(batches: Iterator[Batch], count: int) -> int:
 
 `run_dir` es la razón de que todas las rutas de checkpoint de este módulo lleven fecha
 (`checkpoints/encoder-mmm-20260919-093554/`): en las órdenes del curso esa marca aparece como
-`<fecha>`, y en las tuyas va la de tu tirada. Ninguna orden de este módulo resuelve un nombre sin
-fecha.
-El `cfg.run_name or cfg.default_name` es donde entra la propiedad que redefinen las subclases.
+`<fecha>`, y en las tuyas va la de tu tirada. El `cfg.run_name or cfg.default_name` es donde entra
+la propiedad que redefinen las subclases.
 
 ```python title="src/rukh/train/common.py"
 def load_resume(
@@ -373,7 +367,7 @@ el hash del vocabulario y el del manifiesto de datos. Que esté aquí y no en ca
 ningún entrenamiento de este proyecto puede producir un checkpoint sin decir con qué código y con qué
 datos salió, ni siquiera por descuido.
 
-Dos conversiones merecen un comentario porque las dos protegen de un formato que cambia. El
+Dos conversiones protegen de un formato que cambia. El
 `isinstance(recorded, int | float)` de `load_resume` acepta un `best_val` ausente o nulo —los
 checkpoints de las primeras versiones no lo tenían— en vez de reventar; y `None if
 math.isinf(best_val)` escribe un `null` en el JSON en lugar de un `Infinity`, que no es JSON válido
@@ -400,17 +394,15 @@ def log_metrics(metrics: dict[str, float], step: int) -> None:
 <Src file="src/rukh/train/common.py" tag="p3" lines="234-244" />
 
 El filtro de `nan` no es cosmético: <Term id="mlflow">MLflow</Term> acepta un `nan` y después lo
-dibuja como un hueco o como un cero según el visor, así que una curva con un solo `nan` deja de ser
-legible. Y ya sabes de dónde puede salir un `nan` en este módulo: un lote donde el sorteo no tapó
-nada.
+dibuja como un hueco o como un cero según el visor. Y en este módulo un `nan` sale de algo tan
+normal como un lote donde el sorteo no tapó nada.
 
 ## Lo que queda en `loop.py`
 
-El docstring del módulo gana una frase que dice lo que ha pasado —la maquinaria vive en
-`rukh.train.common`, compartida con el bucle del encoder— y los imports adelgazan: `os`, `datetime`,
-`Iterator`, `BaseConfig`, `lr_at`, `load_checkpoint`, `save_checkpoint` y `restore` ya no se usan
-aquí, porque las
-funciones que los necesitaban se han ido a `common.py`.
+El docstring del módulo gana una frase —la maquinaria vive en `rukh.train.common`, compartida con el
+bucle del encoder— y los imports adelgazan: `os`, `datetime`, `Iterator`, `BaseConfig`, `lr_at`,
+`load_checkpoint`, `save_checkpoint` y `restore` ya no se usan aquí, porque las funciones que los
+necesitaban se han ido a `common.py`.
 
 ```python title="src/rukh/train/loop.py"
 """The decoder's training loop: next-token prediction on a packed stream of move tokens.
@@ -507,10 +499,10 @@ class TrainConfig(RunConfig):
 
 <Src file="src/rukh/train/loop.py" tag="p3" lines="38-85" />
 
-`TrainConfig` pasa de veinticinco campos a dos. Es el mismo movimiento del refactor de la lección 2 y
-la misma precaución: el `__all__` reexporta desde `rukh.train.loop` todo lo que se ha ido a
-`common.py`, porque los tests de M2 y su lección importan `pick_device`, `param_groups` o
-`run_dir` de ahí. Un refactor interno no debería obligar a tocar el módulo anterior del curso.
+`TrainConfig` pasa de más de veinte campos a dos. Es el movimiento del refactor de la lección 2 y la
+misma precaución: el `__all__` reexporta desde `rukh.train.loop` todo lo que se ha ido a
+`common.py`, porque los tests de M2 importan `pick_device`, `param_groups` o `run_dir` de ahí. Un
+refactor interno no debería obligar a tocar el código que ya lo usaba.
 
 `evaluate` no cambia ni una línea respecto a M2. Del cuerpo de `train` desaparecen tres bloques
 que ahora son llamadas de una línea: el reanudado, la elección del autocast y la escritura del
@@ -648,13 +640,12 @@ def train(cfg: TrainConfig, resume: Path | None = None, device: str | None = Non
 
 <Src file="src/rukh/train/loop.py" tag="p3" lines="125-249" />
 
-Léela buscando lo que ya no está. `load_resume(resume, model, optimizer, where)` devuelve en una
-tupla los tres datos que el bucle necesita para seguir —paso, mejor pérdida e id de MLflow— y
-esconde la restauración de pesos, optimizador y generadores. `autocast_for` decide el contexto de
-precisión y si hay bf16, y `run_dir(cfg, resume)` elige la carpeta: la de siempre al reanudar y, si no,
-una nueva, con fecha salvo que `unique_run_name` esté apagado. `save` es un cierre sobre `write_checkpoint` que fija todo lo que no cambia
-entre dos guardados, de modo que las dos llamadas del final (`best.pt` y `step-*.pt`) solo dicen
-dónde y en qué paso.
+Léela buscando lo que ya no está. `load_resume(resume, model, optimizer, where)` devuelve los tres
+datos que el bucle necesita para seguir —paso, mejor pérdida e id de MLflow— y esconde la
+restauración de pesos, optimizador y generadores. `autocast_for` decide el contexto de precisión, y
+`run_dir(cfg, resume)` elige la carpeta: la de siempre al reanudar y, si no, una nueva con fecha.
+`save` es un cierre sobre `write_checkpoint` que fija todo lo que no cambia entre dos guardados, de
+modo que las dos llamadas del final (`best.pt` y `step-*.pt`) solo dicen dónde y en qué paso.
 
 Lo que queda es lo que ningún otro bucle comparte: comprobar que el pack tiene el mismo
 `vocab_size` que el modelo, construir un `MoveDecoder`, y la suma de la pérdida ponderada por tokens
@@ -755,18 +746,11 @@ Scheme = Literal["moves", "squares"]
 
 <Src file="src/rukh/train/mmm.py" tag="p3" lines="25-68" />
 
-Los imports enseñan de un vistazo el reparto del módulo: casi todo viene de `rukh.train.common`, y lo
-propio son cinco cosas —el encoder, su `MMM_IGNORE_INDEX`, los tokens de control de los dos esquemas y
-el `PackedDataset` de M1—.
-
-Los dos `import ... as` con el mismo módulo repetido
-(`from rukh.models.squares import CONTROL_IDS as SQUARE_CONTROL_IDS` y otra línea para `MASK_ID`) son
-la forma de que los nombres de los dos esquemas no colisionen: hay un `MASK_ID` en el vocabulario UCI
-y otro en el de casillas, y renombrar los dos en el import es más claro que cualificarlos en cada uso.
-
-El docstring es la sección «Masked move modeling» de la lección 1 escrita en el código, y lo único
-que añade es la frase que la lección conceptual no podía dar: **son exactamente dos diferencias**.
-Todo lo demás es el bucle del decoder.
+El docstring es la sección «Masked move modeling» de la lección 1 escrita en el código, con una frase
+más: **son dos diferencias con el bucle del decoder**, y solo dos. Los imports lo confirman: casi
+todo viene de `rukh.train.common`, y lo propio es el encoder, su `MMM_IGNORE_INDEX`, los tokens de
+control de los dos esquemas y el `PackedDataset` de M1. Los `import ... as` evitan que colisionen el
+`MASK_ID` del vocabulario UCI y el del de casillas.
 
 ```python title="src/rukh/train/mmm.py"
 MOVE_CONTROL_IDS: frozenset[int] = frozenset(
@@ -797,11 +781,9 @@ principio. Un `frozenset(range(62))` escrito a mano funcionaría hoy y dejaría 
 silencio el día que alguien añada un token especial: las jugadas se desplazarían una posición y el
 sorteo aleatorio empezaría a producir Elos falsos.
 
-Que sean un **prefijo** del vocabulario es lo que hace posible la línea más bonita de la función de
-enmascarado: para sortear «una jugada cualquiera» basta con sortear por encima del último id de
-control. Sin esa propiedad habría que construir una lista de ids válidos y sortear índices sobre
-ella, que es más código y más lento. Es un ejemplo de decisión de enumeración tomada en M1 que paga
-dos módulos después.
+Que sean un **prefijo** del vocabulario permite que, para sortear «una jugada cualquiera», baste con
+sortear por encima del último id de control. Es una decisión de enumeración tomada en M1 que paga dos
+módulos después.
 
 ```python title="src/rukh/train/mmm.py"
 class MaskingConfig(BaseConfig):
@@ -891,8 +873,7 @@ def apply_masking(
 
 <Src file="src/rukh/train/mmm.py" tag="p3" lines="118-156" />
 
-La función central del módulo, y son **dos sorteos independientes**. Esa es la decisión que hay que
-ver.
+La función central del módulo, con **dos sorteos independientes**.
 
 El primero (`draw`) decide **qué posiciones entran**, el 15 %. El segundo (`decision`) reparte, entre
 las elegidas, el 80/10/10. Con un solo sorteo y tres umbrales —`draw < 0.12` para `<mask>`,
@@ -910,7 +891,7 @@ vectorizada: el token original donde se eligió, `-100` en todo lo demás. Es la
 promesa «la pérdida puntúa exactamente las posiciones elegidas» sea cierta por construcción y no por
 disciplina.
 
-Dos detalles de rendimiento y corrección en la rama del ruido. El `if bool(replace.any())` evita
+Dos detalles en la rama del ruido. El `if bool(replace.any())` evita
 construir un `randint` de tamaño cero, que en algunas versiones de PyTorch protesta. Y
 `dtype=batch.dtype` es necesario porque el flujo empaquetado viene en `uint16` convertido a `int64`
 por el cargador; un `randint` con el tipo por defecto produciría un tensor de otro tipo y la
@@ -949,15 +930,11 @@ class MmmConfig(RunConfig):
 
 <Src file="src/rukh/train/mmm.py" tag="p3" lines="159-179" />
 
-`input: Literal["moves"]` con **un solo valor** es lo más interesante del bloque. No es un descuido:
-es una restricción declarada. El preentrenamiento con enmascarado solo existe para el esquema de
-jugadas, porque M1 dejó un flujo empaquetado de partidas y no de tableros. Escribir
-`input: squares` en el YAML de preentrenamiento da un error de validación con el valor permitido en
-el mensaje, en vez de arrancar y fallar al abrir el pack.
-
-Es el hecho que explica la mitad incómoda de los resultados del módulo: la línea de casillas
-**arranca de pesos aleatorios**, así que es el baseline honesto que el preentrenamiento tenía que
-batir.
+`input: Literal["moves"]` con **un solo valor** es una restricción declarada: el preentrenamiento
+con enmascarado solo existe para el esquema de jugadas, porque M1 dejó un flujo empaquetado de
+partidas y no de tableros. Escribir `input: squares` en el YAML da un error de validación con el
+valor permitido en el mensaje, en vez de arrancar y fallar al abrir el pack. Por eso la línea de
+casillas arranca de pesos aleatorios.
 
 `Field(default_factory=MaskingConfig)` y no `= MaskingConfig()`: el segundo crearía **una sola
 instancia compartida** por todas las configuraciones del proceso, que es el error del argumento por
@@ -987,8 +964,8 @@ def masked_step(
 
 <Src file="src/rukh/train/mmm.py" tag="p3" lines="182-200" />
 
-Aquí está «cómo un lote se convierte en una pérdida», la única cosa que este bucle no comparte con el
-del decoder. Y la firma con **dos** modelos —`encoder` y `body`— es la parte que hay que entender.
+Aquí está «cómo un lote se convierte en una pérdida», lo único que este bucle no comparte con el del
+decoder. La firma con **dos** modelos —`encoder` y `body`— es la parte que hay que entender.
 
 `torch.compile` envuelve el `forward` del módulo y nada más. Si el bucle llamara a
 `encoder.masked_lm(...)` sobre el modelo compilado, esa llamada no pasaría por el `forward`
@@ -1053,6 +1030,21 @@ def evaluate_mmm(
 
 <Src file="src/rukh/train/mmm.py" tag="p3" lines="203-243" />
 
+La línea que hay que mirar es `generator = masking_generator(masking.seed, device)`: el generador se
+construye **de nuevo desde la semilla de la configuración** en cada evaluación, en vez de arrastrar
+el del entrenamiento. Si lo arrastrara, cada evaluación taparía posiciones distintas, y la pérdida
+de validación del paso 500 y la del 1 000 se calcularían sobre dos tareas diferentes: la curva
+mezclaría la mejora del modelo con la dificultad del sorteo. Con la semilla reiniciada, **todas** las
+evaluaciones de la tirada —y las de otra tirada con la misma `masking.seed`— tapan las mismas
+posiciones. **La tarea de evaluación es parte del instrumento de medida, y un instrumento que cambia
+entre medidas no mide.** Es la misma razón por la que un benchmark de LLM fija sus preguntas y su
+semilla de muestreo.
+
+El `was_training` / `body.train()` del final devuelve el modelo al modo en el que estaba, en vez de
+a `train()` incondicionalmente. Y la pérdida se acumula **ponderada por posiciones tapadas**
+(`loss.float().item() * tokens`), no como media de medias: un lote donde el sorteo tapó pocas jugadas
+no debe pesar lo mismo.
+
 ```python title="src/rukh/train/mmm.py"
 def train_mmm(cfg: MmmConfig, resume: Path | None = None, device: str | None = None) -> Path:
     """Pretrain a ``PositionEncoder`` with masked move modeling; return the last checkpoint."""
@@ -1101,32 +1093,6 @@ veces y arrancar procesos cuesta más de lo que ahorra.
 `if not len(train_loader)` es el caso de un pack más pequeño que un lote: con `drop_last=True` en el
 cargador de entrenamiento, eso da cero lotes y el bucle se colgaría esperando datos.
 
-La línea que hay que mirar es `generator = masking_generator(masking.seed, device)`: el generador se
-construye **de nuevo desde la semilla de la configuración** en cada evaluación, en vez de arrastrar
-el del entrenamiento.
-
-Si se arrastrara, cada evaluación taparía posiciones distintas, porque el generador ha avanzado. La
-pérdida de validación del paso 500 y la del 1 000 se estarían calculando sobre dos tareas
-diferentes: una podría haber tapado recapturas forzadas y la otra jugadas difíciles de medio juego, y
-la curva mezclaría la mejora del modelo con la dificultad del sorteo. Con la semilla reiniciada,
-**todas** las evaluaciones de la tirada tapan exactamente las mismas posiciones, así que la curva
-mide una sola cosa.
-
-Y el beneficio se extiende entre tiradas: como la semilla vive en la configuración y no en el estado
-del proceso, la evaluación de otra tirada con la misma `masking.seed` usa el mismo conjunto de
-huecos. Comparar dos preentrenamientos deja de tener el asterisco de «sobre tareas distintas». Es la
-misma idea que fijar el conjunto de validación: **la tarea de evaluación es parte del instrumento de
-medida, y un instrumento que cambia entre medidas no mide**.
-
-El `was_training` / `body.train()` del final es la precaución de siempre: devolver el modelo al modo
-en el que estaba, y no a `train()` incondicionalmente, para que llamar a esta función sobre un modelo
-en `eval` no lo despierte.
-
-La pérdida se acumula **ponderada por posiciones tapadas** (`loss.float().item() * tokens`) y no como
-media de medias. Un lote donde el sorteo tapó pocas jugadas tiene una pérdida calculada sobre menos
-casos y no debe pesar lo mismo. La misma idea aparece en el bucle de entrenamiento, y es la razón de
-la métrica `masked_tokens_per_s` de la que habla el bloque siguiente.
-
 ```python title="src/rukh/train/mmm.py"
     autocast, use_bf16 = autocast_for(cfg, where)
     generator = masking_generator(cfg.masking.seed, where)
@@ -1150,6 +1116,14 @@ la métrica `masked_tokens_per_s` de la que habla el bloque siguiente.
 ```
 
 <Src file="src/rukh/train/mmm.py" tag="p3" lines="277-295" />
+
+Es el sondeo del que hablaba `maybe_compile`, con tres detalles. El lote falso se rellena con
+`max(MOVE_CONTROL_IDS) + 1` —la primera jugada de verdad— y no con ceros: con ceros, `padding_mask`
+daría una máscara toda `False`, `_key_mask` lanzaría su error y el sondeo fallaría por algo que no
+tiene nada que ver con compilar. `labels[:, 0] = warm[:, 0]` pone **exactamente una** etiqueta
+puntuable, porque con todas a `-100` la entropía cruzada sale `nan`. Y el `with autocast:` que
+envuelve la compilación evita compilar en `fp32` para ejecutar en `bf16`, que obligaría a recompilar
+en el primer paso.
 
 ```python title="src/rukh/train/mmm.py"
     out_dir = run_dir(cfg, resume)
@@ -1201,23 +1175,7 @@ ejecuciones de preentrenamiento del encoder» sin abrir ninguna configuración. 
 parámetro, no tanto.
 
 Y el `vocab_hash` sale del `meta.json` del pack y viaja al checkpoint, así que un encoder publicado
-dice con qué enumeración de jugadas se entrenó. Es la misma identidad que el hash del vocabulario de
-casillas de la lección 4, un nivel más arriba.
-
-El sondeo del que hablaba `maybe_compile`, con tres detalles que merecen verse.
-
-El lote falso se rellena con `max(MOVE_CONTROL_IDS) + 1` —la primera jugada de verdad— y no con
-ceros. Con ceros, `padding_mask` daría una máscara toda `False`, `_key_mask` lanzaría su error de
-«cada secuencia necesita al menos un token sin enmascarar», y el sondeo fallaría por una razón que no
-tiene nada que ver con compilar.
-
-`labels[:, 0] = warm[:, 0]` pone **exactamente una** etiqueta puntuable. Con todas a `-100`, la
-entropía cruzada sale `nan` —ya sabes por qué— y el `backward` de un `nan` no compila el grafo de
-gradientes de forma útil.
-
-Y el `with autocast:` que envuelve la compilación: compilar en `fp32` y después ejecutar en `bf16`
-forzaría a Dynamo a recompilar en el primer paso, que es otra vez el coste que se está intentando
-pagar por adelantado.
+dice con qué enumeración de jugadas se entrenó.
 
 ```python title="src/rukh/train/mmm.py"
         clock = time.perf_counter()
@@ -1244,6 +1202,14 @@ pagar por adelantado.
 
 <Src file="src/rukh/train/mmm.py" tag="p3" lines="334-353" />
 
+El cuerpo del paso es el del decoder con el enmascarado metido en medio. `loss_sum` y
+`hidden_tokens` son tensores **en la GPU** y no números de Python: si fueran `float`, cada `+=`
+obligaría a sincronizar CPU y GPU para leer el valor. `(loss / cfg.grad_accum).backward()` divide
+antes de retropropagar porque los gradientes de los micro-lotes se suman: sin la división, el
+gradiente efectivo sería tres veces mayor y la tasa de aprendizaje de la configuración significaría
+otra cosa. Y `clip_grad_norm_` recorta sobre **el modelo** y no sobre `runnable`: son los mismos
+tensores, pero así no se depende de cómo el envoltorio de compilación exponga los suyos.
+
 ```python title="src/rukh/train/mmm.py"
             done = step + 1
             last = done == cfg.max_steps
@@ -1256,26 +1222,10 @@ pagar por adelantado.
 
 <Src file="src/rukh/train/mmm.py" tag="p3" lines="355-361" />
 
-Aquí ocurre **la única lectura del dispositivo por paso registrado**: los dos `.item()` traen a la CPU
-los acumuladores que el bucle mantuvo en la GPU. Por eso están dentro del `if`: con `log_every = 10`,
-hay una sincronización cada diez pasos en vez de tres por micro-lote.
-
-`math.nan` cuando `counted` es cero es el caso degenerado del lote sin nada tapado, y `log_metrics` lo
-filtra antes de llegar a MLflow.
-
-El cuerpo del paso, y es el del decoder con el enmascarado metido en medio.
-
-`loss_sum` y `hidden_tokens` son tensores **en la GPU** y no números de Python. Si fueran `float`,
-cada `+=` obligaría a una sincronización entre CPU y GPU para leer el valor, tres veces por
-micro-lote; acumulando en el dispositivo hay una sola lectura por paso, cuando toca registrar.
-
-`(loss / cfg.grad_accum).backward()` divide antes de retropropagar porque los gradientes de los tres
-micro-lotes se suman: sin la división, el gradiente efectivo sería tres veces mayor y la tasa de
-aprendizaje de la configuración significaría otra cosa.
-
-`clip_grad_norm_(model.parameters(), …)` recorta sobre **el modelo**, no sobre `runnable`. Son los
-mismos tensores, pero pedirle los parámetros al objeto original evita depender de cómo el envoltorio
-de compilación exponga los suyos.
+Aquí ocurre **la única lectura del dispositivo**: los dos `.item()` traen a la CPU los acumuladores
+que el bucle mantuvo en la GPU, y están dentro del `if`, así que con `log_every = 10` hay una
+sincronización cada diez pasos en vez de tres por micro-lote. `math.nan` cuando `counted` es cero es
+el lote sin nada tapado, y `log_metrics` lo filtra antes de llegar a MLflow.
 
 ```python title="src/rukh/train/mmm.py"
                 log_metrics(
@@ -1331,12 +1281,11 @@ la evaluación y la métrica de rendimiento tendría un diente de sierra que no 
 directorio y los comandos del curso eligen: `best.pt` para evaluar y publicar, `step-N.pt` para
 reanudar.
 
-Las dos métricas de rendimiento responden a preguntas distintas y por eso van las dos.
-`tokens_per_s` cuenta todo lo que la GPU procesó, y es la comparable con el decoder y entre tarjetas.
-`masked_tokens_per_s` cuenta solo las posiciones que puntúan, y es la que de verdad manda aquí:
-**el 85 % del cómputo de este preentrenamiento no produce ninguna señal de aprendizaje**. Esa es, en
-una cifra, la diferencia de eficiencia entre el MLM y la predicción del siguiente token de la que
-hablaba la lección 1.
+Las dos métricas de rendimiento responden a preguntas distintas. `tokens_per_s` cuenta todo lo que
+la GPU procesó, y es la comparable con el decoder y entre tarjetas. `masked_tokens_per_s` cuenta
+solo las posiciones que puntúan: **el 85 % del cómputo de este preentrenamiento no produce señal de
+aprendizaje**, que es en una cifra la diferencia de eficiencia entre el MLM y la predicción del
+siguiente token de la lección 1.
 
 ## La configuración del hito
 
@@ -1382,11 +1331,9 @@ masking:
 
 <Src file="configs/train/encoder-mmm.yaml" tag="p3" lines="1-36" />
 
-Casi todo son valores por defecto escritos otra vez. Eso es deliberado: una configuración que solo
-lleva lo que cambia obliga a abrir el código para saber con qué se entrenó, y una configuración
-completa es el registro de la tirada.
-
-Tres valores no son el defecto y los tres tienen motivo.
+Casi todo son valores por defecto escritos otra vez, a propósito: una configuración que solo lleva
+lo que cambia obliga a abrir el código para saber con qué se entrenó, y una completa es el registro
+de la tirada. Tres valores no son el defecto.
 
 `batch_size: 96` y `grad_accum: 3` en vez de `64 × 4`. Las 288 secuencias efectivas son algo más que
 las 256 del decoder, y caben en la memoria de la 5090 porque el encoder tiene un tercio de los
@@ -1396,13 +1343,12 @@ parámetros. Más lote por paso compensa en parte que solo el 15 % de las posici
 cuya señal por paso es más escasa y por tanto más ruidosa.
 
 `max_steps: 12000` en vez de 20 000: es el presupuesto del módulo, dieciséis minutos, no un punto de
-convergencia. La lección 11 enseña que la pérdida seguía bajando cuando se cortó, y eso se escribe en
-vez de fingir que el número es un techo.
+convergencia; la lección 11 enseña que la pérdida seguía bajando cuando se cortó.
 
-La forma del `lr` importa y es una trampa de YAML que conviene conocer: `5.0e-4` se lee como número,
-`5e-4` **se lee como cadena** en YAML 1.1 porque le falta el punto decimal. Con `extra="forbid"` y
-pydantic la cadena se convertiría igualmente, pero en otra configuración menos estricta eso es una
-tasa de aprendizaje que se vuelve texto.
+La forma del `lr` es una trampa de YAML que conviene conocer: `5.0e-4` se lee como número, pero
+`5e-4` **se lee como cadena** en YAML 1.1 (el de PyYAML) porque le falta el punto decimal. Pydantic
+la convertiría igualmente, pero con un cargador menos estricto es una tasa de aprendizaje que se
+vuelve texto.
 
 ## La orden
 
@@ -1422,8 +1368,8 @@ app.add_typer(train_app, name="train")
 <Src file="src/rukh/cli.py" tag="p3" lines="30-34" />
 
 `invoke_without_command=True` es la mitad del truco: un grupo de Typer, por defecto, exige un
-subcomando, y `rukh train --config …` se quedaría sin decoder. A `eval` le pasará lo mismo en la
-lección 7, cuando gane `rukh eval encoder`, y allí se repite la jugada con un `eval_app`.
+subcomando, y `rukh train --config …` se quedaría sin decoder. `eval` pasa por lo mismo en la
+lección 7.
 
 La otra mitad está en el comando del decoder. Deja de ser `@app.command("train")` y pasa a ser el
 **callback** del grupo, la función que Typer ejecuta siempre que se invoca `rukh train`, con
@@ -1542,14 +1488,10 @@ def train_encoder_cmd(
 <Src file="src/rukh/cli.py" tag="p3" lines="391-429" />
 
 Así `rukh train encoder` es un **subcomando** de `train`, mientras que el decoder sigue siendo
-`rukh train --config …` sin subcomando. Hacerlo con el callback no es una excentricidad: la
-alternativa limpia, `rukh train decoder`, habría roto todos los comandos de M2 que están escritos en
-el curso, en el README y en el registro de decisiones. Un módulo nuevo no rompe la interfaz del
-anterior.
-
-El resumen que imprime al acabar repite la receta del enmascarado —`15% at 80%/10%/10%`— en vez de
-solo la ruta del checkpoint. Es información que ya está en la configuración y en MLflow, y aun así
-vale la pena tenerla en el terminal: cuando pegues la salida en un cuaderno, la receta va pegada.
+`rukh train --config …`. La alternativa limpia, `rukh train decoder`, habría roto todas las órdenes
+de M2 que están escritas en el curso y en el README: un módulo nuevo no rompe la interfaz del
+anterior. El resumen final repite la receta del enmascarado —`15% at 80%/10%/10%`— para que, cuando
+pegues la salida en un cuaderno, la receta vaya pegada.
 
 <Callout kind="ejecuta" title="El grupo `train`, sin entrenar nada">
   El entrenamiento del encoder todavía no arranca: `train_mmm` y `MmmConfig` se importan de
@@ -1589,10 +1531,10 @@ def moves_batch(rows: int = 50, cols: int = 200, seed: int = 0) -> torch.Tensor:
 
 <Src file="tests/unit/test_mmm.py" tag="p3" lines="24-34" />
 
-`moves_batch` produce por defecto exactamente **diez mil** tokens, y esa cifra es la que hace posible
-el test siguiente: para comprobar una proporción del 15 % con una tolerancia de dos puntos hace falta
-una muestra grande, y diez mil da una desviación típica de unas 0,36 décimas de punto. Un test de
-proporciones con cien tokens fallaría una de cada diez veces.
+`moves_batch` produce por defecto **diez mil** tokens, y esa cifra hace posible el test siguiente:
+para comprobar una proporción del 15 % con dos puntos de tolerancia hace falta una muestra grande, y
+con diez mil la desviación típica es de unas 0,36 décimas de punto. Con cien tokens, el test fallaría
+una de cada diez veces.
 
 ```python title="tests/unit/test_mmm.py"
 def test_the_80_10_10_split_holds_over_ten_thousand_tokens() -> None:
@@ -1627,16 +1569,14 @@ def test_labels_are_minus_100_exactly_where_nothing_was_hidden() -> None:
 
 <Src file="tests/unit/test_mmm.py" tag="p3" lines="110-137" />
 
-El primero es el test que **cuenta en lugar de creerse el código**, y es el que la lección 1
-anunciaba. Un `ignore_index` mal elegido o un umbral mal escrito no lanzan ninguna excepción:
-simplemente dejan de puntuar un puñado de posiciones y la curva de pérdida sale preciosa.
+El primero es el test que **cuenta en lugar de creerse el código**, el que la lección 1 anunciaba
+para cazar el fallo que no da error.
 
 `kept` se mide como «elegida **y** el token de entrada sigue siendo el original», que es una **cota
 superior** del 10 % real: una sustitución aleatoria puede caer por casualidad en el mismo token. Con
-1 968 jugadas la probabilidad de esa coincidencia es de una entre dos mil y la diferencia cabe
-holgadamente en la tolerancia de cuatro puntos, pero saber por qué el número no es exacto es parte
-de entender el test. `replaced` se calcula por diferencia por el mismo motivo: es la única de las
-tres que no se puede contar directamente.
+1 968 jugadas la probabilidad de esa coincidencia es de una entre dos mil y cabe de sobra en la
+tolerancia. `replaced` se calcula por diferencia por el mismo motivo: es la única de las tres que no
+se puede contar directamente.
 
 La última aserción —`inputs[~selected] == batch[~selected]`— es la que impide el fallo más
 destructivo: tocar tokens que no se eligieron. Sin ella, un `inputs[decision < mask_ratio] = …` sin
@@ -1678,8 +1618,8 @@ def test_a_random_replacement_is_always_a_real_move() -> None:
 
 <Src file="tests/unit/test_mmm.py" tag="p3" lines="140-164" />
 
-Los dos usan la misma técnica y merece copiarse: **llevar un parámetro a su extremo para convertir
-una propiedad probabilística en una determinista**. Con `prob=1.0`, «los tokens de control nunca se
+Los dos usan una técnica que merece copiarse: **llevar un parámetro a su extremo para convertir una
+propiedad probabilística en una determinista**. Con `prob=1.0`, «los tokens de control nunca se
 tapan» deja de ser una afirmación estadística y pasa a ser una igualdad exacta que se comprueba con
 `torch.equal`. Con `random_ratio=1.0`, todo lo elegido se sustituye por ruido y el rango del
 resultado se puede acotar con un `min` y un `max`.
@@ -1718,9 +1658,8 @@ La segunda: **un mismo** generador usado dos veces avanza, así que el paso 1 y 
 posiciones distintas. Eso es lo que hace falta durante el entrenamiento; si el enmascarado fuera el
 mismo en cada paso, el modelo vería la misma tarea doce mil veces y memorizaría los huecos.
 
-Las dos juntas son exactamente el comportamiento que la evaluación necesita reiniciar y el
-entrenamiento necesita dejar correr, y por eso es el test que hay que leer para entender el
-`masking_generator` de `evaluate_mmm`.
+Las dos juntas son el comportamiento que la evaluación necesita reiniciar y el entrenamiento necesita
+dejar correr.
 
 ```python title="tests/unit/test_mmm.py"
 def test_the_squares_scheme_hides_squares_and_keeps_its_own_control_tokens() -> None:
@@ -1779,11 +1718,10 @@ def test_masked_step_agrees_with_the_model_method() -> None:
 
 <Src file="tests/unit/test_mmm.py" tag="p3" lines="213-222" />
 
-Este test existe porque hay **dos** implementaciones de la misma cosa en el proyecto:
-`PositionEncoder.masked_lm`, que es la cómoda y la que usan los labs, y `masked_step`, que es la que
-el bucle necesita para que la compilación sirva. Dos caminos que deben dar el mismo número son dos
-caminos que van a divergir el día que alguien toque uno; esta comparación es lo que convierte esa
-divergencia en un test rojo.
+Este test existe porque hay **dos** implementaciones de la misma cosa: `PositionEncoder.masked_lm`,
+la cómoda, y `masked_step`, la que el bucle necesita para que la compilación sirva. Dos caminos que
+deben dar el mismo número acaban divergiendo el día que alguien toca uno; esta comparación convierte
+esa divergencia en un test rojo.
 
 ```python title="tests/unit/test_mmm.py"
 def test_the_run_is_named_after_the_encoder_by_default() -> None:
@@ -1862,11 +1800,10 @@ tienen la misma proporción de `<mask>`.
 
 ## Qué has aprendido
 
-Que compartir la receta no es una elegancia sino la condición para que dos números se puedan
-comparar, y que el punto donde los dos bucles se separan cabe en una sola función, `masked_step`. Y
-el enmascarado entero: dos sorteos independientes, un bloque de control que nunca se toca porque es
-un prefijo del vocabulario, y una validación que se reinicia la semilla porque la tarea de
-evaluación es parte del instrumento de medida.
+Compartir la receta es la condición para que dos números se puedan comparar, y el punto donde los
+dos bucles se separan cabe en una sola función, `masked_step`. Y el enmascarado entero: dos sorteos
+independientes, un bloque de control que nunca se toca porque es un prefijo del vocabulario, y una
+validación que reinicia la semilla porque la tarea de evaluación es parte del instrumento de medida.
 
 **Cómo se mide**: `uv run pytest tests/unit/test_mmm.py -q` pasa los trece tests, y
 `uv run rukh train encoder --config configs/train/encoder-mmm.yaml` deja

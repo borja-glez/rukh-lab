@@ -9,7 +9,7 @@ order: 4
 duration: 120
 level: medio
 status: vigente
-updated: 2026-09-22
+updated: 2026-09-23
 keywords:
   - probe lineal
   - cabezas
@@ -29,9 +29,9 @@ modeling».
 ## Qué vas a construir
 
 Dos ficheros que no se parecen en nada y que van juntos porque cierran el modelo: las tres cabezas
-que leen el vector agrupado (`models/heads.py`, 140 líneas) y el traductor que convierte
+que leen el vector agrupado (`models/heads.py`) y el traductor que convierte
 un <Term id="fen">FEN</Term> en los 69 tokens de la segunda representación de entrada
-(`models/squares.py`, 215 líneas). Con esto, el modelo de M3 está completo y solo falta entrenarlo.
+(`models/squares.py`). Con esto, el modelo de M3 está completo y solo falta entrenarlo.
 
 ## Las tres cabezas
 
@@ -73,14 +73,12 @@ RESULT_CLASSES = 3
 
 <Src file="src/rukh/models/heads.py" tag="p3" lines="1-33" />
 
-El docstring es el diseño del experimento, no una descripción del fichero, y por eso está escrito en
-prosa y no como una lista de clases. Lo que dice es que las cabezas son pequeñas **a propósito**: si
-una capa lineal sobre el vector agrupado basta para leer el valor de una posición, esa información ya
-estaba en el vector, porque una capa lineal no tiene capacidad para inventarla.
+El docstring es el diseño del experimento: las cabezas son pequeñas **a propósito**, la sonda más
+tonta que funciona de la lección 1.
 
-`HEADS` es una tupla y no una lista, y eso es más que estilo: es la clave del orden en el que se
-recorren las cabezas al sumar la pérdida y al imprimir las métricas, y una tupla al nivel del módulo
-no la puede modificar nadie por accidente. Aparece también en los tests (`set(parts) == set(HEADS)`)
+`HEADS` es una tupla y no una lista: fija el orden en el que se recorren las cabezas al sumar la
+pérdida y al imprimir las métricas, y una tupla al nivel del módulo no la puede modificar nadie por
+accidente. Aparece también en los tests (`set(parts) == set(HEADS)`)
 y en la configuración de los pesos, así que es el único sitio donde está escrito cuántas cabezas hay.
 
 ```python title="src/rukh/models/heads.py"
@@ -94,23 +92,20 @@ class HeadWeights(BaseConfig):
 
 <Src file="src/rukh/models/heads.py" tag="p3" lines="36-41" />
 
-Tiene dos decisiones. La primera: hereda de `BaseConfig`, así que los pesos se escriben en el YAML
-del entrenamiento y una clave mal escrita —`results: 0.5`— es un error al cargar y no un peso que
-nunca se aplicó.
+Hereda de `BaseConfig`, así que los pesos se escriben en el YAML del entrenamiento y una clave mal
+escrita —`results: 0.5`— es un error al cargar y no un peso que nunca se aplicó.
 
-La segunda: `result: 0.5` y las otras dos a 1. La cabeza de resultado es la más ruidosa de las tres
-porque su etiqueta es una propiedad de la **partida** repetida en todas sus posiciones; la jugada 3
-de una partida que las blancas acabaron ganando no es una posición ganadora, y el modelo no puede
-acertar ahí. Pesarla la mitad es decir que su gradiente vale la mitad a la hora de mover el tronco
-compartido.
+`result: 0.5` y las otras dos a 1: la cabeza de resultado es la más ruidosa, porque su etiqueta es
+una propiedad de la **partida** repetida en todas sus posiciones, y pesarla la mitad es decir que su
+gradiente cuenta la mitad a la hora de mover el tronco compartido.
 
-Y la razón de que haya pesos en vez de una suma a pelo: las tres pérdidas viven en escalas distintas
-—un error cuadrático medio pequeño frente a dos entropías cruzadas— y tienen cantidades de datos
-distintas. Sumarlas sin más no es «tratarlas por igual»: es dejar que la que tenga los números más
-grandes decida sola en qué dirección se mueve el tronco, sin que nadie lo haya escrito en ninguna
-parte. Un peso explícito, aunque valga 1, al menos es una decisión visible. Y el `0` que «apaga una
-cabeza sin quitarla» es lo que permite medir qué aporta cada tarea sin cambiar la forma del
-checkpoint.
+Hay pesos en vez de una suma a pelo porque las tres pérdidas viven en escalas distintas —un error
+cuadrático medio pequeño frente a dos entropías cruzadas— y tienen cantidades de datos distintas.
+Sumarlas sin más no es tratarlas por igual: es dejar que la de números más grandes decida sola hacia
+dónde se mueve el tronco. Un peso explícito, aunque valga 1, es al menos una decisión visible, y el
+`0` que «apaga una cabeza sin quitarla» permite medir qué aporta cada tarea sin cambiar la forma del
+checkpoint. Es el mismo problema de cualquier pérdida con varios términos, como la recompensa y la
+penalización de KL de M5.
 
 ```python title="src/rukh/models/heads.py"
 class ValueHead(nn.Module):
@@ -148,8 +143,7 @@ class ResultHead(nn.Module):
 
 <Src file="src/rukh/models/heads.py" tag="p3" lines="44-74" />
 
-Tres clases que hacen lo mismo salvo por dos detalles. Merece la pena mirarlos porque los dos son la
-diferencia entre un número que se puede leer y uno que no.
+Tres clases que hacen lo mismo salvo por dos detalles, y los dos importan.
 
 **`ValueHead` pasa por `tanh` y `BlunderHead` no.** La cabeza de valor tiene que producir algo
 comparable con su etiqueta, que es `tanh(cp / 400)`, un número acotado en `(-1, 1)`; el `tanh` en la
@@ -164,14 +158,13 @@ probabilidad la obtiene con un `torch.sigmoid` fuera, que es lo que hace la demo
 **El `.squeeze(-1)`.** `nn.Linear(d, 1)` devuelve `(B, 1)`, y la etiqueta es `(B,)`. Sin el
 `squeeze`, `F.mse_loss((B,1), (B,))` no falla: difunde los dos tensores a `(B, B)` y calcula la
 media de **todas las parejas**, incluidas las que emparejan la predicción de una posición con la
-etiqueta de otra. La pérdida sale finita, el entrenamiento arranca, y lo que se minimiza es otra
-cosa. Es uno de los errores de forma más caros de PyTorch, y los dos `.squeeze(-1)` de arriba
-existen para que no ocurra.
+etiqueta de otra. La pérdida sale finita, el entrenamiento arranca y lo que se minimiza es otra cosa.
 
 <Callout kind="roto" title="La difusión silenciosa entre `(B, 1)` y `(B,)`">
-  No hay aviso, no hay excepción, y la cifra que sale es plausible. La forma de cazarlo es un test
-  que compruebe la **forma** del resultado, no su valor: `assert value.shape == (5,)`. Está en
-  `test_heads.py`, y es la primera aserción del fichero.
+  No hay excepción y la cifra que sale es plausible; como mucho, un `UserWarning` que se pierde
+  entre el resto del registro. Es uno de los errores de forma más caros de cualquier regresión
+  escrita a mano. Se caza con un test que compruebe la **forma** del resultado, no su valor: `assert
+  value.shape == (5,)`, la primera aserción de `test_heads.py`.
 </Callout>
 
 ```python title="src/rukh/models/heads.py"
@@ -218,8 +211,7 @@ lección 6 comparan `after["encoder.blocks.0.mlp.fc.weight"]` con `before["block
 cargar un encoder preentrenado en un `MultiHead` es añadir el prefijo, y no hacerlo es la forma de
 entrenar cabezas sobre pesos aleatorios creyendo que están sobre un preentrenamiento.
 
-La separación entre `forward` y `from_pooled` no es una elegancia: **es lo que hace que el vector se
-calcule una vez**. Tres cabezas sobre la misma posición harían tres pasadas por ocho capas de
+La separación entre `forward` y `from_pooled` **hace que el vector se calcule una vez**. Tres cabezas sobre la misma posición harían tres pasadas por ocho capas de
 Transformer si cada una llamara al encoder. Además, `from_pooled` es lo que usa el exportador de la
 lección 9 para meter el pooling una sola vez en el grafo ONNX, y lo que permitiría montar una cabeza
 nueva sobre embeddings ya calculados sin volver a pasar por el modelo.
@@ -258,21 +250,20 @@ exportador, la pérdida y la demo hablan el mismo idioma: `outputs["value"]`.
 
 <Src file="src/rukh/models/heads.py" tag="p3" lines="111-134" />
 
-Cuatro decisiones, y la tercera es la que impide que un solo lote sin etiquetas de error llene de
-`nan` la tirada entera.
+Cuatro decisiones.
 
 **Devuelve el total y las partes.** Cuando tres cabezas comparten tronco, una suma ponderada puede
-mejorar una tarea a costa de otra y el agregado nunca dice cuál. La lección 11 enseña exactamente
-eso: descongelando el modelo entero, la pérdida de la cabeza de errores empeora mientras el
-`val/loss` global mejora. Si `loss` devolviera solo el total, ese hecho sería invisible.
+mejorar una tarea a costa de otra y el agregado no dice cuál. La lección 11 lo enseña: al
+descongelar el modelo entero, la pérdida de la cabeza de errores empeora. Si `loss` devolviera solo
+el total, eso sería invisible.
 
 **La máscara de la cabeza de errores.** Una buena parte de las filas **no tiene etiqueta de error en
 absoluto**: hace falta la posición anterior de la misma partida para saber cuánto se perdió, y la
 primera jugada no la tiene. `outputs["blunder"][mask]` selecciona solo las filas etiquetadas, así que
 las demás no aportan gradiente a esa cabeza —aunque sí a las otras dos, porque el mismo lote sigue
-valiendo para el valor y el resultado—. Etiquetar «no lo sé» como «no fue error» es una de las
-maneras más rápidas de arruinar un clasificador, y con una clase positiva del 3,72 % envenenaría la
-clase mayoritaria justo con las filas de las que hay menos evidencia.
+valiendo para el valor y el resultado—. Con una clase positiva del 3,72 %, etiquetar «no lo sé»
+como «no fue error» envenenaría la clase mayoritaria justo con las filas de las que hay menos
+evidencia.
 
 **El `if bool(mask.any())` y el `zero`.** Sin él, un lote sin ninguna fila etiquetada daría
 `binary_cross_entropy_with_logits` sobre tensores vacíos, que en PyTorch es `nan`, y ese `nan` se
@@ -301,9 +292,8 @@ correcto, porque convertir la salida a `float32` sacaría el cálculo del autoca
 
 <Src file="src/rukh/models/heads.py" tag="p3" lines="136-140" />
 
-Existe para que la lección 6 pueda escribir «descongela esto» en una línea. Que la lista de cabezas
-esté aquí y no en el módulo de entrenamiento es lo que hace que añadir una cuarta cabeza sea un
-cambio en un fichero.
+Existe para que la lección 6 pueda escribir «descongela esto» en una línea, y para que añadir una
+cuarta cabeza sea un cambio en un solo fichero.
 
 ## Los tests de las cabezas
 
@@ -344,9 +334,9 @@ WHITE_TO_MOVE = f"{BOARDS[0]} w KQkq -"
 
 <Src file="tests/unit/test_heads.py" tag="p3" lines="1-32" />
 
-El comentario de las cuatro posiciones es lo más importante del bloque, y es una regla general sobre
-tests de aprendizaje: **una tarea de juguete tiene que ser aprendible o «la pérdida bajó» no mide
-nada**. Los cuatro tableros son la posición inicial, la misma sin la dama negra, la misma sin la dama
+El comentario de las cuatro posiciones es lo más importante del bloque, y es una regla general para
+cualquier test de entrenamiento: **una tarea de juguete tiene que ser aprendible o «la pérdida bajó»
+no mide nada**. Los cuatro tableros son la posición inicial, la misma sin la dama negra, la misma sin la dama
 blanca y la misma sin ninguna de las dos, con evaluaciones 0, +300, −300 y 0. Un modelo que mire las
 piezas puede aprender eso; si las etiquetas fueran aleatorias, la pérdida también bajaría —por
 memorización— y el test pasaría sin comprobar nada.
@@ -447,9 +437,9 @@ falla en la última línea con un total no finito.
 
 ## `squares.py`: un FEN en 69 tokens
 
-La otra mitad de la lección es la segunda representación de entrada, y el fichero abre con la
-especificación del formato. Es largo y se lee entero una vez: después, el código son cuatro
-funciones evidentes.
+La otra mitad de la lección es la segunda representación de entrada. El fichero abre con la
+especificación del formato; se lee entero una vez y después el código son cuatro funciones
+evidentes.
 
 ```python title="src/rukh/models/squares.py"
 """The ``squares`` input scheme: a FEN as 69 fixed tokens, the didactic rival of ``moves``.
@@ -504,17 +494,17 @@ un índice de casilla signifique lo mismo en el tokenizador, en el encoder y en 
 exportan. Un FEN, en cambio, se escribe por filas y de la 8 a la 1; la transposición entre las dos
 convenciones es la parte peligrosa del fichero y tiene su propio test.
 
-**Los cuatro derechos de enroque en un token de 16 valores.** La aritmética obvia da 71 casillas y el
-número que manda es 69, así que había que juntar algo. Juntar los cuatro bits de un mismo hecho es la
-elección menos arbitraria de las posibles, y deja libre una posición para un `<cls>` de verdad en vez
-de pedirle prestada la casilla a1 al pooling.
+**Los cuatro derechos de enroque en un token de 16 valores.** La aritmética obvia da 71 posiciones y
+el formato fija 69, así que había que juntar algo. Juntar los cuatro bits de un mismo hecho es la
+elección menos arbitraria, y deja libre una posición para un `<cls>` de verdad en vez de pedirle
+prestada la casilla a1 al pooling.
 
 **Los tramos del reloj con fronteras que significan algo sobre el tablero**, no cuatro cuartiles. 0-5
 quiere decir «acaba de haber captura o jugada de peón», 25-49 quiere decir «la regla de las 50
 jugadas ya condiciona el plan». Un tramo que corresponde a un concepto ajedrecístico es una entrada
 que el modelo puede usar; un cuartil de una distribución no lo es.
 
-**Y el aviso que se lee entero antes de sacar conclusiones del experimento**: las filas de P1 se
+**Y el aviso que hay que leer antes de sacar conclusiones del experimento**: las filas de P1 se
 identifican por un FEN de cuatro campos, sin contadores, así que el token 68 vale `clock:0` en
 **toda** la tabla supervisada. En este afinado el tramo de reloj no aporta ni un bit, y el encoder
 aprende un sesgo para él. Se queda en el formato porque una posición en vivo de la demo sí trae los
@@ -574,8 +564,7 @@ CONTROL_IDS: frozenset[int] = frozenset({PAD_ID, MASK_ID, CLS_ID})
 
 <Src file="src/rukh/models/squares.py" tag="p3" lines="42-89" />
 
-El <Term id="vocabulario">vocabulario</Term> **se construye, no se escribe**, y esa es la decisión
-del bloque. Una lista de 47 cadenas escrita a mano es una lista que alguien reordena sin querer al
+El <Term id="vocabulario">vocabulario</Term> **se construye, no se escribe**. Una lista de 47 cadenas escrita a mano es una lista que alguien reordena sin querer al
 añadir un token; construirla con un orden explícito hace que la enumeración sea una consecuencia del
 código. `SQUARE_IDS` es el diccionario inverso, calculado una vez al importar, para que
 `fen_to_tokens` no busque linealmente 47 cadenas por cada una de las 64 casillas de cada posición.
@@ -645,11 +634,11 @@ def _placement_ids(placement: str) -> list[int]:
 <Src file="src/rukh/models/squares.py" tag="p3" lines="105-126" />
 
 La función peligrosa del fichero, y el peligro cabe en una expresión: `ids[file * 8 + rank]`. Un FEN
-se lee por filas de la 8 a la 1; el proyecto guarda por columnas. Equivocarse en esa transposición
-—escribir `rank * 8 + file`— produce un tablero **válido y distinto**, la posición reflejada en la
-diagonal. Ninguna comprobación de forma lo detecta, el modelo entrena tan contento, y lo que aprende
-es ajedrez en un tablero girado. De ahí que exista `tokens_to_fen` y su test de ida y vuelta: es la
-única forma barata de comprobar una permutación.
+se lee por filas de la 8 a la 1; el proyecto guarda por columnas. Escribir `rank * 8 + file` produce
+un tablero **válido y distinto**, la posición reflejada en la diagonal. Ninguna comprobación de forma
+lo detecta, el modelo entrena tan contento y lo que aprende es ajedrez en un tablero girado. Es la
+misma clase de error que trasponer alto y ancho al cargar imágenes, o intercambiar dos columnas al
+leer un CSV sin cabecera: los datos siguen teniendo buena pinta.
 
 Las tres validaciones cubren las tres formas de que un FEN mienta sobre el tablero. `file >= 8` caza
 una fila con piezas de más; `file != 8` al final caza una fila que no llega a cubrir las ocho
@@ -721,10 +710,8 @@ def fen_to_tokens(fen: str) -> list[int]:
 <Src file="src/rukh/models/squares.py" tag="p3" lines="140-173" />
 
 La frase que manda está en el docstring: **un FEN mal formado lanza**. La tentación en un pipeline de
-datos es reparar y seguir —una fila menos no arregla nada, una excepción a las tres horas de
-tokenizar sí molesta— y aquí la política es la contraria, porque un tablero equivocado que entrena es
-peor que una ejecución que se para. Es la misma regla que el `extra="forbid"` de M0, un nivel más
-abajo.
+datos es reparar y seguir; aquí la política es la contraria, porque un tablero equivocado que entrena
+es peor que una ejecución que se para. Es la regla del `extra="forbid"` de M0, un nivel más abajo.
 
 Solo se guarda el campo del reloj (`fields[4]`) y se ignora el número de jugada (`fields[5]`): el
 número de jugada es redundante —se deduce del <Term id="ply">ply</Term>— y no dice nada de la posición.
@@ -779,10 +766,10 @@ def square_name(index: int) -> str:
 
 <Src file="src/rukh/models/squares.py" tag="p3" lines="176-215" />
 
-La inversa existe **solo para poder comprobar la directa**, y eso ya justifica sus cuarenta líneas:
-sin ella, la única manera de saber que la transposición es correcta sería mirarla fijamente.
+La inversa existe **para poder comprobar la directa**: sin ella, la única manera de saber que la
+transposición es correcta sería mirarla fijamente.
 
-La reconstrucción del campo al paso tiene una recuperación de información que merece verse:
+La reconstrucción del campo al paso recupera información que el token no guarda:
 `'6' if turn == 'w' else '3'`. El token solo guarda la columna, no la fila, porque la fila es
 deducible: si mueven las blancas, el último avance doble fue de un peón negro y la casilla al paso
 está en la fila 6. Guardar un dato deducible habría costado ocho tokens más de vocabulario para
@@ -879,11 +866,12 @@ def test_every_square_matches_python_chess() -> None:
 
 <Src file="tests/unit/test_squares.py" tag="p3" lines="48-69" />
 
-El tercero es el que caza la transposición, y lo hace de la única manera fiable: **contra una
-implementación independiente**. `chess.square(file, rank)` de `python-chess` traduce columna y fila a
+El tercero caza la transposición de la única manera fiable: **contra una implementación
+independiente**. `chess.square(file, rank)` de `python-chess` traduce columna y fila a
 su propio índice, y el test comprueba las 64 casillas de diez posiciones distintas contra esa
-traducción. Que la comparación sea con una librería externa es lo que le da valor; comprobar la
-transposición con otra función del mismo fichero solo demostraría que las dos se equivocan igual.
+traducción. Que la comparación sea con una librería externa es lo que le da valor; comprobarla con otra función
+del mismo fichero solo demostraría que las dos se equivocan igual. Es el mismo principio que usa la
+demo en la lección 10 para su tokenizador en TypeScript.
 
 El `index // 8, index % 8` es la lectura del orden por columnas: la casilla 9 es columna 1, fila 1,
 es decir b2. Y el `, square_name(index)` al final del `assert` hace que el fallo diga «g4» en vez de
@@ -1033,12 +1021,11 @@ test y no un comentario.
 
 ## Qué has aprendido
 
-Que la sonda más tonta que funcione es la herramienta correcta para medir una representación, y que
-el precio de ponerle tres cabezas a un tronco es una pérdida con pesos explícitos, con las partes
-publicadas por separado y con una máscara para la tarea cuya etiqueta a veces no existe. Y que una
+El precio de ponerle tres cabezas a un tronco es una pérdida con pesos explícitos, con las partes
+registradas por separado y con una máscara para la tarea cuya etiqueta a veces no existe. Y una
 representación de ancho fijo —69 ranuras— se defiende con tres cosas: un vocabulario construido y
 con hash, una inversa que solo existe para comprobar la directa, y una comparación contra una
-implementación ajena.
+implementación ajena. Las tres sirven igual para cualquier formato de entrada que diseñes.
 
 **Cómo se mide**: `uv run pytest tests/unit/test_squares.py -q` pasa los diez tests, y el hash
 `b0f5308…` es el del vocabulario de 47 tokens. Los tests de las cabezas de `test_heads.py` pasan sin

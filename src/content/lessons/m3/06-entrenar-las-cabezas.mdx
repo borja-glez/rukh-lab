@@ -10,7 +10,7 @@ duration: 230
 runtime: 25
 level: avanzado
 status: vigente
-updated: 2026-09-22
+updated: 2026-09-23
 keywords:
   - etiquetas
   - fuga de datos
@@ -30,13 +30,14 @@ encoder».
 ## Qué vas a construir
 
 Lo que convierte un encoder preentrenado en un modelo que responde tres preguntas: la tabla
-supervisada (`data/labels.py`, 262 líneas), el afinado por etapas con su curva
-(`train/heads.py`, 549 líneas), las dos configuraciones que comparan los dos esquemas de entrada, y
-los cinco cargadores de checkpoint que hacen falta cuando el repositorio pasa a tener tres clases de
-modelo.
+supervisada (`data/labels.py`), el afinado por etapas con su curva (`train/heads.py`), las dos
+configuraciones que comparan los dos esquemas de entrada y los cargadores de checkpoint que hacen
+falta cuando el repositorio pasa a tener tres clases de modelo.
 
-Es la lección más larga del módulo y la que más decisiones lleva dentro, porque aquí es donde una
-etiqueta mal construida o un reparto mal hecho producen números buenos que no significan nada.
+Es la lección más larga del módulo porque aquí es donde una etiqueta mal construida o un reparto mal
+hecho producen números buenos que no significan nada. Lo que se decide en ella —cómo se etiqueta,
+cómo se reparte y qué se congela— es lo mismo que decidirías al afinar un BERT para clasificar
+tickets de soporte.
 
 ## `labels.py`: las 438 093 posiciones etiquetadas
 
@@ -85,15 +86,17 @@ fatal in the demo, so ``test_labels`` proves no ``game_id`` is ever on both side
 
 «No column is invented here» es la primera decisión del fichero: las etiquetas son una función de
 la tabla que P1 dejó, y la convención del mate y el signo de una puntuación **no se reescriben**, se
-importan de `rukh.data.scoring`. Es lo que impide que la etiqueta de valor de M3 y las parejas de
-preferencia de M5 acaben usando dos convenciones distintas para lo mismo.
+importan de `rukh.data.scoring`. Así la etiqueta de valor de M3 y las parejas de preferencia de M5 no
+pueden acabar usando dos convenciones distintas para lo mismo.
 
-Y el último párrafo es la <Term id="fuga-de-datos">fuga de datos</Term> del módulo, escrita donde
-está el código que la evita. Dos posiciones de la misma partida no son independientes: la segunda es
-la primera **más una jugada**, con treinta y una de las treinta y dos piezas donde estaban. Si el <Term id="ply">ply</Term> 30 cae en entrenamiento y el 31 en validación, un modelo que memoriza partidas puntúa igual de
-bien que uno que entiende ajedrez, y la métrica de validación —cuyo único trabajo es distinguir esas
-dos cosas— deja de hacerlo. Lo que hace grave esa fuga es que **no da ninguna señal**: no hay cifra
-en el informe que la delate.
+El último párrafo es la <Term id="fuga-de-datos">fuga de datos</Term> del módulo, escrita donde está
+el código que la evita. Dos posiciones de la misma partida no son independientes: la segunda es la
+primera **más una jugada**. Si el <Term id="ply">ply</Term> 30 cae en entrenamiento y el 31 en
+validación, un modelo que memoriza partidas puntúa igual de bien que uno que entiende ajedrez, y la
+métrica de validación deja de distinguir las dos cosas. Lo grave es que **no da ninguna señal**: no
+hay cifra en el informe que la delate. Es la misma trampa que repartir por fragmentos los trozos de
+un mismo documento al evaluar un RAG, o las frases de una misma conversación al evaluar un
+clasificador.
 
 ```python title="src/rukh/data/labels.py"
 from __future__ import annotations
@@ -123,10 +126,9 @@ SOURCE_COLUMNS = ["fen", "game_id", "ply", "last_move", "result", "phase", "cp",
 
 <Src file="src/rukh/data/labels.py" tag="p3" lines="40-62" />
 
-`SOURCE_COLUMNS` como lista explícita en vez de leer el parquet entero no es una optimización
-cosmética: un `select` de ocho columnas sobre un parquet de catorce lee **solo esas ocho** del disco,
-que es la propiedad que hace útil el formato columnar. Y, más importante, convierte «esta tabla ganó
-una columna» en un cambio que no afecta a nada de aquí.
+`SOURCE_COLUMNS` como lista explícita: un `select` de ocho columnas sobre un parquet de catorce lee
+**solo esas ocho** del disco, que es la gracia del formato columnar, y «esta tabla ganó una columna»
+deja de afectar a nada de aquí.
 
 El orden de `RESULT_CLASSES` —blancas 0, tablas 1, negras 2— es una convención que hay que fijar en
 un sitio, porque la cabeza de resultado produce tres logits y el argmax es un índice. Un `0` que
@@ -183,15 +185,14 @@ def row_order(game_id: int, ply: int, seed: int) -> int:
 
 <Src file="src/rukh/data/labels.py" tag="p3" lines="81-93" />
 
-Esto sostiene todo lo demás. El reparto es una **función pura** del id de la partida y de la
-semilla: no hay estado, no hay orden de filas, no hay barajado.
+El reparto es una **función pura** del id de la partida y de la semilla: no hay estado, ni orden de
+filas, ni barajado.
 
 Por qué CRC-32 y no `hash()`: Python aleatoriza el hash de las cadenas por proceso desde la 3.3
 (`PYTHONHASHSEED`), así que `hash("42:1713")` da un número distinto en cada ejecución del intérprete.
-Un reparto construido con `hash()` no es un reparto, es una lotería que se vuelve a jugar cada vez
-que arrancas el script, y el conjunto de validación de hoy contiene partidas con las que entrenaste
-ayer. Un hash de dataframe tiene el mismo problema con otro disfraz: es estable dentro de una versión
-de polars y no entre versiones.
+Un reparto construido con `hash()` se vuelve a sortear cada vez que arrancas el script, y el
+conjunto de validación de hoy contiene partidas con las que entrenaste ayer. Un hash de dataframe
+tiene el mismo problema: es estable dentro de una versión de polars y no entre versiones.
 
 CRC-32 no es criptográfico y no falta: lo único que se le pide es ser determinista y repartir
 uniforme. Es un bombo grabado en vídeo: cada vez que pones la cinta salen las mismas bolas, en
@@ -227,8 +228,7 @@ def _value_bucket(score: pl.Expr) -> pl.Expr:
 
 `pl.sql_expr(SCORE_WHITE_SQL)` es una idea que vale la pena robar: la convención de puntuación vive
 escrita **una vez**, en SQL, y se ejecuta tal cual en DuckDB (donde se construyó la tabla de
-evaluaciones) y en polars (aquí). No hay dos implementaciones que puedan divergir, que es exactamente
-lo que pasaría con una función Python que reprodujera el mismo `CASE WHEN`.
+evaluaciones) y en polars (aquí). No hay dos implementaciones que puedan divergir.
 
 `_value_bucket` construye la clasificación en cinco tramos encadenando `when/then/otherwise` de menor
 a mayor, de forma que el último umbral que se cumple gana. Es el patrón vectorizado equivalente a una
@@ -263,7 +263,7 @@ def build_labels(cfg: LabelsConfig, frame: pl.DataFrame | None = None) -> pl.Dat
 
 <Src file="src/rukh/data/labels.py" tag="p3" lines="115-137" />
 
-La parte difícil del fichero, y es toda de signos. Vale la pena seguirla con un ejemplo.
+La parte difícil del fichero, y es toda de signos. Se entiende mejor con un ejemplo.
 
 `score_white` es la evaluación desde el punto de vista de **las blancas**, siempre. `mover` vale +1
 si en esta posición mueven las blancas y −1 si mueven las negras, y `score_mover = mover ×
@@ -274,8 +274,8 @@ renombra su `score_mover` a `before_best`. Al unirlo por `(game_id, ply)`, cada 
 `score_mover` de la posición **anterior** de su partida. En la posición anterior movía el otro bando,
 que es precisamente el que hizo la jugada que llevó aquí.
 
-Y ahora la línea que parece un error y no lo es: `loss_cp = before_best + score_mover`, una **suma**
-donde uno esperaría una resta. La explicación cabe en dos frases. `before_best` es lo que el que
+Y ahora la línea que parece un error: `loss_cp = before_best + score_mover`, una **suma** donde uno
+esperaría una resta. `before_best` es lo que el que
 movió tenía disponible en la posición anterior, desde su punto de vista. `score_mover` de la posición
 actual es desde el punto de vista del **rival**, porque ahora mueve el otro. Así que lo que consiguió
 el que movió es `-score_mover`, y lo que tiró es `before_best - (-score_mover) = before_best +
@@ -334,19 +334,18 @@ y tres líneas más abajo un `blunder` nulo. **Nunca un cero.**
 
 <Src file="src/rukh/data/labels.py" tag="p3" lines="139-178" />
 
-El reparto se calcula **una vez por partida** y se une, en vez de aplicar `game_split` a cada fila.
-Con medio millón de filas y unas decenas de miles de partidas, eso son dos órdenes de magnitud menos
-de llamadas a `zlib.crc32`; y, sobre todo, hace imposible que dos filas de la misma partida reciban
-lados distintos, que es el error que este fichero existe para no cometer.
+El reparto se calcula **una vez por partida** y se une, en vez de aplicar `game_split` a cada fila:
+muchas menos llamadas a `zlib.crc32` y, sobre todo, es imposible que dos filas de la misma partida
+reciban lados distintos.
 
-`pl.when(loss_cp.is_null()).then(None)` es la construcción del `null` explícita. Sin ella,
-`(null >= 100)` da `null` en polars de todos modos, pero escribirlo hace que la intención sea legible
-y deja de depender de una regla de tres valores que no todo el mundo recuerda.
+`pl.when(loss_cp.is_null()).then(None)` escribe el `null` explícitamente. `(null >= 100)` daría
+`null` en polars de todos modos, pero así la intención se lee sin recordar la lógica de tres
+valores.
 
 `replace_strict(RESULT_CLASSES, default=None)` seguido de `drop_nulls("result_class")` es el
 tratamiento de las partidas cuyo resultado es `*` —abandonadas, sin resultado registrado—: se
 **tiran**, no se adivinan. Un `default=1` («tablas») habría metido partidas sin terminar en la clase
-de las tablas, que es exactamente el tipo de ruido que hace que una cabeza no aprenda.
+de las tablas.
 
 El `select` final fija el orden de columnas y, con él, el esquema del parquet. Es lo que permite que
 `LabelledPositions` lea por nombre sabiendo que están todas y que `rukh eval encoder` reconstruya la
@@ -383,10 +382,8 @@ def game_moves(frame: pl.DataFrame, games_dir: str = "data/uci") -> pl.DataFrame
 
 <Src file="src/rukh/data/labels.py" tag="p3" lines="181-206" />
 
-La función que hace posible la comparación entre los dos esquemas, y la que lleva el asterisco que
-hay que leer antes que la tabla de resultados.
-
-Técnicamente es un ejercicio de <Term id="predicate-pushdown">empuje de predicados</Term>:
+La función que hace posible la comparación entre los dos esquemas. Técnicamente es un ejercicio
+de <Term id="predicate-pushdown">empuje de predicados</Term>:
 `pl.scan_parquet` es perezoso, el `semi` join contra los `game_id` distintos de las etiquetas se
 resuelve antes de materializar nada, y de dos meses de partidas solo se leen las que llevan alguna
 etiqueta. Un `read_parquet` seguido de un filtro leería los dos meses enteros a memoria.
@@ -395,12 +392,10 @@ El `semi` join en vez de un `inner` importa: un semi join devuelve las columnas 
 y no duplica filas aunque la derecha tenga varias coincidencias. Con un `inner`, una partida con
 tres posiciones etiquetadas aparecería tres veces.
 
-Y el asterisco del docstring: `unique(subset=["game_id"], keep="first")` sobre una tabla deduplicada
-por `fen4` significa que el `game_id` de una fila es la partida que **primera** llegó a esa posición.
-El prefijo que se reconstruye con él es _una_ línea que llega ahí, no necesariamente la que jugó la
-partida que puso la etiqueta. Para una posición común —una apertura de libro— es casi irrelevante;
-para una posición que solo aparece en una partida, es la línea correcta. Pero es una aproximación, y
-los +3,5 puntos de margen del esquema de jugadas se leen sabiéndola.
+Y el asterisco del docstring, el que la lección 1 mencionaba: sobre una tabla deduplicada por `fen4`,
+el `game_id` de una fila es la partida que **primero** llegó a esa posición, así que el prefijo que
+se reconstruye es _una_ línea que llega ahí, no necesariamente la de la partida que puso la
+etiqueta.
 
 ```python title="src/rukh/data/labels.py"
 def label_subsets(frame: pl.DataFrame, fractions: list[float]) -> dict[float, pl.DataFrame]:
@@ -433,21 +428,15 @@ def counts(frame: pl.DataFrame) -> dict[str, int]:
 
 <Src file="src/rukh/data/labels.py" tag="p3" lines="209-234" />
 
-Los subconjuntos **anidados** son el detalle metodológico que separa una curva útil de una anécdota.
-El 10 % está dentro del 25 %, que está dentro del 50 %. Con cuatro muestras independientes, un bache
-en el punto del 50 % podría ser simplemente un sorteo desafortunado, y estarías midiendo la varianza
-del muestreo en lugar del valor de los datos. Creciendo un único conjunto, cada punto es el anterior
-más filas nuevas, y una bajada significa algo.
-
-En el código son un `sort` por la clave estable y un `head(n)`: ordenar por un CRC-32 es lo mismo que
-barajar de forma reproducible, y quedarse con los primeros `n` de un orden fijo es lo que garantiza
-el anidamiento por construcción. El desempate por `(game_id, ply)` hace que el orden sea total
+Los subconjuntos **anidados** de la lección 1, en código: un `sort` por la clave estable y un
+`head(n)`. Ordenar por un CRC-32 es barajar de forma reproducible, y quedarse con los primeros `n`
+de un orden fijo garantiza el anidamiento por construcción. El desempate por `(game_id, ply)` hace que el orden sea total
 incluso si dos filas colisionan en el CRC.
 
-`counts` publica **tres denominadores distintos** al lado: posiciones, posiciones con etiqueta de
-error, y errores. Guárdalos, porque la lección 8 se apoya entera en ellos: 10 000 posiciones
-evaluadas, 7 453 con etiqueta de error, 3 660 puntuadas. Una métrica calculada sobre el denominador
-equivocado de los tres es otra métrica.
+`counts` publica **tres denominadores distintos**: posiciones, posiciones con etiqueta de error y
+errores. La evaluación de la lección 8 tendrá también los suyos (10 000 posiciones, 7 453 con
+etiqueta de error, 3 660 puntuadas), y una métrica calculada sobre el denominador equivocado es otra
+métrica.
 
 ```python title="src/rukh/data/labels.py"
 def run(cfg: LabelsConfig) -> Manifest:
@@ -480,15 +469,11 @@ def run(cfg: LabelsConfig) -> Manifest:
 
 <Src file="src/rukh/data/labels.py" tag="p3" lines="237-262" />
 
-El <Term id="manifiesto">manifiesto</Term> de M0 aplicado a la tabla supervisada. El comentario dice
-la propiedad que lo justifica: las etiquetas son una **función pura** del fichero de evaluaciones y
-de las cuatro claves de abajo, así que el digest del origen más esas claves identifican la tabla por
-completo. Dos tablas con el mismo manifiesto son la misma tabla; dos con manifiestos distintos no se
-pueden comparar aunque tengan el mismo número de filas.
-
-Fíjate en que el reparto también está en el manifiesto (`{"by": "game_id", "val_fraction": …,
-"seed": …}`). Sin eso, «el 10 % de validación» sería una afirmación de una conversación en vez de un
-hecho registrado.
+El <Term id="manifiesto">manifiesto</Term> de M0 aplicado a la tabla supervisada. Las etiquetas son
+una **función pura** del fichero de evaluaciones y de las claves de abajo, así que el digest del
+origen más esas claves identifican la tabla por completo: dos tablas con el mismo manifiesto son la
+misma tabla. El reparto también está ahí (`{"by": "game_id", "val_fraction": …, "seed": …}`), para
+que «el 10 % de validación» sea un hecho registrado y no una afirmación.
 
 ## `heads.py`: los tres modos y la curva
 
@@ -532,10 +517,9 @@ Both input schemes can be fine-tuned here, which is what makes the spec's compar
 
 <Src file="src/rukh/train/heads.py" tag="p3" lines="1-35" />
 
-«`full`: best numbers, most labels needed, easiest to overfit» está escrito antes de medir y la
-lección 11 enseña que la primera parte **no se cumplió**: `last-n` ganó al afinado completo en el
-error del valor. Que la frase siga en el código con el resultado contrario publicado al lado es
-parte de lo que el módulo enseña.
+«`full`: best numbers» está escrito antes de medir, y la lección 11 enseña que no se cumplió:
+`last-n` ganó al afinado completo en el error del valor. Es la expectativa habitual, y por eso
+conviene medirla.
 
 ```python title="src/rukh/train/heads.py"
 from __future__ import annotations
@@ -594,11 +578,10 @@ CURVE = (0.1, 0.25, 0.5, 1.0)
 
 <Src file="src/rukh/train/heads.py" tag="p3" lines="52-80" />
 
-`from rukh.infer.sampler import HEADER_TOKENS, prompt_ids` es un import que merece detenerse: el
-afinado reutiliza **el recorte del muestreador de M2**. Si el prefijo se recortara aquí de otra
-manera —tirando el final en vez del principio, por ejemplo—, el modelo se afinaría sobre secuencias
-con una forma que el preentrenamiento y la demo no producen. Compartir la función es la única forma
-barata de que eso no pase.
+`from rukh.infer.sampler import HEADER_TOKENS, prompt_ids`: el afinado reutiliza **el recorte del
+muestreador de M2**. Si el prefijo se recortara aquí de otra manera, el modelo se afinaría sobre
+secuencias con una forma que el preentrenamiento y la demo no producen. Es el equivalente a usar en
+el afinado de un LLM la misma plantilla de chat que se usará en producción.
 
 ```python title="src/rukh/train/heads.py"
 class LabelledPositions(Dataset[Item]):
@@ -653,13 +636,11 @@ self.blunder = frame["blunder"].fill_null(0).to_numpy().astype("float32")
 ```
 
 El `null` de la etiqueta de error se desdobla en **dos** tensores: una máscara que dice si hay
-etiqueta y un valor que rellena el hueco con 0. El 0 no es una etiqueta: es relleno que nunca se
-mira, porque la pérdida de la lección 4 selecciona con la máscara antes de calcular nada. Es la forma
-estándar de meter un valor ausente en un tensor, que no admite nulos, sin que la ausencia se
-convierta en una clase.
-
-El orden importa y es sutil: `is_not_null()` se calcula **antes** del `fill_null(0)`. Al revés no
-quedaría ningún nulo que detectar y la máscara sería toda `True`.
+etiqueta y un valor que rellena el hueco con 0. Ese 0 es relleno que nunca se mira, porque la pérdida
+de la lección 4 selecciona con la máscara antes de calcular nada. Es la forma estándar de meter un
+valor ausente en un tensor, que no admite nulos, sin que la ausencia se convierta en una clase. El
+orden importa: `is_not_null()` se calcula **antes** del `fill_null(0)`; al revés, la máscara saldría
+toda `True`.
 
 Los tokens se construyen **bajo demanda** en `tokens()`, no en el constructor. Con 438 093 filas y
 hasta 200 enteros por fila, precalcularlos serían unos 350 MB de listas de Python; construirlos en el
@@ -767,16 +748,13 @@ def collate(items: list[Item]) -> Item:
 
 Aquí se cierra el círculo del relleno que abrió la lección 3. El lote se rellena **hasta la más larga
 de sus secuencias**, no hasta el `block` de 200: un lote de partidas cortas se procesa como un lote
-corto, que es entre dos y tres veces más rápido en la fase de apertura.
+corto. Y ese ahorro es justo lo que crea el problema que `pool` resuelve, porque la cantidad de
+relleno depende de **con quién le haya tocado viajar** a cada secuencia. La máscara viaja con el lote
+y `pool` promedia solo lo real.
 
-Y ese ahorro es exactamente lo que crea el problema que `pool` resuelve: la longitud del relleno de
-una secuencia depende de **con quién le haya tocado viajar**. La máscara viaja con el lote y
-`PositionEncoder.pool` promedia solo lo real, así que la representación de una partida no depende del
-lote. Sin la máscara, sí dependería, y la misma posición daría vectores distintos en dos épocas.
-
-Las etiquetas son opcionales (`if key in items[0]`) para que la evaluación de la lección 7 pueda usar
+Las etiquetas son opcionales (`if key in items[0]`) para que la evaluación de la lección 7 use
 **esta misma función** con lotes de tokens pelados. Una segunda copia del `collate` para inferencia
-es una segunda copia que se desincroniza.
+acabaría desincronizándose.
 
 ```python title="src/rukh/train/heads.py"
 def make_label_loader(
@@ -905,7 +883,7 @@ def set_training_mode(model: MultiHead, mode: Mode, last_n: int = 2) -> None:
 
 <Src file="src/rukh/train/heads.py" tag="p3" lines="250-282" />
 
-**Estas dos funciones son el corazón del módulo**, y la segunda es la que casi nadie escribe.
+**Estas dos funciones son el corazón del afinado**, y la segunda es la que casi nadie escribe.
 
 `freeze_encoder` es la evidente: pone `requires_grad` según el modo. Fíjate en que no toca las
 cabezas —de eso se encarga que nunca se hayan congelado— y en que devuelve **cuántos tensores quedan
@@ -917,22 +895,23 @@ El `max(0, len(blocks) - last_n)` protege del caso `last_n > n_layer`: sin él, 
 negativo daría **los últimos `n_layer - last_n` bloques contados al revés**, es decir, algo
 arbitrario en vez de «todos».
 
-`set_training_mode` es la parte que se olvida. **Congelar es más que `requires_grad = False`.** Un
+`set_training_mode` es la parte que se olvida: **congelar es más que `requires_grad = False`**. Un
 módulo que se queda en modo `train` sigue aplicando dropout, así que la misma posición daría a las
-cabezas un vector distinto en cada época: ruido que las cabezas no pueden aprender a compensar —no es
-una propiedad de la posición— y que el encoder no puede absorber —no está aprendiendo—.
+cabezas un vector distinto en cada época: ruido que las cabezas no pueden compensar y que el encoder
+no puede absorber, porque no está aprendiendo. Es como estudiar con unos apuntes que alguien
+reescribe un poco cada vez que los abres: no es que sean malos, es que no son nunca los mismos.
 
-Y el tratamiento de `last-n` es más fino de lo que parece: pone el encoder entero en `eval` y después
-devuelve a `train` **solo** los bloques que sí se entrenan y la normalización final. Así el prefijo
-congelado da el mismo vector siempre y la parte que aprende conserva su regularización.
+El tratamiento de `last-n` es más fino: pone el encoder entero en `eval` y después devuelve a `train`
+**solo** los bloques que se entrenan y la normalización final. El prefijo congelado da siempre el
+mismo vector y la parte que aprende conserva su regularización.
 
 <Callout kind="roto" title="Las tres formas de que «congelado» no signifique congelado">
-  La primera es el dropout, que es la de aquí. La segunda es el decaimiento de pesos del
-  optimizador, que encoge los pesos sin mirar el gradiente y que `param_groups` filtra por
-  `requires_grad` (lección 5). La tercera no aplica en este modelo pero conviene tenerla en la
-  cabeza: en una red con `BatchNorm`, congelar los pesos **no** congela las estadísticas móviles,
-  que se actualizan en modo `train` y cambian la salida. Las tres se manifiestan igual: un tronco
-  que «no se movía» y ya no es el que se preentrenó.
+  La primera es el dropout, la de aquí. La segunda es el decaimiento de pesos del optimizador, que
+  encoge los pesos sin mirar el gradiente y que `param_groups` evita filtrando por `requires_grad`
+  (lección 5). La tercera no aplica a este modelo pero sí a muchas redes de visión: con `BatchNorm`,
+  congelar los pesos **no** congela las estadísticas móviles, que se actualizan en modo `train` y
+  cambian la salida. Las tres se manifiestan igual: un tronco que «no se movía» y ya no es el que se
+  preentrenó. Vale para cualquier afinado parcial, incluido el de un LLM con adaptadores.
 </Callout>
 
 ```python title="src/rukh/train/heads.py"
@@ -988,8 +967,7 @@ def load_encoder_for(cfg: HeadsConfig, where: torch.device) -> PositionEncoder:
 
 <Src file="src/rukh/train/heads.py" tag="p3" lines="308-320" />
 
-Aquí está una de las mejores comprobaciones del repositorio: **un checkpoint entrenado sobre jugadas
-no se puede afinar sobre casillas**. Los dos esquemas tienen vocabularios distintos (2 030 y 47) y
+**Un checkpoint entrenado sobre jugadas no se puede afinar sobre casillas.** Los dos esquemas tienen vocabularios distintos (2 030 y 47) y
 longitudes distintas (200 y 69), así que cargar uno en el otro fallaría igualmente al comparar
 formas… salvo en el caso peor, que es que las formas cuadren por casualidad y lo que se cargue sea
 un embedding que describe otra cosa.
@@ -1024,12 +1002,9 @@ def _compile_probe(
 
 <Src file="src/rukh/train/heads.py" tag="p3" lines="323-344" />
 
-El sondeo de compilación de la lección 5, ahora con **datos de verdad** en vez de un tensor lleno de
-un valor constante: toma las primeras filas del propio dataset. Con secuencias de longitud variable
-—el esquema de jugadas— eso importa, porque la forma que se compila es la de un lote real.
-
-Dicho lo cual, las dos configuraciones del hito traen `compile: false`, y por razones que están
-escritas en ellas: en casillas, tres capas lineales sobre 69 posiciones fijas no dan para amortizar
+El sondeo de compilación de la lección 5, ahora con **datos de verdad**: toma las primeras filas del
+propio dataset, así que la forma que se compila es la de un lote real. Aun así, las dos
+configuraciones del hito traen `compile: false`, por razones que están escritas en ellas: en casillas, tres capas lineales sobre 69 posiciones fijas no dan para amortizar
 la compilación; en jugadas, cada longitud de lote nueva provoca una recompilación y hay tantas
 longitudes como partidas.
 
@@ -1077,16 +1052,15 @@ def evaluate_heads(
 
 <Src file="src/rukh/train/heads.py" tag="p3" lines="347-385" />
 
-Las métricas que imprime el entrenamiento, y las tres tienen un matiz.
+Las métricas que imprime el entrenamiento, cada una con su matiz.
 
 `val/value_mae` es el error absoluto medio en la **escala acotada**, no en centipeones. Un 0,12
 significa «en la zona central, unos 48 centipeones», y esa traducción solo vale cerca del cero,
 donde el `tanh` es casi lineal. Es una métrica para mirar si algo se mueve, no para publicar.
 
-`val/blunder_acc` tiene su propio denominador: `blunder_seen`, las filas **con etiqueta**, no
-`seen`. Es correcto, y es también la cifra más peligrosa del módulo. Con los errores al 3,72 % de las
-filas, un detector que conteste siempre «no hay error» saca 96,3 %, y esta cabeza saca 96,78 %. La
-lección 8 la desmonta entera.
+`val/blunder_acc` tiene su propio denominador: `blunder_seen`, las filas **con etiqueta**. Es
+correcto, y es también la cifra más engañosa del módulo: con los errores al 3,72 % de las filas, un
+detector que conteste siempre «no hay error» saca 96,3 %. La lección 8 la desmonta.
 
 `(outputs["blunder"][mask] > 0)` es la decisión en el espacio de los **logits**: un logit positivo
 equivale a una probabilidad mayor que 0,5. No hace falta pasar por el sigmoide para umbralizar en
@@ -1140,22 +1114,19 @@ def train_heads(
 
 <Src file="src/rukh/train/heads.py" tag="p3" lines="417-423" />
 
-`metrics` se inicializa **vacío** antes del bucle porque el resultado lo devuelve al final: una
-tirada cuyo `max_steps` fuera menor que `eval_every` no evaluaría nunca, y sin esta línea el
-`HeadsResult` fallaría con un `NameError` en vez de con un diccionario vacío que dice la verdad.
+`metrics` se inicializa **vacío** antes del bucle porque el resultado lo devuelve al final: si el
+bucle no ejecuta ningún paso —un reanudado desde el último checkpoint, por ejemplo—, el
+`HeadsResult` sale con un diccionario vacío en vez de fallar con un `NameError`. El `import` de `start_run` dentro de la función es la regla
+de M0: `mlflow` tarda más de un segundo en importarse y `rukh --help` no debe pagarlo.
 
-El `import` de `start_run` dentro de la función es la regla de M0 otra vez: `mlflow` tarda más de un
-segundo en importarse y `rukh --help` no debe pagarlo.
-
-El orden de estas líneas es el contenido. `freeze_encoder` va **antes** de construir el optimizador,
+En el bloque anterior, el orden de las líneas es el contenido. `freeze_encoder` va **antes** de construir el optimizador,
 para que `param_groups` filtre por `requires_grad` y el tronco congelado no entre en ningún grupo. Y
 `set_training_mode` va **después** de `maybe_compile`, porque la compilación ejecuta un paso de
 sondeo y cualquier llamada a `.train()` o `.eval()` posterior tiene que ser la última palabra.
 
-El `shuffle=False` del cargador de validación es lo que hace que los `eval_batches` primeros lotes
-sean **los mismos** en todas las evaluaciones de la tirada. Con barajado, cada evaluación miraría
-50 lotes distintos y la curva de validación mezclaría el progreso con el sorteo, que es el mismo
-error que la semilla del enmascarado evita en la lección 5.
+El `shuffle=False` del cargador de validación hace que los `eval_batches` primeros lotes sean **los
+mismos** en todas las evaluaciones de la tirada, por la misma razón que la semilla del enmascarado
+de la lección 5.
 
 ```python title="src/rukh/train/heads.py"
     params = {
@@ -1208,9 +1179,8 @@ en que se escribió.
 en un dato consultable. Los tags (`mode`, `fraction`) permiten filtrar las ejecuciones de MLflow por
 modo y por punto de la curva sin leer sus configuraciones.
 
-Y el `exclude={"tokens_dir"}` con su comentario es una honestidad pequeña que vale la pena: heredar
-de `RunConfig` trae un campo que este bucle no usa, y registrarlo haría creer que las etiquetas salen
-de ahí.
+Y el `exclude={"tokens_dir"}`: heredar de `RunConfig` trae un campo que este bucle no usa, y
+registrarlo haría creer que las etiquetas salen de ahí.
 
 ```python title="src/rukh/train/heads.py"
         clock = time.perf_counter()
@@ -1266,15 +1236,14 @@ segundo no serían comparables entre ellos. La métrica que se registra es la qu
 El `or last` de las tres condiciones es lo que garantiza que el último paso registre, evalúe y guarde
 aunque `max_steps` no sea múltiplo de los tres intervalos.
 
-`clip_grad_norm_` sobre **los parámetros entrenables** y no sobre todos, que es la tercera trampa de
-la congelación después del dropout y el decaimiento. Un parámetro congelado tiene `grad = None`, y
-`clip_grad_norm_` los ignora, así que el recorte funcionaría igual… pero la **norma** que devuelve y
-que se registra en MLflow se calcula sobre lo que se le pasa. Filtrando, `grad_norm` es la norma de
-lo que de verdad se está moviendo, y en un `probe` es la de tres capas lineales y no una cifra
-diluida por quince millones de ceros.
+`clip_grad_norm_` recorta sobre **los parámetros entrenables** y no sobre todos. Un parámetro
+congelado tiene `grad = None` y `clip_grad_norm_` lo ignora, así que el recorte sería el mismo; lo
+que cambia es lo que se registra: filtrando, `grad_norm` es la norma de lo que de verdad se mueve, y
+en un `probe` es la de tres capas lineales.
 
-Las tres pérdidas por cabeza se acumulan y se registran por separado. Es lo que permite ver que, al
-descongelar del todo, la pérdida de la cabeza de errores sube mientras el total baja.
+Las tres pérdidas por cabeza se acumulan y se registran por separado. Es lo que permite ver, en la
+lección 11, que al descongelar del todo la pérdida de la cabeza de errores sube mientras la
+exactitud del resultado mejora.
 
 ```python title="src/rukh/train/heads.py"
             if done % cfg.eval_every == 0 or last:
@@ -1311,14 +1280,12 @@ El `return` está **fuera** del `with start_run(...)`, así que la ejecución de
 devolver el resultado. Con la curva, eso importa: `label_curve` llama a `train_heads` cuatro veces
 seguidas y cada ejecución tiene que estar terminada antes de que empiece la siguiente.
 
-La llamada a `set_training_mode` que sigue a `evaluate_heads` es el arreglo de un bug real.
+La llamada a `set_training_mode` que sigue a `evaluate_heads` arregla un bug real.
 `evaluate_heads` termina con `model.train()` si el modelo estaba entrenando, y eso **despierta el
 encoder congelado**: `train()` sobre el modelo entero pone en modo entrenamiento también a los
-submódulos que se habían dejado en `eval`. Sin esa llamada, a partir de la primera evaluación el
-tronco «congelado» volvería a aplicar dropout durante el resto de la tirada.
-
-Es exactamente el tipo de fallo que esta lección viene advirtiendo: no lanza, no cambia ninguna
-forma, y solo se nota en que el probe sale un poco peor de lo que debería.
+submódulos que se habían dejado en `eval`. Sin esa llamada, desde la primera evaluación el tronco
+«congelado» volvería a aplicar dropout. No lanza, no cambia ninguna forma, y solo se nota en que el
+probe sale un poco peor de lo que debería.
 
 ```python title="src/rukh/train/heads.py"
 def label_curve(
@@ -1364,12 +1331,11 @@ def write_curve(run_dir: Path, results: Sequence[HeadsResult]) -> list[Path]:
 fracciones se ordenan y se deduplican, así que la **última** tirada es siempre la del conjunto más
 grande. Eso es lo que hace correcta la línea siguiente.
 
-`write_curve` mete los cuatro puntos **dentro de los checkpoints** de esa última tirada. La
-justificación está en el docstring y es una regla general que vale fuera de aquí: **un número que
-solo ha existido en una línea de registro es un número que nadie puede poner en una tabla.** La curva
-es el resultado del módulo y un entregable del plan; si viviera solo en MLflow, `rukh eval encoder`
-tendría que saber dónde están las otras tres tiradas para dibujarla, y publicar el modelo dejaría la
-curva atrás.
+`write_curve` mete los cuatro puntos **dentro de los checkpoints** de esa última tirada. La regla
+del docstring vale fuera de aquí: **un número que solo ha existido en una línea de registro es un
+número que nadie puede poner en una tabla.** Si la curva viviera solo en MLflow, `rukh eval encoder`
+tendría que saber dónde están las otras tres tiradas para dibujarla, y publicar el modelo la dejaría
+atrás.
 
 Que se escriba en **todos** los `.pt` del directorio y no solo en `best.pt` es para que dé igual cuál
 se evalúe o se publique.
@@ -1515,10 +1481,10 @@ def load_any(
 
 <Src file="src/rukh/train/checkpoint.py" tag="p3" lines="225-255" />
 
-«Read off the weights rather than off a flag nobody wrote» es la frase que hay que llevarse. Podría
-haber un campo `kind: "encoder"` en el payload, y funcionaría **para los checkpoints escritos a partir
-de hoy**. Los de M2 no lo tendrían, y habría que tratar su ausencia como «decoder», que es una
-suposición que se convierte en un bug el día que aparezca un tercer tipo.
+«Read off the weights rather than off a flag nobody wrote» es la frase que hay que llevarse. Un campo
+`kind: "encoder"` en el payload funcionaría **para los checkpoints escritos a partir de hoy**; los de
+M2 no lo tendrían, y tratar su ausencia como «decoder» se convierte en un bug el día que aparezca un
+tercer tipo.
 
 Deducirlo de la estructura funciona hacia atrás y hacia delante: un `MultiHead` se reconoce porque
 sus claves empiezan por `encoder.`; un `PositionEncoder` suelto, porque su configuración tiene el
@@ -1600,11 +1566,8 @@ __all__ = [
 
 <Src file="src/rukh/train/__init__.py" tag="p3" lines="41-83" />
 
-La lista ordenada alfabéticamente y con las mayúsculas primero es la que `ruff` impone con su regla
-`RUF022`; no hay nada que decidir ahí. Lo único que se lee de ella es cuántos nombres nuevos trae el
-módulo: once, de los que cinco son cargadores de checkpoint.
-
-La superficie pública del paquete de entrenamiento después del módulo: tres bucles donde había uno.
+La superficie pública del paquete de entrenamiento después del módulo: tres bucles donde había uno,
+y cinco cargadores de checkpoint. El orden de la lista lo impone `ruff` con su regla `RUF022`.
 
 <Callout kind="ejecuta" title="El preentrenamiento ya se puede probar">
   Con este `__init__.py`, `rukh.train` exporta por fin `MmmConfig`, `train_mmm` y `load_encoder`, así
@@ -1681,9 +1644,8 @@ log_every: 10
 
 <Src file="configs/train/encoder-heads.yaml" tag="p3" lines="1-51" />
 
-`lr: 1.0e-3` frente a los `5.0e-4` del preentrenamiento: casi el doble, porque en un `probe` solo se
-mueven tres capas lineales y un `AdamW` sobre tres matrices pequeñas tolera —y necesita— un paso
-mucho mayor que uno sobre quince millones de pesos.
+`lr: 1.0e-3` frente a los `5.0e-4` del preentrenamiento: el doble, porque en un `probe` solo se
+mueven tres capas lineales, que toleran un paso mucho mayor que quince millones de pesos.
 
 `weight_decay: 0.01` frente a `0.1`: una décima parte. Con 438 093 etiquetas y cuatro mil pasos, el
 riesgo de sobreajuste de tres capas lineales es bajo y un decaimiento fuerte solo estorbaría.
@@ -1702,10 +1664,10 @@ input: moves
 
 <Src file="configs/train/encoder-heads-moves.yaml" tag="p3" lines="8-9" />
 
-El checkpoint de masked move modeling y el esquema que le corresponde. Y sí, hay una doble barra en
-esa ruta: es una errata del fichero que no rompe nada —`Path` la normaliza—. Lo que sí tienes que
-cambiar es la fecha: la carpeta es la de la tirada de referencia, y la tuya tendrá otra
-(`ls -td checkpoints/encoder-mmm-*/ | head -1` te dice cuál).
+El checkpoint de masked move modeling y el esquema que le corresponde. La doble barra de la ruta es
+una errata que no rompe nada (`Path` la normaliza). Lo que sí tienes que cambiar es la fecha: la
+carpeta es la de la tirada de referencia, y la tuya tendrá otra (`ls -td checkpoints/encoder-mmm-*/ |
+head -1` te dice cuál).
 
 {/* prettier-ignore */}
 ```yaml title="configs/train/encoder-heads-moves.yaml"
@@ -1734,9 +1696,8 @@ compile: false # variable-length prefixes recompile on every new shape; not wort
 
 <Src file="configs/train/encoder-heads-moves.yaml" tag="p3" lines="38-38" />
 
-Y la razón concreta de no compilar en este esquema, que es distinta de la del otro: aquí el problema
-no es que la compilación no se amortice, es que **cada longitud de lote nueva provoca una
-recompilación**, y con partidas de longitud variable las hay a cientos.
+La razón de no compilar aquí es distinta de la del otro esquema: **cada longitud de lote nueva
+provoca una recompilación**, y con partidas de longitud variable las hay a cientos.
 
 ## Los tests
 
@@ -1770,8 +1731,7 @@ def position(
 
 El comentario es la regla de paridad de la que depende todo el fichero: una posición de ply N es la
 que hay **después** de la N-ésima media jugada, así que en plies pares mueven las blancas y la jugada
-que llevó a una posición de ply par fue de las negras. Escribirlo en el constructor de filas de
-prueba, y no en un comentario perdido, es lo que hace legibles los tres tests siguientes.
+que llevó a una posición de ply par fue de las negras.
 
 ```python title="tests/unit/test_labels.py"
 def toy_frame() -> pl.DataFrame:
@@ -1807,9 +1767,8 @@ def test_a_blunder_is_measured_from_the_side_that_moved() -> None:
 evaluación —trescientos centipeones a favor de las blancas— y la etiqueta sale opuesta, porque en una
 lo provocó el bando que movía y en la otra lo consiguió.
 
-Si el signo estuviera mal, las dos filas saldrían con el mismo `loss_cp` y una de las dos estaría
-mal etiquetada. Es un test de dos casos que cubre la única forma de equivocarse que este cálculo
-tiene, y es mucho mejor que veinte casos del mismo lado.
+Si el signo estuviera mal, las dos filas saldrían con el mismo `loss_cp` y una estaría mal
+etiquetada. Dos casos, uno de cada lado, valen más que veinte del mismo.
 
 ```python title="tests/unit/test_labels.py"
 def test_a_position_without_its_predecessor_has_no_blunder_label() -> None:
@@ -1831,10 +1790,8 @@ def test_the_blunder_threshold_is_configurable() -> None:
 
 <Src file="tests/unit/test_labels.py" tag="p3" lines="87-101" />
 
-`A null is not a zero` como comentario y como aserción. Es la propiedad más fácil de romper de todo
-el fichero —basta un `fill_null(0)` puesto una línea antes de donde toca— y la que más daño hace:
-etiquetar «no lo sé» como «no fue error» envenena la clase mayoritaria precisamente con las filas de
-las que hay menos evidencia.
+`A null is not a zero`, como comentario y como aserción: es la propiedad más fácil de romper del
+fichero —basta un `fill_null(0)` una línea antes de donde toca— y la que más daño hace.
 
 ```python title="tests/unit/test_labels.py"
 def test_the_split_is_by_game_and_never_shares_a_game_id() -> None:
@@ -1863,13 +1820,9 @@ def test_the_split_is_stable_and_depends_on_the_seed() -> None:
 <Src file="tests/unit/test_labels.py" tag="p3" lines="138-158" />
 
 `assert not train & val` es el test de la fuga: la intersección de los dos conjuntos de `game_id`
-tiene que estar vacía. Es una línea y es la que convierte la explicación del docstring en una
-garantía.
-
-El `0.15 < len(val) / 200 < 0.35` sobre una fracción pedida del 25 % es una banda deliberadamente
-ancha: con 200 partidas, la desviación típica de la proporción es de unos tres puntos, así que una
-banda estrecha daría un test que falla de vez en cuando. Un test de aleatoriedad se escribe con
-tolerancias que dejan dormir.
+tiene que estar vacía. El `0.15 < len(val) / 200 < 0.35` sobre una fracción del 25 % es una banda
+ancha a propósito: con 200 partidas, la desviación típica de la proporción es de unos tres puntos, y
+una banda estrecha daría un test que falla de vez en cuando.
 
 ```python title="tests/unit/test_labels.py"
 def test_the_label_curve_uses_nested_subsets() -> None:
@@ -1891,9 +1844,8 @@ def test_the_label_curve_uses_nested_subsets() -> None:
 
 <Src file="tests/unit/test_labels.py" tag="p3" lines="161-175" />
 
-`keys[0.1] < keys[0.25] < keys[0.5] < keys[1.0]` con el operador `<` **entre conjuntos de Python**
-es «subconjunto propio», encadenado. Una línea que comprueba el anidamiento entero, que es la
-propiedad de la que depende que la curva signifique algo.
+`keys[0.1] < keys[0.25] < keys[0.5] < keys[1.0]`: el operador `<` **entre conjuntos de Python** es
+«subconjunto propio», así que una línea comprueba el anidamiento entero.
 
 ```python title="tests/unit/test_heads.py"
 @pytest.mark.parametrize("mode", ["probe", "last-n", "full"])
@@ -1931,10 +1883,10 @@ El primero calcula el número esperado de tensores entrenables **contándolos**,
 número. Así el test sigue siendo correcto si el bloque gana un parámetro, y sigue fallando si el modo
 mueve lo que no debe.
 
-El segundo es el test de `set_training_mode`, y sus tres bloques son las tres afirmaciones del
-docstring: en `probe`, el modelo entrena y el encoder no; en `full`, los dos; en `last-n`, el primer
-bloque está en `eval` y el último y la norma final en `train`. Es un test de una propiedad que no
-tiene nada que ver con los pesos y que decide si el probe mide lo que dice medir.
+El segundo es el test de `set_training_mode`, con las tres afirmaciones del docstring: en `probe`,
+el modelo entrena y el encoder no; en `full`, los dos; en `last-n`, el primer bloque está en `eval`
+y el último y la norma final en `train`. No tiene nada que ver con los pesos y decide si el probe
+mide lo que dice medir.
 
 <Callout kind="ejecuta" title="Las etiquetas y las cabezas, en verde">
   Con `labels.py`, `heads.py` y sus tests escritos, pasa los dos ficheros. El `test_heads.py`
@@ -2017,8 +1969,7 @@ def train_heads_cmd(
 <Src file="src/rukh/cli.py" tag="p3" lines="432-486" />
 
 `results = label_curve(cfg) if curve else [train_heads(cfg)]`: la curva y la tirada suelta devuelven
-**la misma forma**, una lista de resultados, así que el código que imprime es uno solo. Es un truco
-pequeño con mucho rendimiento: la alternativa son dos ramas de impresión que divergen.
+**la misma forma**, una lista de resultados, así que el código que imprime es uno solo.
 
 El `--mode` se valida a mano con código de salida **2** y no 1, porque 2 es el código que typer usa
 para un uso incorrecto de la orden; un error de datos es 1. Que la distinción exista importa en un
@@ -2069,14 +2020,14 @@ siendo del 3-4 % y el modelo aprendería a detectar lo contrario de lo que dice 
 
 ## Qué has aprendido
 
-Que construir un conjunto supervisado es sobre todo cuidar tres cosas: el signo de la etiqueta que
+Construir un conjunto supervisado es sobre todo cuidar tres cosas: el signo de una etiqueta que
 compara dos posiciones, la ausencia que no se puede convertir en un cero, y un reparto que sea una
-función pura de un identificador estable. Y que «congelar» tiene tres significados en PyTorch
-—gradiente, dropout y decaimiento de pesos— y hay que escribir los tres.
+función pura de un identificador estable que agrupe lo que no es independiente. Y «congelar» tiene
+tres significados en PyTorch —gradiente, dropout y decaimiento de pesos— que hay que escribir los
+tres. Las cuatro cosas valen igual para afinar un clasificador de texto.
 
-También la idea que hace del módulo algo más que un entrenamiento: entrenar la misma receta sobre
-subconjuntos **anidados** y guardar la curva dentro del checkpoint, porque un número que solo ha
-existido en un registro es un número que nadie puede poner en una tabla.
+Y la curva: la misma receta sobre subconjuntos **anidados**, guardada dentro del checkpoint para que
+viaje con el modelo.
 
 **Cómo se mide**: `uv run pytest tests/unit/test_labels.py tests/unit/test_heads.py -q` pasa los
 treinta tests, entre ellos el que exige que ningún `game_id` cruce el reparto y el que exige que un
