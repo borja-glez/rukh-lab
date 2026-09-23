@@ -6,7 +6,7 @@ description:
   `EncoderConfig` al lado de `DecoderConfig`.'
 module: m3
 order: 2
-duration: 75
+duration: 65
 level: medio
 status: vigente
 updated: 2026-09-23
@@ -30,26 +30,23 @@ encoder a mano».
 
 Un fichero nuevo, `src/rukh/models/layers.py`, con la atención, el MLP y el bloque pre-norm que
 el <Term id="decoder">decoder</Term> de M2 tenía dentro, más un `EncoderConfig` al lado del
-`DecoderConfig` que ya existía. No hay conceptos nuevos: es la fontanería que hace que
-el <Term id="encoder">encoder</Term> de la lección siguiente sea de verdad «el mismo bloque con otro
-booleano» y no una copia que se le parece.
+`DecoderConfig`. No hay conceptos nuevos: es la fontanería que hace que
+el <Term id="encoder">encoder</Term> de la lección siguiente sea de verdad el mismo bloque con otro
+booleano.
 
 Merece una lección propia porque **este refactor podía romper en silencio todos los checkpoints de
-M2**, y no lo hizo porque se escribió sabiendo dónde estaba el peligro. Eso es lo que se aprende
-aquí, y vale para cualquier refactor de un modelo que ya tiene pesos entrenados.
+M2**. Lo que se aprende aquí vale para cualquier refactor de un modelo que ya tiene pesos entrenados.
 
 <Callout kind="teoria" title="Por qué no vale copiar el fichero y cambiar el booleano">
   La tentación obvia al empezar M3 es duplicar `decoder.py`, cambiar `is_causal=True` por `False` y
   seguir. Funciona el primer día. El segundo, alguien corrige un detalle de la atención en un
-  fichero y no en el otro, y el curso pasa a tener dos modelos que dice que son el mismo bloque y ya
-  no lo son. La frase que sostiene el módulo —«la única diferencia es la máscara»— dejaría de ser
-  comprobable. Compartir el código es lo que la convierte en un hecho.
+  fichero y no en el otro, y la frase que sostiene el módulo —«la única diferencia es la máscara»—
+  deja de ser verdad sin que nadie lo note. Compartir el código la hace comprobable.
 </Callout>
 
 ## `layers.py`: el bloque, sin saber de quién es
 
-El fichero abre con el contrato; las dos últimas frases del docstring son las que hay que leer
-despacio.
+El fichero abre con el contrato.
 
 ```python title="src/rukh/models/layers.py"
 """Transformer building blocks shared by the causal decoder and the bidirectional encoder.
@@ -74,28 +71,25 @@ from torch.nn import functional as F
 
 <Src file="src/rukh/models/layers.py" tag="p3" lines="1-18" />
 
-«The classes take plain numbers rather than a config object» es la decisión de diseño del fichero.
-Si `Block` recibiera un `DecoderConfig`, el encoder tendría que construirse uno falso para llamarlo,
-y `EncoderConfig` tendría que parecerse a `DecoderConfig` para siempre. Con cinco números sueltos
+Los bloques reciben números sueltos y no un objeto de configuración. Si `Block` recibiera un
+`DecoderConfig`, el encoder tendría que construirse uno falso para llamarlo. Con cinco números
 —`d_model`, `n_head`, `ff`, `dropout`, `causal`— las dos configuraciones pueden divergir cuanto
-quieran y los bloques siguen sirviendo a las dos.
+quieran.
 
-El segundo párrafo es el aviso. Un <Term id="checkpoint">checkpoint</Term> de PyTorch
-es un diccionario cuyas claves son los **nombres de los atributos** por los que se llega a cada
-tensor: `blocks.3.attn.qkv.weight` no es una etiqueta decorativa, es la dirección. Renombrar `qkv` a
-`in_proj` o meter la atención un nivel más adentro no da ningún error al arrancar: `load_state_dict`
-con `strict=False` carga lo que reconoce y deja el resto con pesos aleatorios, y lo que sale es un
-modelo que funciona, produce números creíbles y ha olvidado media red. Por eso este refactor mueve
-el código pero **no toca ni un nombre ni el orden de creación**.
+El segundo párrafo es el aviso. Un <Term id="checkpoint">checkpoint</Term> de PyTorch es un
+diccionario cuyas claves son los **nombres de los atributos** por los que se llega a cada tensor:
+`blocks.3.attn.qkv.weight` es una dirección. Renombrar `qkv` a `in_proj` no da ningún error al
+arrancar: `load_state_dict` con `strict=False` carga lo que reconoce y deja el resto con pesos
+aleatorios, y sale un modelo que produce números creíbles y ha olvidado media red. Por eso este
+refactor mueve el código sin tocar ni un nombre ni el orden de creación.
 
 <Callout kind="roto" title="El refactor que borra un entrenamiento sin dar error">
-  Es barato de cometer y caro de pagar. Si al reorganizar `decoder.py` los bloques hubieran pasado a
-  llamarse `layers.0.attn…`, los checkpoints de M2 se habrían cargado a medias y el primer síntoma
-  habría sido una perplejidad rarísima en la primera evaluación, sin ninguna pista de por qué. La
-  defensa no es tener cuidado: es cargar un checkpoint viejo con el código nuevo antes de dar el
-  refactor por bueno, como hace el ejercicio de esta lección. Pasa igual al cargar cualquier modelo
-  de Hugging Face con `strict=False`: el aviso de claves que sobran o que faltan es el único
-  síntoma.
+  Si al reorganizar `decoder.py` los bloques hubieran pasado a llamarse `layers.0.attn…`, los
+  checkpoints de M2 se habrían cargado a medias y el primer síntoma habría sido una perplejidad
+  rarísima, sin ninguna pista de por qué. La defensa es cargar un checkpoint viejo con el código
+  nuevo antes de dar el refactor por bueno, como hace el ejercicio de esta lección. Pasa igual al
+  cargar cualquier modelo de Hugging Face con `strict=False`: el aviso de claves que sobran o que
+  faltan es el único síntoma.
 </Callout>
 
 Las posiciones rotatorias van primeras porque no dependen de nada.
@@ -123,13 +117,10 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 <Src file="src/rukh/models/layers.py" tag="p3" lines="21-38" />
 
-Es el mismo código que escribiste en M2, movido de sitio sin tocar un carácter.
-
-<Term id="rope">RoPE</Term> se explicó allí; aquí solo importa que las tablas se calculan en
-`float32` y se convierten al tipo de `x` **en cada llamada** (`cos[:t].to(dtype=x.dtype)`), porque
-con <Term id="bf16">bf16</Term> activado el ángulo se redondearía en la tabla y el error se
-acumularía a lo largo de la secuencia. El encoder las hereda sin cambios, aunque su configuración
-por defecto use posiciones aprendidas.
+Es el código de <Term id="rope">RoPE</Term> de M2, movido sin tocar un carácter. Las tablas se
+calculan en `float32` y se convierten al tipo de `x` en cada llamada, porque en
+formato <Term id="bf16">bf16</Term> el ángulo se redondearía en la tabla y el error se acumularía a
+lo largo de la secuencia.
 
 ## La atención, con la máscara como parámetro
 
@@ -158,9 +149,9 @@ class SelfAttention(nn.Module):
 
 <Src file="src/rukh/models/layers.py" tag="p3" lines="41-57" />
 
-`causal=True` es el valor por defecto, y eso es deliberado: el código que ya existía sigue
-comportándose igual sin pasar nada. Un refactor que cambia el valor por defecto de un booleano que
-decide si un modelo ve el futuro es un refactor que no se puede revisar leyendo el diff.
+`causal=True` es el valor por defecto a propósito: el código que ya existía sigue comportándose igual
+sin pasar nada. Cambiar el valor por defecto de un booleano que decide si un modelo ve el futuro es
+un cambio que no se puede revisar leyendo el diff.
 
 ```python title="src/rukh/models/layers.py"
     def forward(
@@ -193,27 +184,19 @@ decide si un modelo ve el futuro es un refactor que no se puede revisar leyendo 
 
 <Src file="src/rukh/models/layers.py" tag="p3" lines="59-84" />
 
-La línea importante es `is_causal=self.causal and attn_mask is None`, y el `and` no es una
-precaución: lo exige la API.
+La línea importante es `is_causal=self.causal and attn_mask is None`, y el `and` lo exige la API:
+`F.scaled_dot_product_attention` no admite `is_causal=True` junto con un `attn_mask`. Con los dos,
+el comportamiento depende del backend que se elija en tiempo de ejecución: en el mejor caso lanza,
+en el peor aplica solo uno. Con el `and`, **si hay máscara, la máscara manda**. El decoder nunca pasa
+una y se queda en el camino rápido; el encoder pasa la del relleno y `is_causal` se apaga solo.
 
-`F.scaled_dot_product_attention` **no admite `is_causal=True` junto con un `attn_mask`**. Cuando le
-das los dos, las implementaciones rápidas (la fusionada de CUDA, la de memoria eficiente) no tienen
-cómo combinarlos y el comportamiento pasa a depender del backend que se elija en tiempo de
-ejecución: en el mejor caso lanza, en el peor aplica solo uno de los dos. Con el `and`, la regla es
-explícita y cabe en una frase: **si hay máscara, la máscara manda**. El decoder nunca pasa una, así
-que se queda en el camino rápido de siempre; el encoder pasa la del relleno y `is_causal` se apaga
-solo.
+Pedir la atención causal con el booleano, en vez de pasar una matriz triangular como `attn_mask`,
+también es cuestión de coste. Con el booleano, el kernel fusionado se salta los bloques del triángulo
+superior; con la matriz, calcula la puntuación entera y luego le suma `-inf`. Es la mitad del trabajo
+frente al trabajo entero, así que el decoder no se pasa a la rama de máscara «para unificar».
 
-Pedir la atención causal con `is_causal=True`, en vez de construir una matriz triangular y pasarla
-como `attn_mask`, tampoco es una cuestión de estilo. Con el
-booleano, el kernel fusionado se salta directamente los bloques del triángulo superior y no calcula
-nada ahí; con la matriz, calcula la puntuación entera y luego le suma `-inf`. Es la mitad del trabajo
-frente al trabajo entero más una matriz de `T × T` en memoria. Por eso el decoder de M2 no puede
-pasarse a la rama de máscara «para unificar»: costaría el doble.
-
-`dropout_p=self.dropout if self.training else 0.0` está por la misma razón que en M2, y aquí se
-vuelve importante: en la lección 6, un encoder congelado en modo `train` seguiría metiendo dropout
-dentro de la atención, y la misma posición daría un vector distinto en cada época.
+El dropout se apaga fuera de `train` (`self.training`), y en la lección 6 eso importa: un encoder
+congelado en modo `train` daría un vector distinto para la misma posición en cada época.
 
 ## El MLP y el bloque, que no cambian nada
 
@@ -256,14 +239,11 @@ class Block(nn.Module):
 
 <Src file="src/rukh/models/layers.py" tag="p3" lines="87-120" />
 
-El bloque <Term id="pre-norm">pre-norm</Term> de M2, palabra por palabra, con `attn_mask` añadido al
-final de la firma y pasado hacia dentro. El orden de creación de los cuatro submódulos —`ln1`,
-`attn`, `ln2`, `mlp`— es el que tenía el `Block` de `decoder.py`, y eso mantiene intactas las claves
-`blocks.N.ln1.weight` y compañía de los checkpoints de M2.
-
-Y el `attn_mask` se añade **al final** y con valor por defecto `None`, no en medio. Un argumento
-posicional nuevo en el medio de una firma convierte una llamada antigua que pasaba `cos` y `sin` por
-posición en una llamada que pasa `cos` como máscara, y eso tampoco da error: da basura.
+El bloque <Term id="pre-norm">pre-norm</Term> de M2, palabra por palabra, con los submódulos creados
+en el mismo orden —`ln1`, `attn`, `ln2`, `mlp`— para que las claves de los checkpoints no cambien.
+`attn_mask` se añade al final de la firma y con valor por defecto `None`: un argumento posicional
+nuevo en medio convertiría una llamada antigua que pasaba `cos` y `sin` por posición en una que pasa
+`cos` como máscara, y eso tampoco da error, da basura.
 
 ```python title="src/rukh/models/layers.py"
 def init_weights(module: nn.Module) -> None:
@@ -278,15 +258,13 @@ def init_weights(module: nn.Module) -> None:
 
 <Src file="src/rukh/models/layers.py" tag="p3" lines="123-130" />
 
-La inicialización de GPT-2, ahora compartida: `std = 0.02` fijo, sesgos a cero. Que los dos modelos
-la compartan importa para la comparación del módulo, porque una diferencia de inicialización entre el
-decoder y el encoder aparecería en las métricas y se atribuiría a la máscara.
+La inicialización de GPT-2, ahora compartida: `std = 0.02`, sesgos a cero. Si los dos modelos se
+inicializaran distinto, la diferencia aparecería en las métricas y se atribuiría a la máscara.
 
 ## `decoder.py`, después del refactor: tres clases que traducen su configuración a `layers`
 
-El fichero de M2 pierde 68 líneas y gana 23. Lo que queda de sus clases es esto, y es todo lo que
-queda: lo que antes era el cuerpo de la atención, el MLP y el bloque ahora es una llamada al
-constructor de la clase de `layers` que le corresponde.
+El fichero de M2 pierde 68 líneas y gana 23: lo que antes era el cuerpo de la atención, el MLP y el
+bloque ahora es una llamada al constructor de la clase de `layers` que le corresponde.
 
 ```python title="src/rukh/models/decoder.py"
 from rukh.models import layers
@@ -306,11 +284,9 @@ __all__ = [
 
 <Src file="src/rukh/models/decoder.py" tag="p3" lines="22-34" />
 
-Ese `__all__` es el otro lado del cuidado con la compatibilidad, y esta vez no con los checkpoints
-sino con el código. `rope_tables` y `apply_rope` vivían en `decoder.py`, y en M2 hay tests y un
-exportador que hacen `from rukh.models.decoder import rope_tables`. Reexportarlos desde donde
-estaban es lo que hace que ese refactor no aparezca en el diff de ningún otro fichero. Escribirlos en
-`__all__` además de importarlos es lo que impide que `ruff` los borre como imports sin usar.
+Ese `__all__` cuida la compatibilidad con el código. En M2 hay tests y un exportador que hacen
+`from rukh.models.decoder import rope_tables`; reexportarlos desde donde estaban evita tocar esos
+ficheros, y ponerlos en `__all__` impide que `ruff` los borre como imports sin usar.
 
 ```python title="src/rukh/models/decoder.py"
 class CausalSelfAttention(layers.SelfAttention):
@@ -336,25 +312,15 @@ class Block(layers.Block):
 
 <Src file="src/rukh/models/decoder.py" tag="p3" lines="40-58" />
 
-Tres clases que solo existen para traducir un `DecoderConfig` en los números que espera `layers`.
-Podrían no existir: `MoveDecoder` podría construir `layers.Block(cfg.d_model, …)` directamente, como
-hace el encoder. Se quedan por dos motivos y los dos son de compatibilidad.
+Tres clases que solo traducen un `DecoderConfig` en los números que espera `layers`. `MoveDecoder`
+podría construir `layers.Block` directamente, como hace el encoder, pero se quedan por
+compatibilidad: `from rukh.models import Block, CausalSelfAttention, Mlp` es una importación que M2
+usó en sus tests y en su lección, y borrarla habría convertido un refactor interno en un cambio de
+API pública.
 
-El primero, otra vez, es el formato en disco. `self.blocks = nn.ModuleList(Block(self.cfg) …)` sigue
-creando módulos que se llaman igual, con submódulos que se llaman igual. Si `MoveDecoder` pasara a
-instanciar `layers.Block`, las claves seguirían siendo `blocks.N.attn.qkv.weight` —el nombre de la
-clase no entra en la clave— pero el cambio sería innecesario y habría que demostrar que no rompe
-nada. No hacer el cambio es gratis.
-
-El segundo es que `from rukh.models import Block, CausalSelfAttention, Mlp` es una importación que
-M2 usó en sus tests y en su lección. Borrarla habría convertido un refactor interno en un cambio de
-API pública por comodidad de quien refactoriza.
-
-Y la herencia en vez de la composición está elegida a propósito: `CausalSelfAttention(cfg)` sigue
-siendo **la misma clase de módulo** desde el punto de vista de `isinstance`, así que cualquier código
-que discriminara por tipo sigue funcionando. Un `self.inner = layers.SelfAttention(…)` habría metido
-un nivel más en las claves del checkpoint (`attn.inner.qkv.weight`) y habría roto exactamente lo que
-el docstring del fichero nuevo avisa.
+La herencia en vez de la composición también es deliberada. Un
+`self.inner = layers.SelfAttention(…)` habría metido un nivel más en las claves del checkpoint
+(`attn.inner.qkv.weight`) y habría roto lo que el docstring del fichero nuevo avisa.
 
 ```python title="src/rukh/models/decoder.py"
     @staticmethod
@@ -364,9 +330,8 @@ el docstring del fichero nuevo avisa.
 
 <Src file="src/rukh/models/decoder.py" tag="p3" lines="91-93" />
 
-El método se queda como delegación de una línea en vez de desaparecer, porque
-`self.apply(self._init_weights)` está en el `__init__` y `_init_weights` aparece en un test de M2.
-El día que el decoder quiera una inicialización distinta de la del encoder, este es el sitio.
+El método se queda como delegación de una línea porque `_init_weights` aparece en un test de M2, y
+porque es el sitio donde el decoder tendría una inicialización propia si algún día la quiere.
 
 <Callout kind="ejecuta" title="Los tests de M2, sin tocar ninguno">
   Con `layers.py` escrito y `decoder.py` reducido a sus tres clases, todo lo de M2 tiene que seguir
@@ -411,19 +376,17 @@ print(sorted(saved - built)[:5], sorted(built - saved)[:5])
   hermanos (dos por cada uno de los doce bloques de `small`), y `built - saved` los mismos con el
   nombre nuevo.
 
-Lo peligroso es lo que pasa **si nadie ejecuta esta comprobación**.
-`load_state_dict(..., strict=True)` lanza, y eso sería un buen día. Con `strict=False` —que es lo
-que hace falta para cargar un checkpoint al que se le han añadido cabezas, como en M3— las claves
-desconocidas se ignoran y las que faltan se quedan con su inicialización aleatoria. El modelo carga,
-entrena, evalúa y da números. Solo son los números de otro modelo.
+Lo peligroso es lo que pasa si nadie ejecuta esta comprobación. `load_state_dict(..., strict=True)`
+lanza, y eso sería un buen día. Con `strict=False` —lo que hace falta para cargar un checkpoint al
+que se le han añadido cabezas, como en M3— las claves que faltan se quedan con su inicialización
+aleatoria. El modelo carga, entrena y da números. Solo son los números de otro modelo.
 
 </Solution>
 </Exercise>
 
 ## `EncoderConfig`: la configuración del hermano
 
-`config.py` gana un import y una clase. El import primero, porque es el que decide una dependencia
-entre módulos:
+`config.py` gana un import y una clase. El import decide una dependencia entre módulos:
 
 ```python title="src/rukh/models/config.py"
 from rukh.config import BaseConfig
@@ -432,9 +395,9 @@ from rukh.models.squares import SQUARE_TOKENS, SQUARE_VOCAB_SIZE
 
 <Src file="src/rukh/models/config.py" tag="p3" lines="9-10" />
 
-`config.py` importa de `squares.py` y no al revés, y eso es lo que permite que el tamaño del
-vocabulario de casillas sea **un valor por defecto calculado** en vez de un 47 escrito a mano. Las
-dos formas funcionan; solo una de ellas no se queda desfasada el día que el esquema gane un token.
+`config.py` importa de `squares.py` y no al revés, así que el tamaño del vocabulario de casillas es
+un valor calculado en vez de un 47 escrito a mano que se quedaría desfasado el día que el esquema
+gane un token.
 
 ```python title="src/rukh/models/config.py"
 class EncoderConfig(BaseConfig):
@@ -462,23 +425,19 @@ class EncoderConfig(BaseConfig):
 
 <Src file="src/rukh/models/config.py" tag="p3" lines="69-89" />
 
-Los campos son los quince millones de parámetros de la lección 1 escritos como datos: ocho capas,
-seis cabezas, 384 dimensiones. Tres merecen comentario.
+Los campos son los quince millones de parámetros de la lección 1 escritos como datos. Tres merecen
+comentario:
 
-`input` es un `Literal` de dos valores y no un booleano. Con `Literal["moves", "squares"]`, un YAML
-que diga `input: square` falla al cargar con un mensaje que dice cuáles son los valores válidos, y
-como `EncoderConfig` hereda de `BaseConfig` —con `extra="forbid"`, la decisión de M0— una clave mal
-escrita tampoco pasa. Es la misma regla de siempre: fallar al cargar, no al usar.
-
-**Dos tamaños de vocabulario a la vez**, `vocab_size` y `square_vocab`, en vez de uno que signifique
-lo que toque. Es más largo de escribir y tiene una ventaja concreta: una configuración de casillas
-que venga con un `vocab_size: 2030` heredado de una plantilla no confunde a nadie, porque el campo
-que se usa lo elige `input`. Lo mismo con `block`, que solo pinta en `moves`.
-
-Y `dropout: 0.1`, mientras el decoder de M2 entrena con cero: el encoder va a ver 438 093 posiciones
-etiquetadas en el afinado, dos órdenes de magnitud menos que los tokens del preentrenamiento del
-decoder, y con tan pocos datos un poco de regularización paga. Es también la razón de que la
-lección 6 tenga que acordarse de poner el tronco en modo `eval` al congelarlo.
+- `input` es un `Literal` de dos valores. Un YAML que diga `input: square` falla al cargar con un
+  mensaje que lista los válidos, y como `EncoderConfig` hereda de `BaseConfig` (con
+  `extra="forbid"`, la decisión de M0) una clave mal escrita tampoco pasa. Fallar al cargar, no al
+  usar.
+- Dos tamaños de vocabulario, `vocab_size` y `square_vocab`, en vez de uno que signifique lo que
+  toque: el que se usa lo elige `input`, y un `vocab_size: 2030` heredado de una plantilla no
+  confunde a nadie. Lo mismo con `block`, que solo pinta en `moves`.
+- `dropout: 0.1`, mientras el decoder entrena con cero: el afinado verá 438 093 posiciones, dos
+  órdenes de magnitud menos que los tokens del preentrenamiento, y con tan pocos datos un poco de
+  regularización paga.
 
 ```python title="src/rukh/models/config.py"
     @model_validator(mode="after")
@@ -500,23 +459,15 @@ lección 6 tenga que acordarse de poner el tronco en modo `eval` al congelarlo.
 
 <Src file="src/rukh/models/config.py" tag="p3" lines="91-105" />
 
-Seis comprobaciones para una configuración de once campos, y cada una corresponde a una forma de que
-el modelo se construya y falle más tarde en un sitio que no explica nada.
+Cada comprobación corresponde a una forma de que el modelo se construya y falle más tarde en un sitio
+que no explica nada. Si `d_model % n_head` no divide, la atención revienta con un error sobre el
+número de elementos de un tensor, a cuatro llamadas del número mal puesto; aquí el mensaje trae los
+dos números. Con `dropout = 1.0` el modelo entrenaría tranquilamente contra el vacío.
 
-`d_model % n_head` es la que más veces salta. Si no divide, la línea
-`q.view(batch, seq, n_head, head_dim)` de la atención revienta con un error sobre el número de
-elementos de un tensor, a cuatro llamadas de distancia del número mal puesto. Aquí el mensaje trae
-los dos números.
-
-`dropout < 1.0` y no `<= 1.0`: con `dropout = 1.0` se anula toda la señal y el modelo entrena
-tranquilamente contra el vacío. `0.0 <= dropout` hace falta porque un `-0.1` copiado de otra
-configuración no lo rechaza `nn.Dropout`, que solo comprueba el extremo de arriba.
-
-La de `rope` con dimensión impar es la más específica y la que más se agradece. `apply_rope` parte el
-vector por la mitad (`half = x.shape[-1] // 2`) y con una dimensión impar la división entera pierde
-una componente: el resultado tiene la forma correcta, el modelo entrena, y una de las dimensiones de
-cada cabeza no recibe información de posición. No falla nada; solo aprende algo peor por un motivo
-que nadie encontraría. Esta sola justifica las otras cinco.
+La de `rope` con dimensión impar es la que más se agradece. `apply_rope` parte el vector por la mitad
+y con una dimensión impar la división entera pierde una componente: el modelo entrena y una
+dimensión de cada cabeza no recibe información de posición. No falla nada; solo aprende algo peor
+por un motivo que nadie encontraría.
 
 ```python title="src/rukh/models/config.py"
     @property
@@ -542,14 +493,10 @@ que nadie encontraría. Esta sola justifica las otras cinco.
 
 <Src file="src/rukh/models/config.py" tag="p3" lines="107-125" />
 
-Las cuatro propiedades resuelven en un solo sitio la dualidad de los dos esquemas. `tokens` y `seq` responden «¿cuántos tokens hay?» y «¿cuánto mide la secuencia?»
-para el esquema activo, así que `PositionEncoder` se construye con `cfg.tokens` y `cfg.seq` y no
-tiene ni un `if cfg.input == …` en su `__init__`. La alternativa —preguntar por el esquema en cada
-sitio donde hace falta un tamaño— es la que produce el bug de construir la tabla de posiciones con
-200 entradas para una secuencia de 69 y no enterarse hasta la exportación.
-
-`ff` con `d_ff = None` como valor por defecto es el patrón de M2: `4 × d_model` es la proporción
-habitual, se puede sobrescribir y el valor efectivo se lee en un sitio.
+`tokens` y `seq` resuelven en un solo sitio la dualidad de los dos esquemas, así que
+`PositionEncoder` se construye con `cfg.tokens` y `cfg.seq` sin un solo `if cfg.input == …`.
+Preguntar por el esquema en cada sitio que necesita un tamaño es lo que produce el bug de construir
+la tabla de posiciones con 200 entradas para una secuencia de 69 y no enterarse hasta la exportación.
 
 ## Los reexportes
 
@@ -591,10 +538,8 @@ __all__ = [
 
 <Src file="src/rukh/models/__init__.py" tag="p3" lines="1-33" />
 
-Es la superficie pública del paquete, y lo único que hay que ver es que `layers` **no** está en la
-lista. Los bloques son un detalle de implementación compartido por los dos
-modelos, no algo que el resto del proyecto deba importar; quien los necesita los pide por su ruta
-completa, como hacen `decoder.py` y `encoder.py`.
+Es la superficie pública del paquete, y `layers` no está en ella: los bloques son un detalle de
+implementación de los dos modelos, y quien los necesita los pide por su ruta completa.
 
 ## Qué has aprendido
 

@@ -6,7 +6,7 @@ description:
   esquema del checkpoint, la caché del baseline y la fila del encoder en la tabla única.'
 module: m3
 order: 7
-duration: 165
+duration: 150
 runtime: 5
 level: avanzado
 status: vigente
@@ -29,15 +29,13 @@ engañarse».
 ## Qué vas a construir
 
 `src/rukh/eval/encoder.py` es el fichero más grande del módulo y se lee en dos lecciones. Esta es
-**qué mide la suite y qué produce**: la configuración, los modelos de datos que definen lo que se
-publica, de dónde salen las filas, cómo se tokenizan, cómo se calculan las predicciones del modelo y
-las del baseline, y cómo se escriben el informe y la fila de la tabla única. La lección siguiente es
-**cómo se evita engañarse**: las métricas a mano y el reparto del umbral.
+**qué mide la suite y qué produce**: los modelos de datos que definen lo que se publica, de dónde
+salen las filas, las predicciones del modelo y del baseline, y el informe con su fila en la tabla
+única, más la orden `rukh eval encoder`. La siguiente es cómo se evita engañarse: las métricas a mano
+y el reparto del umbral.
 
-Va también lo que el módulo cambió alrededor: la fila de encoder de la tabla de resultados
-(`eval/report.py`), los reexportes de `eval/__init__.py` y la orden `rukh eval encoder`. Si alguna
-vez montas la evaluación de un clasificador o de un sistema de recuperación, esta lección es la
-lista de lo que conviene guardar además del número.
+Si alguna vez montas la evaluación de un clasificador o de un sistema de recuperación, esta lección
+es la lista de lo que conviene guardar además del número.
 
 ## El contrato de la suite
 
@@ -94,11 +92,9 @@ checkpoint evaluated on the same rows pays nothing for them.
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="1-48" />
 
-El docstring es la lección 8 resumida por adelantado: el fichero se diseñó desde él, y cada párrafo
-tiene luego su función. La primera frase justifica que exista una suite aparte: `rukh eval` mide un
-decoder por las jugadas que hace, y un encoder no hace ninguna. La segunda es la regla que hace que
-el margen signifique algo: **el encoder y la heurística se miden sobre las mismas filas**. Un margen
-medido sobre dos conjuntos distintos no es un margen.
+El docstring es la lección 8 resumida por adelantado: el fichero se diseñó desde él. Un encoder no
+juega, así que necesita una suite aparte, y la regla que da sentido al margen es que **el encoder y
+la heurística se miden sobre las mismas filas**.
 
 ```python title="src/rukh/eval/encoder.py"
 from __future__ import annotations
@@ -133,10 +129,9 @@ log = logging.getLogger(__name__)
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="50-77" />
 
-Los imports dicen de qué depende la suite, y hay dos ausencias: no hay `scipy` ni `scikit-learn`. Las cuatro métricas de la lección siguiente están escritas a mano sobre `numpy`,
-que ya es dependencia del proyecto. Y `torch` no aparece al nivel del módulo: se importa dentro de
-`predict`, porque cargarlo cuesta más de un segundo y `rukh eval encoder --help` tiene que responder
-al instante.
+Faltan `scipy` y `scikit-learn`: las métricas de la lección siguiente van a mano sobre `numpy`. Y
+`torch` se importa dentro de `predict`, porque cargarlo cuesta más de un segundo y
+`rukh eval encoder --help` tiene que responder al instante.
 
 ```python title="src/rukh/eval/encoder.py"
 SUITE = "encoder"
@@ -166,17 +161,13 @@ DEFAULT_CONFIG = "encoder.yaml"
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="79-101" />
 
-Los dos <Term id="criterio-de-aceptacion">criterios de aceptación</Term> del hito son dos constantes
-en el código, escritas en el plan antes de que existiera el modelo. Por eso no se pueden mover
-después de medir.
+Los dos <Term id="criterio-de-aceptacion">criterios de aceptación</Term> del hito son constantes
+escritas en el plan antes de que existiera el modelo, así que no se pueden mover después de medir.
 
-`HEURISTIC_KEY = "material-mobility-v1"` con el `v1` al final: es la clave de la caché de los
-veredictos del baseline, y el docstring dice lo que hay que hacer cuando la heurística cambie:
-subir el número. Sin eso, un cambio en el cálculo del material se quedaría oculto tras miles de
-veredictos cacheados y la comparación mezclaría dos baselines.
-
-`CURVE_KEY` duplica a propósito `rukh.train.checkpoint.CURVE_KEY`, y un test los ata: así `rukh.eval`
-no depende de `rukh.train` al nivel del módulo.
+El `v1` de `HEURISTIC_KEY` es la versión de la caché del baseline: si la heurística cambia y no se
+sube, el cambio queda oculto tras miles de veredictos viejos y la comparación mezcla dos baselines.
+`CURVE_KEY` duplica a propósito la de `rukh.train.checkpoint`, atada por un test, para que
+`rukh.eval` no dependa de `rukh.train`.
 
 ```python title="src/rukh/eval/encoder.py"
 class EncoderEvalConfig(BaseConfig):
@@ -205,18 +196,15 @@ class EncoderEvalConfig(BaseConfig):
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="104-125" />
 
-`labels: LabelsConfig` embebida es lo que garantiza que la evaluación reconstruya **la misma tabla**
-que el entrenamiento: la misma semilla, la misma fracción de validación, el mismo umbral de
-centipeones para definir un error. Con dos configuraciones separadas, un `blunder_cp: 150` en una y
-`100` en la otra daría una métrica sobre una definición de «error» que el modelo nunca vio.
+`labels: LabelsConfig` embebida garantiza que la evaluación reconstruya **la misma tabla** que el
+entrenamiento: misma semilla, misma fracción de validación y mismo umbral de centipeones para
+definir un error. Con dos configuraciones separadas, un `blunder_cp: 150` en una y `100` en la otra
+mediría el modelo contra una definición de «error» que nunca vio.
 
-`stage: None` con el valor por defecto «el directorio del checkpoint» es una comodidad con un
-efecto que conviene conocer: como las tiradas llevan marca de tiempo, sin `--stage` cada evaluación
-escribiría en una carpeta distinta y añadiría una fila nueva a la tabla en vez de actualizar la que
-hay. Por eso los comandos del módulo lo fijan.
-
-`positions: 10_000` es un tope, y es de donde sale el «10 000 posiciones» de todos los informes del
-módulo. Con `0` se evalúa la partición entera, que son unas cuarenta mil.
+Como las tiradas llevan marca de tiempo, sin `--stage` cada evaluación añadiría una fila nueva a la
+tabla en vez de actualizar la suya; por eso los comandos del módulo lo fijan. `positions: 10_000` es
+el tope del que salen las «10 000 posiciones» de los informes; con `0` se evalúa la partición entera,
+unas cuarenta mil.
 
 ```python title="src/rukh/eval/encoder.py"
     def heuristic_fields(self) -> dict[str, Any]:
@@ -238,9 +226,9 @@ módulo. Con `0` se evalúa la partición entera, que son unas cuarenta mil.
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="127-141" />
 
-La lista de lo que invalida una entrada de la caché, y lo interesante es lo que **no** está: los
-pesos del modelo. El veredicto del baseline es una función de la posición y de dos constantes,
-así que evaluar un segundo checkpoint sobre las mismas filas no vuelve a pagar la parte lenta.
+Es la lista de lo que invalida una entrada de la caché, y lo interesante es lo que falta: los pesos.
+El veredicto del baseline depende de la posición y de dos constantes, así que evaluar otro
+checkpoint sobre las mismas filas no vuelve a pagar la parte lenta.
 
 ## Los modelos de resultado, que son el catálogo de lo publicable
 
@@ -266,13 +254,10 @@ class ClassificationResult(BaseModel):
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="144-160" />
 
-Además de las tres métricas guarda **los conteos que las explican**: cualquiera que lea el
-`results.json` puede recalcular la precisión y la exhaustividad, y sobre todo ver `predicted`,
-cuántas posiciones se marcaron. Una precisión del 11,7 % y una del 4,7 % suenan parecidas hasta que
-se ve que una marcó 488 posiciones y la otra 2 359.
-
-`accuracy` se guarda aunque el informe la califique de inútil, porque es la cifra que todo el mundo
-va a buscar, y tenerla al lado de la tasa base es lo que hace visible el problema.
+Además de las tres métricas guarda **los conteos que las explican**, sobre todo `predicted`: una
+precisión del 11,7 % y una del 4,7 % suenan parecidas hasta que se ve que una marcó 488 posiciones y
+la otra 2 359. `accuracy` se guarda aunque sea inútil aquí, porque es la cifra que todo el mundo
+busca, y verla junto a la tasa base hace visible el problema.
 
 ```python title="src/rukh/eval/encoder.py"
 class RankingResult(BaseModel):
@@ -302,15 +287,13 @@ class RankingResult(BaseModel):
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="163-185" />
 
-**El rango de las probabilidades es un campo del resultado.** `min_score`, `max_score` y
-`mean_score` no miden calidad: explican por qué un F1 en un umbral fijo vale cero. Una cabeza cuya
-probabilidad más alta es 0,31 no se dispara nunca en 0,5, y sin esa línea el lector pensaría que el
-modelo no funciona. La regla vale para cualquier clasificador: **cuando publiques una métrica que
-depende de un umbral, publica también la distribución de lo que se umbraliza.**
+`min_score`, `max_score` y `mean_score` no miden calidad: explican por qué un F1 en umbral fijo vale
+cero. Una cabeza cuya probabilidad más alta es 0,31 no se dispara nunca en 0,5, y sin esa línea el
+lector pensaría que el modelo no funciona. Vale para cualquier clasificador: **cuando publiques una
+métrica que depende de un umbral, publica también la distribución de lo que se umbraliza.**
 
-`base_rate` en el mismo registro que `average_precision` no es redundante: la precisión media se lee
-**contra la tasa base** —un orden aleatorio saca exactamente la tasa base— y publicar una sin la otra
-es publicar un número sin su referencia.
+`base_rate` va junto a `average_precision` porque la precisión media se lee contra ella: un orden
+aleatorio saca la tasa base.
 
 ```python title="src/rukh/eval/encoder.py"
 class CorrelationResult(BaseModel):
@@ -340,12 +323,9 @@ class CurvePoint(BaseModel):
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="188-210" />
 
-`target` es un **campo del resultado**: el informe imprime contra qué se correlacionó, porque aquí la
-diferencia entre `cp` y `tanh(cp/400)` cambia el resultado por completo.
-
-Los `float | None` en vez de `nan` son deliberados: una correlación indefinida —una de las dos series
-constante— es `None`, que en JSON es `null` y se distingue de un cero. Un `nan` en JSON no es válido
-y algunos lectores lo convierten en cero sin avisar.
+`target` guarda contra qué se correlacionó, porque aquí la diferencia entre `cp` y `tanh(cp/400)`
+cambia el resultado por completo. Una correlación indefinida (una serie constante) es `None`, que en
+JSON es `null`; un `nan` no es JSON válido y algunos lectores lo convierten en cero sin avisar.
 
 ```python title="src/rukh/eval/encoder.py"
 class EncoderResult(BaseModel):
@@ -390,21 +370,16 @@ class EncoderResult(BaseModel):
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="213-250" />
 
-Esta clase es **el catálogo de todo lo que el módulo se compromete a publicar**. Tres campos la hacen
-honesta.
+Esta clase es **el catálogo de todo lo que el módulo se compromete a publicar**. Tres campos la
+hacen honesta:
 
-`model_sha` es el SHA-256 del fichero de pesos: ata cada fila de la tabla a un checkpoint concreto y
-no a «el mejor de esa carpeta», así que publicar un checkpoint con las métricas de otro deja de ser
-posible sin que se note.
-
-`tune_f1` es **el número optimista guardado a propósito** al lado del honesto: el F1 que el umbral
-alcanza en la mitad donde se eligió. Publicarlo permite ver cuánto cuesta elegir un punto de
-operación.
-
-`threshold_split_degenerate` sirve para decir «esta vez no pude hacerlo bien». Si el reparto por
-partida no consigue dejar errores en las dos mitades, el umbral se elige y se mide en las mismas
-filas, y el informe lo dice. Un booleano que admite una limitación vale más que un número sin
-asterisco.
+- `model_sha`, el SHA-256 de los pesos, ata cada fila a un checkpoint concreto: publicar uno con las
+  métricas de otro ya no pasa desapercibido.
+- `tune_f1` guarda a propósito el número optimista, el F1 en la mitad donde se eligió el umbral, al
+  lado del honesto. La distancia entre los dos es lo que cuesta elegir un punto de operación.
+- `threshold_split_degenerate` dice «esta vez no pude hacerlo bien»: si el reparto por partida no
+  deja errores en las dos mitades, el umbral se elige y se mide en las mismas filas, y el informe lo
+  avisa.
 
 ```python title="src/rukh/eval/encoder.py"
     encoder_blunder: ClassificationResult | None = None
@@ -433,16 +408,11 @@ asterisco.
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="251-272" />
 
-Tres booleanos de criterio —`meets_goal`, `value_correlation_meets_goal`, `meets_all_goals`— y no
-uno. En este hito el primero es `True`, el segundo `False` y el tercero `False`. Con un solo booleano,
-«el hito no se cumple» habría escondido que la detección de errores sí lo hace.
-
-Los tres son `bool | None` y no `bool`, y ese tercer estado es «no medido». Un criterio que no se
-pudo medir no es un criterio incumplido, y `None` es lo que permite que el informe escriba «not
-measured» en vez de «no».
-
-`config: dict[str, Any]` guarda la configuración entera dentro del resultado. Con eso, un
-`results.json` de hace seis meses dice con qué umbral, con qué semilla y sobre qué tabla se midió.
+Hay tres booleanos de criterio porque en este hito el primero es `True` y los otros dos `False`: con
+uno solo, «el hito no se cumple» habría escondido que la detección de errores sí cumple. Son
+`bool | None` porque un criterio que no se pudo medir no es un criterio incumplido, y el informe
+escribe «not measured» en vez de «no». Y `config` guarda la configuración entera: un `results.json`
+de hace seis meses sigue diciendo con qué umbral, semilla y tabla se midió.
 
 ## De dónde salen las filas
 
@@ -461,9 +431,8 @@ def load_encoder_suite(config: Path | None = None) -> EncoderEvalConfig:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="275-284" />
 
-`paths.package_root()` y no `paths.root()`, y esa es la distinción que M0 dejó preparada: la
-configuración de la suite es **código**, vive en el árbol de fuentes, y no se mueve con `RUKH_HOME`.
-Los datos sí.
+`paths.package_root()` en vez de `paths.root()`: la configuración de la suite es código, vive en el
+árbol de fuentes y no se mueve con `RUKH_HOME`, como sí hacen los datos.
 
 ```python title="src/rukh/eval/encoder.py"
 def build_items(cfg: EncoderEvalConfig, source: pl.DataFrame | None = None) -> pl.DataFrame:
@@ -489,17 +458,11 @@ def build_items(cfg: EncoderEvalConfig, source: pl.DataFrame | None = None) -> p
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="526-544" />
 
-El mismo auto-join desplazado de la lección 6, esta vez para traer el **FEN** anterior en vez de su
-puntuación. La heurística lo necesita porque juzga una jugada volviéndola a jugar en un tablero, y
-para eso hace falta la posición de partida.
-
-La última frase del docstring cierra el círculo: exactamente las filas con predecesor tienen
-etiqueta. Como el `left join` es el mismo en los dos sitios, las filas que el modelo puede puntuar y
-las que el baseline puede juzgar son **el mismo conjunto**, por construcción.
-
-El `.sort(["order", "game_id", "ply"])` antes del `head` es lo que hace que «las primeras 10 000
-filas» sea una muestra reproducible y no «las que polars devolviera hoy». Es el mismo CRC-32 de la
-curva: un orden barajado de forma determinista.
+Es el auto-join desplazado de la lección 6, esta vez para traer el FEN anterior: la heurística juzga
+una jugada volviéndola a jugar, y necesita la posición de partida. Como el `left join` es el mismo
+que construyó la etiqueta, las filas que el modelo puede puntuar y las que el baseline puede juzgar
+son el mismo conjunto por construcción. El `.sort` antes del `head` hace que «las primeras 10 000
+filas» sea una muestra reproducible, con el mismo orden barajado por CRC-32 de la curva.
 
 ```python title="src/rukh/eval/encoder.py"
 def encoder_items(items: pl.DataFrame, model: Any, labels: LabelsConfig) -> list[list[int]]:
@@ -522,17 +485,12 @@ def encoder_items(items: pl.DataFrame, model: Any, labels: LabelsConfig) -> list
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="547-562" />
 
-**El esquema lo dice el modelo, no la configuración.** `model.encoder.cfg.input` sale del checkpoint,
-así que evaluar un encoder de jugadas con una configuración que menciona casillas no puede producir
-un número: produce los tokens correctos o falla al cargar.
-
-Y la evaluación **reutiliza el `LabelledPositions` del entrenamiento** en vez de tokenizar por su
-cuenta. Si tokenizara distinto, mediría un modelo alimentado con una entrada que nunca vio, y la
-diferencia sería pequeña, plausible y muy difícil de encontrar. Es el error clásico de evaluar un
-modelo de texto con un preprocesado distinto del que tuvo en el entrenamiento.
-
-Los dos `import` dentro de la función son la convención del proyecto para romper un ciclo:
-`rukh.train.heads` importa de `rukh.data.labels`, y `rukh.eval.encoder` importa de los dos.
+El esquema sale del checkpoint (`model.encoder.cfg.input`), no de la configuración: o produce los
+tokens correctos o falla al cargar. Y la evaluación **reutiliza el `LabelledPositions` del
+entrenamiento** en vez de tokenizar por su cuenta. Si tokenizara distinto, mediría el modelo con una
+entrada que nunca vio, y la diferencia sería pequeña, plausible y difícil de encontrar: el error
+clásico de evaluar un modelo de texto con un preprocesado distinto del de entrenamiento. Los
+`import` dentro de la función rompen un ciclo entre `rukh.train.heads` y `rukh.data.labels`.
 
 ```python title="src/rukh/eval/encoder.py"
 def predict(
@@ -571,18 +529,11 @@ def predict(
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="565-596" />
 
-Aquí es donde el logit se convierte en probabilidad: `torch.sigmoid(outputs["blunder"])`. La cabeza
-emite un logit por las razones numéricas de la lección 4, y la evaluación necesita una probabilidad
-porque el umbral y su barrido se definen ahí. Que la conversión esté en un sitio y no en cada
-métrica es lo que hace que el `min_score`/`max_score` del `RankingResult` esté en la misma escala que
-el umbral de la configuración.
-
-`.detach().float().cpu().numpy()` va en ese orden: `detach` saca del grafo, `float` convierte de
-`bf16` —que numpy no conoce— a `float32`, `cpu` trae los datos y `numpy` los comparte sin copiar.
-
-`collate` es **el del entrenamiento**, con los ítems sin etiquetas. Ese es el motivo por el que la
-lección 6 puso las etiquetas detrás de un `if key in items[0]`: una función de agrupación que sirve
-para las dos cosas es una función que no se puede desincronizar.
+Aquí el logit se convierte en probabilidad con `torch.sigmoid`, en un solo sitio, para que
+`min_score`/`max_score` y el umbral de la configuración estén en la misma escala. El `.float()` va
+antes de `.numpy()` porque numpy no conoce `bf16`. Y `collate` es el del entrenamiento, con ítems sin
+etiquetas: por eso la lección 6 las puso detrás de un `if key in items[0]`. Una sola función de
+agrupación no se puede desincronizar.
 
 ## El baseline y su caché
 
@@ -628,21 +579,16 @@ def heuristic_predictions(
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="599-635" />
 
-El comentario sobre la clave de la caché es lo que hay que leer aquí: **la entrada se indexa por la
-posición juzgada, no por `game_id:ply`.** Con `game_id:ply` como clave, la caché sería una promesa
-sobre una tabla concreta: si mañana se reconstruye `positions-eval.parquet` con otro muestreo, el <Term id="ply">ply</Term> 30 de la partida 1 713 puede ser otra posición, y heredaría el veredicto de la anterior sin que
-nada fallara. Con la posición como clave, dos tablas que comparten una posición comparten la
-respuesta —que es el ahorro que se quiere— y una posición distinta nunca puede heredar un veredicto
-viejo.
+Lo que hay que leer aquí es el comentario: **la entrada se indexa por la posición juzgada, no por
+`game_id:ply`.** Con `game_id:ply`, si mañana se reconstruye `positions-eval.parquet` con otro
+muestreo, el <Term id="ply">ply</Term> 30 de la partida 1 713 puede ser otra posición y heredaría el
+veredicto viejo sin que nada fallara. Con la posición como clave, dos tablas que la comparten
+comparten la respuesta, que es el ahorro buscado. Es la diferencia entre archivar una ficha por su
+contenido o por el número de estantería: si reordenas la biblioteca, el número apunta a otro libro.
 
-El `fen_before` está en la clave porque **`fen` más `last_move` no recuperan la pieza capturada**. Si la jugada fue una captura, la pieza comida ya no está en el
-tablero resultante y no hay forma de saber cuál era. Y todo el juicio del baseline es la
-diferencia de material entre el antes y el después. Sin `fen_before` en la clave, dos jugadas
-distintas que llevan al mismo tablero compartirían un veredicto que solo vale para una.
-
-El `nan` para las filas sin predecesor es la otra mitad del «las dos partes se saltan las mismas
-filas»: la etiqueta es nula y la predicción del baseline también, así que la máscara de filas
-puntuables sale de la intersección de las dos.
+`fen_before` entra en la clave porque `fen` más `last_move` no recuperan la pieza capturada, y el
+juicio del baseline es justo la diferencia de material. El `nan` de las filas sin predecesor iguala
+a su etiqueta nula, así que las dos partes se saltan las mismas filas.
 
 ```python title="src/rukh/eval/encoder.py"
 def _heuristic_cache(cfg: EncoderEvalConfig, use_cache: bool) -> EvalCache:
@@ -664,9 +610,8 @@ def _heuristic_cache(cfg: EncoderEvalConfig, use_cache: bool) -> EvalCache:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="890-904" />
 
-«There is deliberately no cache for the model's own predictions» es el tipo de frase que hay que
-escribir, porque la ausencia de una optimización obvia parece un olvido: lo caro es la heurística y
-lo barato es la pasada hacia delante, que además cambia con cada checkpoint.
+«There is deliberately no cache for the model's own predictions» es el tipo de frase que conviene
+escribir, porque la ausencia de una optimización obvia parece un olvido.
 
 ## La curva, leída del checkpoint
 
@@ -706,19 +651,15 @@ def label_curve_points(payload: dict[str, Any]) -> list[CurvePoint]:
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="638-668" />
 
-«Nothing is invented when they are absent»: un checkpoint sin curva produce una lista vacía y una
-nota en el informe que dice cómo generarla. La alternativa —rellenar con ceros o con la métrica del
-100 % repetida— sería una tabla llena que miente.
-
-Las comprobaciones de tipo (`isinstance(found, list)`, `"fraction" not in entry`) no son paranoia: el
-payload de un checkpoint es un diccionario que alguien escribió con `torch.save`, no un modelo
-validado, y puede venir de una versión anterior del código. **Lo que se lee de un fichero se trata
-como dato no fiable.**
+Un checkpoint sin curva produce una lista vacía y una nota que dice cómo generarla, no una tabla
+rellena con ceros que miente. Las comprobaciones de tipo están porque el payload es un diccionario
+escrito con `torch.save`, quizá por una versión anterior del código: **lo que se lee de un fichero
+se trata como dato no fiable**.
 
 ## La fila del encoder en la tabla única
 
-El módulo tuvo que decidir cómo meter un modelo que no juega en la tabla de resultados que M2
-construyó para modelos que juegan. La respuesta está en `eval/report.py`.
+¿Cómo se mete un modelo que no juega en la tabla que M2 construyó para modelos que juegan? La
+respuesta está en `eval/report.py`.
 
 ```python title="src/rukh/eval/report.py"
 class EncoderWebRow(BaseModel):
@@ -770,14 +711,10 @@ TableRow = WebRow | EncoderWebRow
 
 <Src file="src/rukh/eval/report.py" tag="p3" lines="62-106" />
 
-**Dos esquemas y una tabla**, en vez de un esquema con el doble de columnas medio vacías. Un encoder
-no tiene legalidad, ni Elo, ni puzles, y un decoder no tiene F1 de errores; forzarlos a un esquema
-común llenaría la tabla de columnas que son `null` **por construcción**, indistinguibles después de
-las que son `null` por falta de medida.
-
-El campo `kind` con `Literal["encoder"]` y valor por defecto convierte la unión en una **unión
-discriminada**: una fila con `kind: "encoder"` es del encoder, y una sin `kind` es del decoder, que es
-lo que son todas las filas escritas antes de M3. La compatibilidad hacia atrás sale gratis.
+**Dos esquemas y una tabla.** Forzar encoder y decoder a un esquema común llenaría la tabla de
+columnas `null` por construcción, indistinguibles luego de las que son `null` por falta de medida.
+El campo `kind` convierte la unión en una unión discriminada: una fila sin `kind` es del decoder,
+como todas las escritas antes de M3, así que la compatibilidad hacia atrás sale gratis.
 
 ```python title="src/rukh/eval/report.py"
 def encoder_row_of(result: EncoderResult) -> EncoderWebRow:
@@ -811,10 +748,9 @@ def encoder_row_of(result: EncoderResult) -> EncoderWebRow:
 
 <Src file="src/rukh/eval/report.py" tag="p3" lines="140-166" />
 
-Una proyección del resultado completo a la fila que ve la web. Lo que decide qué entra es una
-pregunta: ¿se puede leer esta cifra sin el informe al lado? Por eso van juntos el F1 ajustado, el
-fijo, el umbral, el del baseline y **la tasa base**: sin ella, ni el ROC AUC ni la precisión
-media significan nada.
+Qué entra en la fila de la web lo decide una pregunta: ¿se puede leer esta cifra sin el informe al
+lado? Por eso van juntos los dos F1, el umbral, el baseline y la tasa base, sin la cual la precisión
+media no significa nada.
 
 ```python title="src/rukh/eval/report.py"
 def write_report_files(
@@ -848,9 +784,9 @@ def write_report_files(
 
 <Src file="src/rukh/eval/report.py" tag="p3" lines="359-385" />
 
-El refactor de la lección 2 en otro sitio: lo que las dos suites hacen igual se saca a una función y
-`write_report` de M2 pasa a llamarla. El `newline="\n"` es la precaución de Windows: sin él, Python
-traduce los saltos de línea a `\r\n` y los ficheros dejarían de ser comparables entre máquinas.
+El refactor de la lección 2 en otro sitio: lo que las dos suites hacen igual va a una función, y
+`write_report` de M2 la llama. `newline="\n"` evita que Windows escriba `\r\n` y los ficheros dejen
+de ser comparables entre máquinas.
 
 ## La configuración de la suite
 
@@ -889,24 +825,16 @@ track: true
 
 <Src file="configs/eval/encoder.yaml" tag="p3" lines="1-29" />
 
-El comentario más largo del fichero explica un `0.5`: es el valor que la lección 8 desmonta, y dejar
-escrito **en el fichero** por qué se publica al lado del ajustado y nunca como titular impide que
-alguien lo lea como el número bueno.
-
-El bloque `labels` repite la configuración del entrenamiento porque tiene que ser **la misma**: la
-semilla 42, la fracción de validación 0,1 y los 100 centipeones que definen un error. Si el
-entrenamiento hubiera usado 150 y la evaluación 100, el modelo se estaría midiendo contra una
-definición de «error» que nunca vio.
-
-`split: val` con el comentario «never `train` for a published number» es la regla de una línea que
-más veces se rompe en un proyecto que va con prisa.
+El comentario más largo explica un `0.5`, el valor que la lección 8 desmonta: dejar escrito en el
+fichero por qué nunca es el titular evita que alguien lo lea como el número bueno. El bloque `labels`
+repite el del entrenamiento porque tiene que ser el mismo. Y `split: val`, «never `train` for a
+published number», es la regla de una línea que más se rompe en un proyecto con prisa.
 
 ## La orden
 
-`rukh eval` pasa por lo mismo que `rukh train` en la lección 5: era un comando suelto,
-`@app.command("eval")`, y para colgarle `rukh eval encoder` se convierte en un grupo. Su `Typer` va
-justo debajo del de `train_app`, también con `invoke_without_command=True` para que el decoder siga
-evaluándose sin subcomando:
+`rukh eval` pasa por lo mismo que `rukh train` en la lección 5: se convierte en un grupo, debajo de
+`train_app` y también con `invoke_without_command=True` para que el decoder siga evaluándose sin
+subcomando:
 
 ```python title="src/rukh/cli.py"
 eval_app = typer.Typer(
@@ -918,10 +846,9 @@ app.add_typer(eval_app, name="eval")
 
 <Src file="src/rukh/cli.py" tag="p3" lines="35-39" />
 
-Y el comando del decoder pasa a ser el callback del grupo, con los tres cambios del de `train`: el
-`ctx` para salir en cuanto hay subcomando, `--model` con `None` por defecto para que el grupo no la
-exija a `rukh eval encoder`, y la comprobación a mano de que, sin subcomando, `--model` está puesta. Es la cabeza
-de la función; de la línea `if suite not in SUITES:` hacia abajo, el cuerpo es el de M2 sin cambios:
+El comando del decoder pasa a ser el callback, con los cambios del de `train`: salir si hay
+subcomando, `--model` opcional y comprobado a mano. Es la cabeza de la función; de
+`if suite not in SUITES:` hacia abajo, el cuerpo es el de M2:
 
 ```python title="src/rukh/cli.py"
 @eval_app.callback(invoke_without_command=True)
@@ -1016,12 +943,9 @@ def eval_encoder_cmd(
 
 <Src file="src/rukh/cli.py" tag="p3" lines="629-669" />
 
-`--config` es **opcional** aquí y obligatorio en las órdenes de entrenamiento, y la diferencia tiene
-sentido: la suite trae una configuración empaquetada que es la buena, y pasar otra es la excepción.
-En un entrenamiento no hay «la buena».
-
-`--no-cache` recalcula los veredictos del baseline, que es lo que hay que hacer después de tocar
-`heuristic.py` si no se ha subido la versión de `HEURISTIC_KEY`.
+`--config` es opcional aquí, y obligatorio al entrenar, porque la suite trae empaquetada la
+configuración buena; en un entrenamiento no hay «la buena». `--no-cache` es lo que toca si cambias
+`heuristic.py` sin subir la versión de `HEURISTIC_KEY`.
 
 ```python title="src/rukh/cli.py"
     typer.echo(f"stage:    {result.stage} ({result.params:,} parameters)")
@@ -1058,12 +982,9 @@ En un entrenamiento no hay «la buena».
 
 <Src file="src/rukh/cli.py" tag="p3" lines="670-699" />
 
-La línea del `ranking` imprime **lo que sacaría una moneda** al lado de las dos cifras: `0.5000` para
-el ROC AUC y la tasa base para la precisión media. Un 0,112 de precisión media parece un desastre
-hasta que al lado pone que el azar saca 0,0370.
-
-Y la línea del `split` imprime las dos mitades con sus filas **y sus partidas**. Que las partidas
-aparezcan es lo que hace comprobable de un vistazo que el reparto se hizo por partida y no por fila.
+La línea del `ranking` imprime **lo que sacaría una moneda** al lado de las dos cifras: un 0,112 de
+precisión media parece un desastre hasta que al lado pone que el azar saca 0,0370. La del `split`
+imprime las partidas de cada mitad, para comprobar de un vistazo que el reparto fue por partida.
 
 ```python title="src/rukh/cli.py"
     if result.f1_margin is not None:
@@ -1094,10 +1015,9 @@ aparezcan es lo que hace comprobable de un vistazo que el reparto se hizo por pa
 
 <Src file="src/rukh/cli.py" tag="p3" lines="700-723" />
 
-**Las notas se imprimen en el terminal, no solo en el informe.** Dicen dónde se eligió el umbral,
-que el baseline no tuvo ninguno que ajustar, que la exactitud no significa nada con esta tasa base y
-que los dos detectores no ven lo mismo. Ponerlas donde las va a leer quien ejecuta la orden, y no
-solo en un fichero que abrirá otro, es una decisión de producto.
+Las notas (dónde se eligió el umbral, que el baseline no ajustó nada, que la exactitud no significa
+nada con esta tasa base) se imprimen también en el terminal: donde las lee quien ejecuta la orden,
+no solo en un fichero que abrirá otro.
 
 <Callout kind="ejecuta" title="El grupo `eval`, antes de evaluar nada">
   Como con `train`, la ayuda no ejecuta el cuerpo de los comandos, así que la forma de la orden se
@@ -1152,13 +1072,9 @@ def run_encoder_suite(
 
 <Src file="src/rukh/eval/encoder.py" tag="p3" lines="1166-1195" />
 
-Las dos últimas funciones del fichero; la de abajo es la que la CLI llama: medir, registrar,
-escribir. `track_result` va **antes** del informe porque devuelve el identificador de la ejecución de
-MLflow, que entra en el informe y en la fila de la tabla.
-
-`json.loads(result.model_dump_json())` en vez de `result.model_dump()` no es un rodeo: el volcado a
-JSON de pydantic convierte tipos que `json.dumps` no sabe serializar, y volverlo a cargar da un
-diccionario con solo tipos básicos, tal como quedará en el fichero.
+La CLI llama a `run_encoder_suite`: medir, registrar, escribir. `track_result` va antes del informe
+porque devuelve el id de MLflow que entra en él. `json.loads(result.model_dump_json())` deja un
+diccionario de tipos básicos, tal como quedará en el fichero, que `json.dumps` sabe serializar.
 
 ```python title="src/rukh/eval/__init__.py"
 from rukh.eval.encoder import (
@@ -1195,10 +1111,9 @@ from rukh.eval.report import (
 
 <Src file="src/rukh/eval/__init__.py" tag="p3" lines="52-62" />
 
-`EncoderWebRow` y `encoder_row_of` salen aquí porque cualquiera que lea la tabla de resultados
-necesita el esquema de la fila del encoder, no solo el de la del decoder. Y `pearson`, `spearman` y
-`ranks` están en la superficie pública del paquete: son utilidades de medida escritas a mano que
-cualquier otra parte puede usar.
+`EncoderWebRow` y `encoder_row_of` se exportan porque quien lea la tabla necesita el esquema de las
+dos filas; `pearson`, `spearman` y `ranks`, porque son utilidades de medida que otras partes pueden
+usar.
 
 ```python title="src/rukh/eval/__init__.py"
     "file_sha",
@@ -1253,9 +1168,8 @@ no hay problema, porque la clave sigue apuntando a la misma posición. Es el cas
 peligro no es el tamaño de la muestra sino la **reasignación** de los identificadores.
 
 La peor es la primera, porque el síntoma es un baseline que cambia sin que nadie haya tocado la
-heurística, y lo primero que se piensa es que el modelo mejoró.
-Con la posición como clave, ese fallo es imposible por construcción, y el precio es una clave más
-larga.
+heurística, y lo primero que se piensa es que el modelo mejoró. Con la posición como clave, ese
+fallo es imposible por construcción, a cambio de una clave más larga.
 
 </Solution>
 </Exercise>
@@ -1264,16 +1178,15 @@ larga.
 
 Una suite de evaluación es sobre todo un **catálogo de lo que te comprometes a publicar**, y los
 campos que la hacen honesta son los que casi nadie guarda: el rango de las probabilidades, el número
-optimista al lado del honesto, la tasa base junto a cada métrica que depende de ella, y un booleano
+optimista al lado del honesto, la tasa base junto a cada métrica que depende de ella y un booleano
 que admite cuándo la medida no se pudo hacer bien.
 
-Y dos reglas de ingeniería que se transfieren: una caché se indexa por **aquello de lo que el
-resultado es función**, nunca por un identificador de fila que puede reasignarse (en un RAG, la
-caché de embeddings se indexa por el hash del texto, no por la posición del fragmento); y dos cosas
-que miden fenómenos distintos van en dos esquemas con una clave común, no en uno con el doble de
-columnas nulas.
+De ingeniería te llevas dos reglas. Una caché se indexa por aquello de lo que el resultado es
+función, nunca por un identificador de fila que puede reasignarse: en un RAG, la caché de embeddings
+va por el hash del texto, no por la posición del fragmento. Y dos cosas que miden fenómenos
+distintos van en dos esquemas con una clave común.
 
-**Cómo se mide**: `uv run rukh eval encoder --model <checkpoint> --stage encoder` escribe
+Cómo se mide: `uv run rukh eval encoder --model <checkpoint> --stage encoder` escribe
 `artifacts/eval/encoder/report.md`, `results.json` y una fila en `artifacts/web/results.json`, e
 imprime las notas en el terminal. Se puede ejecutar cuando la lección siguiente complete
 `encoder.py` y escriba `heuristic.py`: hasta entonces el paquete `rukh.eval` no se importa, porque

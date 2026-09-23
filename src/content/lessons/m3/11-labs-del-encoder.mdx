@@ -7,7 +7,7 @@ description:
   millones que se publicó y la barra de evaluación en vivo.'
 module: m3
 order: 11
-duration: 110
+duration: 95
 runtime: 90
 level: base
 status: vigente
@@ -60,35 +60,30 @@ cd ../rukh-main && uv sync --extra cpu
 RUKH_HOME=<ruta-a-tu-repo> uv run rukh pull --module m3
 ```
 
-Los checkpoints bajados llegan con nombre estable, sin fecha (`checkpoints/encoder-mmm-v4/best.pt`,
-`checkpoints/encoder-heads-v4/step-4000.pt`). El `data/tokens/uci/` no se publica: sale de
-`uv run rukh data tokenize` sobre `data/uci/`, como en M1. El encoder de 15 millones de los labs 1 a
-3b se entrena siempre en local: son quince minutos y la comparación entre los dos es parte de lo
-que se aprende. Lo que entrenas tú cae en una carpeta con fecha
-(`checkpoints/encoder-mmm-20260919-093554/` en la tirada de referencia), y ninguna orden de `p3`
-resuelve el nombre sin ella.
+Los checkpoints bajados llegan con nombre estable (`checkpoints/encoder-mmm-v4/best.pt`,
+`checkpoints/encoder-heads-v4/step-4000.pt`). `data/tokens/uci/` no se publica: sale de
+`uv run rukh data tokenize` sobre `data/uci/`, como en M1. El encoder de 15 millones de los labs 1
+a 3b se entrena siempre en local (son quince minutos), y lo que entrenas tú cae en una carpeta con
+fecha (`checkpoints/encoder-mmm-20260919-093554/` en la tirada de referencia).
 
 </Callout>
 
-Al terminar tendrás el encoder preentrenado, las tres cabezas afinadas en los tres modos, la curva
-por número de etiquetas, la comparación contra la heurística, el modelo exportado y los datos de la
-isla de esta página. Los comandos se ejecutan desde la raíz del repo `rukh`. Los directorios de las
-tiradas llevan una marca de tiempo; en los comandos se escribe `<fecha>`, y en los tuyos va la de tu
-tirada (`ls -td checkpoints/encoder-mmm-*/ | head -1` te da la última). Debajo de cada comando va la
-salida real de la tirada de referencia.
+Al terminar tendrás el encoder preentrenado, las cabezas afinadas en los tres modos, la curva por
+número de etiquetas, la comparación contra la heurística, el modelo exportado y los datos de la isla
+de esta página. Los comandos se ejecutan desde la raíz del repo `rukh`; donde pone `<fecha>` va la
+de tu tirada (`ls -td checkpoints/encoder-mmm-*/ | head -1` te da la última). Debajo de cada comando
+va la salida real de la tirada de referencia.
 
 <LabRoutes lesson="m3/11-labs-del-encoder" />
 
-Los labs son dos scripts de `labs/m3/`, que se ejecutan desde la raíz del repositorio:
-`bidirectional.py` no necesita ni checkpoint ni datos, porque construye su propio encoder de
-juguete, y `value_bar_export.py` necesita un checkpoint de las cabezas y Stockfish, y escribe
+De los dos scripts de `labs/m3/`, `bidirectional.py` construye su propio encoder de juguete y no
+necesita nada; `value_bar_export.py` necesita un checkpoint de las cabezas y Stockfish, y escribe
 `artifacts/web/value-bar.json`, que llega a este sitio con `pnpm sync:data`.
 
 ### Lab 1 · El encoder bidireccional y el enmascarado
 
 Primero, demuestra que el modelo es lo que dices que es. En M2 exigías que cambiar un token futuro
-**no** moviera los logits pasados; aquí se exige lo contrario. El script es
-**`labs/m3/bidirectional.py`**:
+no moviera los logits pasados; aquí se exige lo contrario. El script es `labs/m3/bidirectional.py`:
 
 ```python title="labs/m3/bidirectional.py"
 """Show that the encoder is not causal, and that the masking recipe does what it claims."""
@@ -162,11 +157,10 @@ selected 14.910% of the tokens (target 15 %)
   <mask> 80.6%  kept 9.9%  random 9.5%
 ```
 
-Las tres comprobaciones salen como tienen que salir. Cambiar el **último** token mueve el estado
-oculto del **primero** en 0,24, un número que en el decoder de M2 sería 0,000000. El relleno no
-contamina: la diferencia entre la secuencia rellena y la justa es 1e-6, ruido numérico. Y el sorteo,
-contado en vez de creído, selecciona el 14,91 % de los tokens con un reparto 80,6 / 9,9 / 9,5 (el
-`kept` es una cota superior del 10 % real, como se explicó en la lección 5).
+Cambiar el último token mueve el estado oculto del primero en 0,24, un número que en el decoder de
+M2 sería 0,000000. El relleno no contamina (1e-6 es ruido numérico). Y el sorteo, contado en vez de
+creído, selecciona el 14,91 % de los tokens con un reparto 80,6 / 9,9 / 9,5 (el `kept` es una cota
+superior del 10 % real, lección 5).
 
 <Callout kind="ejecuta" title="Una tirada de humo antes de los dieciséis minutos">
   El preentrenamiento necesita GPU y `data/tokens/uci/` de M1. Antes de comprometer la tarjeta,
@@ -176,11 +170,11 @@ contado en vez de creído, selecciona el 14,91 % de los tokens con un reparto 80
 uv run rukh train encoder --config configs/train/encoder-mmm.yaml --max-steps 20
 ```
 
-La primera parte se va en `torch.compile`, que compila con un paso de prueba antes del bucle. El
-último paso siempre evalúa y guarda, así que tiene que acabar con una línea `step 20  val/loss …
-val/top1 …`, el resumen `input: moves` / `masking: 15% at 80%/10%/10%` / `steps: 20` y un
-`checkpoint:` dentro de una carpeta `checkpoints/encoder-mmm-<fecha>/` nueva. Si falla al abrir el
-pack, el problema es `tokens_dir` y no el modelo. Esa carpeta de humo se puede borrar después.
+La primera parte se va en `torch.compile`. El último paso siempre evalúa y guarda, así que tiene que
+acabar con una línea `step 20  val/loss … val/top1 …`, el resumen `input: moves` /
+`masking: 15% at 80%/10%/10%` / `steps: 20` y un `checkpoint:` en una carpeta
+`checkpoints/encoder-mmm-<fecha>/` nueva, que luego puedes borrar. Si falla al abrir el pack, el
+problema es `tokens_dir` y no el modelo.
 
 </Callout>
 
@@ -192,8 +186,8 @@ que come el decoder:
 uv run rukh train encoder --config configs/train/encoder-mmm.yaml
 ```
 
-Salida real de la ejecución de referencia (RTX 5090, 2026-09-19). Son las últimas seis evaluaciones
-de validación de las doce mil de la tirada, que tardó **dieciséis minutos**:
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19), las últimas seis evaluaciones de
+una tirada de dieciséis minutos:
 
 ```text
 step  9500  val/loss 1.0621  val/top1 0.7396
@@ -209,18 +203,14 @@ steps:      12000
 checkpoint: checkpoints/encoder-mmm-20260919-093554/step-12000.pt
 ```
 
-**75,2 % de acierto en las jugadas tapadas.** Tres de cada cuatro huecos se rellenan bien, y esa
-cifra no es comparable con el 51,1 % de top-1 del decoder de M2 aunque las dos se llamen «acierto».
-El decoder adivina el futuro: ve la partida hasta el <Term id="ply">ply</Term> _n_ y elige el _n+1_
-entre treinta jugadas legales, muchas razonables, sin una respuesta correcta. El encoder rellena un
-hueco con la partida entera alrededor, y lo que vino después restringe mucho lo que pudo haber
-pasado: si en el ply _n+2_ hay una torre en d1, la jugada tapada era seguramente la que la puso ahí.
-Es la diferencia entre escribir la siguiente palabra de una frase y rellenar un hueco en una frase
-ya escrita.
-
-La pérdida sigue bajando en el paso 12 000 —de 1,0621 a 1,0032 en los últimos 2 500 pasos—, así que
-el preentrenamiento no ha terminado de exprimirse: dieciséis minutos es el presupuesto del módulo,
-no un techo.
+**75,2 % de acierto en las jugadas tapadas**, que no se compara con el 51,1 % de top-1 del decoder de
+M2 aunque las dos se llamen «acierto». El decoder ve la partida hasta el <Term id="ply">ply</Term>
+_n_ y elige el _n+1_ entre treinta jugadas legales, muchas razonables. El encoder rellena un hueco
+con la partida entera alrededor, y lo que vino después restringe mucho lo que pudo pasar: si en el
+ply _n+2_ hay una torre en d1, la jugada tapada era seguramente la que la puso ahí. Es la diferencia
+entre escribir la siguiente palabra de una frase y rellenar un hueco en una frase ya escrita. La
+pérdida sigue bajando en el paso 12 000, así que dieciséis minutos es el presupuesto del módulo, no
+un techo.
 
 <Exercise n="01" title="¿Por qué la validación del MLM se reinicia la semilla en cada evaluación?">
   Mira `evaluate_mmm` en `src/rukh/train/mmm.py`: antes de recorrer los lotes de validación crea un
@@ -228,37 +218,30 @@ no un techo.
   pasaría si no lo hiciera, y por qué eso hace que dos tiradas distintas se puedan comparar.
 
   <Solution>
-    Si la validación usara el generador del entrenamiento, cada evaluación taparía posiciones
-    distintas, porque el generador ha avanzado. La pérdida de validación del paso 500 y la del paso
-    1 000 se estarían calculando sobre dos tareas diferentes: una podría haber tapado jugadas fáciles
-    (recapturas forzadas, enroques) y la otra difíciles, y la curva mezclaría la mejora del modelo
-    con la dificultad del sorteo. Con la semilla reiniciada, **todas** las evaluaciones de la tirada
-    tapan exactamente las mismas posiciones, así que la curva mide una sola cosa.
+    Con el generador del entrenamiento, que ha avanzado, cada evaluación taparía posiciones
+    distintas: el paso 500 podría haber tapado recapturas forzadas y el 1 000 jugadas difíciles, y la
+    curva mezclaría la mejora del modelo con la dificultad del sorteo. Con la semilla reiniciada,
+    todas las evaluaciones tapan las mismas posiciones y la curva mide una sola cosa.
 
-    El beneficio se extiende entre tiradas: como la semilla está en la configuración y no depende del
-    estado del proceso, la evaluación de otra tirada con la misma `masking.seed` usa el mismo
-    conjunto de huecos. Comparar dos preentrenamientos deja de tener el asterisco de "sobre tareas
-    distintas". Es la misma idea que fijar el conjunto de validación: la tarea de evaluación es
-    parte del instrumento de medida, y un instrumento que cambia entre medidas no mide.
+    Y como la semilla está en la configuración, otra tirada con la misma `masking.seed` usa los
+    mismos huecos, así que dos preentrenamientos se comparan sobre la misma tarea. La tarea de
+    evaluación es parte del instrumento de medida, y un instrumento que cambia entre medidas no mide.
 
   </Solution>
 </Exercise>
 
 ### La tabla supervisada, antes de afinar nada
 
-Las «438 093 posiciones etiquetadas» de los labs que vienen salen de `positions-eval.parquet` con
-las decisiones de `src/rukh/data/labels.py` (lección 6): el valor acotado con `tanh(score / 400)`
-desde el lado de las blancas; la etiqueta de error medida desde el lado del que movió, y `null`
-—nunca `0`— cuando falta la posición anterior; y el reparto por `game_id`, como función pura del id y
-de la semilla. La tabla se construye en memoria al arrancar cada afinado, así que no hay una orden
-aparte para ella.
+Las 438 093 posiciones etiquetadas de los labs que vienen salen de `positions-eval.parquet` con las
+reglas de `src/rukh/data/labels.py` (lección 6): valor `tanh(score / 400)` desde las blancas, error
+medido desde el lado del que movió (`null`, nunca `0`, si falta la posición anterior) y reparto por
+`game_id`. La tabla se construye en memoria al arrancar cada afinado; no hay orden aparte.
 
 ### Lab 2 · Las tres cabezas con el tronco congelado
 
-Ahora el probe. Cuatro mil pasos, lotes de 128 prefijos (`encoder-heads-moves.yaml`), tasa de
-aprendizaje `1e-3` —mucho más alta que la del preentrenamiento, porque solo se mueven tres capas
-lineales— y el encoder congelado y en modo `eval` (`freeze_encoder` y `set_training_mode`, lección
-6).
+Ahora el probe: cuatro mil pasos, lotes de 128 prefijos, tasa de aprendizaje `1e-3` (mucho más alta
+que en el preentrenamiento, porque solo se mueven tres capas lineales) y el encoder congelado y en
+modo `eval` (lección 6).
 
 <Callout kind="ejecuta" title="Apunta las cabezas a tu preentrenamiento">
   `configs/train/encoder-heads-moves.yaml` trae en `encoder_ckpt` la carpeta con fecha de la tirada
@@ -271,11 +254,10 @@ ls -td checkpoints/encoder-mmm-*/ | head -1
 uv run rukh train heads --config configs/train/encoder-heads-moves.yaml --mode probe --max-steps 50
 ```
 
-La primera orden da la carpeta más reciente; si es la de la tirada de humo, usa la anterior, la de
-doce mil pasos. La segunda tiene que imprimir `mode:       probe`, las siete métricas `val/…` y un
-checkpoint en `checkpoints/encoder-heads-moves-<fecha>/`. Si se queja de que el checkpoint se
-entrenó en otro esquema, `encoder_ckpt` apunta a algo que no es el preentrenamiento de jugadas; si
-dice que no encuentra el fichero, la ruta sigue siendo la de referencia.
+La primera orden da la carpeta más reciente (si es la de humo, usa la anterior). La segunda tiene
+que imprimir `mode:       probe`, las siete métricas `val/…` y un checkpoint en
+`checkpoints/encoder-heads-moves-<fecha>/`. Si se queja del esquema, `encoder_ckpt` no apunta al
+preentrenamiento de jugadas; si no encuentra el fichero, sigue siendo la ruta de referencia.
 
 </Callout>
 
@@ -283,8 +265,8 @@ dice que no encuentra el fichero, la ruta sigue siendo la de referencia.
 uv run rukh train heads --config configs/train/encoder-heads-moves.yaml --mode probe
 ```
 
-Salida real de la ejecución de referencia (RTX 5090, 2026-09-19), sobre las **438 093 posiciones
-etiquetadas** de la tabla supervisada, con el 10 % de validación repartido por partida:
+Salida real de la ejecución de referencia (RTX 5090, 2026-09-19), con el 10 % de validación
+repartido por partida:
 
 ```text
 mode:       probe
@@ -298,19 +280,17 @@ mode:       probe
     val/result_acc       0.4586
 ```
 
-La salida imprime, por cabeza, la pérdida de validación y una métrica legible: `val/value_mae` (el
-error absoluto medio del valor en la escala acotada; 0,1 son unos 40 centipeones en la zona central),
-`val/blunder_acc` y `val/result_acc`.
+Por cabeza salen la pérdida y una métrica legible; `val/value_mae` es el error absoluto medio en la
+escala acotada (0,1 son unos 40 centipeones en la zona central).
 
 Antes de ejecutarlo, escribe qué esperas: la mitad del valor de un experimento está en haberse
-comprometido antes. Una expectativa razonable: el resultado de la partida debería ser la tarea más
-difícil, porque su etiqueta es una propiedad de la partida y no de la posición, y el valor la más
-fácil. Se cumplen las dos: 45,9 % de acierto en el resultado sobre tres clases, trece puntos por
-encima del azar, y 0,1429 de error del valor, unos 57 centipeones en la zona central.
+comprometido antes. Lo razonable es que el resultado sea la tarea más difícil, porque su etiqueta es
+de la partida y no de la posición, y el valor la más fácil. Se cumplen las dos: 45,9 % en el
+resultado, trece puntos sobre el azar de tres clases, y 0,1429 de error del valor, unos 57
+centipeones.
 
-Y **el 96,78 % de `val/blunder_acc` es la cifra más engañosa del módulo**. Parece que la cabeza de
-errores es la que mejor va, y es al revés: un detector que conteste siempre «no hay error», sin mirar
-el tablero, saca **96,3 %**. La lección 8 la desmonta.
+Y **el 96,78 % de `val/blunder_acc` es la cifra más engañosa del módulo**: un detector que conteste
+siempre «no hay error», sin mirar el tablero, saca 96,3 %. La lección 8 la desmonta.
 
 <Exercise n="02" title="El probe no mueve el encoder: demuéstralo tú">
   Escribe un test que cargue un checkpoint del encoder, entrene tres pasos en modo `probe` y
@@ -319,20 +299,15 @@ el tablero, saca **96,3 %**. La lección 8 la desmonta.
   no se muevan?
 
   <Solution>
-    Comparar con `torch.equal` sobre cada tensor del `state_dict` sirve, y es mejor que
-    `allclose`: aquí la exigencia es igualdad bit a bit, no parecido. Si el test pasara con
-    `allclose` pero no con `equal`, algo estaría moviendo los pesos un poquito, y "un poquito" en
-    tres pasos es "mucho" en cuatro mil.
+    `torch.equal` sobre cada tensor del `state_dict` sirve, y es mejor que `allclose`: aquí se exige
+    igualdad bit a bit. Si pasara con `allclose` y no con `equal`, algo movería los pesos un poquito,
+    y un poquito en tres pasos es mucho en cuatro mil.
 
-    Lo otro que puede cambiar el vector sin tocar un solo peso es el **dropout**. `EncoderConfig`
-    trae `dropout = 0.1`, y un módulo en modo `train` lo aplica aunque sus parámetros estén
-    congelados: la misma posición daría un vector distinto en cada pasada. Las cabezas verían ruido
-    que no pueden compensar, porque no es una propiedad de la posición, y el encoder no puede
-    absorberlo porque no está aprendiendo. Por eso `set_training_mode` pone el modelo en `train` y
-    acto seguido devuelve el encoder a `eval` cuando el modo es `probe`. También hay una tercera
-    fuente, más sutil, que no aplica aquí pero conviene tener en la cabeza: en una red con
-    `BatchNorm`, congelar los pesos no congela las estadísticas móviles, que se actualizan en modo
-    `train` y cambian la salida. Congelar es más que `requires_grad = False`.
+    Lo otro que cambia el vector sin tocar un peso es el **dropout**: `EncoderConfig` trae
+    `dropout = 0.1`, y un módulo en modo `train` lo aplica aunque esté congelado, así que la misma
+    posición daría un vector distinto en cada pasada, ruido que las cabezas no pueden compensar. Por
+    eso `set_training_mode` devuelve el encoder a `eval` en modo `probe`. En una red con `BatchNorm`
+    pasa algo parecido con las estadísticas móviles: congelar es más que `requires_grad = False`.
 
   </Solution>
 </Exercise>
@@ -392,40 +367,34 @@ Compara las tres columnas, que es todo el punto del lab:
 
 </div>
 
-Lee primero la fila del valor, porque dice lo contrario de lo que casi todo el mundo espera:
-**afinar menos red salió mejor que afinarla entera**. El error del valor baja de 0,1429 con el tronco
-congelado a **0,1180** descongelando los dos últimos bloques, y vuelve a subir a 0,1354 con el
-modelo entero. El punto intermedio gana a los dos extremos.
+La fila del valor dice lo contrario de lo que casi todo el mundo espera: **afinar menos red salió
+mejor que afinarla entera**. El error baja de 0,1429 con el tronco congelado a 0,1180 descongelando
+los dos últimos bloques, y vuelve a subir a 0,1354 con el modelo entero.
 
-La lectura habitual en transferencia, y te la vas a encontrar fuera del ajedrez: con 438 093
-etiquetas, el afinado completo mueve también las capas de abajo, las que el preentrenamiento dejó
-representando lo general de una partida, y moverlas con la señal ruidosa de tres cabezas y 4 000
-pasos las **aleja** de esa representación sin construir otra mejor. Es el <Term id="olvido-catastrofico">olvido catastrófico</Term> en versión leve. La adaptación a la tarea
-vive en los últimos bloques, y `last-n` mueve solo esa parte. Es la misma razón por la que, con
-pocas etiquetas, afinar un BERT entero suele salir peor que afinar sus capas altas o ponerle un
-adaptador.
+Te la vas a encontrar fuera del ajedrez. El afinado completo mueve también las capas de abajo, las
+que el preentrenamiento dejó representando lo general de una partida, y moverlas con la señal ruidosa
+de tres cabezas y 4 000 pasos las aleja de esa representación sin construir otra mejor: es el <Term id="olvido-catastrofico">olvido catastrófico</Term> en versión leve. `last-n` solo mueve los
+últimos bloques, donde vive la adaptación a la tarea. Por lo mismo, con pocas etiquetas, afinar un
+BERT entero suele salir peor que afinar sus capas altas o ponerle un adaptador.
 
-Con una salvedad que no se puede saltar: **es una tirada por modo**, con una sola semilla, y las
-diferencias de `val/loss` (0,6310 / 0,6028 / 0,6384) están en el rango del ruido entre tiradas que
-vas a medir dentro de un momento. La ordenación es **sugerente, no establecida**: harían falta tres
-o cinco semillas por modo y publicar media y dispersión.
+Eso sí, es una tirada por modo, y las diferencias de `val/loss` (0,6310 / 0,6028 / 0,6384) están en
+el rango del ruido entre tiradas que vas a medir enseguida. La ordenación es sugerente; para
+establecerla harían falta tres a cinco semillas por modo.
 
-El resultado de la partida ordena distinto: ahí gana `full`, 51,4 % frente a 47,8 %, y es la única
-tarea cuya etiqueta es una propiedad de la partida entera, la que necesita que el tronco busque
-información que el preentrenamiento no dejó legible. Y la pérdida de la cabeza de errores sube de
-0,1270 a 0,1310 al descongelar del todo: una suma ponderada de pérdidas puede mejorar una tarea a
-costa de otra, y por eso el bucle registra las tres por separado.
+El resultado de la partida ordena distinto: gana `full`, 51,4 % frente a 47,8 %, en la única tarea
+cuya etiqueta es de la partida entera y necesita que el tronco busque información que el
+preentrenamiento no dejó legible. Mientras, la pérdida de errores sube de 0,1270 a 0,1310: una suma
+de pérdidas puede mejorar una tarea a costa de otra, y por eso el bucle registra las tres aparte.
 
-Y ahora la curva. `--curve` ejecuta la misma receta cuatro veces, con el 10, 25, 50 y 100 % de las
-etiquetas de entrenamiento, sobre subconjuntos anidados, y nombra cada tirada con su porcentaje:
+Ahora la curva. `--curve` ejecuta la misma receta con el 10, 25, 50 y 100 % de las etiquetas, sobre
+subconjuntos anidados:
 
 ```bash title="Terminal"
 uv run rukh train heads --config configs/train/encoder-heads-moves.yaml --mode last-n --curve
 ```
 
-Se ejecuta en el modo que mejor salió, `last-n`, para que la curva mida el valor de las etiquetas y
-no el de un modo de afinado de segunda. Salida real (RTX 5090, 2026-09-19); son cuatro
-entrenamientos de 4 000 pasos encadenados, uno por porcentaje:
+Va en `last-n`, el modo que mejor salió, para que la curva mida el valor de las etiquetas. Salida
+real (RTX 5090, 2026-09-19), cuatro entrenamientos de 4 000 pasos encadenados:
 
 ```text
     10% of the labels (43809 rows)
@@ -450,8 +419,6 @@ entrenamientos de 4 000 pasos encadenados, uno por porcentaje:
     val/loss             0.6133
 ```
 
-Puesta en tabla, que es como se lee:
-
 <div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
 
 | Etiquetas | Filas   | `val/value_mae` | `val/blunder_acc` | `val/loss` |
@@ -470,26 +437,22 @@ Puesta en tabla, que es como se lee:
   <M3LabelCurve />
 </Figure>
 
-**La curva está plana desde el 25 %.** Cuadruplicar las etiquetas, de 109 523 a 438 093, mueve el
-error del valor de 0,1192 a 0,1215, que es _peor_, y deja igual la exactitud de errores. La pregunta
-con la que se abrió el módulo —_¿cuántas etiquetas hacen falta de verdad?_— tiene respuesta medida:
-con la cuarta parte del conjunto habría bastado.
+**La curva está plana desde el 25 %.** Cuadruplicar las etiquetas, de 109 523 a 438 093, lleva el
+error del valor de 0,1192 a 0,1215, algo peor, y deja igual la exactitud de errores. La pregunta con
+la que se abrió el módulo, cuántas etiquetas hacen falta de verdad, tiene respuesta medida: con la
+cuarta parte habría bastado.
 
-Y hay que leerla con la misma honestidad. La diferencia entre el mejor y el peor de los cuatro puntos
-es **0,0025**. La tirada `last-n` de más arriba —misma receta, mismo modo, **el mismo 100 % de las
-etiquetas**— sacó 0,1180 frente a los 0,1215 del punto del 100 %: **0,0035**, más que el ancho entero
-de la curva. Dos tiradas con los mismos datos se separan más que dos tiradas con cuatro veces más
-datos. Eso refuerza la lectura «plana», porque cualquier ordenación dentro de esos cuatro puntos
-sería leer ruido, y deja la lección que más veces vas a necesitar: **antes de explicar una diferencia
-pequeña, mide cuánto se mueve tu montaje cuando no cambias nada.** Una segunda tirada idéntica es el
-experimento más barato que existe, y casi nadie lo hace. Vale igual para comparar dos prompts, dos
-modelos de embeddings o dos configuraciones de un RAG.
+Hay que leerla con la misma honestidad. Entre el mejor y el peor punto hay 0,0025. La tirada
+`last-n` de antes, con la misma receta y el mismo 100 % de etiquetas, sacó 0,1180 frente a 0,1215:
+**dos tiradas idénticas se separan 0,0035, más que el ancho entero de la curva**. Eso refuerza la
+lectura «plana», porque ordenar esos cuatro puntos sería leer ruido, y deja la costumbre que más vas
+a necesitar: antes de explicar una diferencia pequeña, mide cuánto se mueve tu montaje cuando no
+cambias nada. Una segunda tirada idéntica es el experimento más barato que existe, y vale igual para
+comparar dos prompts, dos modelos de embeddings o dos configuraciones de un RAG.
 
-Hay una excepción que sí supera el ruido: la exactitud de errores en el 10 %, **0,9559 frente a
-0,9678** en los otros tres, que coinciden entre sí hasta la última cifra. Tiene sentido: con los
-errores al 3,72 %, el 10 % del conjunto deja unas 1 600 posiciones positivas, y ahí la clase rara
-empieza a escasear de verdad. En un problema desbalanceado, el tamaño efectivo del conjunto es el de
-la clase minoritaria.
+La única diferencia que supera el ruido es la exactitud de errores en el 10 % (0,9559 frente a
+0,9678). Con los errores al 3,72 %, ese 10 % deja unas 1 600 posiciones positivas: en un problema
+desbalanceado, el tamaño efectivo del conjunto es el de la clase minoritaria.
 
 <Exercise n="03" title="Lee tu propia curva antes de verla">
   Dibuja en un papel las tres formas que puede tener la curva de F1 contra número de etiquetas: (a)
@@ -498,49 +461,40 @@ la clase minoritaria.
   ¿qué significaría que la curva **baje** entre el 50 % y el 100 %?
 
   <Solution>
-    (a) Plana desde el 10 %: las etiquetas no son el cuello de botella. O la tarea es fácil y ya
-    está resuelta, o el modelo o la representación limitan. Lo siguiente es cambiar el modo de
-    afinado (`probe` → `full`), cambiar la representación de entrada, o revisar si la etiqueta tiene
-    tanto ruido que más cantidad no añade información. Etiquetar más es lo único que seguro no hay
-    que hacer.
+    (a) Plana desde el 10 %: las etiquetas no son el cuello de botella. O la tarea ya está resuelta,
+    o limitan el modelo o la representación. Toca cambiar el modo de afinado, la representación de
+    entrada, o revisar si la etiqueta es tan ruidosa que más cantidad no informa. Etiquetar más es lo
+    único que seguro no hay que hacer.
 
-    (b) Subiendo y aplanándose hacia el 50 %: el punto dulce está ahí, y el 100 % solo compra los
-    últimos decimales. Con presupuesto limitado, congelas el tamaño del conjunto y gastas en otra
-    cosa: más modos de afinado, más semillas para tener barras de error, o una segunda
+    (b) Subiendo y aplanándose hacia el 50 %: el punto dulce está ahí. Congelas el tamaño del
+    conjunto y gastas en otra cosa: modos de afinado, semillas para tener barras de error, otra
     representación.
 
-    (c) Subiendo en el 100 %: etiquetar más es la inversión más rentable que te queda, y ninguna
-    idea arquitectónica va a competir con eso. Es también la señal de que cualquier comparación
-    entre arquitecturas hecha con estas etiquetas está limitada por los datos y no por el modelo, así
-    que sus conclusiones son provisionales.
+    (c) Subiendo en el 100 %: etiquetar más es la inversión más rentable, y cualquier comparación de
+    arquitecturas con estas etiquetas está limitada por los datos, así que es provisional.
 
-    Que baje entre el 50 % y el 100 % no puede deberse a "más datos hacen daño": con subconjuntos
-    anidados, el conjunto grande contiene al pequeño. Las explicaciones reales son otras. Puede ser
-    que el número de pasos esté fijo (`max_steps: 4000`) y con cuatro veces más filas el modelo dé
-    muchas menos pasadas por cada una: estás comparando dos regímenes de entrenamiento distintos, no
-    dos cantidades de datos. Puede ser que las filas nuevas sean sistemáticamente distintas —el
-    orden es un CRC-32, así que no debería—, o simplemente ruido de una sola semilla, que es el
-    motivo por el que una curva de un único sorteo se lee con prudencia y una diferencia de dos
-    puntos no se celebra.
+    Que baje entre el 50 % y el 100 % no significa que más datos hagan daño: con subconjuntos
+    anidados, el grande contiene al pequeño. Lo probable es que los pasos estén fijos
+    (`max_steps: 4000`) y con cuatro veces más filas el modelo pase menos veces por cada una, así que
+    comparas dos regímenes de entrenamiento; o simplemente ruido de una sola semilla.
 
   </Solution>
 </Exercise>
 
 ### Lab 3b · La otra entrada: las casillas desde cero
 
-Queda la tercera fila de la tabla de la lección 1, la de `squares`, y el lab 5 la necesita: la isla
-de esta página y los embeddings salen de **este** checkpoint, porque los dos scripts tokenizan un
-FEN. La config es `encoder-heads.yaml`, con `encoder_ckpt: null`: sin preentrenamiento sobre
-casillas, el encoder arranca de pesos aleatorios, y congelar pesos aleatorios (`probe`, `last-n`)
-sería congelar ruido. El único modo con sentido es `full`:
+Queda la fila `squares` de la tabla de la lección 1, y el lab 5 la necesita: la isla de esta página
+y los embeddings salen de este checkpoint, porque los dos scripts tokenizan un FEN. En
+`encoder-heads.yaml`, `encoder_ckpt: null`: sin preentrenamiento sobre casillas, el encoder arranca
+de pesos aleatorios, y congelarlos sería congelar ruido, así que el único modo con sentido es `full`:
 
 ```bash title="Terminal"
 uv run rukh train heads --config configs/train/encoder-heads.yaml --mode full
 ```
 
-Cuatro mil pasos, lotes de 256 posiciones —el doble que en jugadas, porque un tablero son siempre
-69 tokens y un prefijo hasta 200—, mismas 438 093 filas y mismo reparto por partida. Salida real
-de una ejecución de comprobación (RTX 5090, 2026-09-21, dos minutos):
+Lotes de 256 posiciones (el doble que en jugadas: un tablero son 69 tokens y un prefijo hasta 200),
+mismas filas y mismo reparto. Salida real de una ejecución de comprobación (RTX 5090, 2026-09-21,
+dos minutos):
 
 ```text
 step 3500  val/loss 0.6204
@@ -558,9 +512,9 @@ mode:       full
     checkpoint           checkpoints/encoder-heads-20260921-185425/step-4000.pt
 ```
 
-El directorio que deja no lleva `-moves`: sale `checkpoints/encoder-heads-<fecha>/` (en la tirada de
-referencia, `checkpoints/encoder-heads-20260919-100532/`). Evalúalo con la misma suite que el lab 4
-pero con otra etapa, para que el informe no pise al del esquema de jugadas:
+El directorio no lleva `-moves` (en la tirada de referencia,
+`checkpoints/encoder-heads-20260919-100532/`). Evalúalo con la suite del lab 4 y otra etapa, para
+que el informe no pise al de jugadas:
 
 ```bash title="Terminal"
 uv run rukh eval encoder --model checkpoints/encoder-heads-<fecha>/best.pt --stage encoder-squares
@@ -592,33 +546,29 @@ heuristic  rule, no threshold to tune      3660       144     2359    4.7 %  77.
 encoder    probability span: 0.0022 to 0.1930 (mean 0.0287)
 ```
 
-Son las cifras de la fila `squares` de la lección 1. Apunta dos para el lab 5: el umbral elegido
-para **este** checkpoint es **0,04459** (cada checkpoint tiene el suyo; el `last-n` de jugadas sale
-en 0,0663), y la probabilidad más alta que da es 0,1930, así que en 0,5 tampoco se dispara nunca. Aun
-sin preentrenamiento y sin ver la jugada anterior, bate a la heurística por 5,7 puntos: las casillas
-llevan bastante información sobre lo que se acaba de tirar, aunque menos que la línea entera.
+Apunta dos cifras para el lab 5: el umbral elegido para este checkpoint es 0,04459 (el `last-n`
+de jugadas sale en 0,0663; cada uno tiene el suyo), y su probabilidad más alta es 0,1930, así que en
+0,5 no se dispara nunca. Aun sin preentrenamiento ni la jugada anterior, bate a la heurística por
+5,7 puntos: las casillas dicen bastante de lo que se acaba de tirar, aunque menos que la línea.
 
 ### Lab 4 · Medir contra la heurística
 
-Antes de nada, la ruta del checkpoint. El nombre de la carpeta distingue el **esquema**, no el modo:
-`checkpoints/encoder-heads-moves-<fecha>/` para jugadas y `checkpoints/encoder-heads-<fecha>/` para
-casillas. El modo queda dentro del checkpoint, en `cfg.mode`, así que los tres afinados del lab 3
-son tres carpetas con tres fechas. El último directorio de una serie sale así:
+El nombre de la carpeta distingue el esquema, no el modo (que va dentro, en `cfg.mode`): los tres
+afinados del lab 3 son tres carpetas `encoder-heads-moves-<fecha>`. La última sale así:
 
 ```bash title="Terminal"
 ls -td checkpoints/encoder-heads-moves-*/ | head -1
 ```
 
-La suite se ejecuta sobre un checkpoint de las cabezas, no del preentrenamiento, y conviene evaluar
-**el que se va a publicar**, el `last-n` del lab 3, y no uno parecido: las métricas de un checkpoint
-no valen para otro, por muy de la misma receta que sea.
+Evalúa el checkpoint que se va a publicar, el `last-n` del lab 3, y no uno parecido: las métricas de
+un checkpoint no valen para otro de la misma receta.
 
 ```bash title="Terminal"
 uv run rukh eval encoder --model checkpoints/encoder-heads-moves-<fecha>/best.pt --stage encoder
 ```
 
 Titular real de `artifacts/eval/encoder/report.md` en la ejecución de referencia (RTX 5090,
-2026-09-19), sobre **10 000 posiciones** del conjunto held-out:
+2026-09-19), sobre 10 000 posiciones del conjunto held-out:
 
 ```text
 Blunder F1, encoder (tuned, p >= 0.06631)    18.0 %
@@ -647,49 +597,41 @@ heuristic  rule, no threshold to tune      3660       144     2359    4.7 %  77.
 encoder    probability span: 0.0020 to 0.3102 (mean 0.0353)
 ```
 
-Los dos criterios del hito salen en direcciones opuestas y los dos se publican tal cual: el de
-detección de errores **se cumple** con +9,2 puntos sobre la heurística; el de correlación de valor
-**no se cumple**, con 0,520 de Spearman frente a un listón de 0,80. La lección 8 explica cada número.
+Los dos criterios del hito salen en direcciones opuestas y los dos se publican tal cual: la
+detección de errores se cumple, con +9,2 puntos sobre la heurística; la correlación del valor
+no, con 0,520 de Spearman frente a un listón de 0,80. La lección 8 explica cada número.
 
-La orden escribe además `artifacts/eval/<stage>/report.md` y una fila en
-`artifacts/web/results.json`, que llega a la tabla única de esta web con `pnpm sync:data`. Sin
-`--stage`, la etapa sería el nombre del directorio del checkpoint, con su fecha, y cada ejecución
-añadiría una fila nueva; por eso el comando la fija en `encoder`. Los veredictos de la heurística,
-la parte lenta, van a una caché que no depende de los pesos: evaluar un segundo checkpoint sobre las
-mismas filas no los vuelve a pagar (`--no-cache` los recalcula).
+La orden escribe además una fila en `artifacts/web/results.json`, que llega a la tabla de esta web
+con `pnpm sync:data`. `--stage` fija el nombre; sin él sería el del directorio, con su fecha, y cada
+ejecución añadiría una fila. Los veredictos de la heurística, la parte lenta, van a una caché que no
+depende de los pesos (`--no-cache` los recalcula).
 
 <Exercise n="04" title="Si el encoder no bate a la heurística por cinco puntos, ¿qué haces?">
   El plan del hito pide un margen de cinco puntos de F1. Supón que sale uno. Enumera, en orden de coste, qué
   comprobarías antes de tocar el modelo, y di qué **no** vale hacer.
 
   <Solution>
-    Lo primero, y es gratis, es mirar la descomposición en vez del titular. ¿El encoder tiene
-    precisión alta y exhaustividad baja, o al revés? Si marca poquísimo, el umbral de 0,5 puede
-    estar mal para una clase rara y mover ese único número puede valer varios puntos de F1 sin tocar
-    un peso. Eso no es hacer trampa siempre que el umbral se elija **en validación** y se publique.
+    Lo primero, gratis: mirar la descomposición en vez del titular. Si el encoder marca poquísimo,
+    el umbral de 0,5 puede estar mal para una clase rara, y moverlo puede valer varios puntos sin
+    tocar un peso. No es trampa si el umbral se elige en validación y se publica.
 
     Lo segundo: ¿cuántas filas tenían etiqueta de error? Si son pocas, el intervalo de confianza del
-    F1 es ancho y un punto de diferencia no significa nada; antes de rediseñar nada hay que saber si
-    la diferencia es medible.
+    F1 es ancho y un punto no significa nada.
 
-    Lo tercero, ya con coste: la curva por etiquetas. Si sigue subiendo en el 100 %, el camino es
-    etiquetar más, no cambiar el modelo. Después, `--mode full` si venías de `probe`, y después
-    reabrir la representación de entrada, que es el experimento grande del módulo.
+    Lo tercero, ya con coste: la curva por etiquetas (si sigue subiendo, etiquetar más), después
+    `--mode full` si venías de `probe`, y después reabrir la representación de entrada.
 
-    Lo que no vale: mover el listón. Tampoco vale cambiar el conjunto de evaluación, ni redefinir
-    "error" a 150 centipeones porque así sale mejor, ni comparar el encoder sobre unas filas y la
-    heurística sobre otras. Si después de todo el margen sigue siendo de un punto, la cifra se
-    publica tal cual y se escribe por qué, que es exactamente lo que el plan del hito manda hacer. Un
-    resultado negativo documentado vale más que un resultado positivo cocinado, y además es el que
-    enseña.
+    Lo que no vale: mover el listón, cambiar el conjunto de evaluación, redefinir «error» a 150
+    centipeones porque así sale mejor, o medir encoder y heurística sobre filas distintas. Si el
+    margen sigue en un punto, se publica tal cual y se escribe por qué: un resultado negativo
+    documentado vale más que uno positivo cocinado.
 
   </Solution>
 </Exercise>
 
 ### Lab 5 · Exportar, embeddings y los datos de la isla
 
-El navegador necesita el encoder en ONNX, y con dos salidas nada más: la demo pinta el valor y la
-alerta de error, y no tiene ningún uso para los logits del MLM ni para el resultado.
+El navegador necesita el encoder en ONNX con dos salidas, el valor y la alerta de error:
 
 ```bash title="Terminal"
 uv run rukh export --ckpt checkpoints/encoder-heads-moves-<fecha>/best.pt --out artifacts/onnx/encoder --kind encoder --fp16 --int8 --check-parity
@@ -709,28 +651,23 @@ parity fp16: 1.0000 of the blunder decisions on 1000 positions (max |delta value
 parity int8: 1.0000 of the blunder decisions on 1000 positions (max |delta value| 0.0241)
 ```
 
-**60,7 MB en fp32, 30,6 en fp16, 18,3 en int8**, y lo importante: **el 100 % de las decisiones de
-error coinciden con PyTorch en las tres precisiones**. El valor se mueve 0,024 como mucho en int8,
-unos diez centipeones, invisible en la barra.
+60,7 MB en fp32, 30,6 en fp16 y 18,3 en int8, y **el 100 % de las decisiones de error coinciden con
+PyTorch en las tres precisiones**. El valor se mueve como mucho 0,024 en int8, unos diez
+centipeones, invisible en la barra. (Es el checkpoint de jugadas, de ahí el
+`sequence dynamic=True (verified)`; el de casillas fija ese eje en 69.)
 
-En M2, el int8 del decoder **cambiaba el 4,6 % de sus jugadas**. Misma técnica, dos modelos del mismo
-proyecto, resultados opuestos, y no es suerte. El decoder termina en un `argmax` sobre 2 030 logits:
-dos jugadas razonables están a menudo a milésimas, y un redondeo cambia cuál gana. El encoder termina
-en dos escalares, y la decisión de error es un umbral sobre uno de ellos: para que cambie, el ruido
-tiene que cruzar la frontera, y 0,024 solo la cruza si la probabilidad ya estaba pegada al umbral.
-**La sensibilidad a la cuantización es una propiedad de la cabeza, no del cuerpo**: antes de
-cuantizar cualquier modelo, pregúntate cuántos candidatos compiten en la última operación. Es la
-diferencia entre una foto finish y un semáforo: en la foto finish, un poco de desenfoque cambia
-quién gana, porque dos corredores llegan a milésimas; en el semáforo, el mismo desenfoque solo
-importa si estabas justo en el ámbar. Por eso un clasificador binario aguanta la cuantización mucho
-mejor que un LLM eligiendo el siguiente token.
+En M2, el int8 del decoder cambiaba el 4,6 % de sus jugadas. Misma técnica, resultados opuestos, y
+no por suerte. El decoder termina en un `argmax` sobre 2 030 logits, con jugadas razonables a menudo
+a milésimas, y un redondeo cambia cuál gana. El encoder termina en un umbral sobre un escalar, y
+0,024 solo lo cruza si la probabilidad ya estaba pegada a él. **La sensibilidad a la cuantización es
+una propiedad de la cabeza, no del cuerpo**: antes de cuantizar un modelo, pregúntate cuántos
+candidatos compiten en la última operación. Es la diferencia entre una foto finish y un semáforo:
+en la foto finish, un poco de desenfoque cambia quién gana; en el semáforo solo importa si estabas
+justo en el ámbar. Por eso un clasificador binario aguanta la cuantización mucho mejor que un LLM
+eligiendo el siguiente token.
 
-La salida lo dice también: el checkpoint exportado es el de **jugadas**, cuya secuencia crece con la
-partida, y anuncia `sequence dynamic=True (verified)`; el de casillas tiene siempre 69 tokens y ese
-eje se fija.
-
-La salida secundaria del encoder son los embeddings de posición, que no usa la demo pero sí la fase
-2 del curso, cuando montes recuperación de posiciones parecidas:
+Los embeddings de posición no los usa la demo, sino la fase 2 del curso, cuando montes recuperación
+de posiciones parecidas:
 
 ```bash title="Terminal"
 uv run rukh encoder embed --positions data/evals/positions-eval.parquet --out artifacts/embeddings/positions.npy --ckpt checkpoints/encoder-heads-<fecha>/best.pt
@@ -747,14 +684,13 @@ array:     artifacts/embeddings/positions.npy
 sidecar:   artifacts/embeddings/positions.parquet (row, fen4)
 ```
 
-Esos **488 159 vectores de 384 dimensiones son el índice sobre el que buscará la recuperación de
-posiciones parecidas de la fase 2**: cuando allí preguntes por «posiciones como esta», lo que se
-compara es un vector de esta matriz contra todos los demás, igual que un RAG compara el embedding de
-una pregunta con los de sus fragmentos. Y van con su `.parquet` de acompañamiento, porque el índice
-viaja con los datos (lección 9).
+Esos 488 159 vectores de 384 dimensiones son el índice de la fase 2: preguntar por «posiciones como
+esta» será comparar un vector de esta matriz con todos los demás, igual que un RAG compara el
+embedding de una pregunta con los de sus fragmentos. Van con su `.parquet`, porque el índice viaja
+con los datos (lección 9).
 
-Queda el script que alimenta la isla de esta página, **`labs/m3/value_bar_export.py`**: recorre una
-partida, evalúa cada posición con las cabezas del encoder y con Stockfish, y escribe
+Queda el script que alimenta la isla de esta página, `labs/m3/value_bar_export.py`: evalúa cada
+posición de una partida con las cabezas del encoder y con Stockfish, y escribe
 `artifacts/web/value-bar.json`.
 
 ```python title="labs/m3/value_bar_export.py"
@@ -862,19 +798,16 @@ Salida real de una ejecución de comprobación (RTX 5090, 2026-09-21, dos minuto
 wrote artifacts/web/value-bar.json (34 plies, depth 12)
 ```
 
-El fichero llega a esta web con `pnpm sync:data`. La figura de más abajo es ese JSON, generado con
-el checkpoint de **casillas** del lab 3b, porque el script tokeniza un FEN con `fen_to_tokens`.
+Antes de ejecutarlo, cambia su `CKPT`: `checkpoints/encoder-heads-full/best.pt` no existe (el modo
+no entra en el nombre de la carpeta) y el script moriría con un `FileNotFoundError`. Pon tu
+checkpoint de casillas del lab 3b, porque el script tokeniza un FEN; es el que generó la figura de
+más abajo, que llega a esta web con `pnpm sync:data`.
 
-Antes de ejecutarlo, cambia su `CKPT`: apunta a `checkpoints/encoder-heads-full/best.pt`, una
-carpeta que **no existe** (el modo no entra en el nombre de la carpeta). Tal cual, el script muere
-con un `FileNotFoundError`; pon el directorio que te haya salido a ti, que es lo que se hizo para
-generar la figura.
-
-Y mira el fichero antes que el gráfico: **ningún ply sale marcado como error**. El `THRESHOLD = 0.5`
-del script es el de `configs/eval/encoder.yaml`, y las probabilidades de esta cabeza no pasan de
-0,1930. Se publica así en vez de bajar el umbral a mano hasta que salgan marcas. Cambiar `THRESHOLD`
-a **0,04459**, el umbral elegido para este checkpoint de casillas, es el lab que te llevas a casa (el
-0,0663 del de jugadas no vale aquí: cada cabeza tiene su escala).
+Mira el fichero antes que el gráfico: **ningún ply sale marcado como error**. El `THRESHOLD = 0.5`
+es el de fábrica y las probabilidades de esta cabeza no pasan de 0,1930. Se publica así en vez de
+bajar el umbral a mano hasta que salgan marcas. Cambiarlo a 0,04459, el umbral elegido para este
+checkpoint, es el lab que te llevas a casa (el 0,0663 del de jugadas no vale: cada cabeza tiene su
+escala).
 
 <Exercise n="05" title="¿Por qué la partida del script termina en 17…Ae6 y no sigue?">
   El script se para justo en la jugada del sacrificio. Explica qué se vería si continuara hasta el
@@ -882,33 +815,27 @@ a **0,04459**, el umbral elegido para este checkpoint de casillas, es el lab que
   el problema técnico: ¿qué le pasaría al eje vertical si la partida llegara al mate?
 
   <Solution>
-    Si continuara, las dos curvas se separarían cada vez más en la dirección de las negras hasta
-    pegarse al suelo, porque la partida se decide. La figura pasaría a estar dominada por un tramo
-    final en el que las dos fuentes están de acuerdo y no hay nada que mirar, y el punto interesante
-    —el ply donde la heurística, y quizá también el encoder, llaman error a una jugada genial—
-    quedaría aplastado en un rincón del eje horizontal. Cortar en el sacrificio deja la figura
-    centrada en la pregunta del módulo.
+    Si continuara, las dos curvas bajarían hasta pegarse al suelo porque la partida se decide, y la
+    figura quedaría dominada por un tramo final en el que las dos fuentes están de acuerdo. El punto
+    interesante, el ply donde la heurística llama error a una jugada genial, quedaría aplastado en
+    un rincón. Cortar en el sacrificio centra la figura en la pregunta del módulo.
 
-    Lo técnico: la escala es `tanh(cp/400)` y un mate se convierte con `mate_score=10000`, así que
-    vale exactamente ±1 y se pega al borde del eje. Como el eje está **fijado** a `[-1, 1]` en vez
-    de ajustarse a los datos, el mate no deforma nada: se dibuja donde le toca. Un eje ajustado
-    automáticamente sí sería un problema, porque un solo mate al final comprimiría todo el resto de
-    la partida contra la línea del cero y una partida tranquila parecería un electrocardiograma. Es
-    la razón por la que la isla no ajusta su eje: las dos series están acotadas por construcción, y
-    ajustar una escala ya acotada solo sirve para exagerar.
+    Lo técnico: con `tanh(cp/400)` y `mate_score=10000`, un mate vale ±1 y se pega al borde. Como el
+    eje está fijado a `[-1, 1]`, no deforma nada. Un eje ajustado a los datos sí sufriría: un mate al
+    final comprimiría el resto contra el cero. Las dos series están acotadas por construcción, y
+    reajustar una escala ya acotada solo sirve para exagerar.
 
   </Solution>
 </Exercise>
 
 ## El encoder que se publicó: 39 millones y una pérdida de orden
 
-Todo lo anterior es el encoder de 15 millones. El que está en `chorcat/rukh-encoder`, el que sirve la
-demo, es otro, y sale de dos cambios medidos después de cerrar el módulo.
+Todo lo anterior es el encoder de 15 millones. El que sirve la demo desde `chorcat/rukh-encoder` sale
+de dos cambios medidos después de cerrar el módulo.
 
-**El primero es de pérdida, no de tamaño.** Es el de la lección 8: `pairwise_rank_loss` añade a la
-cabeza de valor un término por pares, detrás de `HeadWeights.value_rank` (a cero por defecto, para
-que las ejecuciones anteriores sigan siendo reproducibles). Mismo encoder de 15 M, mismo afinado
-`last-n`, distintos pesos para ese término:
+El primero es de pérdida: el `pairwise_rank_loss` de la lección 8, un término por pares para la
+cabeza de valor detrás de `HeadWeights.value_rank` (a cero por defecto, para que las ejecuciones
+anteriores sigan siendo reproducibles). Mismo encoder de 15 M, mismo `last-n`, distintos pesos:
 
 <div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
 
@@ -921,17 +848,16 @@ que las ejecuciones anteriores sigan siendo reproducibles). Mismo encoder de 15 
 
 </div>
 
-Con peso 1 **sube todo**, Pearson incluido, y el Spearman se satura en torno a 0,66 a partir de ahí;
-se elige 1,0 por el mejor Pearson y el margen holgado. (El 3,0 con su F1 hundido y el 8,0 de vuelta
-a +7,76 no son una tendencia: es ruido de tirada única, el mismo aviso de la curva por etiquetas.)
+Con peso 1 sube todo, Pearson incluido, y el Spearman se satura en torno a 0,66; se elige 1,0 por el
+mejor Pearson y un margen holgado. (El F1 hundido del 3,0 y el +7,76 del 8,0 no son tendencia: es
+ruido de tirada única, como en la curva por etiquetas.)
 
-**El segundo es de tamaño y de corpus.** El encoder sube a 12 capas y 512 dimensiones —38 971 392
-parámetros, el tamaño de `small`— y se preentrena sobre los 1 681 millones de tokens de `tokens-v4`
-en vez de los 240 del corpus de M1. Acierta el **81,4 %** de las jugadas tapadas frente al 75,2 %.
+El segundo es de tamaño y corpus: 12 capas y 512 dimensiones (38 971 392 parámetros, el tamaño de
+`small`), preentrenado sobre los 1 681 millones de tokens de `tokens-v4` en vez de los 240 de M1.
+Acierta el 81,4 % de las jugadas tapadas frente al 75,2 %.
 
-El código de los dos cambios es de la etiqueta `p4`, no de `p3`: en un repositorio en `p3` estas
-órdenes fallan porque las configuraciones no existen. Necesitan además los tokens de
-`data/tokens-v4/uci/` de «Más datos, no más red»:
+El código de los dos cambios es de la etiqueta `p4`: en un repositorio en `p3` las configuraciones no
+existen. Necesitan además los tokens de `data/tokens-v4/uci/` de «Más datos, no más red»:
 
 ```bash title="Terminal"
 uv run rukh train encoder --config configs/train/encoder-mmm-v4.yaml
@@ -941,65 +867,57 @@ uv run rukh export --ckpt checkpoints/encoder-heads-v4-<fecha>/step-4000.pt --ou
 ```
 
 El preentrenamiento tardó 40 minutos en la RTX 5090; el afinado, dos y medio; la evaluación, cinco.
-El `encoder_ckpt` de `encoder-heads-v4.yaml` apunta a la carpeta con fecha del preentrenamiento de
-referencia: cambia esa línea por la tuya antes de la segunda orden. Si no quieres los 40 minutos, los
-dos checkpoints están publicados y el `rukh pull` del principio de la lección los deja en tu
-repositorio (`RUKH_HOME=<ruta-a-tu-repo> uv run rukh pull encoder-mmm-v4 encoder-v4`):
-`checkpoints/encoder-mmm-v4/best.pt` es el preentrenado, la ruta que va en `encoder_ckpt`, y
-`checkpoints/encoder-heads-v4/step-4000.pt` el afinado, que sustituye a la carpeta con fecha en las
+Antes de la segunda orden, cambia el `encoder_ckpt` de `encoder-heads-v4.yaml`, que apunta a la
+carpeta con fecha de referencia. Si no quieres los 40 minutos, el `rukh pull` del principio
+(`RUKH_HOME=<ruta-a-tu-repo> uv run rukh pull encoder-mmm-v4 encoder-v4`) deja
+`checkpoints/encoder-mmm-v4/best.pt`, el preentrenado que va en `encoder_ckpt`, y
+`checkpoints/encoder-heads-v4/step-4000.pt`, el afinado que sustituye a la carpeta con fecha en las
 dos últimas órdenes.
 
-El resumen de los dos cambios está en la lección 8: la pérdida dio **+0,119** de Spearman y
-triplicar la capacidad **+0,027**. Y el listón sigue sin cumplirse —0,6665 frente a 0,80— porque el
-modelo falla donde hace falta táctica: pasa de 0,80 en las posiciones decididas y se queda en 0,46
-en las igualadas, que son el 61 %. Sin búsqueda, ese techo no lo mueve el tamaño.
+Como resume la lección 8, la pérdida dio +0,119 de Spearman y triplicar la capacidad, +0,027. El
+listón sigue sin cumplirse (0,6665 frente a 0,80) porque el modelo falla donde hace falta táctica:
+pasa de 0,80 en las posiciones decididas y se queda en 0,46 en las igualadas, que son el 61 %. Sin
+búsqueda, ese techo no lo mueve el tamaño.
 
 ## Ver las dos evaluaciones: ValueBar
 
 La isla de abajo recorre una partida ply a ply. La línea continua es el valor del encoder; la de
-trazos, el `cp` de Stockfish convertido a la misma escala acotada. Las dos miran desde el punto de
-vista de las blancas: por encima del cero, ventaja blanca; por debajo, ventaja negra. El deslizador
-elige una media jugada, la barra de arriba muestra su valor, y el texto de debajo dice de quién es
-la ventaja **con palabras**, porque el signo de una evaluación no puede depender de distinguir dos
-colores. Las verticales punteadas son los plies que la cabeza de error marca, y están además
-enumerados en texto justo debajo del deslizador.
+trazos, el `cp` de Stockfish en la misma escala acotada, las dos desde las blancas (por encima del
+cero, ventaja blanca). El deslizador elige una media jugada, y el texto de debajo dice de quién es la
+ventaja con palabras, para no depender de distinguir colores. Las verticales punteadas, enumeradas
+también en texto, son los plies que la cabeza de error marca.
 
 Cuatro cosas que mirar, en este orden:
 
-1. **Dónde se separan las dos líneas.** Mientras van juntas, el encoder está haciendo el trabajo de
-   un motor con una sola pasada hacia delante, que ya es un resultado. Las separaciones son lo
-   interesante, y casi siempre ocurren en el mismo tipo de posición: cuando la ventaja es táctica y
-   depende de una secuencia forzada. El encoder no busca; evalúa de un vistazo. Todo lo que exija
-   calcular tres jugadas por delante es, por construcción, su punto ciego.
-2. **Si el encoder es sistemáticamente más plano.** Es lo esperable: un `tanh` entrenado con error
-   cuadrático tiende a la media, así que las ventajas grandes se quedan cortas. Si lo ves, mira
-   Pearson y Spearman de la evaluación: es exactamente el caso en el que Spearman es alto y Pearson
-   más bajo, y verlo en una partida concreta es la mejor manera de entender esas dos cifras.
-3. **Qué plies marca como error: ninguno.** No hay una sola vertical punteada en toda la partida:
-   el script marca con el umbral de fábrica de 0,5, y las probabilidades de esta cabeza no llegan a
-   0,20. El punto de operación equivocado convierte un detector con 0,696 de ROC AUC en uno que no
-   detecta nada. Con `THRESHOLD` en 0,04459 aparecen las verticales.
-4. **El sacrificio, y el escalón que sí está.** La partida termina en 17…Ae6, la jugada que la
-   heurística de material llama error garrafal. En la curva de trazos, en el ply 22, Stockfish pasa
-   de −0,015 a **−0,52** y se queda ahí, porque ahí se decide la partida a favor de las negras. La
-   línea continua se mueve entre 0,00 y 0,16 de principio a fin, **siempre del lado de las
-   blancas**, y no registra el escalón. Es el Spearman bajo, visto con los ojos: el modelo está
-   aplastado contra el cero, sobre todo porque su pérdida premiaba acercarse a cada etiqueta y no
-   ordenarlas. Con el término de ordenación esta curva se despega, pero el escalón del ply 22 sigue
-   sin aparecer: esa parte necesita táctica, no otra pérdida.
+1. **Dónde se separan las dos líneas.** Mientras van juntas, el encoder hace el trabajo de un motor
+   con una sola pasada, que ya es un resultado. Se separan cuando la ventaja depende de una
+   secuencia forzada: el encoder evalúa de un vistazo, y calcular tres jugadas por delante es su
+   punto ciego por construcción.
+2. **Si el encoder es más plano.** Es lo esperable: un `tanh` entrenado con error cuadrático tiende a
+   la media y se queda corto en las ventajas grandes. Es el caso de Spearman alto y Pearson más
+   bajo, y verlo en una partida es la mejor manera de entender esas dos cifras.
+3. **Qué plies marca como error: ninguno.** Con el umbral de fábrica de 0,5 y probabilidades que no
+   llegan a 0,20, un detector con 0,696 de ROC AUC no detecta nada. Con `THRESHOLD` en 0,04459
+   aparecen las verticales.
+4. **El sacrificio y el escalón.** La partida termina en 17…Ae6, la jugada que la heurística de
+   material llama error garrafal. En el ply 22, Stockfish pasa de −0,015 a −0,52 y se queda ahí,
+   porque ahí se decide la partida. La línea continua se mueve entre 0,00 y 0,16 de principio a fin,
+   siempre del lado de las blancas, y no registra el escalón: es el Spearman bajo visto con los
+   ojos, un modelo aplastado contra el cero porque su pérdida premiaba acercarse a cada etiqueta y
+   no ordenarlas. Con el término de ordenación la curva se despega, pero el escalón sigue sin
+   aparecer: eso necesita táctica, no otra pérdida.
 
 <ValueBar client:visible />
 
 Que dos líneas vayan juntas tampoco demostraría que el modelo entiende la posición como el motor:
-puede leer material y estructura y acertar en casi todas las posiciones porque casi todas se
-explican con eso. Por eso el titular del módulo no es esta figura sino el F1 contra el baseline
-sobre diez mil posiciones que el modelo no ha visto: la figura sirve para entender, la tabla para
-concluir.
+casi todas las posiciones se explican con material y estructura. Por eso el titular del módulo es el
+F1 contra el baseline sobre diez mil posiciones no vistas: la figura sirve para entender, la tabla
+para concluir.
 
 <DemoEmbed
   query="?stage=small-int8&encoder=encoder-int8"
   title="La barra de evaluación en la demo"
-  note="La barra es opcional y solo se descarga si aceptas el encoder (~30 MB además del decoder). Sin consentimiento la pantalla queda exactamente como estaba."
+  note="La barra es opcional y solo se descarga si aceptas el encoder (~30 MB además del decoder). Sin consentimiento la pantalla queda como estaba."
 />
 
 ## Qué has aprendido, cómo se mide
@@ -1011,71 +929,53 @@ eso marca su techo, pero es la segunda mitad de lo que hace cualquier modelo de 
 generar, comprender, clasificar y representar.
 
 Por el camino has escrito un encoder que es el modelo de M2 con un booleano cambiado, y sabes por
-qué ese booleano lo cambia todo. Lo has preentrenado con masked move modeling defendiendo cada número
-de la receta, y has montado encima tres cabezas lineales porque son demasiado tontas para hacer
-trampa. Ver el tablero resultó mejor para _cuánto vale esto_ y ver la línea para _qué se acaba de
-tirar_.
+qué ese booleano lo cambia todo. Lo has preentrenado con masked move modeling y le has puesto encima
+tres cabezas lineales, demasiado tontas para hacer trampa. Ver el tablero resultó mejor para _cuánto
+vale esto_, y ver la línea, para _qué se acaba de tirar_.
 
 Te llevas dos resultados que contradicen el instinto: **afinar menos red salió mejor que afinarla
 entera**, y **la curva por etiquetas es plana desde el 25 %**, así que «faltan etiquetas» quedó
-descartado por medida y no por opinión. Las dos conclusiones se enuncian como lo que son —una
-ordenación sugerente y una meseta clara—, porque el ruido entre dos tiradas idénticas es del mismo
-tamaño que las diferencias.
-
-Y has aprendido a medir: contra un baseline malo a propósito, sobre las mismas filas, con métricas
-que no se dejan engañar por una clase rara, un umbral elegido en unas filas y medido en otras, y un
-reparto por partida que cierra la fuga. Es lo que harás con cualquier clasificador, detector o
-sistema de recuperación que construyas.
+descartado por medida. Y has aprendido a medir: contra un baseline malo a propósito, sobre las
+mismas filas, con métricas que una clase rara no engaña, un umbral elegido en unas filas y medido en
+otras, y un reparto por partida que cierra la fuga. Lo harás igual con cualquier clasificador,
+detector o sistema de recuperación.
 
 **Cómo se mide el módulo 3.** Todo lo que sigue es un número o un test:
 
-- **F1 de detección de errores**, del encoder y de la heurística de material sobre las mismas filas
-  de validación, con su precisión y su exhaustividad al lado, en el umbral ajustado y en el fijo, y
-  con ROC AUC y precisión media, que no dependen de ningún umbral. El umbral se elige en una mitad
-  `tune` y el F1 se mide en la mitad `score`, partidas por `game_id`. Objetivo del hito: al
-  menos cinco puntos de margen. **Medido: 0,180 contra 0,089, +9,2 puntos. Se cumple.**
-- **Correlación del valor con `tanh(cp/400)`**, Pearson y Spearman, esta última como titular.
-  Objetivo: ≥ 0,80. **Medido: 0,520 al cerrar el hito y 0,6665 tras cambiar la pérdida por una que
-  mira el orden. No se cumple** ni con lo segundo, y el desglose por dificultad dice dónde: 0,88
+- **F1 de detección de errores**, del encoder y de la heurística sobre las mismas filas, con
+  precisión, exhaustividad, ROC AUC y precisión media; umbral elegido en la mitad `tune` y F1 medido
+  en la `score`, partidas por `game_id`. Objetivo: cinco puntos de margen. Medido: 0,180 contra
+  0,089, +9,2 puntos. Se cumple.
+- **Correlación del valor con `tanh(cp/400)`**, Spearman como titular. Objetivo: ≥ 0,80.
+  Medido: 0,520 al cerrar el hito y 0,6665 con la pérdida de ordenación. No se cumple: 0,88
   donde la ventaja está decidida, 0,46 en el 61 % de posiciones igualadas.
-- **Exactitud del resultado** sobre las tres clases, con la advertencia de que su techo es bajo por
-  construcción. Medido: 51,4 % en validación con el modelo entero descongelado, 50,0 % en la
-  evaluación del `last-n` sobre las 10 000 posiciones held-out.
-- **Curva por número de etiquetas** al 10, 25, 50 y 100 %, sobre subconjuntos anidados, en modo
-  `last-n`. **Medida: plana desde el 25 %** —error del valor 0,1217 / 0,1192 / 0,1210 / 0,1215—, así
-  que más allá de unas cien mil etiquetas más evaluaciones de Stockfish no compran nada medible. La
-  única diferencia que supera el ruido entre tiradas es la exactitud de errores en el 10 % (0,9559
-  frente a 0,9678), que es lo que pasa cuando la clase rara se queda en unas 1 600 filas.
-- **Modo de afinado**, los tres a 4 000 pasos sobre las mismas etiquetas. **Medido: `last-n` gana**
-  con 0,1180 de error de valor, frente a 0,1354 de `full` y 0,1429 de `probe`; `full` solo gana en
-  la exactitud del resultado (51,4 %). Es una tirada por modo, así que la ordenación es sugerente y
-  no establecida: para cerrarla harían falta varias semillas por modo.
-- **Paridad ONNX** de las dos salidas que usa la demo: coincidencia de la decisión de error y
-  diferencia máxima del valor, para fp32, fp16 e int8. **Medido: 100 % en las tres**, con 60,7 /
-  30,6 / 18,3 MB y un desvío máximo del valor de 0,024 en int8, frente al 4,6 % de jugadas que
-  cambiaba el int8 del decoder de M2.
-- **Tests unitarios** que se quedan para siempre: que el modelo **no** es causal, que el relleno no
-  influye en los tokens reales, que `pool("mean")` lo ignora, que un FEN va y vuelve casilla a
-  casilla, que las proporciones 80/10/10 se cumplen sobre diez mil tokens, que los tokens de control
-  nunca se tapan, que el modo `probe` deja el encoder idéntico bit a bit, que ningún `game_id` cruza
-  el reparto y que el F1 calculado a mano sobre un caso pequeño coincide con el del código.
-- **Reproducibilidad**: el hash del vocabulario de casillas fijado en un test, la semilla del
-  enmascarado en la configuración, el reparto como función pura del id y de la semilla, y cada
-  tirada en <Term id="mlflow">MLflow</Term> con sus curvas.
+- **Exactitud del resultado** sobre tres clases, con un techo bajo por construcción: 51,4 % en
+  validación con `full`, 50,0 % del `last-n` sobre las 10 000 posiciones held-out.
+- **Curva por número de etiquetas** en `last-n`: plana desde el 25 % (0,1217 / 0,1192 /
+  0,1210 / 0,1215); solo la exactitud de errores en el 10 % supera el ruido.
+- **Modo de afinado**, a 4 000 pasos: `last-n` gana con 0,1180 de error de valor, frente a
+  0,1354 de `full` y 0,1429 de `probe`; `full` solo gana en el resultado. Una tirada por modo:
+  ordenación sugerente.
+- **Paridad ONNX**: 100 % de decisiones de error en fp32, fp16 e int8, con 60,7 / 30,6 / 18,3 MB
+  y un desvío máximo del valor de 0,024 en int8.
+- **Tests unitarios** que se quedan: el modelo no es causal, el relleno no influye, un FEN va y
+  vuelve casilla a casilla, el 80/10/10 se cumple, `probe` deja el encoder idéntico bit a bit,
+  ningún `game_id` cruza el reparto y el F1 a mano coincide con el del código.
+- **Reproducibilidad**: cada tirada en <Term id="mlflow">MLflow</Term>, hash del vocabulario de
+  casillas fijado en un test, semilla del enmascarado en la configuración y reparto como función
+  pura del id.
 
-Lo siguiente es M4: las clases particulares. Vuelves al decoder de M2 y le enseñas a jugar como un
+Lo siguiente es M4, las clases particulares: vuelves al decoder de M2 y le enseñas a jugar como un
 1500 o como un 2200 cambiando dos tokens del principio, con LoRA para no mover los ciento quince
-millones de pesos del `medium` cada vez. El encoder no se queda parado: su barra sigue en la demo,
-sus embeddings son la entrada de la recuperación de posiciones de la fase 2, y
-su <Term id="probe-lineal">probe lineal</Term> es la técnica con la que en M2 leíste que se puede
-extraer el tablero de las activaciones de un modelo de ajedrez, ahora montada por ti sobre tu propio
-modelo.
+millones de pesos del `medium`. El encoder sigue ahí: su barra en la demo, sus embeddings como
+entrada de la fase 2, y su <Term id="probe-lineal">probe lineal</Term>, la técnica con la que en M2
+leíste que se extrae el tablero de las activaciones de un modelo de ajedrez, ahora montada por ti.
 
 <RepoTag
   tag="p3"
   at="final"
   module="M3"
-  note="El encoder de 39 millones con el que cierra la parte de labs se hizo después y está en el tag p3-elo-1200."
+  note="El encoder de 39 millones con el que cierra la parte de labs se hizo después: sus configuraciones están en la etiqueta p4."
 />
 
 La cheatsheet del módulo, once preguntas con su respuesta corta, está justo debajo.
