@@ -9,7 +9,7 @@ order: 4
 duration: 190
 level: base
 status: vigente
-updated: '2026-09-22'
+updated: '2026-09-23'
 keywords:
   - temperatura
   - top-k
@@ -20,6 +20,7 @@ keywords:
 ---
 
 import SoftmaxPush from '../../../components/figures/SoftmaxPush.astro';
+import M2Temperature from '../../../components/figures/M2Temperature.astro';
 
 ## Qué vas a construir
 
@@ -30,16 +31,8 @@ muestreador devuelve **dos cosas**, la jugada y qué propuso la red.
 
 ## Teoría justa: tres perillas y un orden
 
-El modelo da 2 030 logits. Convertirlos en una jugada es una decisión de diseño con tres perillas.
-
-Antes de las perillas, una advertencia sobre la palabra que todo el mundo usa para la temperatura:
-**creatividad**. Es falsa, y entenderlo ahorra disgustos. Le preguntas a alguien que se conoce el
-restaurante qué pedir. A temperatura cero te dice siempre su plato favorito, el mismo cada vez;
-subiéndola empieza a nombrarte el segundo y el tercero de su lista; muy arriba te acaba proponiendo
-la ensalada que no le gusta a nadie. **No ha aprendido platos nuevos.** Solo está dispuesto a bajar
-más por la lista que ya tenía. La temperatura no añade opciones, redistribuye confianza entre las
-que el modelo ya había ordenado —y por eso bajar por la lista cuesta, en este proyecto, unos 180
-puntos de Elo—.
+El modelo da 2 030 logits. Convertirlos en una jugada es una decisión de diseño con tres perillas,
+y son las mismas que ajustas cuando llamas a la API de un LLM de texto.
 
 **<Term id="temperatura">Temperatura</Term>.** Se dividen los logits por `T` antes del softmax. Con
 `T = 1` la distribución es la que el modelo aprendió; con `T` pequeña las diferencias se amplifican
@@ -47,11 +40,26 @@ y la mejor jugada se lleva casi toda la probabilidad (en el límite, `T → 0`, 
 grande todo se aplana hacia el azar. Rukh usa 0,6 por defecto: suficiente para que dos partidas no
 sean idénticas, poco para que el modelo se tire a la piscina.
 
+A la temperatura se la suele llamar «creatividad», y la palabra engaña. Le preguntas a alguien que
+se conoce el restaurante qué pedir. A temperatura cero te dice siempre su plato favorito, el mismo
+cada vez; subiéndola empieza a nombrarte el segundo y el tercero de su lista; muy arriba te acaba
+proponiendo la ensalada que no le gusta a nadie. No ha aprendido platos nuevos: solo está dispuesto
+a bajar más por la lista que ya tenía. La temperatura no añade opciones, redistribuye confianza
+entre las que el modelo ya había ordenado, y bajar por esa lista tiene un precio: en este proyecto,
+unos 180 puntos de Elo, como verás al medirlo.
+
 **<Term id="top-k">Top-k</Term>.** Se conservan solo los `k` logits mayores y el resto pasa a menos
 infinito. Con `k = 20` de 2 030 jugadas, la cola —donde hay mil jugadas con probabilidad 0,0001
 cada una, que sumadas son un 10 % de probabilidad de hacer una tontería— desaparece. Temperatura y
-top-k no son alternativas sino complementarias: la temperatura reescala, el top-k recorta. Sin
-top-k, una temperatura alta muestrea basura; sin temperatura, el top-k solo limita cuánta basura.
+top-k se complementan: la temperatura reescala, el top-k recorta. Sin top-k, una temperatura alta
+muestrea basura; sin temperatura, el top-k solo limita cuánta basura.
+
+<Figure
+  n="01"
+  caption="Las mismas ocho jugadas con cuatro ajustes. La temperatura cambia cuánto se concentra la probabilidad, nunca el orden de las jugadas. El top-k, en el último panel, saca la cola del reparto antes de muestrear: las recortadas, en discontinuo, se quedan en cero y su masa se reparte entre las que quedan."
+>
+  <M2Temperature />
+</Figure>
 
 <Callout kind="teoria" title="Una propiedad del softmax que cuesta entrenamientos enteros">
   Las tres perillas tienen algo en común que conviene ver ahora, porque explica errores que vas a
@@ -63,30 +71,30 @@ jugada te gusta menos y empujas su puntuación hacia abajo, esa probabilidad no 
 reparte entre el resto en proporción a lo que ya tenían.
 
 <Figure
-  n="01"
+  n="02"
   caption="Empujar hacia abajo la mejor jugada no la sustituye por la segunda. Las dos columnas suman uno, así que todo lo demás sube a la vez: la cola —las ocho jugadas que no querías— pasa de sumar el 26 % al 38 % sin que nadie la haya tocado. El softmax no tiene papelera."
 >
   <SoftmaxPush />
 </Figure>
 
-Quitas peso de un platillo de una balanza de brazos y no desaparece: se va al otro lado. Tú solo
-elegiste de dónde quitarlo, no adónde va.
+Es un presupuesto cerrado. Si recortas una partida, el dinero no vuelve a Hacienda: se reparte
+entre todas las demás en proporción a lo que ya tenían, incluidas las que nunca habrías querido
+subir. Tú eliges de dónde quitar, no adónde va.
 
 De ahí sale una regla que vale para cualquier cosa que le pidas a un modelo: **todo «esto no»
 necesita un «y conserva lo que ya estaba bien» emparejado.** Un objetivo que solo prohíbe está
 infraespecificado, porque no dice dónde poner lo que libera. Es la razón de que un prompt escrito
 como lista de prohibiciones —nunca digas X, nunca te disculpes, nunca uses viñetas— produzca
-salidas raras: has movido masa sin decir adónde. Y es exactamente el mecanismo por el que, en M5,
-un método de alineamiento mal montado destruye un modelo en un par de cientos de pasos.
+salidas raras: has movido masa sin decir adónde. Volverás a ver este mecanismo en M5, cuando una
+pérdida de alineamiento empuje hacia abajo las respuestas que no se quieren.
 
 El `top-k` es la versión sana de la misma idea: en vez de empujar hacia abajo lo que no quieres,
 **lo saca del reparto antes de repartir**. Nada que hayas descartado puede recibir masa.
 
-Pero cuidado con la conclusión fácil, porque hay una distinción que vale la mitad de la lección:
-el `top-k` actúa **al decodificar** y la cola engorda **en los pesos**. Tapar la cola al muestrear
-no arregla un modelo cuya cola creció durante el entrenamiento. Y tienes la prueba a la vista: la
-legalidad sin máscara se mide **sin temperatura y sin top-k** precisamente por eso, y es el número
-que se resiente cuando alguien mueve masa sin mirar adónde va.
+Pero cuidado con la conclusión fácil: el `top-k` actúa **al decodificar** y la cola engorda **en
+los pesos**. Tapar la cola al muestrear no arregla un modelo cuya cola creció durante el
+entrenamiento. Por eso la legalidad sin máscara se mide **sin temperatura y sin top-k**: es el
+número que se resiente cuando alguien mueve masa sin mirar adónde va.
 
 </Callout>
 
@@ -108,6 +116,17 @@ partidas contra Stockfish. Y aquí está el argumento honesto de todo el módulo
   eso `SampleConfig` tiene `mask_illegal` y por eso `rukh play` tiene `--no-mask`: no es un modo de
   depuración, es el experimento.
 </Callout>
+
+<Transfer
+  concept="Decodificación restringida"
+  where="El modo JSON de una API, una gramática que obliga a un LLM a emitir llamadas a herramientas válidas, un clasificador que solo puede contestar una de cinco etiquetas."
+>
+  La máscara de legalidad es la misma técnica con la que se obliga a un LLM a producir JSON válido:
+  antes de muestrear, los logits de todo token que rompería la gramática pasan a menos infinito.
+  Funciona, y hereda la misma trampa: un 100 % de JSON válido con la gramática puesta no dice nada
+  de lo que el modelo sabe hacer sin ella. Si quieres saber si el modelo ha aprendido el formato,
+  mídelo con la restricción quitada.
+</Transfer>
 
 ## `sampler.py`: una jugada
 
@@ -250,7 +269,7 @@ Las jugadas legales, traducidas a ids del vocabulario. Hay dos decisiones:
 - **El enroque es `e1g1`**, el movimiento de dos casillas del rey, que es la cadena que enumera el
   tokenizador de M1 y la que devuelve `Move.uci()` de `python-chess` en el modo por defecto. Si el
   tokenizador hubiera enumerado la notación de Chess960 (`e1h1`, rey captura torre) el vocabulario y
-  el motor hablarían idiomas distintos y el enroque sería literalmente imposible.
+  el motor hablarían idiomas distintos y el enroque sería imposible.
 - **Una jugada legal que faltara del vocabulario se salta**, no se adivina. Con la enumeración de M1
   no puede pasar; y si algún día pasa, una conjetura silenciosa sería peor que una jugada que el
   muestreador simplemente no propone.
@@ -369,10 +388,10 @@ def _as_move(token: str) -> chess.Move | None:
 
 <Src file="src/rukh/infer/sampler.py" tag="p2" lines="152-157" />
 
-Aquí está el detalle que nadie recuerda: el vocabulario tiene tokens que no son jugadas
-—`<bos>`, `<eos>`, `<1-0>`, los de Elo—, y sin máscara el modelo puede proponerlos. `Move.from_uci`
-lanza `ValueError` con ellos, así que la conversión devuelve `None` y el informe lo cuenta como
-ilegal, que es exactamente lo que es.
+Un detalle que se olvida con facilidad: el vocabulario tiene tokens que no son jugadas —`<bos>`,
+`<eos>`, `<1-0>`, los de Elo—, y sin máscara el modelo puede proponerlos. `Move.from_uci` lanza
+`ValueError` con ellos, así que la conversión devuelve `None` y el informe lo cuenta como ilegal,
+que es lo que es.
 
 ## `game.py`: una partida entera
 
@@ -491,9 +510,6 @@ El oponente de verdad. `UCI_Elo` de Stockfish no baja de 1320, así que para ten
 debajo hay que usar `Skill Level`, que es **otro mecanismo** —introduce errores deliberados— y cuya
 equivalencia en Elo es una convención y no una medida. El constructor acepta uno u otro y configura
 el motor en consecuencia, con `UCI_LimitStrength` encendido o apagado según cuál.
-
-Esa distinción, que aquí parecen dos ramas de un `if`, es la que dos lecciones más adelante resulta
-estar detrás de un error de 350 puntos de Elo en la tabla publicada del módulo.
 
 El gestor de contexto (`__enter__`/`__exit__` más `close`) existe porque `SimpleEngine.popen_uci`
 arranca un proceso. Sin cerrarlo, una suite que juega ocho escalones deja ocho Stockfish vivos.

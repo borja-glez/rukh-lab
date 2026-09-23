@@ -10,7 +10,7 @@ duration: 205
 runtime: 45
 level: base
 status: vigente
-updated: '2026-09-22'
+updated: '2026-09-23'
 keywords:
   - AdamW
   - warmup
@@ -37,8 +37,9 @@ sus veinte checkpoints, sus curvas en MLflow y la propiedad de la que depende to
 proceso se corta, `--resume` continúa donde estaba en vez de empezar otra vez.
 
 Un modelo bien construido no entrena solo. La receta que sigue es casi la misma que usaría
-cualquiera para un GPT pequeño, y el objeto de esta lección es que cada número tenga un motivo que
-sepas defender.
+cualquiera para un GPT pequeño y, con otros números, la de cualquier LLM que se preentrena hoy:
+AdamW, warmup y coseno, recorte de gradiente y bf16. El objeto de esta lección es que cada número
+tenga un motivo que sepas defender.
 
 <LabRoutes lesson="m2/03-la-receta-de-entrenamiento" />
 
@@ -53,29 +54,25 @@ cambia deprisa al principio y una media demasiado larga reacciona tarde. Es el v
 de nanoGPT.
 
 **Weight decay 0,1, solo en las matrices.** El decaimiento de pesos resta en cada paso una fracción
-del propio peso: empuja todo hacia cero salvo que el gradiente lo sostenga. En las matrices —la
-atención, el MLP, los embeddings— eso es regularización clásica. En los parámetros de `LayerNorm` y
-en los sesgos, no.
-
-El decaimiento es un alquiler que se cobra por peso: cada parámetro paga cada paso una fracción de
-lo que vale, y solo se queda grande el que el gradiente sostiene porque de verdad hace falta. Lo
-que no se usa se va encogiendo hasta desaparecer. A las ganancias del `LayerNorm` no se les cobra
-porque su tamaño no es capacidad: es un ajuste de escala, y cobrarles alquiler es apagar el canal.
+del propio peso: empuja todo hacia cero salvo que el gradiente lo sostenga, así que solo se queda
+grande lo que de verdad hace falta. En las matrices —la atención, el MLP, los embeddings— eso es
+regularización clásica. En los parámetros de `LayerNorm` y en los sesgos, no: su tamaño no es
+capacidad sino un ajuste de escala o un desplazamiento, y encogerlos solo estropea la señal.
 
 **<Term id="warmup">Warmup</Term> de 1 000 pasos y después coseno.** La tasa de aprendizaje empieza
 en cero, sube en línea recta hasta 6e-4 en el paso 1 000 y desde ahí baja siguiendo medio coseno
 hasta el 10 % de ese valor en el paso 20 000, donde se queda.
 
 Qué pasa sin warmup. En el paso 1, Adam tiene una estimación del segundo momento hecha con un único
-gradiente; el cociente que calcula es casi arbitrario —es calcular tu velocidad media en un viaje
-cuando llevas recorrido el primer metro: el número existe, pero no significa nada todavía—, y como
-el paso de Adam está normalizado, un parámetro puede moverse tanto como la tasa de aprendizaje de
-golpe. El warmup es no fiarse de esa media hasta que hay kilómetros detrás. Sobre una red recién
-inicializada, con 24 escrituras en la corriente residual, eso basta para que las activaciones
-exploten, el softmax de la atención sature y el modelo caiga en un mínimo tonto: predecir siempre
-las jugadas más frecuentes del corpus. La curva no revienta con un `NaN` espectacular; se queda
-plana en una pérdida mediocre y no baja nunca. El warmup cuesta el 5 % de los pasos y elimina ese
-riesgo entero.
+gradiente, y el cociente que calcula es casi arbitrario. Es como calcular tu velocidad media en un
+viaje cuando llevas recorrido el primer metro: el número existe, pero todavía no significa nada. Y
+como el paso de Adam está normalizado, con esa media sin sentido un parámetro puede moverse de
+golpe tanto como la tasa de aprendizaje entera. Sobre una red recién inicializada, con 24
+escrituras en la corriente residual, eso basta para que las activaciones exploten, el softmax de la
+atención sature y el modelo caiga en un mínimo tonto: predecir siempre las jugadas más frecuentes
+del corpus. La curva no revienta con un `NaN` espectacular; se queda plana en una pérdida mediocre
+y no baja nunca. El warmup es no fiarse de esa media hasta que hay kilómetros detrás: cuesta el 5 %
+de los pasos y elimina ese riesgo.
 
 La bajada en coseno tiene una lógica parecida por el otro lado: al final del entrenamiento el
 modelo está cerca de un mínimo y pasos grandes solo lo sacan de él. El suelo del 10 % evita que los
@@ -127,7 +124,7 @@ if TYPE_CHECKING:  # pragma: no cover - only for type checkers
 
 El `TYPE_CHECKING` no es un adorno: `schedule.py` necesita el tipo de `TrainConfig` para anotarse, y
 `loop.py` importa `lr_at`. Importarlo de verdad sería un ciclo. Bajo `TYPE_CHECKING` el import no
-ocurre en tiempo de ejecución y el verificador de tipos sí lo ve, que es exactamente lo que hace
+ocurre en tiempo de ejecución y el verificador de tipos sí lo ve, que es lo que hace
 falta.
 
 ```python title="src/rukh/train/schedule.py"
@@ -347,7 +344,7 @@ un error. Los valores por defecto son los de `small`. Tres campos que no son obv
 
 - **`grad_accum: 4`**, con `batch_size: 64`, son 256 secuencias efectivas. La <Term id="acumulacion-de-gradiente">acumulación de gradiente</Term> no es un lote más grande gratis: es partir el lote que no cabe en la GPU en cuatro pasadas que sí caben.
 - **`unique_run_name: True`** añade una marca de tiempo al nombre. Sin ella, una segunda ejecución de
-  la misma configuración sobreescribiría los `step-*.pt` de la primera, que son exactamente los que
+  la misma configuración sobreescribiría los `step-*.pt` de la primera, que son los que
   lee la isla `TrainingReplay` de este módulo. El docstring del campo lo dice ahí mismo, que es
   donde se lee.
 - **`model: DecoderConfig | None`** permite describir un modelo a mano en el YAML en vez de usar un
@@ -382,11 +379,11 @@ def param_groups(model: nn.Module, weight_decay: float) -> list[dict[str, Any]]:
 `pick_device` mira primero `RUKH_DEVICE`, y esa variable de entorno es lo que permite a los tests
 forzar CPU en una máquina con GPU sin tocar ninguna configuración.
 
-`param_groups` reparte el decaimiento de pesos, y la regla es literalmente «tensores de
-dos dimensiones o más». Un `LayerNorm` tiene una ganancia por canal inicializada a 1; empujarla hacia
-cero es apagar el canal, no regularizarlo. Un sesgo tiene una dimensión y desplaza, no escala. Son
-unos pocos miles de parámetros de los 39 millones, y meterlos en el grupo equivocado degrada el
-entrenamiento en silencio, que es la peor forma de degradarlo.
+`param_groups` reparte el decaimiento de pesos, y la regla es «tensores de dos dimensiones o más».
+Un `LayerNorm` tiene una ganancia por canal inicializada a 1; empujarla hacia cero es apagar el
+canal, no regularizarlo. Un sesgo tiene una dimensión y desplaza, no escala. Son unos pocos miles de
+parámetros de los 39 millones, y meterlos en el grupo equivocado degrada el entrenamiento en
+silencio.
 
 ```python title="src/rukh/train/loop.py"
 def forever(loader: DataLoader[Batch]) -> Iterator[Batch]:
@@ -440,15 +437,13 @@ ejecución**, cuando ya has invertido media hora. Forzar la compilación aquí c
 entrenamiento hace que el fallo ocurra donde todavía se puede caer a modo _eager_.
 
 Y la caída es un aviso, no una excepción: `log.warning` y se entrena igual. La máquina de referencia
-entrena `small` entero en eager por exactamente esto, a 422 000 tokens por segundo, y lo dice en vez
-de fingir que la bandera funcionó.
+entrena `small` entero en eager por esto, a 422 000 tokens por segundo, y lo dice en vez de fingir
+que la bandera funcionó.
 
-<Callout kind="roto" title="`model.zero_grad()` después del lote de prueba">
-  El lote de prueba hace un `backward()` de verdad, así que deja gradientes puestos en todos los
-  parámetros. Sin el `zero_grad(set_to_none=True)` de las dos ramas, el primer paso real del
-  entrenamiento sumaría esos gradientes de un lote de unos a los suyos. No revienta nada: el modelo
-  simplemente empieza con un paso envenenado, y es imposible de ver en la curva.
-</Callout>
+Fíjate en los dos `model.zero_grad(set_to_none=True)`. El lote de prueba hace un `backward()` de
+verdad y deja gradientes en todos los parámetros; sin borrarlos, el primer paso real sumaría a los
+suyos los de un lote de unos. No revienta nada, y por eso se escapa con facilidad: el modelo empieza
+con un paso envenenado que la curva no deja ver.
 
 ```python title="src/rukh/train/loop.py"
 @torch.no_grad()
@@ -928,6 +923,18 @@ Y la escritura es **atómica**: fichero temporal y `replace`. Un `torch.save` di
 `best.pt` que se interrumpa a mitad —se va la luz, se llena el disco— deja un fichero corrupto donde
 antes había uno bueno. Con el temporal, el peor caso es un `.tmp` huérfano.
 
+<Transfer
+  concept="Un checkpoint no son los pesos"
+  where="Un fine-tuning en instancias spot que la nube te quita sin avisar; una evaluación de varias horas; cualquier modelo que otra persona vaya a descargar."
+>
+  Para reanudar sin que se note hacen falta los pesos, el estado del optimizador, el paso (que fija
+  la tasa del planificador), los generadores aleatorios y por dónde iba el flujo de datos. Para que
+  otro se fíe, además, la procedencia: qué datos, qué vocabulario, qué commit. Y para que se pueda
+  descargar sin riesgo, un formato que no ejecute código al cargarse (`weights_only`, o
+  `safetensors`, que llega en «Publicar el modelo»). Guardar solo `model.state_dict()` es la versión
+  que funciona hasta el primer corte.
+</Transfer>
+
 ```python title="src/rukh/train/checkpoint.py"
 def load_checkpoint(path: Path, map_location: str | torch.device = "cpu") -> dict[str, Any]:
     """Read a checkpoint written by ``save_checkpoint``."""
@@ -1302,14 +1309,13 @@ log_every: 10
 <Src file="configs/train/small.yaml" tag="p2" lines="1-27" />
 
 El modelo del curso. Ninguna clave es decorativa: `BaseConfig` rechaza las que
-no reconoce, así que lo que está aquí es exactamente lo que `TrainConfig` sabe leer. Los números son
+no reconoce, así que lo que está aquí es lo que `TrainConfig` sabe leer. Los números son
 los de la receta de arriba; el resto son decisiones de operación: `eval_every: 500` (cuarenta
 evaluaciones en la ejecución), `ckpt_every: 1000` (veinte checkpoints, que son los que recorre la isla
 de «Exportar a ONNX»), `workers: 4` para que el cargador no sea el cuello de botella y `seed: 42`.
 
-El comentario de la cabecera merece leerse: dice 440 000 tokens/s medidos y «unos 40 minutos, no las
-4-8 horas que estimaba el spec antes de que nadie lo cronometrara». Dejar la corrección escrita
-donde estaba la estimación es más útil que borrarla.
+El comentario de la cabecera guarda la medida (440 000 tokens/s, unos 40 minutos) al lado de la
+estimación que corrigió, que es donde alguien la va a buscar.
 
 {/* prettier-ignore */}
 ```yaml title="configs/train/tiny.yaml"
@@ -1351,8 +1357,8 @@ la ejecución, frente al 5 % de `small`. Una ejecución corta necesita calentar 
 el riesgo del warmup no es proporcional a los pasos totales sino a lo mal calibrado que está Adam
 en los primeros.
 
-La frase del comentario de `tiny.yaml` —«menos de 20 minutos en una 5090»— también quedó corta: la
-tirada real fueron **189 segundos**.
+El comentario de `tiny.yaml` promete «menos de 20 minutos en una 5090»; la tirada real fueron
+**189 segundos**.
 
 ## Lanzarlo
 
@@ -1476,7 +1482,7 @@ sobreajuste y el `best.pt` ya está guardado del paso anterior. `lr` debe dibuja
 y el coseno. Y `grad_norm` debe estabilizarse: picos recurrentes significan que el clipping está
 trabajando demasiado y que la tasa de aprendizaje es alta para este modelo.
 
-Cada 1 000 pasos se escribe un checkpoint, y esos checkpoints son exactamente los que alimentan la
+Cada 1 000 pasos se escribe un checkpoint, y esos checkpoints son los que alimentan la
 repetición del entrenamiento de la lección 7.
 
 ### `small`, el modelo del curso
@@ -1484,13 +1490,11 @@ repetición del entrenamiento de la lección 7.
 12 capas, 512 dimensiones, 8 cabezas, 38 971 392 parámetros, 20 000 pasos de 64 × 4 secuencias
 (51 200 tokens por paso, 1 024 millones de tokens en total), tasa 6e-4 con 1 000 de warmup.
 
-Cuánto tardó, ya medido y no estimado: el bucle sostuvo **422 000 tokens/s** de mediana en esta
-5090 —423 309 en el último paso registrado—, en modo eager (`torch.compile` no arranca en este
-Windows porque no hay Triton, y el bucle cae a eager sin romperse). Mil veinticuatro millones de
-tokens a esa velocidad son **2 498 segundos de principio a fin: 42 minutos**. El spec del proyecto
-estimaba entre cuatro y ocho horas; era una estimación conservadora escrita antes de medir nada, y
-la dejamos dicha aquí para que se vea la diferencia entre estimar y medir: el error fue de un
-factor de entre seis y once.
+Cuánto tardó: el bucle sostuvo **422 000 tokens/s** de mediana en esta 5090 —423 309 en el último
+paso registrado—, en modo eager (`torch.compile` no arranca en este Windows porque no hay Triton, y
+el bucle cae a eager sin romperse). Mil veinticuatro millones de tokens a esa velocidad son **2 498
+segundos de principio a fin: 42 minutos**, cuando el diseño, antes de medir nada, estimaba entre
+cuatro y ocho horas.
 
 ```bash title="Terminal"
 uv run rukh train --config configs/train/small.yaml
@@ -1542,19 +1546,19 @@ el paquete de tokens no tenía `meta.json`.
 
 </Callout>
 
-<Exercise n="01" title="Dos entrenamientos de 300 pasos que explican la receta">
+<Exercise n="01" title="Tres entrenamientos de 300 pasos que explican la receta">
   Con `--max-steps 300`, lanza `tiny` tres veces: (a) tal cual; (b) con `warmup: 0` en una copia de
   la configuración; (c) con `lr: 1.0e-2`. Compara las tres curvas de `train/loss` y de `grad_norm`
-  en MLflow. Después responde: ¿cuál de las dos variantes rotas se parece más a la sana en los
-  primeros diez pasos, y por qué es eso peligroso?
+  en MLflow. Después responde: ¿se distinguen las tres en los primeros diez pasos? ¿Por qué es eso
+  peligroso?
 
   <Solution>
-    (a) baja suave desde `ln(2030) ≈ 7,6`. (b) sin warmup pega un salto en los primeros pasos: o la
-    pérdida sube por encima de 8 antes de volver, o se queda estancada alrededor de 6, que es
-    aproximadamente la entropía de la distribución de jugadas más frecuentes del corpus; el modelo
-    ha caído en "predecir siempre lo común". (c) con lr diez veces mayor, `grad_norm` se pega al
-    techo del clipping en casi todos los pasos, señal de que el paso real es el que decide el
-    clipping y no el optimizador; la pérdida oscila o diverge.
+    Lo esperable: (a) baja suave desde `ln(2030) ≈ 7,6`. (b) sin warmup pega un salto en los
+    primeros pasos: o la pérdida sube por encima de 8 antes de volver, o se queda estancada
+    alrededor de 6, que es aproximadamente la entropía de la distribución de jugadas más frecuentes
+    del corpus; el modelo ha caído en "predecir siempre lo común". (c) con lr diez veces mayor,
+    `grad_norm` se pega al techo del clipping en casi todos los pasos, señal de que el paso real lo
+    decide el clipping y no el optimizador; la pérdida oscila o diverge.
 
 Lo peligroso es la comparación en los primeros diez pasos: **las tres bajan**. Cualquier
 configuración razonable baja de 7,6 a 5 en unos pocos cientos de pasos, simplemente aprendiendo la

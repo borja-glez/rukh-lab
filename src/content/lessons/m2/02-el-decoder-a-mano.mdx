@@ -9,7 +9,7 @@ order: 2
 duration: 110
 level: base
 status: vigente
-updated: '2026-09-22'
+updated: '2026-09-23'
 keywords:
   - decoder
   - atención
@@ -35,7 +35,7 @@ encoder sea «lo mismo sin la máscara causal» sabrás exactamente qué frase e
 Todo lo que sigue está aquí entero, en el tag `p2`, con su enlace a GitHub debajo de cada bloque.
 Si copias los bloques en orden, tienes `src/rukh/models/`.
 
-<Callout kind="hoy" title="Escríbelo, no lo copies">
+<Callout kind="guia" title="Escríbelo, no lo copies">
   La diferencia entre leer este fichero y escribirlo es la diferencia entre reconocer
   `q.view(shape).transpose(1, 2)` y saber por qué hay un `transpose` ahí. Escribe cada clase,
   ejecuta los tests después de cada una, y usa los bloques para comparar cuando algo no pase.
@@ -179,7 +179,7 @@ def preset(name: str) -> DecoderConfig:
 Ese `model_copy(deep=True)` parece paranoia y no lo es: sin él, un entrenamiento que sobreescribiera
 `cfg.block` estaría modificando el objeto del diccionario, y el siguiente preset que alguien pidiera
 en el mismo proceso —por ejemplo, el barrido de tres tallas de `labs/m2/params.py`— vendría ya
-contaminado. Hay un test para exactamente eso, al final de esta lección.
+contaminado. Hay un test para eso, al final de esta lección.
 
 ## `decoder.py`: el modelo
 
@@ -287,11 +287,13 @@ M3 sí lo enciende.
 
 <Callout kind="roto" title="Los nombres de los módulos son el formato de disco">
   `ln1`, `attn.qkv`, `attn.proj`, `ln2`, `mlp.fc`, `mlp.proj` y el orden en que se crean **son las
-  claves de todos los checkpoints escritos hasta hoy**. Renombrar uno no es una refactorización: es
-  una incompatibilidad silenciosa, porque `load_state_dict` con `strict=False` carga lo que reconoce
-  y deja el resto en la inicialización. El modelo arranca, entrena y es otro. Por eso
+  claves de todos los checkpoints escritos hasta hoy**. Renombrar uno parece una refactorización y
+  es una incompatibilidad silenciosa, porque `load_state_dict` con `strict=False` carga lo que
+  reconoce y deja el resto en la inicialización. El modelo arranca, entrena y es otro. Por eso
   `rukh.train.load_state` —la lección siguiente— carga con `strict=False` y **después** comprueba a
-  mano que no falta ni sobra ninguna clave salvo la que sabe que falta.
+  mano que no falta ni sobra ninguna clave salvo la que sabe que falta. Es el mismo aviso que ves al
+  cargar un modelo de Hugging Face con una versión distinta de su clase («some weights were not
+  initialized»): léelo siempre, porque el modelo funciona igual y ya no es el que crees.
 </Callout>
 
 ```python title="src/rukh/models/decoder.py"
@@ -445,7 +447,7 @@ Tres detalles que se pagan caros si se cambian de orden:
 La inicialización, que es la de GPT-2: normal de desviación 0,02 en cada `Linear` y cada
 `Embedding`, y sesgos a cero. Es un `staticmethod` porque no necesita nada del modelo y así
 `self.apply` puede pasárselo a cada submódulo. Los `LayerNorm` no aparecen: PyTorch ya los inicializa
-con ganancia 1 y sesgo 0, que es exactamente lo que se quiere.
+con ganancia 1 y sesgo 0, que es lo que se quiere.
 
 ```python title="src/rukh/models/decoder.py"
     def num_params(self, non_embedding: bool = True) -> int:
@@ -522,14 +524,10 @@ La inferencia: los logits del último paso y nada más. El `@torch.no_grad()` es
 que impide que una partida de doscientos plies vaya acumulando un grafo de autograd que nadie va a
 derivar.
 
-<Callout kind="roto" title="El recorte de `next_logits` no sirve para jugar">
-  `idx[:, -block:]` es correcto para una pasada suelta y **equivocado** para muestrear una partida
-  más larga que el contexto: se lleva por delante el `<bos>` y los dos tokens de Elo. El modelo
-  pierde el condicionamiento con el que se entrenó y, además, todas sus posiciones aprendidas se
-  desplazan tres lugares. La versión que usa el muestreador conserva la cabecera y recorta por el
-  medio; está en `prompt_ids`, en «Muestrear jugadas», y el recorte de aquí es solo la red de
-  seguridad para que el modelo nunca lance una excepción con una entrada larga.
-</Callout>
+El recorte `idx[:, -block:]` es solo una red de seguridad para que el modelo nunca lance una
+excepción con una entrada larga. No sirve para jugar una partida que no cabe en el contexto,
+porque se lleva por delante el `<bos>` y los dos tokens de Elo. El muestreador de «Muestrear
+jugadas» recorta de otra manera, conservando la cabecera; allí se ve por qué.
 
 ## `__init__.py`: la puerta del paquete
 
@@ -555,8 +553,8 @@ __all__ = [
 
 Solo reexportes y ninguna decisión, salvo una que se nota en todo el resto del curso:
 `from rukh.models import MoveDecoder` funciona desde cualquier sitio, así que ningún otro fichero del
-proyecto importa `rukh.models.decoder` directamente. El día que el decoder se parta en dos ficheros
-—que es lo que M3 estuvo a punto de hacer—, esta lista es lo único que hay que tocar.
+proyecto importa `rukh.models.decoder` directamente. El día que el decoder se parta en dos ficheros,
+esta lista es lo único que hay que tocar.
 
 <Callout kind="ejecuta" title="El modelo ya se construye">
   Con los tres ficheros de `src/rukh/models/` escritos, construye los presets y haz una pasada:
@@ -575,8 +573,11 @@ suele ser un `view` o un `transpose` de la atención.
 
 ## Los tests, que son el contrato
 
-Quince tests, y todos corren en CPU en menos de un segundo. No son una formalidad: son
-la definición ejecutable de qué es un `MoveDecoder`, y el módulo 3 los va a heredar casi enteros.
+Quince tests, y todos corren en CPU en menos de un segundo. Son la definición ejecutable de qué es
+un `MoveDecoder`, y el módulo 3 los va a heredar casi enteros. Si algún día escribes o afinas otro
+modelo de secuencias, de texto o de lo que sea, estos son los que merece la pena copiar: formas,
+causalidad, relleno ignorado por la pérdida, determinismo con semilla y unos pasos de gradiente que
+bajan la pérdida.
 
 ```python title="tests/unit/test_decoder.py"
 """Tests for rukh.models: shapes, causality, loss masking, RoPE, presets and determinism."""
@@ -763,7 +764,7 @@ tengan los mismos números, es que **sean el mismo objeto**. Con `==` el test pa
 copias recién inicializadas de la misma semilla, que es justo el bug que se quiere cazar.
 
 `test_preset_sizes` usa `capsys.disabled()` para imprimir siempre las tres cuentas, incluso con
-`pytest -q`: es un test que además es un informe. Y la aserción es una horquilla generosa (38 a 45
+`pytest -q`: es un test que además hace de informe. Y la aserción es una horquilla generosa (38 a 45
 millones) en vez de la cifra exacta, porque el número exacto ya lo comprueba `labs/m2/params.py`
 contra la fórmula cerrada y un test que se rompe al tocar el vocabulario sería ruido.
 
@@ -810,7 +811,7 @@ def test_a_few_steps_of_gradient_descent_reduce_the_loss() -> None:
 
 <Src file="tests/unit/test_decoder.py" tag="p2" lines="145-159" />
 
-Y el último, que es el que da más tranquilidad por línea escrita: diez pasos de AdamW sobre un lote
+Y el último, el que más tranquilidad da por línea escrita: diez pasos de AdamW sobre un lote
 de juguete tienen que bajar la pérdida. No comprueba que el modelo sea bueno; comprueba que los
 gradientes llegan a todas partes. Un tensor desconectado del grafo —un `.detach()` de más, un
 `torch.no_grad()` mal puesto, un `with` que sobra— no falla ningún otro test de este fichero y hace
@@ -839,7 +840,7 @@ posiciones y totales, y el total de `small` tiene que ser `38,971,392`.
   <Solution>
     Falla `test_embeddings_are_tied_and_can_be_untied`, en el `assert tied.lm_head.weight is
     tied.tokens.weight`, y no falla ningún otro: el modelo construye, entrena, muestrea y exporta
-    exactamente igual. Es el mejor ejemplo del módulo de por qué un test de identidad vale la pena:
+    igual. Es el mejor ejemplo del módulo de por qué un test de identidad vale la pena:
     el bug no produce un error, produce **otro modelo**, con un millón de parámetros más que se
     entrenan por separado.
 
