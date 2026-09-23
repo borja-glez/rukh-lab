@@ -7,7 +7,7 @@ duration: 130
 runtime: 100
 level: base
 status: vigente
-updated: 2026-09-22
+updated: 2026-09-23
 keywords:
   - Lichess
   - DuckDB
@@ -969,6 +969,62 @@ lección y se recoge en M1, donde el manifiesto tendrá los conteos por mes.
 
 Mientras corre, la lección siguiente no necesita datos: es el tablero de la demo, que en este hito
 funciona sin modelo.
+
+<Callout kind="roto" title="Si la descarga muere con HTTP 429">
+  Es probable que la descarga se corte a los pocos minutos con un error como este:
+
+```text
+HTTPException: HTTP Error: HTTP GET error on 'https://huggingface.co/datasets/Lichess/
+standard-chess-games/resolve/main/data/year=2025/month=01/train-00001-of-00072.parquet'
+(HTTP 429 Too Many Requests)
+```
+
+No es un fallo tuyo. Leer un mes por `hf://` son cientos de peticiones de rango contra el mismo
+servidor: 72 shards de alrededor de un giga, leídos a trozos. Y este `run` las lanza en las peores
+condiciones posibles. `duckdb.connect()` usa todos los núcleos, así que salen muchas peticiones en
+paralelo. Van sin firmar, así que Hugging Face les aplica el límite más bajo. Y DuckDB solo lo
+intenta tres veces. Cuando llega el `429`, el `COPY` falla después de minutos de trabajo y no deja
+nada de lo que reanudar: no hay manifiesto, y al relanzar se empieza de cero.
+
+**Por qué el código de `p0` sigue así.** El curso cita `rukh` tal como estaba el día en que se
+cerró cada hito, y cuando se cerró `p0` esta lectura en remoto funcionaba: el corpus del proyecto
+se descargó con ella. Los `429` empezaron el 2026-09-20, cuando M4 tuvo que bajar meses nuevos, y
+la corrección vive en `p4`. Cambiar `p0` ahora sería reescribir la historia: el bloque de arriba ya
+no coincidiría con su tag, y M4 no tendría nada que corregir. Así que el código de la lección se
+queda como estaba, y lo que se añade es este parche. Lo cuenta
+[M4 · Los tokens de Elo y el corpus que faltaba](/curso/m4/02-tokens-de-elo/).
+
+**El parche.** En `run`, justo después de `con = duckdb.connect()` y antes del `try:`, añade:
+
+```python title="Parche de curso para run() en fetch.py"
+    # Course patch (not in p0): a month is hundreds of range requests against one host, and
+    # anonymous ones get HTTP 429 partway through. Fewer parallel reads, a retry budget that
+    # treats 429 as "wait", and requests signed with the local Hugging Face token when there is one.
+    con.execute("SET threads = 3")
+    con.execute("SET http_retries = 8")
+    con.execute("SET http_retry_wait_ms = 500")
+    con.execute("SET http_timeout = 120")
+    from huggingface_hub import get_token
+
+    if token := get_token():
+        con.execute("INSTALL httpfs")
+        con.execute("LOAD httpfs")
+        con.execute("CREATE OR REPLACE SECRET hf (TYPE huggingface, TOKEN ?)", [token])
+```
+
+Hace tres cosas. Deja tres hilos, que es lo que usó el proyecto en M4 después de que ocho
+provocaran tres `429` seguidos. Sube a ocho los reintentos, con espera creciente, porque un `429`
+es un «espera», no un «no». Y firma las peticiones con tu token de Hugging Face, lo que sube el
+límite. La firma necesita que hayas iniciado sesión con `hf auth login`; sin token, el parche
+sigue ayudando, pero las peticiones salen anónimas. Después relanza la misma orden.
+
+Reduce mucho los `429`, pero no los elimina. La solución de fondo llega en M4: bajar cada shard
+entero con `huggingface_hub`, que reanuda y espera bien, y filtrarlo en local. Tu copia deja de
+ser idéntica a `p0` en estas líneas, y está bien que así sea: en M1 el `run` cambia
+`duckdb.connect()` por `connect(cfg.duckdb)` y el parche se va con ese cambio. Para entonces los
+datos ya están en disco.
+
+</Callout>
 
 <Callout kind="roto" title="Lo que este código todavía no tiene">
   `FetchConfig` no tiene `max_elo`, y en M4 hará falta. Al entrenar el modelo condicionado por Elo
