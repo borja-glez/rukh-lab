@@ -2,17 +2,18 @@
 title: 'Alineamiento: el instrumento y la teoría justa'
 description:
   'Para medir una diferencia, mide la diferencia: el enfrentamiento directo frente a restar dos
-  escaleras, y su control. Después la teoría justa: qué dice y qué no dice un par de preferencia,
-  Bradley-Terry, DPO y su referencia implícita, pares dentro y fuera de política, GRPO y por qué la
-  KL no es un adorno.'
+  escaleras, y su control. Después la teoría justa, que es la del RLHF de cualquier asistente: qué
+  dice un par de preferencia, Bradley-Terry, DPO y su referencia implícita, pares dentro y fuera de
+  política, GRPO y la KL que sujeta a la política.'
 module: m5
 order: 1
 duration: 40
 level: medio
 status: vigente
-updated: 2026-09-22
+updated: 2026-09-23
 keywords:
   - alineamiento
+  - RLHF
   - par de preferencia
   - Bradley-Terry
   - reward model
@@ -43,93 +44,88 @@ demo: ?stage=medium-dpo-fp16
 
 import SubtractingNoise from '../../../components/figures/SubtractingNoise.astro';
 import GroupBaseline from '../../../components/figures/GroupBaseline.astro';
+import M5ThreePaths from '../../../components/figures/M5ThreePaths.astro';
 
 <RepoTag tag="p4" at="inicio" module="M4" next="m5" />
 
-Primera de las nueve lecciones del módulo «Alineamiento». Esta es la conceptual: el instrumento con
-el que se mide todo lo demás y la teoría justa para decidir. El código llega entero a partir de la
-siguiente, fichero a fichero.
+Hasta ahora Rukh ha aprendido como aprende un aprendiz que solo mira: millones de partidas ajenas y,
+en M4, clases particulares con partidas mejores. En este módulo llega un entrenador. No le enseña
+partidas; le enseña dos jugadas y le dice cuál prefiere, o le pone nota a cada intento. Es la
+lección conceptual del módulo: el instrumento con el que se mide todo lo demás y la teoría justa
+para decidir. El código llega entero a partir de la siguiente.
 
 ## Qué vas a construir
 
 Al terminar esta lección sabrás qué deja de hacer el modelo, qué empieza a hacer, y por qué el
 primer trabajo del módulo no es entrenar nada sino cambiar de instrumento.
 
-El <Term id="alineamiento">alineamiento</Term> empieza donde termina la imitación, y los cuatro módulos anteriores enseñaron al modelo a **imitar**. El preentrenamiento le puso delante
+El <Term id="alineamiento">alineamiento</Term> empieza donde termina la imitación. El preentrenamiento le puso al modelo delante
 cinco millones de partidas y le pidió la siguiente jugada; el afinado de M4 le puso delante otras
-partidas y le pidió lo mismo. Toda la señal salía de gente que jugó. M4 terminó midiendo el techo
-de eso con cinco instrumentos distintos: afinar **cambia el comportamiento de forma total y barata,
-y no cambia la competencia**. Un adaptador de 1,6 MB sube `1. e4` del 59,64 % al 99,85 %; ningún
-afinado mueve el Elo de forma demostrable.
+partidas y le pidió lo mismo. Toda la señal salía de gente que jugó, y M4 terminó midiendo el techo
+de eso: afinar cambia el comportamiento de forma total y barata, y no cambia la competencia. Un
+adaptador de 1,6 MB sube `1. e4` del 59,64 % al 99,85 %; ningún afinado mueve el Elo de forma
+demostrable.
 
-Este módulo cambia de dónde sale la señal. En vez de «esto es lo que jugó un humano de 2000», la
-señal pasa a ser «**de estas dos jugadas, esta es mejor**» —que es un par de preferencia— o «esta
-jugada vale 0,84 y esta otra 0,31» —que es una recompensa—. Ninguna de las dos frases aparece en
-una partida. Las dos se pueden construir, y el ajedrez es uno de los poquísimos sitios donde la
-segunda se puede **verificar**: una jugada es legal o no lo es, un mate es un mate, y un motor
-pone un número a cualquier posición.
+Este módulo cambia de dónde sale la señal. En vez de «esto es lo que jugó un humano de 2000», pasa a
+ser «de estas dos jugadas, esta es mejor» —un par de preferencia— o «esta jugada vale 0,84 y esta
+otra 0,31» —una recompensa—. Ninguna de las dos frases aparece en una partida, y las dos se pueden
+construir. El ajedrez es además uno de los pocos sitios donde la segunda se puede **verificar**: una
+jugada es legal o no lo es, un mate es un mate, y un motor pone un número a cualquier posición.
+
+Si esto te suena, es porque es lo mismo que convierte un modelo de lenguaje base en un asistente.
+Un LLM recién preentrenado continúa texto; lo que lo hace útil y educado es una segunda fase en la
+que alguien compara dos respuestas y elige una, y el modelo aprende de esas elecciones. Eso es el <Term id="rlhf">RLHF</Term>
+(_reinforcement learning from human feedback_), y todo lo de este módulo
+—reward model, Bradley-Terry, DPO, GRPO, la penalización KL y el reward hacking— es su vocabulario.
+Aquí lo vas a construir con jugadas en vez de con respuestas, que tienen la ventaja de que un motor
+las puede juzgar sin cansarse.
 
 La pregunta del módulo es: **¿se puede mover la competencia cambiando el objetivo?** Y la primera
-respuesta del hito no fue un modelo, fue un instrumento — porque con el que había, la pregunta no
-se podía contestar.
+respuesta del hito no fue un modelo sino un instrumento, porque con el que había la pregunta no se
+podía contestar.
 
-Vas a construir, y a leer entero en las lecciones siguientes:
+Lo que vas a escribir, pieza a pieza:
 
 {/* prettier-ignore */}
-- `rukh eval match`, un <Term id="enfrentamiento-directo">enfrentamiento directo</Term> entre dos modelos, con libro de aperturas
-  sembrado y colores espejados. Sale 8,1 veces más barato en partidas que restar dos Elo de la
-  escalera, y se ahorra el ruido de un tercero. Es lo primero del hito y lo que más se reutiliza
-  (lección 5).
-- `src/rukh/models/reward.py` y `src/rukh/train/reward.py`: un <Term id="reward-model">reward
-  model</Term> entrenado con la pérdida de <Term id="bradley-terry">Bradley-Terry</Term>, que
-  acierta cerca de tres de cada cuatro pares no vistos y **falla justo donde tiene que fallar**
-  (lección 2).
-- `src/rukh/data/onpolicy.py`, que construye pares con las jugadas que propone **el propio
-  modelo**, para poder comparar dos <Term id="dpo">DPO</Term> —el entrenamiento que aprende
-  directamente de los pares, sin reward model— cuya única diferencia sea de dónde salen las dos
-  jugadas (lección 3).
-- `src/rukh/train/rewards.py`: la <Term id="recompensa-verificable">recompensa verificable</Term>, con su puerta de legalidad, sus topes y
-  un test que comprueba sobre cientos de entradas aleatorias que nada se sale del intervalo
-  (lección 4).
-- `src/rukh/train/grpo.py`: <Term id="grpo">GRPO</Term> con grupos de ocho, <Term id="ventaja">ventaja</Term> relativa al
-  propio grupo y una <Term id="kl">penalización KL</Term> contra los pesos de partida (lección 4).
-- Y `labs/m5/reward_hacking.py`, la **galería** de <Term id="reward-hacking">reward hacking</Term>: la misma recompensa rota de cinco maneras, medida
-  (lección 9). Su primera versión preguntaba qué jugada corona cada una, las seis coronaron la
-  misma, y esa respuesta —que parecía un fracaso— es el hallazgo que ordena el final del módulo.
+- `rukh eval match`, un <Term id="enfrentamiento-directo">enfrentamiento directo</Term> entre dos modelos con libro de aperturas y
+  colores espejados (lección 5).
+- Un <Term id="reward-model">reward model</Term> entrenado con la pérdida de <Term id="bradley-terry">Bradley-Terry</Term> (lección 2).
+- <Term id="dpo">DPO</Term>, que aprende directamente de los pares, y un constructor de pares con las jugadas del propio
+  modelo (lección 3).
+- Una <Term id="recompensa-verificable">recompensa verificable</Term> y <Term id="grpo">GRPO</Term>, que la optimiza con una <Term id="ventaja">ventaja</Term> relativa al grupo y una <Term id="kl">penalización KL</Term> (lección 4).
+- Una galería de <Term id="reward-hacking">reward hacking</Term>: la misma recompensa rota de cinco maneras, y medida (lección 9).
 
 ## El instrumento: para medir una diferencia, mide la diferencia
 
-Al terminar esta sección sabrás por qué restar dos números medidos es peor que medir la
-diferencia, cuánto peor exactamente, y por qué el primer día del hito no se entrenó nada.
+Al terminar esta sección sabrás por qué restar dos números medidos es peor que medir la diferencia,
+cuánto peor, y por qué el primer día del hito no se entrenó nada.
 
-El plan del hito pide para este módulo **+50 Elo con intervalo de confianza** sobre el modelo de partida.
-Con el instrumento que había al empezar, esa frase no se podía comprobar, y conviene ver por qué
-antes de aceptar ningún número del resto del módulo.
+El plan del hito pide **+50 Elo con intervalo de confianza** sobre el modelo de partida. Con el
+instrumento que había al empezar, esa frase no se podía comprobar.
 
-El instrumento que había es la **escalera**: el modelo juega contra ocho Stockfish de fuerza
-limitada, se mira dónde saca el 50 % y eso da un Elo. Funcionó bien durante tres módulos. Pero P4
-midió algo sobre ella que aquí cambia todo: la **misma** configuración, con la misma semilla, medida
-dos veces por dos caminos distintos, dio **1498 y 1558** (D-107, en el <Term id="registro-de-decisiones">registro de decisiones</Term>).
-Sesenta puntos de diferencia sin
-que nada cambiara.
+Ese instrumento es la **escalera**: el modelo juega contra ocho Stockfish de fuerza limitada, se mira
+dónde saca el 50 % y eso da un Elo. Funcionó bien durante tres módulos, pero en M4 se midió algo que
+aquí lo cambia todo: la misma configuración, con la misma semilla, medida dos veces, dio **1498 y
+1558**. Sesenta puntos sin que nada cambiara. La semilla fija _nuestro_ muestreo, no el del rival:
+Stockfish juega con límite de **tiempo** y `UCI_LimitStrength` aleatoriza a propósito para acertar
+el Elo pedido, así que «las mismas 160 partidas» son 160 partidas nuevas contra alguien que no se
+repite. El suelo de reproducibilidad de la escalera es de unos **40 Elo de una sigma**.
 
-No es un fallo. La semilla fija _nuestro_ muestreo, no el del rival: Stockfish juega con un límite
-de **tiempo** y `UCI_LimitStrength` aleatoriza a propósito para acertar el Elo pedido. Así que «las
-mismas 160 partidas» son 160 partidas nuevas contra alguien que no se repite. El suelo de
-reproducibilidad de la escalera es de unos **40 Elo de una sigma**.
-
-Y ahora la aritmética que decide el hito. Si mides el Elo de la base y el del modelo alineado por
+Ahora la aritmética que decide el hito. Si mides el Elo de la base y el del modelo alineado por
 separado y los restas, la diferencia hereda **los dos** ruidos:
 
 <SubtractingNoise />
 
 Los números son los del propio proyecto. La escalera lee `medium-v4` en **1504 (1446-1558)** y el
 mismo modelo tras DPO en **1529 (1470-1583)**. Resta: **+25**, con un semiancho de
-`√(56² + 56,5²) = 80`. O sea, de **−55 a +105**: atraviesa el cero de lado a lado.
+`√(56² + 56,5²) = 80`, o sea de **−55 a +105**: atraviesa el cero de lado a lado. La diferencia
+acaba más ancha que cualquiera de las dos medidas que entraron, y buscar 50 con un instrumento que
+devuelve ±80 no se arregla con más partidas: es el instrumento equivocado.
 
-Cada absoluto trae su ruido entero a la resta, y la diferencia acaba **más ancha que cualquiera de
-las dos medidas que entraron**. Buscar una diferencia de 50 con un instrumento que devuelve ±80 no
-es cuestión de más partidas: es el instrumento equivocado.
+Los mismos dos modelos enfrentados entre sí dan **+40 Elo con intervalo de 11 a 69**, separado del
+cero, en cuatro minutos. (Ese `medium-v4-dpo` es un DPO previo al resto del módulo, entrenado sobre
+todos los pares de Lichess; aquí sirve para probar el instrumento, y los números que se publican son
+los de la lección 8.)
 
 <Callout kind="mundo-real" title="La báscula del baño y la balanza de cocina">
   Para saber cuánto pesa el gato, puedes subirte a la báscula del baño con él en brazos, volver a
@@ -138,12 +134,9 @@ es cuestión de más partidas: es el instrumento equivocado.
   báscula del baño; el enfrentamiento directo es la balanza de cocina.
 </Callout>
 
-Los mismos dos checkpoints enfrentados entre sí dan **+40 Elo con intervalo 11 a 69**, separado del
-cero, en cuatro minutos. Ese `medium-v4-dpo` es un DPO **anterior** al resto del módulo: se entrenó
-sobre el fichero completo de 13 838 pares fuera de política, antes de que existieran los pares del
-propio modelo y el conjunto igualado con los que la lección 8 compara los dos brazos. Sirve aquí
-como prueba del instrumento, no como resultado del hito; los números que se publican son los de la
-lección 8.
+Fuera del ajedrez es la misma regla. Un test A/B reparte el mismo tráfico entre dos variantes en
+vez de comparar la conversión de esta semana con la del mes pasado, y las arenas de LLM como Chatbot
+Arena enseñan a una persona dos respuestas a la vez en vez de puntuar cada modelo por separado.
 
 ### La cuenta, y los dos números que salen
 
@@ -159,73 +152,45 @@ Para distinguir dos **proporciones** que difieren en Δp hacen falta, en cada la
 n > 3,84 / (Δp)²
 ```
 
-partidas —es la aproximación normal al 95 % con dos colas, y el 3,84 no es una constante mágica:
-es `1,96²`, el cuadrado del número de desviaciones típicas que deja fuera el 5 % de una campana—.
-Para detectar una ventaja en un **enfrentamiento** directo, donde lo que se mide es una sola
-proporción contra 0,5, hacen falta
+partidas. Es la aproximación normal al 95 % con dos colas, y el 3,84 es `1,96²`, el cuadrado del
+número de desviaciones típicas que deja fuera el 5 % de una campana. Para detectar una ventaja en un
+**enfrentamiento** directo, donde se mide una sola proporción contra 0,5, hacen falta
 
 ```text
 n > z² · p(1-p) / (p - 0,5)²
 ```
 
-partidas **en total**. Para +50 Elo, la primera pide 8,1 veces más partidas que la segunda. Y la
-tabla que imprime el lab es la que se usa al revés, que es como se usa de verdad: con 200 partidas,
-la diferencia más pequeña que se puede ver es de **48 Elo**; con 400, de **34**; con 50, de **95**.
-Antes de jugar una sola partida ya sabes si tu presupuesto puede contestar tu pregunta. Las dos
-fórmulas están escritas en `labs/m5/games_needed_match.py` y la del enfrentamiento vive además
-dentro del motor de evaluación, en `games_for_edge`; las dos se leen en la lección 5.
+partidas **en total**. Para +50 Elo, la primera pide 8,1 veces más partidas que la segunda.
+
+La tabla que imprime el lab se usa sobre todo al revés: con 200 partidas, la diferencia más pequeña
+que se puede ver es de **48 Elo**; con 400, de **34**; con 50, de **95**. Antes de jugar una sola
+partida ya sabes si tu presupuesto puede contestar tu pregunta. Las dos fórmulas se leen en la
+lección 5 y en la 9.
 
 ### El control: un modelo contra sí mismo tiene que dar 0,5
 
 Un instrumento nuevo se estrena midiendo algo cuya respuesta ya se sabe. Un modelo contra una copia
-exacta de sí mismo tiene que dar **0,5000 clavado**:
+exacta de sí mismo tiene que dar **0,5000**:
 
 ```bash title="Terminal"
 uv run rukh eval match --a <base> --b <base> --games 100
 ```
 
-Salió **0,975 a favor de uno de los dos lados, con 999 jugadas ilegales**.
+Salió **0,975 a favor de uno de los dos lados, con 999 jugadas ilegales**. Había dos errores en el
+bucle de partida: el modelo no veía las jugadas del libro de aperturas con las que empezaba la
+partida, y al rival no se le contaba ninguna jugada. La lección 5 los enseña con su arreglo y su
+test. Después del arreglo, **0,5000 exacto, 11 ilegales por bando**. Costó un minuto de máquina y
+evitó publicar un +40 que habría sido un artefacto de fontanería.
 
-Los dos errores estaban en `infer/game.py` y ninguno era sutil de encontrar una vez que había un
-número imposible señalándolos (D-111):
+`rukh eval match` juega un número **par** de partidas —se niega a jugar uno impar, para que el
+reparto de colores no pueda salir torcido—, cada apertura dos veces con los colores cambiados.
+Devuelve la puntuación, su intervalo por <Term id="bootstrap">bootstrap</Term> y la conversión a Elo, `400 · log₁₀(p / (1 − p))`, con un tope,
+porque una puntuación de 1,0 es un logaritmo infinito.
 
-1. `play_game_with` empezaba la partida desde un tablero con las jugadas del libro de aperturas ya
-   puestas, pero **nunca se las reproducía al jugador**. El modelo veía un prompt vacío y un tablero
-   con seis jugadas hechas, así que proponía jugadas de la posición inicial.
-2. Al rival, si guardaba estado, **no se le contaba ninguna jugada**. `Opponent` no tiene `observe`
-   en su protocolo, así que nadie preguntaba si lo tenía.
-
-Los dos arreglos están en la lección 5, con su test. Después del arreglo:
-**0,5000 exacto, 11 ilegales por bando**. El control pasa.
-
-<Callout kind="mundo-real" title="Estrenar midiendo lo sabido">
-  Un instrumento nuevo se estrena midiendo algo cuya respuesta ya sabes. Aquí costó un minuto de
-  máquina y evitó publicar un +40 que habría sido un artefacto de dos errores de fontanería.
-</Callout>
-
-### Lo que mide, cuando ya mide
-
-`rukh eval match` juega un número **par** de partidas —se niega a jugar un número impar, para que
-el reparto de colores no pueda salir torcido— desde posiciones de un libro de aperturas sembrado,
-cada una jugada dos veces con los colores cambiados. Devuelve la puntuación, su intervalo por <Term id="bootstrap">bootstrap</Term> y la conversión a Elo, que es `400 · log₁₀(p / (1 − p))` con
-un tope: una puntuación de 1,0 es un logaritmo infinito, y un instrumento que puede devolver
-infinito acaba metiéndolo en una tabla.
-
-Con este instrumento, `medium-v4-dpo` contra `medium-v4` da **+40 Elo con intervalo 11 a 69**, en
-cuatro minutos — que es el número de la figura de arriba, y el mismo par de modelos que la escalera
-dejaba en +25 con el intervalo atravesando el cero. Misma conclusión cualitativa, y un instrumento
-que la puede afirmar mientras el otro no.
-
-<Callout kind="mundo-real" title="Medir la diferencia, no restar">
-  Si lo que quieres saber es una diferencia, no midas dos absolutos y restes. Cada absoluto trae su
-  ruido entero a la resta, y el ruido de la resta es la suma de los dos.
-</Callout>
-
-## Tres caminos, y cómo se elige antes de leer la teoría
+## Tres caminos, y cómo se elige
 
 DPO, reward model y GRPO llegan seguidos y suenan intercambiables. No lo son, y lo que decide cuál
-usas no es cuál te parece más elegante: es **qué señal tienes**. Este es el mapa; la teoría de la
-sección siguiente explica el porqué de cada fila.
+usas es **qué señal tienes**:
 
 <div class="table-wrap">
 
@@ -237,31 +202,34 @@ sección siguiente explica el porqué de cada fila.
 
 </div>
 
+<Figure caption="Los tres caminos del módulo, y cuántas redes hay que entrenar en cada uno. La receta clásica de RLHF entrena tres; DPO y GRPO, una. Debajo de cada fila, lo mismo en un asistente de texto.">
+  <M5ThreePaths />
+</Figure>
+
 Tres consecuencias que conviene tener antes de entrar:
 
 - **DPO es fuera de política por defecto.** Los pares los generó otro. Cuando los genera el propio
-  modelo —pares _dentro de política_— la comparación cambia, y la lección 3 enseña la trampa de
-  comparar las dos fuentes sin igualarlas.
+  modelo la comparación cambia, y la lección 3 enseña a comparar las dos fuentes sin hacer trampa.
 - **GRPO no necesita reward model porque el ajedrez le da la <Term id="recompensa">recompensa</Term> gratis.** Un motor dice si
   la jugada es legal, si hay mate y cuántos centipeones se pierden. Ese es el lujo del dominio, y
-  también donde aparece el <Term id="reward-hacking">reward hacking</Term>: si la regla está mal
-  escrita, el modelo la cumple igual.
+  también donde aparece el reward hacking: si la regla está mal escrita, el modelo la cumple igual.
 - **El reward model no es un paso previo obligatorio.** Aquí se entrena para ver qué aprende y
   cuánto depende de la semilla, no porque DPO o GRPO lo pidan.
 
 ## Teoría justa
 
 Al terminar esta sección sabrás qué es un par de preferencia, qué promete y qué no promete
-Bradley-Terry, por qué DPO no necesita reward model, y qué hace GRPO que <Term id="ppo">PPO</Term>
-hace más caro.
+Bradley-Terry, por qué DPO no necesita reward model, qué hace GRPO que <Term id="ppo">PPO</Term> hace más caro y qué papel
+juega la KL en los dos.
 
 ### Un par de preferencia no dice cuánto vale nada
 
 Un <Term id="par-de-preferencia">par de preferencia</Term> son dos respuestas a la misma entrada,
 una marcada mejor y otra peor. En Rukh son dos jugadas legales en la misma posición, con la
-distancia en centipeones que el motor les puso. Lo que el par **no** dice es cuánto vale ninguna de
-las dos: solo dice cuál gana. Es una cata a ciegas: «este vino es mejor que este otro» se contesta
-sin saber si los dos son buenos, si los dos son malos, ni cuántos puntos tiene ninguno.
+distancia en centipeones que el motor les puso; en un asistente son dos respuestas a la misma
+pregunta y una persona que eligió. Lo que el par no dice es cuánto vale ninguna de las dos: solo cuál
+gana. Es una cata a ciegas: «este vino es mejor que este otro» se contesta sin saber si los dos son
+buenos, si los dos son malos, ni cuántos puntos tiene ninguno.
 
 Eso basta, y el modelo que lo convierte en números es <Term id="bradley-terry">Bradley-Terry</Term>:
 la probabilidad de que `a` gane a `b` es `σ(r(a) − r(b))`, así que la pérdida es
@@ -270,129 +238,109 @@ la probabilidad de que `a` gane a `b` es `σ(r(a) − r(b))`, así que la pérdi
 L = −log σ(r(chosen) − r(rejected))
 ```
 
-La consecuencia que más se olvida está a la vista en la fórmula: **solo aparecen diferencias**.
-Sumarle cien a todas las puntuaciones no cambia la pérdida ni un decimal. La escala de un reward
-model no significa nada por sí sola, y comparar el «0,8» de un entrenamiento con el «1,4» de otro
-es comparar dos reglas sin origen: es como leer temperaturas en Celsius y en Kelvin, donde «hoy
-hace 20 grados más que ayer» significa lo mismo en las dos escalas y «hace 300» no significa nada
-hasta que sabes dónde está el cero. La lección 2 tiene el modelo, la pérdida y el
-test que fija esa invariancia, porque un modelo que se rompa con un desplazamiento constante no lo
-notaría nadie aguas abajo.
+La consecuencia que más se olvida está a la vista: **solo aparecen diferencias**. Sumarle cien a
+todas las puntuaciones no cambia la pérdida ni un decimal, así que la escala de un reward model no
+significa nada por sí sola. El «0,8» de un entrenamiento y el «1,4» de otro son dos reglas sin
+origen, y compararlos no dice nada. La lección 2 tiene el modelo, la pérdida y el test que fija esa
+invariancia.
 
 ### DPO: la referencia que no hay que entrenar
 
-El camino clásico es entrenar un reward model, y luego usarlo para hacer refuerzo sobre la <Term id="politica">política</Term>
-con PPO. Son dos entrenamientos y una red de valor. PPO es el algoritmo de refuerzo que se usaba
-para esto antes de DPO, y la **red de valor** es una segunda red que entrena por el camino para
-estimar cuánto vale cada estado, y así saber si una recompensa fue buena _para lo que cabía
-esperar_. Piensa en vender un piso: antes de aceptar una oferta contratas a un tasador que te dice
-qué vale, y con eso juzgas si la oferta es buena. La red de valor es el tasador, y hay que
-formarlo. <Term id="dpo">DPO</Term> se salta al tasador: demuestra que, para el caso de las
-preferencias, se puede escribir el óptimo de ese refuerzo en función de la política y de una
-**referencia**, y entrenar la política directamente sobre los pares.
+El camino clásico, el de los primeros asistentes, es entrenar un reward model y usarlo para hacer
+refuerzo sobre la <Term id="politica">política</Term> —el modelo que elige las jugadas— con PPO. Son dos entrenamientos y una
+red más: PPO necesita una **red de valor** que estime cuánto vale cada estado, para saber si una
+recompensa fue buena _para lo que cabía esperar_. <Term id="dpo">DPO</Term> se ahorra las dos cosas.
+Demuestra que, para el caso de las preferencias, el óptimo de ese refuerzo se puede escribir en
+función de la política y de una **referencia**, y entonces se entrena la política directamente sobre
+los pares.
 
-La referencia es **implícita**: una copia congelada de los pesos de partida. No se entrena, no se
-publica, y `β` mide cuánto se le deja a la política alejarse de ella. Es la foto del piso el día
-que entras a vivir de alquiler: no la enseña nadie, pero es contra lo que se compara todo al
-salir, y `β` es la fianza — cuánto te cuesta cada cosa que has cambiado respecto a la foto.
+La referencia es **implícita**: una copia congelada de los pesos de partida. No se entrena ni se
+publica, y está ahí para que la política no se aleje demasiado de donde empezó. Piensa en un perro
+con una correa elástica atada a un poste: puede ir hacia donde huele algo bueno, pero cuanto más se
+aleja más tira la correa, y `β` es lo dura que es la goma. Con una correa muy floja, la política
+persigue los pares hasta olvidarse de jugar; con una muy dura, casi no se mueve. Esa misma correa
+aparece en el RLHF clásico y en GRPO como penalización KL: es el término que impide que el modelo
+alineado se convierta en otro modelo.
 
-En Rukh la completación es **una sola jugada**, así que toda la maquinaria de secuencia se colapsa
-a dos log-probabilidades en una posición; el fichero está entero en la
-lección 3. Dos cosas de él merecen adelantarse. La primera: la pérdida devuelve el **margen** y el
-**acierto** por separado, porque un margen puede crecer con la ordenación todavía mal, y el que hay
-que mirar es el segundo. La segunda: `nll_weight`, que es opcional y suele hacer falta. DPO puro
-sube el margen sin mirar si la política sigue sabiendo jugar —el margen dice «`chosen` gana a
-`rejected`», no dice «`chosen` es buena»—, y un poco de pérdida de siguiente token sobre la jugada
-preferida la ancla.
-
-<Callout kind="roto" title="La referencia también tiene que estar en modo `eval`">
-  La copia congelada no basta con congelarla: hay que ponerla en `eval`. Una referencia que se queda
-  en `train` sigue aplicando dropout, así que el mismo par daría una log-probabilidad de referencia
-  distinta en cada época y `β` estaría midiendo ruido. Es el mismo detalle que el modo `probe` de M3
-  cuida por la misma razón, y las dos veces es invisible en la curva.
-</Callout>
+En Rukh la completación es **una sola jugada**, así que toda la maquinaria de secuencia se colapsa a
+dos log-probabilidades en una posición. Dos cosas del fichero merecen adelantarse. La pérdida
+devuelve el **margen** y el **acierto** por separado, porque un margen puede crecer con la ordenación
+todavía mal y el que hay que mirar es el acierto. Y `nll_weight`, opcional, añade un poco de pérdida
+de siguiente token sobre la jugada preferida: el margen dice «`chosen` gana a `rejected`», no dice
+«`chosen` es buena», y ese término ancla a la política para que siga sabiendo jugar. La lección 3
+enseña las dos con un dibujo.
 
 ### On-policy y off-policy: de dónde salen las dos jugadas
 
-Los 13 838 pares que el proyecto trae de P1 son **fuera de política**: salen de las evaluaciones
-multi-PV de Lichess. Dicen «en esta posición `e4` es mejor que `h4`» tanto si el modelo iba a
+Los 13 838 pares que el proyecto trae de M1 son **fuera de política**: salen de las evaluaciones
+multi-PV de Lichess, y dicen «en esta posición `e4` es mejor que `h4`» tanto si el modelo iba a
 considerar alguna de las dos como si no.
 
 Un par **<Term id="on-policy">dentro de política</Term>** hace una pregunta más estrecha y, en
 principio, más útil: _de las jugadas que ibas a considerar aquí, ¿cuál era la mejor y cuál la
 peor?_ Se construye muestreando cuatro jugadas del propio modelo, puntuándolas con el motor y
-quedándose con los extremos si están lo bastante lejos.
-
-El argumento a favor es de una línea: **un modelo solo pierde partidas con las jugadas que juega**.
-Es la diferencia entre estudiar con el examen corregido de otro y con el tuyo: el de otro enseña
-errores que tú quizá nunca ibas a cometer; el tuyo enseña exactamente los que cometes, y solo esos.
-El argumento en contra también: los pares on-policy son más caros, y su calidad depende de que el
-modelo proponga cosas distintas. Este módulo no elige entre los dos con un argumento, los entrena y
-los mide.
+quedándose con los extremos si están lo bastante lejos. El argumento a favor cabe en una línea: **un
+modelo solo pierde partidas con las jugadas que juega**. El argumento en contra, también: estos pares
+son más caros y su calidad depende de que el modelo proponga cosas distintas. En los LLM pasa igual
+—pares de respuestas escritas por otros frente a respuestas que genera el propio modelo y juzga un
+evaluador—, y este módulo no elige con un argumento: entrena los dos y los mide.
 
 ### GRPO: el grupo es el baseline
 
-<Term id="grpo">GRPO</Term> no necesita ni los pares ni el reward model. Para cada posición, la
-política propone `group_size` jugadas; una **función** las puntúa; y cada una se empuja arriba o
+Con <Term id="grpo">GRPO</Term> no hacen falta ni los pares ni el reward model. Para cada posición, la
+política propone `group_size` jugadas, una **función** las puntúa, y cada una se empuja arriba o
 abajo según cómo le fue **frente a la media de su propio grupo**:
 
 ```text
 A_i = (r_i − media(r)) / (desviación(r) + ε)
 ```
 
-Esa media es el <Term id="baseline-grupo">baseline</Term>. PPO entrena una red de valor entera
-para estimarla; GRPO la saca del grupo, que ya estaba pagado. Es la nota sobre la media de la
-clase: un 7 no dice nada hasta que sabes que la media fue un 5 —entonces es un buen examen— o un 9
-—entonces no lo es—. GRPO no pregunta «¿cuánto vale esta jugada?» sino «¿cuánto mejor que sus
-siete compañeras de grupo?». El precio está en la misma fórmula y es el detalle que casi nunca se
-menciona:
+Esa media es el <Term id="baseline-grupo">baseline</Term>. PPO entrena una red de valor entera para
+estimarla; GRPO la saca del grupo, que ya estaba pagado. Es la nota sobre la media de la clase: un
+7 no dice nada hasta que sabes que la media fue un 5 —entonces es un buen examen— o un 9 —entonces
+no lo es—. GRPO no pregunta «¿cuánto vale esta jugada?» sino «¿cuánto mejor que sus siete
+compañeras de grupo?». El precio está en la misma fórmula:
 
 <GroupBaseline />
 
 Si el grupo no tiene dispersión —un <Term id="grupo-plano">grupo plano</Term>— el baseline cae
-encima de todos y **todas las ventajas son cero**. Si toda la clase saca un 7, nadie está por
-encima de la media y no hay a quién subir. El motor ya se ha pagado y el paso es un no-op. Por eso
-`GrpoResult` cuenta los grupos planos aparte: el número dice qué parte del presupuesto se lleva la
-propia confianza del modelo, y no hay manera de saberlo por adelantado. La lección 4 tiene el
-código que lo calcula y el test que comprueba que un grupo de acuerdo no fabrica gradiente.
+encima de todos y **todas las ventajas son cero**. Si toda la clase saca un 7, nadie está por encima
+de la media y no hay a quién subir, aunque el motor ya se haya pagado. Por eso GRPO cuenta los grupos
+planos aparte: el número dice qué parte del presupuesto se lleva la propia confianza del modelo, y
+no hay manera de saberlo por adelantado.
 
-### La KL es un término, no un adorno
-
-Una recompensa verificable es exactamente especificable, y por tanto exactamente **hackeable**. Lo
-único que impide que la política se vaya a la esquina del espacio de jugadas que mejor puntúa es la <Term id="kl">penalización KL</Term> contra los pesos de partida. Rukh usa el estimador k3,
-`exp(d) − d − 1` con `d = logp_ref − logp_política`, que es **no negativo por construcción**, y eso
-importa para algo que quiere ser un castigo. La diferencia de log-probabilidades a secas es
-negativa la mitad de las veces: como término de penalización, le pagaría al modelo precisamente en
-las muestras en las que se alejó. Sería un radar de velocidad que la mitad de las veces te multa y
-la otra mitad te ingresa dinero por pasarte: en promedio no disuade de nada. Hay un test que lo
-dispara en las dos direcciones a propósito, y está en la lección 4 con la pérdida completa.
+GRPO tiene además su propia correa: una penalización KL contra los pesos de partida. Rukh usa el
+estimador k3, `exp(d) − d − 1` con `d = logp_ref − logp_política`, que nunca es negativo; la
+diferencia de log-probabilidades a secas lo es la mitad de las veces, y como castigo pagaría al
+modelo justo cuando se aleja. La lección 4 lo enseña con la pérdida completa y su test.
 
 ### La recompensa verificable
 
-GRPO no necesita un reward _model_: necesita una **función** de recompensa, y el ajedrez es uno de
-los poquísimos sitios donde esa función se puede escribir y comprobar. Nada de ella se aprende, así
-que nada puede equivocarse como se equivoca una recompensa aprendida: solo puede estar **mal
-diseñada**, que es otro problema y el que vas a mirar en la galería de la última lección.
+La recompensa de GRPO no es un modelo: es una **función** que se escribe y se comprueba. Nada de ella
+se aprende, así que no se equivoca como se equivoca una recompensa aprendida; solo puede estar **mal
+diseñada**. Por eso lleva cuatro reglas —la legalidad es una puerta, todo está acotado, el signo y
+la escala se fijan a mano, y las funciones son puras— que la lección 4 lee una a una con su código.
 
-Cuatro reglas le dan forma y conviene leerlas como reglas y no como detalles. **La legalidad es una
-puerta, no un término**: sumar un _bonus_ de legalidad a una suma ponderada le permite al modelo
-cambiarla por otra cosa, y el sentido de una recompensa verificable es que hay cosas que no se
-cambian por nada. **Todo está acotado**: una recompensa sin techo es una invitación a que el
-optimizador encuentre la dirección que crece sin límite y se vaya por ahí. **El signo y la escala se
-fijan a mano**, no con la dispersión del lote: una recompensa que se reescala a sí misma hace
-incomparables dos ejecuciones y esconde el momento en que el modelo deja de mejorar. Y **todas las
-funciones son puras**: tablero dentro, número fuera, sin llamar al motor, que es lo que permite que
-los tests corran en milisegundos y que el presupuesto de análisis se decida en un solo sitio.
-
-Las cuatro están escritas en Python, y cada una tiene su test. Es la lección 4.
+<Transfer
+  concept="Recompensa verificable (RLVR)"
+  where="Modelos de razonamiento: problemas de matemáticas con solución conocida, código que tiene que pasar sus tests, extracción que tiene que validar contra un esquema."
+>
+  Los modelos que «piensan antes de contestar» se entrenan con esta misma receta: el modelo genera
+  varias soluciones al mismo problema, un programa comprueba cuáles son correctas, y GRPO (DeepSeek
+  la presentó así) empuja las mejores respecto a la media del grupo. Funciona donde hay un juez
+  automático barato; donde no lo hay —un resumen, un tono— se vuelve al reward model aprendido, con
+  todas sus dudas. Y en los dos casos el modelo aprende a cumplir la regla que escribiste, no la que
+  querías escribir.
+</Transfer>
 
 ## Qué has aprendido
 
-Que antes de medir una diferencia hay que elegir el instrumento, y que el instrumento correcto para
-una diferencia es el que la mide de frente: 8,1 veces más barato en partidas y con un ruido menos.
-Que un instrumento nuevo se estrena contra una respuesta conocida, y que ese minuto encontró dos
-errores que habrían publicado un artefacto como resultado. Y las cuatro piezas de teoría que hacen
-falta para leer lo que salió: el par y su pérdida, DPO y su referencia implícita, las dos fuentes de
-pares, y GRPO con su baseline y su KL.
+Que antes de medir una diferencia hay que elegir el instrumento, y que el correcto es el que la mide
+de frente: 8,1 veces más barato en partidas y con un ruido menos. Que un instrumento nuevo se
+estrena contra una respuesta conocida, y que ese minuto encontró dos errores que habrían publicado un
+artefacto como resultado. Y la teoría justa para leer el resto: el par y su pérdida, DPO con su
+referencia congelada, las dos fuentes de pares, GRPO con su baseline de grupo, y la KL como la
+correa que sujeta a la política en los dos métodos. Es la misma teoría con la que se alinea un
+asistente de texto.
 
-Lo siguiente es el código, entero. Empieza por la pieza que se puede medir sola: el reward model.
+Lo siguiente es el código. Empieza por la pieza que se puede medir sola: el reward model.
