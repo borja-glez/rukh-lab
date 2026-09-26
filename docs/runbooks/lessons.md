@@ -15,7 +15,7 @@ final.
   `Salida en la máquina de referencia (RTX 5090):`. Nada de salidas inventadas en una lección
   `vigente`.
 - **Se ejecuta a medida que se escribe.** En cuanto lo escrito se puede probar, una
-  `<Callout kind="ejecuta">` dice qué órdenes lanzar y qué mirar en la salida (ver abajo).
+  `<Callout kind="ejecuta">` dice qué comandos lanzar y qué mirar en la salida (ver abajo).
 - Nada de secciones sobre el propio curso: inventarios de lo que se enlaza en vez de pegarse, la CI,
   el README, los ficheros generados. Ver `docs/runbooks/codigo-en-lecciones.md`.
 - **Los títulos dicen qué hace o qué decide el código**, no cuántas líneas tiene ni un gancho
@@ -46,18 +46,18 @@ final.
 
 El lector escribe el código bloque a bloque; la caja `<Callout kind="ejecuta" title="…">` es la
 parada en la que comprueba que lo que lleva escrito funciona. No es un ejercicio (no tiene pregunta
-ni `<Solution>`): son las órdenes y lo que hay que mirar en su salida.
+ni `<Solution>`): son los comandos y lo que hay que mirar en su salida.
 
 - **Cuándo**: en los momentos en que algo nuevo ya se puede ejecutar. El primer `uv sync`, la primera
-  vez que una orden de la CLI responde, al terminar los tests de una pieza (`uv run pytest -m unit -q
+  vez que un subcomando de la CLI responde, al terminar los tests de una pieza (`uv run pytest -m unit -q
 tests/unit/test_<pieza>.py`), antes de lanzar algo largo (el `--dry-run`, una configuración de
   humo), al terminar un entrenamiento o una exportación (la evaluación, el fichero que tiene que
   existir), en la demo (`pnpm test`, `pnpm dev` con su query). No después de cada bloque de código:
   una lección de código típica tiene entre dos y cinco.
-- **Qué lleva**: una frase de contexto, un bloque ` ```sh ` con las órdenes, y lo que hay que mirar:
+- **Qué lleva**: una frase de contexto, un bloque ` ```sh ` con los comandos, y lo que hay que mirar:
   qué tiene que aparecer, qué fichero tiene que existir, qué significa si sale otra cosa.
-- **Solo órdenes que existen en la etiqueta del módulo** y que funcionan en ese punto de la lección
-  (que no dependan de un fichero que llega más abajo). Si una orden necesita GPU, datos descargados
+- **Solo comandos que existen en la etiqueta del módulo** y que funcionan en ese punto de la lección
+  (que no dependan de un fichero que llega más abajo). Si un comando necesita GPU, datos descargados
   o un modelo entrenado, se dice.
 - **Nada de salidas inventadas**: se describe lo que se espera ("tiene que imprimir `0.0.1`", "siete
   tests en verde") solo cuando se deduce del código o está medido; la salida real pegada sigue la

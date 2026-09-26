@@ -32,7 +32,7 @@ export const STOPS: readonly Stop[] = [
       'Todavía no hay aprendiz. Montas el club donde va a estudiar: el tablero, un árbitro de confianza, un cuaderno donde apuntar cada sesión y una biblioteca de partidas.',
     why: 'Sin un entorno que se instala igual cada vez y un juez fiable, ningún número de los módulos siguientes valdría nada.',
     achieved:
-      'Un repositorio que se instala con una orden, Stockfish respondiendo, MLflow anotando cada ejecución, dos meses de partidas de Lichess en disco y un tablero web que solo acepta jugadas legales.',
+      'Un repositorio que se instala con un comando, Stockfish respondiendo, MLflow anotando cada ejecución, dos meses de partidas de Lichess en disco y un tablero web que solo acepta jugadas legales.',
     flow: {
       takes: ['un directorio vacío', 'Lichess y Stockfish, fuera'],
       builds: ['entorno uv con CUDA', 'Stockfish y MLflow', 'descarga con manifiesto', 'tablero legal en la web'],
@@ -122,7 +122,7 @@ export const STOPS: readonly Stop[] = [
       'Toca competir en serio: torneos con rating oficial, una ficha de jugador que cuenta la verdad y partidas en público.',
     why: 'Un modelo que no se mide igual cada día ni se puede usar no existe fuera de tu disco.',
     achieved:
-      'Todas las etapas medidas el mismo día con una orden, dos rivales externos, el coste real del int8, veintiuna model cards y la demo final con arena y puzles.',
+      'Todas las etapas medidas el mismo día con un comando, dos rivales externos, el coste real del int8, veintiuna model cards y la demo final con arena y puzles.',
     flow: {
       takes: ['todas las etapas', 'dos modelos públicos'],
       builds: ['escalera calibrada', 'tabla cada noche', 'int8 medido', 'cards desde la tabla'],
