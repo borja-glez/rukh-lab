@@ -42,6 +42,19 @@ describe('llm chapters', () => {
     }
   });
 
+  it('never start a prose line with a number and a bracket, which Markdown reads as a list', () => {
+    // «(capítulo
+1) no recibe…»: Prettier moved the number to the start of a line, Markdown made
+    // it item 1 of an ordered list and the sentence broke in two.
+    for (const file of chapterFiles) {
+      const source = readFileSync(resolve(root, 'src/components/llm/chapters', file), 'utf8');
+      expect(source, file).not.toMatch(/^\d+\)\s/m);
+      expect(source, file).not.toMatch(/cap[íi]tulos?
+
+\d/);
+    }
+  });
+
   it('never start a prose line with an inline JSX tag, which MDX would split off', () => {
     // A line that opens with `<Term` is read by MDX as a block element: Prettier then puts a blank
     // line before it and the sentence breaks in two paragraphs.
