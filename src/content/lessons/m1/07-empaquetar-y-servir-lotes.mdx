@@ -45,7 +45,9 @@ memoria, sea de partidas, de texto o de fragmentos para un RAG.
   `tokenize` de `cli.py` y los tests `test_loader.py`, `test_bpe.py` y `test_pack.py` (estos dos,
   plegados).
 - **Traes del repo**: la fixture `tests/fixtures/games.pgn`, con `git checkout p1 --
-tests/fixtures/games.pgn` cuando lo pide su caja «Ejecútalo».
+tests/fixtures/games.pgn` cuando lo pide su caja «Ejecútalo». Lo plegado que decidas no teclear se
+  trae con el `git checkout p1 -- …` que da la frase de antes de cada pliegue; el subcomando de
+  `cli.py` no, porque pisaría el tuyo: ese se copia del pliegue.
 - **Referencia**: `p1`.
 
 </Callout>
@@ -94,7 +96,10 @@ vocabularios. Con `int32` el fichero pesaría el doble sin guardar nada más.
 
 Los codificadores son adaptadores con la misma forma sobre los vocabularios de la lección anterior;
 puedes saltarlos en la primera lectura y volver al teclearlos. El del BPE, justo debajo, sí tiene
-una decisión que importa al entrenamiento.
+una decisión que importa al entrenamiento. Si no vas a teclear lo plegado de `pack.py`, trae el
+fichero entero antes de empezarlo, con `git checkout p1 -- src/rukh/tokenize/pack.py`, y lee sobre
+tu copia lo que queda a la vista; si ya tecleaste una parte, no lo traigas (pisaría lo tuyo):
+`git diff p1 -- src/rukh/tokenize/pack.py` te marca con `-` las líneas que te faltan.
 
 <Fold summary="pack.py: el Protocol GameEncoder y los codificadores UCI y SAN">
 
@@ -329,7 +334,9 @@ memoria es `starts`, un entero por partida (24 MB para tres millones).
   `PermissionError` que no menciona los memmaps. En Linux sobraría.
 </Callout>
 
-El resto del fichero es copia y rutas, y se puede saltar en la primera lectura.
+El resto del fichero es copia y rutas, y se puede saltar en la primera lectura, pero no al teclear:
+`pack_month` llama a `_copy_raw` y la CLI a `pack_scheme`. Si lo saltas, `git diff p1 --
+src/rukh/tokenize/pack.py` te marca con `-` las líneas que faltan, o trae el fichero como se dice arriba.
 
 <Fold summary="pack.py, el final: la copia por trozos, leer el meta.json y empaquetar los dos meses">
 
@@ -470,8 +477,9 @@ discutirla.
 `window` pide `block + 1` tokens porque `y[t]` es el token que viene después de `x[t]`. Solo la
 última partida del flujo necesita relleno. `y[-1]` va a `<pad>` porque su objetivo real está fuera
 de la ventana, y es más honesto no entrenarlo que inventarlo. El paso a `int64` es lo que esperan
-`nn.Embedding` y la entropía cruzada, y el `.copy()` es obligatorio porque un trozo de memmap es de
-solo lectura.
+`nn.Embedding` (la primera capa del modelo: una tabla con un vector aprendido por id, el
+<Term id="embedding">embedding</Term>, que se consulta con el id como índice) y la entropía cruzada,
+y el `.copy()` es obligatorio porque un trozo de memmap es de solo lectura.
 
 ```python title="src/rukh/tokenize/loader.py"
 def make_loader(
@@ -498,16 +506,66 @@ def make_loader(
 
 <Src file="src/rukh/tokenize/loader.py" tag="p1" lines="60-79" />
 
-`drop_last=True` hace que todos los lotes tengan la misma forma: con `torch.compile`, un lote corto
-dispararía una recompilación una vez por época. El `torch.Generator` sembrado es lo único que decide
-el orden, así que la misma <Term id="semilla">semilla</Term> da los mismos lotes. Y
-`persistent_workers` evita arrancar intérpretes nuevos en cada época, que con `spawn` cuesta
-segundos de GPU parada.
+`workers` llega al `DataLoader` como `num_workers`: cuántos procesos aparte preparan lotes mientras
+la GPU calcula el anterior. Con 0, el valor por defecto, los prepara el propio proceso, que es lo
+que quieres en un test; en M2 van cuatro.
+
+`drop_last=True` hace que todos los lotes tengan la misma forma. M2 acelera el modelo con
+<Term id="torch-compile">`torch.compile`</Term>, que genera código de GPU especializado en las formas
+que ve, y un lote corto al final de cada época dispararía una recompilación. El `torch.Generator`
+sembrado es lo único que decide el orden, así que la misma <Term id="semilla">semilla</Term> da los
+mismos lotes. Y `persistent_workers` evita arrancar intérpretes nuevos en cada época, que con
+`spawn` cuesta segundos de GPU parada.
+
+<Callout kind="ejecuta" title="Un lote, de cerca">
+  Con `pack.py` y `loader.py` escritos ya puedes ver un lote de verdad, sin esperar a los packs
+  grandes: empaqueta las veinte partidas de `tests/fixtures/games.parquet` (la fixture de la
+  lección del pipeline), saca un lote, pásalo por un embedding y calcula la pérdida que tendría un
+  modelo que no sabe nada. Guarda esto como `.tmp/lote.py` (la carpeta está en el `.gitignore`):
+
+```python title=".tmp/lote.py"
+import torch
+
+from rukh.tokenize.loader import PackedDataset, make_loader
+from rukh.tokenize.pack import UciGameEncoder, pack_month
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+pack_month("tests/fixtures/games.parquet", UciGameEncoder(), ".tmp/pack-prueba")
+xb, yb = next(iter(make_loader(PackedDataset(".tmp/pack-prueba"), batch_size=4)))
+print(xb.shape, xb.dtype)
+print(UciTokenizer().decode(xb[0, :8].tolist()))
+print(xb[0, :8].tolist(), yb[0, :8].tolist())
+
+emb = torch.nn.Embedding(2030, 8)
+print(emb(xb).shape)
+
+torch.manual_seed(0)
+logits = torch.randn(4, 200, 2030)
+loss = torch.nn.CrossEntropyLoss(ignore_index=0)(logits.view(-1, 2030), yb.view(-1))
+print(round(loss.item(), 2))
+```
+
+```sh
+uv run python .tmp/lote.py
+```
+
+La primera línea es `torch.Size([4, 200]) torch.int64`: cuatro ventanas de 200 ids. La segunda
+decodifica los ocho primeros de la primera ventana: `<bos>`, los dos tramos de Elo y cinco jugadas
+UCI. En la tercera, `y` es `x` desplazada una posición: cada objetivo es el id que viene después.
+`emb(xb)` tiene forma `(4, 200, 8)`, un vector de ocho números por id; en M2 son 512. La pérdida
+ronda 8,1: un modelo que reparte la probabilidad por igual entre 2 030 ids paga ln 2030 ≈ 7,6 por
+token, y el ruido de los logits al azar la sube un poco. De ahí arranca la curva de pérdida de M2.
+Lo que hace cada una de esas llamadas por dentro está en
+[PyTorch mínimo](/curso/m2/00-pytorch-minimo/).
+
+</Callout>
 
 ## `run.py`: lo que hace `rukh data tokenize`
 
 `run.py` es el orquestador de `rukh data tokenize`. Casi todo es fontanería que puedes saltar en la
-primera lectura; lo que enseña es `compute_stats`, la tabla de lo que cuesta cada esquema.
+primera lectura; lo que enseña es `compute_stats`, la tabla de lo que cuesta cada esquema. Sin los
+dos pliegues el comando no existe, así que si no los tecleas, trae `run.py` entero antes de
+empezarlo, con `git checkout p1 -- src/rukh/tokenize/run.py`, y lee `compute_stats` sobre tu copia.
 
 <Fold summary="run.py, primera parte: el informe, el BPE que se carga o se reentrena y los artefactos para la web">
 
@@ -662,7 +720,10 @@ más, no 5,2.
   rápido y caben en el navegador con menos memoria.
 </Callout>
 
-Escribir el JSON, ordenar los pasos y exponerlos en la CLI no añade ninguna idea: plegado.
+Escribir el JSON, ordenar los pasos y exponerlos en la CLI no añade ninguna idea: plegado. El
+«Ejecútalo» de los tokens lo necesita entero; si no lo tecleas, `run.py` llega con el
+`git checkout` de arriba y el subcomando `tokenize` de `cli.py` se copia del pliegue,
+porque un `checkout` de `cli.py` pisaría lo que llevas escrito.
 
 <Fold summary="run.py, el resto, y el subcomando rukh data tokenize de cli.py">
 
@@ -794,7 +855,8 @@ cargar la configuración para salir con el código 2 de typer en vez de una traz
 ## `fixture.py`: veinte partidas que el navegador tendrá que reproducir
 
 La fixture de paridad es un contrato entre repositorios, no de modelado; puedes saltarla en la
-primera lectura, pero la necesita el «Ejecútalo» de debajo.
+primera lectura, pero la necesita el «Ejecútalo» de debajo: si no la tecleas, tráela antes con
+`git checkout p1 -- src/rukh/tokenize/fixture.py`.
 
 <Fold summary="fixture.py: veinte partidas codificadas con los tres esquemas para comparar con TypeScript">
 
@@ -1086,8 +1148,10 @@ def test_cli_stats_and_bpe_training(rukh_home: Path, repo_root: Path) -> None:
   Con `fixture.py` escrito ya se pueden pasar los dos ficheros de test de la lección anterior. Los
   dos leen `tests/fixtures/games.pgn`, las veinte partidas de la fixture de paridad, elegidas para
   cubrir los tres resultados, los enroques de los dos bandos y una promoción a caballo; tráelo de
-  `p1` con `git checkout`. Teclea también `tests/unit/test_bpe.py`, plegado justo encima: la
-  mitad son partidas con promociones a alfil desde la columna b, el caso del callout de `split_moves`.
+  `p1` con `git checkout`. Teclea también `tests/unit/test_bpe.py`, plegado justo encima (o
+  tráelo con `git checkout p1 -- tests/unit/test_bpe.py`): de sus ocho tests,
+  `test_split_moves_handles_promotion_ambiguity` es el caso del callout de `split_moves`, con un
+  alfil que acaba en la columna b y una promoción a alfil seguida de una jugada desde la b.
 
 ```sh
 git checkout p1 -- tests/fixtures/games.pgn
@@ -1106,6 +1170,8 @@ la lección.
 ## Los tests del loader
 
 Los tests fijan el contrato del loader; léelos al teclearlos, no hacen falta para seguir la lección.
+El «Ejecútalo» del final los pasa: si no los tecleas, tráelos con
+`git checkout p1 -- tests/unit/test_loader.py`.
 
 <Fold summary="tests/unit/test_loader.py: ventanas alineadas, relleno y reproducibilidad" label="Tests">
 
@@ -1348,27 +1414,34 @@ def test_cli_pack_writes_train_and_val(rukh_home: Path, games_parquet: Path) -> 
 
 <Callout kind="ejecuta" title="Los tokens, empaquetados">
   El comando `rukh data tokenize` ya funciona entero. Lanza los tres comandos en su orden (las
-  estadísticas y los `bpe_ids` de la fixture que escribe el tercero salen del `bpe.json` del primero) y con ellos pasan los tests que
-  comparan contra los artefactos versionados. Teclea también `tests/unit/test_pack.py`, plegado
-  justo encima: fija
-  los bytes de un pack con un hash y comprueba que `meta.json` es coherente con los arrays
-  (`n_tokens == len(tokens)`, `n_games == len(starts)`), que es lo primero que hay que mirar si un
-  pack sale raro.
+  estadísticas y los `bpe_ids` de la fixture que escribe el tercero salen del `bpe.json` del
+  primero) y con ellos pasan los tests que comparan contra los artefactos que acabas de generar.
+  Teclea también `tests/unit/test_pack.py`, plegado justo encima (o tráelo con
+  `git checkout p1 -- tests/unit/test_pack.py`): fija los bytes de un pack con un hash y comprueba
+  que `meta.json` es coherente con los arrays (`n_tokens == len(tokens)`, `n_games == len(starts)`),
+  que es lo primero que hay que mirar si un pack sale raro.
 
 ```sh
 uv run rukh data tokenize --scheme bpe --pack
 uv run rukh data tokenize --scheme san --pack   # opcional: hora y media
 uv run rukh data tokenize --scheme uci --stats --export-fixture --pack
-uv run pytest -m unit -q tests/unit/test_uci_vocab.py tests/unit/test_bpe.py tests/unit/test_san_chars.py tests/unit/test_pack.py tests/unit/test_loader.py
+uv run pytest -m unit -q tests/unit/test_uci_vocab.py tests/unit/test_bpe.py tests/unit/test_san_chars.py tests/unit/test_pack.py tests/unit/test_loader.py --deselect tests/unit/test_pack.py::test_pack_month_bytes_are_stable --deselect tests/unit/test_pack.py::test_san_and_bpe_encoders
 ```
 
 Los tres necesitan `data/uci/` de la conversión. El BPE tarda unos minutos y el UCI entre cinco y
 diez; el último imprime `vocab_size: 2030` y deja `artifacts/tokenizer/vocab.json`,
-`fixtures/games.json`, `artifacts/web/tokenizer-stats.json` y `data/tokens/uci/`. Los tests son 49,
-ya sin `-k`: `test_committed_vocab_matches` comprueba que tu `vocab.json` tiene el sha256 del de
-referencia. Si el que falla es el hash BPE de `test_pack_month_bytes_are_stable`, tu `bpe.json` no
-salió idéntico al de referencia: mira que el BPE se entrenara sobre las mismas 200 000 partidas de
-enero.
+`fixtures/games.json`, `artifacts/web/tokenizer-stats.json` y `data/tokens/uci/`. Los tests son 47
+en verde y dos deseleccionados, ya sin `-k`: `test_committed_vocab_matches` comprueba que tu
+`vocab.json` tiene el sha256 del de referencia.
+
+Los dos deseleccionados no prueban tu código sino un fichero que no tienes. En `p1`,
+`test_pack.py` carga `artifacts/tokenizer/bpe.json` y da por hecho que es el BPE versionado en el
+repositorio de referencia, uno de 600 entradas entrenado para los tests: exige `vocab_size == 600`
+y fija el hash del pack que produce. El tuyo es el de 4 096 que acaba de entrenar
+`--scheme bpe`, así que esos dos fallan aunque todo esté bien; sin `--deselect` verás
+`2 failed, 47 passed`. Las versiones posteriores de `rukh` lo arreglaron entrenando dentro del
+test su propio BPE de 600. No traigas el `bpe.json` de `p1` para ponerlos en verde: pisarías el
+de 4 096 con el que están hechos tus packs y el que lee el lab 5.
 
 </Callout>
 
@@ -1410,7 +1483,9 @@ uv run rukh data tokenize --scheme uci --stats --export-fixture --pack
 
 El último imprime `vocab_size: 2030` y la lista de lo escrito. El pack de enero con el esquema UCI
 tiene 2 949 514 partidas y 240 068 954 tokens; el de febrero, 2 946 874 y 238 657 571.
-`uv run pytest -m unit -q tests/unit/test_pack.py tests/unit/test_loader.py` pasa en verde.
+`uv run pytest -m unit -q tests/unit/test_pack.py tests/unit/test_loader.py` pasa en verde salvo
+los dos tests de `test_pack.py` que esperan el BPE de 600 de la referencia (los del `--deselect` de
+la última caja).
 
 Lo siguiente es sacar todo esto del disco: las cards y el comando que sube seis datasets y un
 tokenizador a Hugging Face.
