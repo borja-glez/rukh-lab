@@ -134,7 +134,9 @@ test.describe('links from /como-funciona-un-llm/', () => {
     await page.goto(PAGE);
     const ids = await page
       .locator('.term__link')
-      .evaluateAll((links) => [...new Set(links.map((a) => new URL(a.href).hash.slice(1)))]);
+      .evaluateAll((links) => [
+        ...new Set(links.map((a) => new URL((a as HTMLAnchorElement).href).hash.slice(1))),
+      ]);
     await page.goto('/glosario/');
     for (const id of ids) await expect(page.locator(`[id="${id}"]`)).toHaveCount(1);
   });

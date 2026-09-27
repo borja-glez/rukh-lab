@@ -88,3 +88,5 @@ if (chapters.length > 0 && 'IntersectionObserver' in window) {
   );
   chapters.forEach((chapter) => chapterObserver.observe(chapter));
 }
+
+export {};
