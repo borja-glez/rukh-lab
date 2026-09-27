@@ -328,7 +328,15 @@ export const CHAPTERS: Chapter[] = [
         label: 'M3 · masked move modeling: preentrenar tapando',
       },
     ],
-    terms: ['preentrenamiento', 'perdida', 'descenso-de-gradiente', 'adamw', 'perplejidad', 'lote'],
+    terms: [
+      'preentrenamiento',
+      'perdida',
+      'descenso-de-gradiente',
+      'retropropagacion',
+      'adamw',
+      'perplejidad',
+      'lote',
+    ],
     check: [
       {
         q: "¿Por qué una sola frase da muchos ejemplos de entrenamiento a la vez?",
@@ -339,8 +347,8 @@ export const CHAPTERS: Chapter[] = [
         a: "Porque al azar reparte la probabilidad casi por igual entre los V tokens, y la pérdida es menos el logaritmo de la probabilidad del correcto: −log(1/V) = log V.",
       },
       {
-        q: "¿Por qué el preentrenamiento no necesita que nadie etiquete datos?",
-        a: "Porque el propio texto trae la respuesta: la etiqueta de cada posición es el token que venía a continuación.",
+        q: '¿Cómo sabe cada peso hacia dónde moverse, sin probarlos uno a uno?',
+        a: 'Por la retropropagación: el error recorre la red una vez hacia atrás y la culpa se multiplica eslabón a eslabón, así que cada peso recibe su parte y su signo en una sola pasada.',
       },
     ],
   },
