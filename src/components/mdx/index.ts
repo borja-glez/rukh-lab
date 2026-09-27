@@ -7,6 +7,9 @@ import Callout from './Callout.astro';
 import Exercise from './Exercise.astro';
 import LabRoutes from './LabRoutes.astro';
 import Solution from './Solution.astro';
+import Fold from './Fold.astro';
+import LessonLabs from './LessonLabs.astro';
+import LabOrigin from './LabOrigin.astro';
 import Term from './Term.astro';
 import Transfer from './Transfer.astro';
 import Figure from './Figure.astro';
@@ -27,6 +30,9 @@ export {
   Exercise,
   LabRoutes,
   Solution,
+  Fold,
+  LessonLabs,
+  LabOrigin,
   Term,
   Transfer,
   Figure,
@@ -48,6 +54,9 @@ export const components = {
   Exercise,
   LabRoutes,
   Solution,
+  Fold,
+  LessonLabs,
+  LabOrigin,
   Term,
   Transfer,
   Figure,

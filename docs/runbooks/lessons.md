@@ -39,6 +39,16 @@ final.
   es Rukh como aprendiz; su mapa (`src/components/Recorrido.astro`, textos en
   `src/data/recorrido.ts`) sale solo al principio y al final de cada módulo, así que la lección no
   repite el itinerario en prosa.
+- **La fontanería se pliega.** El código que hace funcionar el proyecto pero no enseña la idea de
+  ML de la lección (configuración pydantic, CLI, informes, `__all__`, cachés, publicadores, tests
+  con maquinaria avanzada) va dentro de `<Fold summary="…">`, con el bloque y su `<Src>` intactos.
+  Antes del pliegue, una frase dice qué hace y si se puede saltar en la primera lectura. Quedan a
+  la vista las piezas que enseñan (pérdidas, modelo, muestreo, métricas, la lógica de evaluación)
+  y cada «Ejecútalo». Plegar no es borrar: el curso sigue siendo el único sitio donde leer ese
+  código.
+- **Cada lab, junto a su lección.** Los labs viven juntos en la lección de labs del módulo, pero
+  la lección cuyo código ejercitan termina con `<LessonLabs from="…" labs={['Lab 2']} />`, y cada
+  lab lleva debajo de su encabezado `<LabOrigin lessons={['…']} />` con la vuelta.
 - **Fuera del ajedrez.** Si lo que se enseña sirve igual en un LLM de texto, un RAG o un agente,
   se dice (una frase, o un `<Transfer>` si lo merece).
 
@@ -126,6 +136,9 @@ Qué se ha hecho, cómo se mide (columnas de la tabla única que cambian) y qué
 | `Callout`      | Aparte con etiqueta                                                     | `kind`: `teoria` · `mundo-real` · `entrevista` · `hoy` · `roto` (error que enseña) · `ejecuta` · `guia` (punto de partida, cómo seguir la lección); `title?` |
 | `Exercise`     | Ejercicio enmarcado                                                     | `title`, `n?`                                                               |
 | `Solution`     | Desplegable con la solución (dentro de `Exercise`)                      | `label?`                                                                    |
+| `Fold`         | Fontanería plegada: código o prosa que hace funcionar el proyecto pero no enseña la idea de ML; cerrado por defecto, se abre al buscar en la página y al imprimir. Antes, una frase que diga qué hace y si se puede saltar en la primera lectura | `summary` (una línea: qué hace), `label?` (por defecto «Fontanería») |
+| `LessonLabs`   | «Lab de esta lección», al final de una lección de código: los labs de la lección de labs que ejercitan lo construido, con ruta y reloj de `lab-routes.ts` y enlace al encabezado | `from` (id de la lección de labs), `labs: string[]` (`['Lab 2']`), `note?` |
+| `LabOrigin`    | La vuelta: bajo el encabezado de un lab, la lección que construyó lo que ejecuta | `lessons: string[]` (ids, `['m1/02-de-pgn-a-uci']`) |
 | `Term`         | Término enlazado al glosario; popover solo con `(hover: hover)`, en táctil es un enlace | `id` (de `terms.json`)                                                      |
 | `Figure`       | Figura con marco y pie                                                  | `caption`, `n?`                                                             |
 | `Tabs`         | Pestañas accesibles; contenido en `slot="tab-0"`, `slot="tab-1"`…       | `labels: string[]`                                                          |
