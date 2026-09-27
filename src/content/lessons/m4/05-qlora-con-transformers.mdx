@@ -7,7 +7,7 @@ description:
   no tiene, y qwen_suite.py, que corre la misma suite sobre otro jugador.'
 module: m4
 order: 5
-duration: 220
+duration: 235
 runtime: 75
 level: avanzado
 status: vigente
@@ -562,6 +562,31 @@ hf = ["transformers>=5.17", "peft>=0.21", "trl>=1.13", "accelerate>=1.15", "bits
 Nada de M0 a M3 importa ninguno de estos cinco paquetes, y la CI de CPU tiene tres minutos de
 presupuesto: meterlos en las dependencias pagaría la instalación en cada ejecución de cada rama.
 
+### Para qué sirve cada librería del extra
+
+Son cinco piezas del mismo ecosistema, y cada una hace una cosa:
+
+- **`transformers`** es el catálogo y el cargador. `AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")`
+  baja del Hub la configuración y los pesos, construye la arquitectura que dicen y te devuelve un
+  `nn.Module` corriente; `AutoTokenizer` hace lo mismo con el tokenizador, y `generate()` muestrea.
+  Es lo que hace que cambiar de modelo sea cambiar una cadena. La envoltura `hf.py` existe para que
+  el decoder de Rukh hable ese mismo idioma.
+- **`peft`** (_parameter-efficient fine-tuning_) mete adaptadores en un modelo ya construido:
+  `get_peft_model` congela todos los pesos, añade una <Term id="lora">LoRA</Term> en los módulos que
+  le nombras (`q_proj`, `v_proj`…) y al guardar escribe solo el adaptador. Es la LoRA de la lección
+  3, hecha por otros, y por eso sirve de referencia para comprobar la nuestra.
+- **`trl`** trae los bucles de entrenamiento de un LLM: `SFTTrainer` para el afinado supervisado
+  (lotes, pérdida, checkpoints, registro) y también los de DPO y GRPO que
+  M5 escribe a mano. `SFTConfig` es su lista de hiperparámetros.
+- **`accelerate`** es la fontanería de dispositivos: dónde va cada capa, la precisión mixta, varias
+  GPU. Los entrenadores de `trl` la usan por debajo y casi nunca se llama a mano.
+- **`bitsandbytes`** son los núcleos de CUDA que guardan y multiplican pesos de 8 y 4 bits.
+  `BitsAndBytesConfig` le dice a `transformers` que cargue las capas lineales así.
+
+Si vienes de la web, es la diferencia entre escribir tu servidor HTTP y usar un framework: M2 y M3
+escribieron el bucle y el modelo para entenderlos, y aquí se usa lo que usaría un equipo que
+necesita afinar un modelo esta semana.
+
 <Callout kind="ejecuta" title="Instala el extra y pasa la prueba contra `peft`">
   Hasta que el extra esté instalado, `test_hf_wrapper.py` se salta entero por sus dos
   `importorskip`, y con él la única comprobación de que la LoRA escrita a mano es la misma regla de
@@ -693,6 +718,55 @@ En `QwenReport`, `four_bit` dice si la cuantización se usó de verdad, no si se
 pesos cargados, que es lo que QLoRA mueve, y `peak_memory_mb`, el pico durante el entrenamiento,
 dominado por activaciones y optimizador. Publicar solo el pico haría parecer inútil la técnica;
 publicar solo los pesos, milagrosa.
+
+### Qué es cuantizar a 4 bits
+
+Cuatro bits dan para 16 valores distintos. <Term id="cuantizacion">Cuantizar</Term> un peso a 4
+bits es sustituirlo por el más cercano de 16 niveles fijos, y guardar solo cuál de ellos es. Para
+que los niveles sirvan a pesos de cualquier tamaño, se reparten los pesos en bloques de 64 y cada
+bloque guarda su propia escala, el mayor valor absoluto. Con ocho pesos y 16 niveles repartidos a
+partes iguales entre −1 y 1:
+
+```python
+import torch
+
+w = torch.tensor([0.12, -0.53, 0.07, 0.91, -0.02, 0.33, -0.18, 0.46])  # un bloque de pesos
+scale = w.abs().max()                        # 0,91: la constante del bloque
+levels = torch.linspace(-1, 1, 16)           # 16 niveles: lo que caben en 4 bits
+codes = ((w / scale)[:, None] - levels).abs().argmin(dim=1)  # el nivel más cercano
+back = levels[codes] * scale                 # lo que se usa al calcular
+print(codes.tolist())
+print(back.numpy().round(2))
+print(round((w - back).abs().max().item(), 3))
+```
+
+```text
+[8, 3, 8, 15, 7, 10, 6, 11]
+[ 0.06 -0.55  0.06  0.91 -0.06  0.3  -0.18  0.42]
+0.059
+```
+
+Cada peso ocupa ahora cuatro bits más su parte de la escala, y el error máximo es de 0,06. Fíjate
+en dónde duele: 0,07 y −0,02 acaban en ±0,06, porque 16 niveles repartidos a partes iguales no
+tienen un cero y gastan la mitad de su resolución en valores grandes que casi no aparecen. Las tres
+piezas de la receta de QLoRA atacan justo eso:
+
+- **NF4** (_normal float_ de 4 bits) no reparte los niveles a partes iguales: los pone donde se
+  amontonan los pesos de una red entrenada, que siguen más o menos una campana centrada en cero.
+  Hay un cero exacto, muchos niveles cerca de él y pocos en los extremos, de modo que cada nivel
+  recibe más o menos el mismo número de pesos.
+- **Doble cuantización**: la escala de cada bloque, guardada en 32 bits, cuesta medio bit por peso
+  (32 / 64). Cuantizarla a su vez a 8 bits, en bloques de 256 escalas, la deja en unos 0,13 bits
+  por peso. Es poco, pero en un modelo de miles de millones son cientos de megas.
+- **Cómputo en bf16**: los pesos se **guardan** en 4 bits, pero la GPU no multiplica en 4 bits.
+  Cada bloque se descuantiza al vuelo a <Term id="bf16">bf16</Term>, se multiplica y se tira. Eso es
+  `bnb_4bit_compute_dtype`: ahorra memoria, no cálculo.
+
+La base cuantizada está **congelada**: nadie podría darle un paso de gradiente a un peso que solo
+puede valer uno de 16 números. Lo que se entrena es la LoRA de encima, en bf16. En cuentas redondas,
+una matriz de mil millones de pesos pasa de 2 GB en bf16 a algo más de 0,5 GB, y eso es lo que deja
+afinar un modelo de 7 B en una tarjeta de consumo. Con los 0,6 B de Qwen3 en una tarjeta de 32 GB no
+hay nada que ahorrar, y por eso aquí los cuatro bits se intentan pero no se exigen.
 
 ```python title="src/rukh/train/qwen.py"
 def four_bit_config() -> tuple[Any | None, str | None]:
