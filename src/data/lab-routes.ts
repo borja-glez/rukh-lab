@@ -183,7 +183,7 @@ export const labRoutes: Record<string, LabRoute[]> = {
       lab: 'Lab 1',
       what: 'El encoder bidireccional y el enmascarado',
       route: 'con-gpu',
-      clock: 'segundos el script, 16 min el preentrenamiento',
+      clock: '~2 min el script, 16 min el preentrenamiento',
       gives: 'checkpoints/encoder-mmm-<fecha>/best.pt, 75,2 % en jugadas tapadas',
       skip: 'rukh pull encoder-mmm-v4 trae la versión grande, no esta',
     },
