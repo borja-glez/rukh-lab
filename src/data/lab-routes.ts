@@ -316,7 +316,7 @@ export const labRoutes: Record<string, LabRoute[]> = {
     },
     {
       lab: 'Lab 4',
-      what: 'Cuánto se mueve la recompensa con la profundidad',
+      what: 'Cuánto se mueve la recompensa con la profundidad (necesita la mitad del script del Lab 8)',
       route: 'imprescindible',
       clock: '~2 min',
       gives: 'las tablas de la galería de reward hacking',
@@ -333,7 +333,7 @@ export const labRoutes: Record<string, LabRoute[]> = {
       lab: 'Lab 6',
       what: 'DPO con dos fuentes de pares, y la trampa de no igualarlas',
       route: 'con-gpu',
-      clock: '~4 min dentro de política, ~8 fuera',
+      clock: '~4 min cada brazo, los dos con 6 386 pares',
       gives: 'checkpoints/medium-v4-dpo-{on,off}policy/dpo.pt',
       skip: 'rukh pull medium-v4-dpo-onpolicy',
     },
@@ -356,7 +356,7 @@ export const labRoutes: Record<string, LabRoute[]> = {
       what: 'El reward model, y por qué su número depende de la semilla',
       route: 'con-gpu',
       clock: '~4 min por semilla',
-      gives: 'checkpoints/rm/reward.pt, run.json',
+      gives: 'checkpoints/rm-<fecha>/reward.pt y run.json (checkpoints/rm/ si lo bajas)',
       skip: 'rukh pull rm',
     },
     {
@@ -369,9 +369,9 @@ export const labRoutes: Record<string, LabRoute[]> = {
     },
     {
       lab: 'Lab 11',
-      what: 'La suite, la exportación y el Hub',
+      what: 'La suite, la exportación y el Hub, para DPO y para GRPO',
       route: 'con-gpu',
-      clock: '~26 min por etapa + 12 por exportación',
+      clock: '~26 min por evaluación + 12 por exportación, dos de cada',
       gives: 'las filas de la tabla y los repos del Hub',
     },
   ],
