@@ -150,6 +150,45 @@ test.describe('links from /como-funciona-un-llm/', () => {
   });
 });
 
+test.describe('the fold-outs of /como-funciona-un-llm/', () => {
+  test('every "Más a fondo" opens on click and shows its body', async ({ page }) => {
+    await page.goto(PAGE);
+    const folds = page.locator('details.llm-deeper');
+    const count = await folds.count();
+    expect(count).toBeGreaterThan(2);
+    for (let i = 0; i < count; i++) {
+      const fold = folds.nth(i);
+      const body = fold.locator('.llm-deeper__body');
+      await expect(body).toBeHidden();
+      await fold.locator('summary').click();
+      await expect(fold).toHaveAttribute('open', '');
+      await expect(body).toBeVisible();
+      expect((await body.innerText()).trim().length).toBeGreaterThan(40);
+    }
+  });
+
+  test('every chapter but the recap has self-check questions that open', async ({ page }) => {
+    await page.goto(PAGE);
+    const ids = await page
+      .locator('[data-llm-chapter]')
+      .evaluateAll((chapters) => chapters.map((c) => c.id));
+    for (const id of ids) {
+      const checks = page.locator(`#${id} .llm-check__item`);
+      if (id === 'cierre') {
+        await expect(checks).toHaveCount(0);
+        continue;
+      }
+      const count = await checks.count();
+      expect(count, `${id} has no self-check questions`).toBeGreaterThanOrEqual(2);
+      const first = checks.first();
+      const answer = first.locator('.llm-check__a');
+      await expect(answer).toBeHidden();
+      await first.locator('summary').click();
+      await expect(answer).toBeVisible();
+    }
+  });
+});
+
 test.describe('the widgets of /como-funciona-un-llm/', () => {
   test('the BPE stepper merges, counts and undoes', async ({ page }) => {
     await page.goto(PAGE);

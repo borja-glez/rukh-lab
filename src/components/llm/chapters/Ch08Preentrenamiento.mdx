@@ -1,9 +1,12 @@
 import Chapter from '../Chapter.astro';
 import Simile from '../Simile.astro';
 import LlmFigure from '../LlmFigure.astro';
+import Deeper from '../Deeper.astro';
 import Term from '../../mdx/Term.astro';
 import GradientDescent from '../figures/GradientDescent.astro';
+import ShiftTargets from '../figures/ShiftTargets.astro';
 import TokensPerParam from '../figures/TokensPerParam.astro';
+import ToyTraining from '../../../islands/llm/ToyTraining';
 
 <Chapter id="preentrenamiento">
 
@@ -21,11 +24,30 @@ correcto le había dado un 90 %, la pérdida es pequeña; si le había dado un 0
 falta que nadie etiquete nada: el propio texto trae la respuesta, que es lo que permite entrenar con
 todo lo escrito que se pueda reunir.
 
+Y un solo texto da muchos ejemplos a la vez. La respuesta de cada posición es el token que tiene
+justo a su derecha, así que basta con poner el texto dos veces, la segunda desplazada un sitio: una
+frase de seis tokens son cinco preguntas con su respuesta, y el modelo las contesta todas en la misma
+pasada. La máscara causal del capítulo 5 es lo que impide que cada posición mire su propia respuesta
+en la fila de arriba.
+
+<LlmFigure
+  animated
+  caption="Entrada y objetivo son el mismo texto, desplazado un token. Cada columna es un ejemplo: lee lo que hay hasta ahí (la ventana) y debe producir el token de abajo. Todos se calculan a la vez."
+>
+  <ShiftTargets />
+</LlmFigure>
+
+¿Y desde dónde se empieza? Un modelo recién creado no prefiere nada: reparte la probabilidad a
+partes iguales entre los `V` tokens de su vocabulario, así que a cada token correcto le da `1/V` y su
+pérdida inicial es `ln V`. Con un vocabulario de unos 50 000 tokens, como el de GPT-2, sale 10,8; con
+las 2 030 de Rukh, `ln 2030 ≈ 7,6`. Si la primera pérdida que imprime un entrenamiento no se parece a
+ese número, algo está mal montado antes de empezar.
+
 Luego viene el ajuste. Con el <Term id="descenso-de-gradiente">descenso de gradiente</Term> se
 calcula, para cada uno de los millones de pesos, hacia dónde habría que moverlo para que la pérdida
-bajase un poco, y se mueven todos un pasito en esa dirección. Otro <Term id="lote">lote</Term>
-de texto, otro cálculo, otro pasito. Nadie programa la gramática ni las
-aperturas de ajedrez: aparecen porque ayudan a acertar.
+bajase un poco, y se mueven todos un pasito en esa dirección. Otro <Term id="lote">lote</Term> de
+texto, otro cálculo, otro pasito. Nadie programa la gramática ni las aperturas de ajedrez: aparecen
+porque ayudan a acertar.
 
 <LlmFigure
   animated
@@ -44,12 +66,48 @@ cortos y se hace de noche. Y nunca sabes si el valle en el que estás es el más
 
 </Simile>
 
-Los detalles de la receta (el optimizador <Term id="adamw">AdamW</Term>, una tasa que sube despacio
-al principio y baja al final, recortar los gradientes que se disparan) sirven para que esos pasos
-sean estables en una red de muchas capas. Rukh `small` se entrena así 20 000 pasos y acaba con una
-pérdida de validación de 1,52: una <Term id="perplejidad">perplejidad</Term> de 4,6, como si en cada
+### Entrénalo tú
+
+Lo que sigue es un entrenamiento de verdad, en tu navegador: un modelo diminuto que solo mira la
+letra anterior para adivinar la siguiente (un _bigrama_), aprendiendo de unas frases en español. Es
+muchísimo más tonto que un transformer, pero el bucle es el mismo: predecir, medir la pérdida, mover
+los pesos un pasito y repetir.
+
+<LlmFigure
+  widget
+  caption="Un modelo de bigramas de caracteres entrenado aquí mismo con descenso de gradiente. Empieza en ln V, la pérdida de adivinar al azar, y baja hacia lo mejor que puede hacer un modelo que solo ve la letra anterior. Mira el texto: pasa de ruido a sílabas con pinta de español, pero nunca a frases, porque para eso hace falta ver más atrás, que es lo que aporta la atención."
+>
+  <ToyTraining client:visible />
+</LlmFigure>
+
+Rukh `small` hace lo mismo a lo grande: 20 000 pasos que llevan la pérdida desde `ln 2030 ≈ 7,6`
+hasta 1,52 en validación, una <Term id="perplejidad">perplejidad</Term> de 4,6, como si en cada
 jugada dudase entre unas cuatro o cinco candidatas. Acierta la jugada exacta de la partida el 51 %
 de las veces.
+
+<Deeper title="La receta: AdamW, calentamiento y recorte">
+
+Con millones de pesos y muchas capas, el pasito ingenuo del descenso de gradiente es inestable. La
+receta que usan casi todos, y la del curso, añade tres cosas. El optimizador <Term id="adamw">AdamW</Term>
+ajusta el tamaño del paso de cada peso según cómo se ha movido su
+gradiente últimamente. La tasa de aprendizaje sube despacio al principio (el _warmup_), cuando los
+pesos aún son ruido, y baja al final para asentarse en el valle. Y los gradientes que se disparan en
+un lote raro se recortan a una longitud máxima antes de dar el paso, para que un solo lote no tire
+por tierra lo aprendido.
+
+</Deeper>
+
+<Deeper title="Por qué entrenar necesita mucha más memoria que ejecutar">
+
+Para ejecutar un modelo basta con tener sus pesos: en fp16, 2 bytes por parámetro. Para entrenarlo
+hay que guardar, además, un gradiente por peso y los dos promedios que AdamW lleva de cada uno, y en
+precisión mixta se suele conservar una copia de los pesos en fp32. La cuenta estándar sale en unos
+16 bytes por parámetro, sin contar las activaciones intermedias. No es una medición del curso, es la
+contabilidad habitual: para los 39 millones de parámetros de `rukh-small` son unos 0,6 GB, que caben
+de sobra en cualquier tarjeta; para un modelo de 7 000 millones son unos 112 GB, más que ninguna
+tarjeta de consumo. Por eso se entrena en granjas de GPU y se ejecuta en un portátil.
+
+</Deeper>
 
 ### Escalar: ¿más red o más datos?
 
@@ -58,14 +116,18 @@ que, para un presupuesto de cómputo dado, conviene repartirlo entre parámetros
 tokens de entrenamiento por parámetro**. Muchos modelos de entonces eran demasiado grandes para lo
 poco que habían leído.
 
-Rukh se topó con lo mismo. El primer `small` tenía 6,2 tokens únicos por parámetro y el modelo
-`medium`, con el triple de parámetros y los mismos datos, apenas mejoró: más red sobre el mismo libro
-recita mejor el libro. Devolver al entrenamiento un mes de partidas que estaba apartado hizo que el
-`small` pequeño superase al `medium` grande.
+<Deeper title="Rukh se topó con lo mismo">
+
+El primer `small` tenía 6,2 tokens únicos por parámetro y el modelo `medium`, con el triple de
+parámetros y los mismos datos, apenas mejoró: más red sobre el mismo libro recita mejor el libro.
+Devolver al entrenamiento un mes de partidas que estaba apartado hizo que el `small` pequeño
+superase al `medium` grande.
 
 <LlmFigure caption="Tokens únicos de entrenamiento por parámetro en cuatro ejecuciones de Rukh, medidos en el curso. La línea de Chinchilla supone una sola pasada por los datos; repetir el mismo corpus no cuenta como datos nuevos.">
   <TokensPerParam />
 </LlmFigure>
+
+</Deeper>
 
 Al final del preentrenamiento sale un **modelo base**: sabe continuar textos (o partidas) con
 muchísima soltura, pero no sabe que tiene que obedecer ni contestar. Eso llega después.
