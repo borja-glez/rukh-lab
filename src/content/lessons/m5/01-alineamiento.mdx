@@ -7,7 +7,7 @@ description:
   política, GRPO y la KL que sujeta a la política.'
 module: m5
 order: 1
-duration: 35
+duration: 50
 level: medio
 status: vigente
 updated: 2026-09-23
@@ -136,9 +136,10 @@ Para distinguir dos proporciones que difieren en Δp hacen falta, en cada lado,
 n > z² · 2p(1-p) / (Δp)²
 ```
 
-partidas (aproximación normal al 95 %: `z² = 1,96² = 3,84`, y el 2 es porque la varianza de una
-resta es la suma de las dos varianzas). En un enfrentamiento directo se mide una sola proporción
-contra 0,5, y hacen falta
+partidas (aproximación normal al 95 %: `z² = 1,96² = 3,84`, que la
+[estadística justa](/curso/m2/06-el-elo-y-la-suite/#cuántas-partidas-hacen-falta) de M2 deriva con
+una moneda, y el 2 es porque la varianza de una resta es la suma de las dos varianzas). En un
+enfrentamiento directo se mide una sola proporción contra 0,5, y hacen falta
 
 ```text
 n > z² · p(1-p) / (p - 0,5)²
@@ -203,7 +204,9 @@ Antes de entrar, conviene tener presente:
 ## Teoría justa
 
 Lo mínimo para leer el resto del módulo: qué dice un par de preferencia, por qué DPO no necesita
-reward model, qué ahorra GRPO frente a <Term id="ppo">PPO</Term> y qué papel juega la KL en los dos.
+reward model, cómo sube una jugada el gradiente de política, qué ahorra GRPO frente a <Term id="ppo">PPO</Term> y qué es la KL que sujeta a los dos. El capítulo de
+[alineamiento](/como-funciona-un-llm/#alineamiento) de «Cómo funciona un LLM» cuenta lo mismo sin
+fórmulas.
 
 ### Un par de preferencia no dice cuánto vale nada
 
@@ -235,7 +238,7 @@ directamente sobre los pares.
 
 La referencia es una copia congelada de los pesos de partida, que no se entrena ni se publica.
 Piensa en un perro con una correa elástica atada a un poste: puede ir hacia donde huele algo bueno,
-pero cuanto más se aleja más tira la goma, y `β` es lo dura que es. Con una correa muy floja, la
+pero cuanto más se aleja más tira la goma, y <Term id="beta">`β`</Term> es lo dura que es. Con una correa muy floja, la
 política persigue los pares hasta olvidarse de jugar; con una muy dura, casi no se mueve. En el RLHF
 clásico y en GRPO ese mismo papel lo cumple la penalización KL.
 
@@ -257,6 +260,44 @@ bastante lejos. A favor: un modelo solo pierde partidas con las jugadas que jueg
 más caros, y su calidad depende de que el modelo proponga cosas distintas. En los LLM es la misma
 disyuntiva —respuestas escritas por otros frente a respuestas del propio modelo juzgadas por un
 evaluador—, y este módulo no la resuelve con un argumento: entrena los dos y los mide.
+
+### El gradiente de política, con cuatro jugadas
+
+GRPO, y PPO antes que él, se apoyan en una sola regla. La política da una probabilidad a cada
+jugada, y se trabaja con su logaritmo, la <Term id="log-probabilidad">log-probabilidad</Term>, porque
+las probabilidades de una partida se multiplican y se hacen diminutas mientras que sus logaritmos se
+suman. Si una jugada salió mejor de lo que se esperaba (una <Term id="ventaja">ventaja</Term>
+positiva), hay que subir su probabilidad; si salió peor, bajarla. La pérdida que lo hace es
+`−ventaja · log π(jugada)`, y basta un paso de descenso sobre ella:
+
+```python
+import torch
+
+logits = torch.tensor([2.0, 1.0, 0.5, 0.0], requires_grad=True)  # cuatro jugadas
+logp = logits.log_softmax(dim=-1)
+print(logp.exp().detach().numpy().round(3))
+chosen, advantage = 1, 1.5            # la jugada 1 salió mejor que la media del grupo
+loss = -(advantage * logp[chosen])    # el gradiente de política, desnudo
+loss.backward()
+print(logits.grad.numpy().round(3))
+with torch.no_grad():
+    logits -= 0.5 * logits.grad       # un paso de descenso con tasa 0,5
+print(logits.softmax(dim=-1).detach().numpy().round(3))
+```
+
+```text
+[0.579 0.213 0.129 0.078]
+[ 0.869 -1.18   0.194  0.118]
+[0.395 0.404 0.123 0.078]
+```
+
+El gradiente del logit elegido es `−ventaja · (1 − π)`, negativo, así que el descenso lo sube; el de
+cada una de las demás es `+ventaja · π`, así que bajan, más la que más tenía. La jugada 1 pasa de
+0,213 a 0,404 y la favorita cede casi todo lo que esta gana. Con una ventaja negativa, los signos se dan
+la vuelta y la jugada baja. Eso es el <Term id="gradiente-de-politica">gradiente de política</Term>,
+y la línea `-(advantages * chosen_policy).mean()` de la lección 4 es exactamente esto, con ocho
+jugadas por posición y un lote de posiciones. Lo que distingue a REINFORCE, PPO y GRPO es de dónde
+sale la ventaja.
 
 ### GRPO: el grupo es el baseline
 
@@ -281,6 +322,37 @@ del modelo, y no hay manera de saberlo por adelantado.
 
 GRPO también se ata a los pesos de partida con una penalización KL. Rukh usa el estimador k3, que
 nunca es negativo; la lección 4 explica por qué eso importa, con la pérdida completa.
+
+### Qué es una KL
+
+La divergencia KL mide cuánto se aparta una distribución de otra: `KL(π ‖ ref) = Σ π · log(π / ref)`,
+cero si las dos son iguales y mayor cuanto más difieren. No es simétrica —cambiar el orden da otro
+número—, así que es una «distancia» entre comillas. Con tres jugadas:
+
+```python
+import torch
+
+policy = torch.tensor([0.5, 0.3, 0.2])     # el modelo que se entrena
+ref = torch.tensor([0.4, 0.4, 0.2])        # la copia congelada
+kl = (policy * (policy / ref).log()).sum()
+print(round(kl.item(), 4))
+d = ref.log() - policy.log()               # por jugada: log ref - log política
+k3 = d.exp() - d - 1                       # el estimador k3, nunca negativo
+print(k3.numpy().round(4), round((policy * k3).sum().item(), 4))
+print(d.numpy().round(4))
+```
+
+```text
+0.0253
+[0.0231 0.0457 0.    ] 0.0253
+[-0.2231  0.2877  0.    ]
+```
+
+La política ha pasado 0,1 de la segunda jugada a la primera, y la KL vale 0,0253. Al entrenar no se suma sobre
+todas las jugadas posibles: se estima con la jugada que se muestreó. La diferencia a secas, `d`, es
+negativa en unas jugadas y positiva en otras; el estimador k3, `exp(d) − d − 1`, nunca es negativo y
+su media ponderada por la política da exactamente la KL, 0,0253. La <Term id="kl">penalización KL</Term> suma ese número a la pérdida multiplicado por un peso, `β`
+(`beta_kl: 0.02` en GRPO): la dureza de la correa del perro de DPO, escrita como término.
 
 ### La recompensa verificable
 
