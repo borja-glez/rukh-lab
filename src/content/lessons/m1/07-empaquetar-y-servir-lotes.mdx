@@ -39,6 +39,17 @@ El puente entre los vocabularios de la lección anterior y la GPU de M2, en tres
 Escribir en flujo, indexar aparte y leer con memmap sirve para cualquier corpus que no cabe en
 memoria, sea de partidas, de texto o de fragmentos para un RAG.
 
+<Callout kind="guia" title="Qué tecleas y qué traes">
+
+- **Tecleas**: `src/rukh/tokenize/pack.py`, `loader.py`, `run.py` y `fixture.py`, el subcomando
+  `tokenize` de `cli.py` y los tests `test_loader.py`, `test_bpe.py` y `test_pack.py` (estos dos,
+  plegados).
+- **Traes del repo**: la fixture `tests/fixtures/games.pgn`, con `git checkout p1 --
+tests/fixtures/games.pgn` cuando lo pide su caja «Ejecútalo».
+- **Referencia**: `p1`.
+
+</Callout>
+
 ## `pack.py`: tres codificadores con la misma forma
 
 ```python title="src/rukh/tokenize/pack.py"
@@ -856,16 +867,188 @@ def write_fixture(entries: list[dict[str, object]], path: Path) -> None:
 `write_fixture` repite el determinismo de `UciTokenizer.export`, porque el fichero se compara byte a
 byte entre tres repositorios.
 
+<Fold summary="Código completo: tests/unit/test_bpe.py">
+
+```python title="tests/unit/test_bpe.py"
+"""Tests for rukh.tokenize.bpe: training, exact round trip, saved file and statistics."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from tokenizers import Tokenizer
+from typer.testing import CliRunner
+
+from rukh.cli import app
+from rukh.tokenize.bpe import (
+    bpe_text,
+    decode,
+    encode,
+    load_bpe,
+    longest_tokens,
+    save,
+    split_moves,
+    train_bpe,
+)
+from rukh.tokenize.fixture import read_pgn_games
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(scope="module")
+def games(repo_root: Path) -> list[str]:
+    return [str(g["uci"]) for g in read_pgn_games(repo_root / "tests" / "fixtures" / "games.pgn")]
+
+
+@pytest.fixture(scope="module")
+def trained(games: list[str]) -> Tokenizer:
+    return train_bpe((bpe_text(g) for g in games), vocab_size=600)
+
+
+@pytest.fixture(scope="module")
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def test_specials_and_config(trained: Tokenizer) -> None:
+    assert trained.get_vocab_size() == 600
+    for i, token in enumerate(UciTokenizer.specials):
+        assert trained.token_to_id(token) == i
+    payload = json.loads(trained.to_str())
+    assert payload["model"]["type"] == "BPE"
+    assert payload["model"]["unk_token"] == "<unk>"
+    assert payload["model"]["continuing_subword_prefix"] is None
+    assert payload["model"]["end_of_word_suffix"] is None
+    assert payload["pre_tokenizer"]["type"] == "WhitespaceSplit"
+    assert payload["normalizer"] is None
+    assert payload["decoder"] is None
+
+
+def test_round_trip_is_exact(trained: Tokenizer, games: list[str]) -> None:
+    for uci in games:
+        ids = encode(trained, bpe_text(uci))
+        assert decode(trained, ids) == uci
+        assert UciTokenizer.unk_id not in ids
+
+
+def test_learns_multi_move_tokens(trained: Tokenizer) -> None:
+    longest = longest_tokens(trained, 10)
+    assert len(longest) == 10
+    assert longest[0]["moves"] >= 2
+    assert longest[0]["length"] == len(longest[0]["token"])
+
+
+def test_save_and_load(tmp_path: Path, trained: Tokenizer, games: list[str]) -> None:
+    path = tmp_path / "bpe.json"
+    save(trained, path)
+    again = Tokenizer.from_file(str(path))
+    assert again.encode(bpe_text(games[3])).ids == trained.encode(bpe_text(games[3])).ids
+    assert load_bpe(path).get_vocab_size() == 600
+
+
+def test_split_moves_handles_promotion_ambiguity() -> None:
+    assert split_moves("e2e4e7e5") == ["e2e4", "e7e5"]
+    # 4...Bxc1 is a bishop move from rank 2 to rank 1 followed by 5.b4: the 'b' is a file.
+    bishop = "d2d3 e7e6 e1d2 f8b4 d2e3 b4d2 e3f3 d2c1 b2b4"
+    assert split_moves(bishop.replace(" ", "")) == bishop.split()
+    # 5.gxh8=B then 5...Nc6: the first 'b' is the promotion piece, the second a file.
+    promo = "h2h4 g7g5 h4g5 h7h6 g5g6 f7f6 g6g7 f6f5 g7h8b b8c6"
+    assert split_moves(promo.replace(" ", "")) == promo.split()
+    # After an illegal move the split falls back to the rank rule.
+    assert split_moves("e2e5e7e8qa1a2") == ["e2e5", "e7e8q", "a1a2"]
+
+
+def test_committed_bpe_matches_fixture(repo_root: Path) -> None:
+    bpe = load_bpe(repo_root / "artifacts" / "tokenizer" / "bpe.json")
+    fixture = json.loads(
+        (repo_root / "artifacts" / "tokenizer" / "fixtures" / "games.json").read_text("utf-8")
+    )
+    for entry in fixture:
+        assert entry["bpe_ids"] == encode(bpe, bpe_text(entry["uci"])), entry["id"]
+        assert decode(bpe, entry["bpe_ids"]) == entry["uci"]
+
+
+def test_stats_lengths_match_the_encoders(repo_root: Path, trained: Tokenizer) -> None:
+    """The statistics count exactly what each encoder emits (BPE frames with three tokens)."""
+    import polars as pl
+
+    from rukh.data.pipeline import TokenizeConfig
+    from rukh.tokenize.pack import BpeGameEncoder, SanGameEncoder, UciGameEncoder
+    from rukh.tokenize.run import compute_stats
+
+    games = repo_root / "tests" / "fixtures" / "games.parquet"
+    stats = compute_stats(TokenizeConfig(), games, trained)
+    frame = pl.read_parquet(games.as_posix()).select("uci", "white_elo", "black_elo", "result")
+    encoders = {
+        "uci": UciGameEncoder(),
+        "san": SanGameEncoder(),
+        "bpe": BpeGameEncoder(trained),
+    }
+    for scheme, encoder in encoders.items():
+        lengths = [
+            len(encoder.encode_game(uci, int(w), int(b), result, max_len=1 << 30))
+            for uci, w, b, result in frame.iter_rows()
+        ]
+        assert stats["schemes"][scheme]["mean"] == round(sum(lengths) / len(lengths), 2), scheme
+
+
+def test_cli_stats_and_bpe_training(rukh_home: Path, repo_root: Path) -> None:
+    games = (repo_root / "tests" / "fixtures" / "games.parquet").as_posix()
+    pgn = (repo_root / "tests" / "fixtures" / "games.pgn").as_posix()
+    cfg = rukh_home / "pipeline.yaml"
+    cfg.write_text(
+        f"tokenize:\n  fixture_pgn: {pgn}\n  bpe_vocab_size: 300\n  bpe_train_games: 20\n",
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "data",
+            "tokenize",
+            "--config",
+            str(cfg),
+            "--scheme",
+            "bpe",
+            "--stats",
+            "--export-fixture",
+            "--games",
+            games,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "vocab_size: 300" in result.output
+    bpe_path = rukh_home / "artifacts" / "tokenizer" / "bpe.json"
+    assert Tokenizer.from_file(str(bpe_path)).get_vocab_size() == 300
+    stats = json.loads((rukh_home / "artifacts" / "web" / "tokenizer-stats.json").read_text())
+    assert set(stats["schemes"]) == {"uci", "san", "bpe"}
+    assert stats["schemes"]["uci"]["vocab_size"] == 2030
+    assert stats["schemes"]["san"]["vocab_size"] == 35
+    assert stats["schemes"]["bpe"]["vocab_size"] == 300
+    assert stats["schemes"]["san"]["mean"] > stats["schemes"]["uci"]["mean"]
+    assert stats["source"]["n_games"] == 20
+    assert len(stats["bpe_longest_tokens"]) == 10
+    fixture = json.loads(
+        (rukh_home / "artifacts" / "tokenizer" / "fixtures" / "games.json").read_text("utf-8")
+    )
+    assert all("bpe_ids" in e and "san_ids" in e for e in fixture)
+```
+
+<Src file="tests/unit/test_bpe.py" tag="p1" lines="1-164" />
+
+</Fold>
+
 <Callout kind="ejecuta" title="La enumeración y el BPE, fijados por sus tests">
   Con `fixture.py` escrito ya se pueden pasar los dos ficheros de test de la lección anterior. Los
   dos leen `tests/fixtures/games.pgn`, las veinte partidas de la fixture de paridad, elegidas para
-  cubrir los tres resultados, los enroques de los dos bandos y una promoción a caballo; descárgalo a
-  su sitio. Copia también
-  [`tests/unit/test_bpe.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_bpe.py): la
+  cubrir los tres resultados, los enroques de los dos bandos y una promoción a caballo; tráelo de
+  `p1` con `git checkout`. Teclea también `tests/unit/test_bpe.py`, plegado justo encima: la
   mitad son partidas con promociones a alfil desde la columna b, el caso del callout de `split_moves`.
 
 ```sh
-curl -L -o tests/fixtures/games.pgn https://github.com/borja-glez/rukh/raw/p1/tests/fixtures/games.pgn
+git checkout p1 -- tests/fixtures/games.pgn
 uv run pytest -m unit -q tests/unit/test_uci_vocab.py tests/unit/test_bpe.py -k "not committed"
 ```
 
@@ -983,11 +1166,143 @@ distinto) es la que detectaría un generador ignorado. `test_thousand_samples_in
 propiedad: no prueba un caso concreto, sino que ninguna de mil ventanas al azar se sale del
 vocabulario.
 
+<Fold summary="Código completo: tests/unit/test_pack.py">
+
+```python title="tests/unit/test_pack.py"
+"""Tests for rukh.tokenize.pack: stream layout, index, metadata and the three encoders."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from rukh.tokenize.bpe import load_bpe
+from rukh.tokenize.pack import (
+    STARTS_FILE,
+    TOKENS_FILE,
+    BpeGameEncoder,
+    SanGameEncoder,
+    UciGameEncoder,
+    make_encoder,
+    pack_month,
+    read_pack_info,
+)
+from rukh.tokenize.uci_vocab import UciTokenizer
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+def games_parquet(repo_root: Path) -> Path:
+    return repo_root / "tests" / "fixtures" / "games.parquet"
+
+
+def test_pack_month_layout(tmp_path: Path, games_parquet: Path) -> None:
+    info = pack_month(games_parquet, UciGameEncoder(), tmp_path / "pack")
+    tokens = np.load(tmp_path / "pack" / "tokens.npy", mmap_mode="r")
+    starts = np.load(tmp_path / "pack" / "starts.npy")
+    assert tokens.dtype == np.uint16 and starts.dtype == np.int64
+    assert info.n_games == 20 and len(starts) == 20
+    assert info.n_tokens == len(tokens)
+    assert tokens[-1] == UciTokenizer.eos_id
+    assert all(tokens[s] == UciTokenizer.bos_id for s in starts)
+    assert starts[0] == 0 and np.all(np.diff(starts) > 0)
+    # Every game is stored whole: <bos>, two Elo tokens, plies, result, <eos>.
+    import polars as pl
+
+    plies = pl.read_parquet(games_parquet.as_posix())["n_plies"].to_list()
+    lengths = np.diff(np.append(starts, len(tokens)))
+    assert lengths.tolist() == [p + 5 for p in plies]
+    assert not (tmp_path / "pack" / "tokens.bin").exists()
+    meta = json.loads((tmp_path / "pack" / "meta.json").read_text("utf-8"))
+    assert meta["scheme"] == "uci" and meta["vocab_size"] == 2030
+    assert len(meta["vocab_hash"]) == 64
+    assert read_pack_info(tmp_path / "pack") == info
+
+
+def test_pack_month_bytes_are_stable(tmp_path: Path, games_parquet: Path, repo_root: Path) -> None:
+    """The packed bytes are a published contract: streaming must not change them."""
+    expected = {
+        "uci": (
+            "a9df9aa63875adee99b42d4d1ef8ed2db7ba4dd087c5b0533dc88705bb82eb30",
+            "91ffa8971d5552917893774c773245cfd980c0c7db1fe5c103140360cd08b1da",
+        ),
+        "bpe": (
+            "028a4281a0cade6ccbb55abbe68a393354da394d74554caea12626c3afda5a18",
+            "cc8eda0b46c069c982b6e9ad1a4ea1ac39dcf37f303a220a292e33919c72d60f",
+        ),
+    }
+    encoders = {
+        "uci": UciGameEncoder(),
+        "bpe": BpeGameEncoder(load_bpe(repo_root / "artifacts" / "tokenizer" / "bpe.json")),
+    }
+    for scheme, encoder in encoders.items():
+        out = tmp_path / scheme
+        pack_month(games_parquet, encoder, out)
+        digests = tuple(
+            hashlib.sha256((out / name).read_bytes()).hexdigest()
+            for name in (TOKENS_FILE, STARTS_FILE)
+        )
+        assert digests == expected[scheme], scheme
+
+
+def test_san_and_bpe_encoders(tmp_path: Path, games_parquet: Path, repo_root: Path) -> None:
+    san = SanGameEncoder()
+    ids = san.encode_game("e2e4 e7e5", 1800, 1800, "1-0", max_len=1000)
+    assert ids[0] == 1 and ids[-1] == 2
+    assert san.tokenizer.decode(ids) == "1.e4 e5 1-0"
+    info = pack_month(games_parquet, san, tmp_path / "san")
+    assert info.scheme == "san" and info.vocab_size == 35
+
+    bpe = BpeGameEncoder(load_bpe(repo_root / "artifacts" / "tokenizer" / "bpe.json"))
+    ids = bpe.encode_game("e2e4 e7e5", 1800, 1800, "0-1", max_len=1000)
+    assert ids[0] == 1 and ids[-2] == 6 and ids[-1] == 2
+    info = pack_month(games_parquet, bpe, tmp_path / "bpe")
+    assert info.scheme == "bpe" and info.vocab_size == 600
+    tokens = np.load(tmp_path / "bpe" / "tokens.npy")
+    assert tokens[-1] == 2 and tokens[0] == 1
+
+
+def test_make_encoder() -> None:
+    assert make_encoder("uci").scheme == "uci"
+    assert make_encoder("san").scheme == "san"
+    with pytest.raises(ValueError):
+        make_encoder("bpe")
+    with pytest.raises(ValueError):
+        make_encoder("nope")
+
+
+def test_cli_pack_writes_train_and_val(rukh_home: Path, games_parquet: Path) -> None:
+    import shutil
+
+    from typer.testing import CliRunner
+
+    from rukh.cli import app
+
+    for month in ("01", "02"):
+        target = rukh_home / "data" / "uci" / "year=2025" / f"month={month}" / "games.parquet"
+        target.parent.mkdir(parents=True)
+        shutil.copy(games_parquet, target)
+    result = CliRunner().invoke(app, ["data", "tokenize", "--scheme", "uci", "--pack"])
+    assert result.exit_code == 0, result.output
+    for split in ("train", "val"):
+        info = read_pack_info(rukh_home / "data" / "tokens" / "uci" / split)
+        assert info.n_games == 20
+```
+
+<Src file="tests/unit/test_pack.py" tag="p1" lines="1-123" />
+
+</Fold>
+
 <Callout kind="ejecuta" title="Los tokens, empaquetados">
   El comando `rukh data tokenize` ya funciona entero. Lanza los tres comandos en su orden (las
   estadísticas y los `bpe_ids` de la fixture que escribe el tercero salen del `bpe.json` del primero) y con ellos pasan los tests que
-  comparan contra los artefactos versionados. Copia también
-  [`tests/unit/test_pack.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_pack.py): fija
+  comparan contra los artefactos versionados. Teclea también `tests/unit/test_pack.py`, plegado
+  justo encima: fija
   los bytes de un pack con un hash y comprueba que `meta.json` es coherente con los arrays
   (`n_tokens == len(tokens)`, `n_games == len(starts)`), que es lo primero que hay que mirar si un
   pack sale raro.

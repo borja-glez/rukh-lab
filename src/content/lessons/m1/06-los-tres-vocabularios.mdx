@@ -43,6 +43,15 @@ Son cuatro ficheros.
 
 Sin reexportes, para que importar `rukh.tokenize` no arrastre `tokenizers` ni `polars`.
 
+<Callout kind="guia" title="Qué tecleas y qué traes">
+
+- **Tecleas**: `src/rukh/tokenize/__init__.py`, `uci_vocab.py`, `san_chars.py` y `bpe.py`, y los
+  tests `test_uci_vocab.py` y `test_san_chars.py` (este, plegado).
+- **Traes del repo**: nada.
+- **Referencia**: `p1`.
+
+</Callout>
+
 ## `uci_vocab.py`: una tabla que se calcula, no se guarda
 
 ```python title="src/rukh/tokenize/uci_vocab.py"
@@ -395,6 +404,71 @@ misma jugada es `Nf3` o `Ngf3` según dónde esté el otro caballo. El número d
 de las blancas (`1.e4 e5 2.Nf3`), y el gemelo de TypeScript tiene que copiarlo exacto: un espacio de
 más son partidas un 8 % más largas.
 
+<Fold summary="Código completo: tests/unit/test_san_chars.py">
+
+```python title="tests/unit/test_san_chars.py"
+"""Tests for rukh.tokenize.san_chars: alphabet, round trip and UCI to SAN conversion."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from rukh.tokenize.san_chars import ALPHABET, SanCharTokenizer, san_text, uci_to_san
+
+pytestmark = pytest.mark.unit
+
+
+def test_alphabet_has_32_symbols_and_specials_first() -> None:
+    tok = SanCharTokenizer()
+    assert len(ALPHABET) == 32
+    assert len(set(ALPHABET)) == 32
+    assert len(tok) == 35
+    assert tok.ids[:3] == ["<pad>", "<bos>", "<eos>"]
+    assert tok.vocab[" "] == 3
+    assert tok.vocab["/"] == 34
+
+
+def test_round_trip() -> None:
+    tok = SanCharTokenizer()
+    text = san_text(
+        "1.e4 e5 2.Nf3 Nc6 3.Bb5 a6 4.Bxc6 dxc6 5.O-O f6 6.d4 exd4 7.Nxd4 c5", "1/2-1/2"
+    )
+    ids = tok.encode(text)
+    assert ids[0] == tok.bos_id and ids[-1] == tok.eos_id
+    assert len(ids) == len(text) + 2
+    assert tok.decode(ids) == text
+
+
+def test_rejects_unknown_character() -> None:
+    with pytest.raises(ValueError):
+        SanCharTokenizer().encode("1.e4 e5 {comment}")
+
+
+def test_uci_to_san_numbers_and_notation() -> None:
+    san = uci_to_san("e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5c6 d7c6 e1g1 f7f6")
+    assert san == "1.e4 e5 2.Nf3 Nc6 3.Bb5 a6 4.Bxc6 dxc6 5.O-O f6"
+    assert uci_to_san("e2e4 d7d5 e4d5 d8d5 b1c3 d5e5") == "1.e4 d5 2.exd5 Qxd5 3.Nc3 Qe5+"
+    with pytest.raises(ValueError):
+        uci_to_san("e2e5")
+
+
+def test_fixture_san_ids_match(repo_root: Path) -> None:
+    tok = SanCharTokenizer()
+    fixture = json.loads(
+        (repo_root / "artifacts" / "tokenizer" / "fixtures" / "games.json").read_text("utf-8")
+    )
+    for entry in fixture:
+        assert entry["san_ids"] == tok.encode(san_text(entry["san"], entry["result"]))
+        assert uci_to_san(entry["uci"]) == entry["san"]
+```
+
+<Src file="tests/unit/test_san_chars.py" tag="p1" lines="1-56" />
+
+</Fold>
+
 <Callout kind="ejecuta" title="Dos tokenizadores que no necesitan datos">
   `uci_vocab.py` y `san_chars.py` no dependen de nada más que de `python-chess`. Codifica una
   apertura con los dos y pasa los tests del alfabeto; el último de ese fichero compara contra la
@@ -408,9 +482,8 @@ uv run pytest -m unit -q tests/unit/test_san_chars.py -k "not fixture"
 
 El primero imprime `2030` y `[1, 20, 48, 997, 1164, 1455, 5, 2]`: `<bos>`, `<w1800>`, `<b1900>`,
 las tres jugadas, `<1-0>` y `<eos>`, que es lo que devuelve el `decode`. El segundo, `35` y
-`'1.e4 e5 2.Nf3'`, con el número pegado a la jugada de las blancas. Copia
-[`tests/unit/test_san_chars.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_san_chars.py)
-—tamaños, un carácter de fuera que lanza, `decode` que salta los especiales, `uci_to_san` que numera
+`'1.e4 e5 2.Nf3'`, con el número pegado a la jugada de las blancas. Teclea
+`tests/unit/test_san_chars.py`, plegado justo encima —tamaños, un carácter de fuera que lanza, `decode` que salta los especiales, `uci_to_san` que numera
 solo las blancas y rechaza una ilegal— para el tercero: cuatro tests en verde y uno deseleccionado.
 
 </Callout>
