@@ -73,7 +73,7 @@ export default function AttentionPlayground() {
 
       <p class="ap__hint">Toca una palabra (o muévete con las flechas) para ver a quién escucha.</p>
 
-      <ol class="ap__rows" aria-label="Palabras de la frase y peso de atención que reciben">
+      <ol class="ap__rows" aria-label="Palabras de la frase y porcentaje de atención que reciben">
         {SENTENCE.map((word, k) => {
           const hidden = causal && k > query;
           const w = weights[k];

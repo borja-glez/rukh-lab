@@ -183,6 +183,12 @@ export default function BackpropByHand() {
             <span class="bh__value">{value(f?.loss)}</span>
           </li>
         </ol>
+        {stale && (
+          <p class="bh__stale">
+            Los valores tachados son de la pasada anterior: los pesos ya han cambiado. Pulsa «Hacia
+            delante» para recalcularlos con los nuevos.
+          </p>
+        )}
         <p class="bh__note caption">
           Error = la mitad de (ŷ − y) al cuadrado: el cuadrado lo hace siempre positivo y castiga
           más los fallos grandes.

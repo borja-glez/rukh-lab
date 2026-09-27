@@ -18,12 +18,13 @@ export interface Word {
 }
 
 export const WORDS: Word[] = [
-  { word: 'gato', group: 'animales', x: 12, y: 18 },
-  { word: 'gatito', group: 'animales', x: 18, y: 26 },
-  { word: 'perro', group: 'animales', x: 26, y: 14 },
-  { word: 'cachorro', group: 'animales', x: 32, y: 22 },
-  { word: 'pato', group: 'animales', x: 10, y: 36 },
-  { word: 'caballo', group: 'animales', x: 30, y: 36 },
+  /* Spread wide enough that three neighbour lines and their distances never land on a label. */
+  { word: 'gato', group: 'animales', x: 8, y: 14 },
+  { word: 'gatito', group: 'animales', x: 14, y: 30 },
+  { word: 'perro', group: 'animales', x: 30, y: 10 },
+  { word: 'cachorro', group: 'animales', x: 36, y: 26 },
+  { word: 'pato', group: 'animales', x: 6, y: 44 },
+  { word: 'caballo', group: 'animales', x: 30, y: 44 },
   { word: 'hombre', group: 'personas', x: 58, y: 40 },
   { word: 'mujer', group: 'personas', x: 82, y: 40 },
   { word: 'rey', group: 'personas', x: 58, y: 16 },

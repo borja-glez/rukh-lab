@@ -344,7 +344,7 @@ export const CHAPTERS: Chapter[] = [
       },
       {
         q: "¿Por qué la pérdida de un modelo recién creado ronda el logaritmo del tamaño del vocabulario?",
-        a: "Porque al azar reparte la probabilidad casi por igual entre los V tokens, y la pérdida es menos el logaritmo de la probabilidad del correcto: −log(1/V) = log V.",
+        a: "Porque un modelo sin entrenar reparte la probabilidad casi por igual entre los V tokens: acierta como quien adivina al azar, y la pérdida de adivinar al azar entre V opciones es justo el logaritmo de V.",
       },
       {
         q: '¿Cómo sabe cada peso hacia dónde moverse, sin probarlos uno a uno?',

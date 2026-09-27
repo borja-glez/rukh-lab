@@ -1,7 +1,7 @@
 /**
  * SamplingDial (/como-funciona-un-llm/, chapter 8): the three knobs of every chat API over one
  * fixed set of next-word logits. Moving temperature, top-k or top-p redraws the probabilities
- * (outline: after temperature; filled: what is left after the filters, renormalised), and
+ * (thin upper strip: after temperature; thick bar: what is left after the filters, renormalised), and
  * «Muestrear» draws words from the final distribution. The maths is src/lib/llm/sampling.ts;
  * styles are src/styles/llm/sampling-dial.css (`.sd*`), never inline (CSP).
  */
@@ -26,7 +26,8 @@ export const CANDIDATES: Candidate[] = [
 const PRESETS = [
   { name: 'Siempre el favorito', temperature: 0, topK: 8, topP: 1 },
   { name: 'Un chat típico', temperature: 0.7, topK: 8, topP: 0.9 },
-  { name: 'Caos', temperature: 1.8, topK: 8, topP: 1 },
+  /* Hot and unfiltered: the long tail («perro», «piano») gets a real share of the draws. */
+  { name: 'Caos', temperature: 3, topK: 8, topP: 1 },
 ];
 
 const HISTORY = 20;
@@ -93,7 +94,7 @@ export default function SamplingDial() {
             class="sd__range"
             type="range"
             min="0"
-            max="2"
+            max="3"
             step="0.1"
             value={temperature}
             onInput={set(setTemperature)}
@@ -143,9 +144,9 @@ export default function SamplingDial() {
           <li key={s.token} class={s.kept ? 'sd__row' : 'sd__row sd__row--out'}>
             <span class="sd__token">{s.token}</span>
             <svg class="sd__bar" viewBox="0 0 100 10" preserveAspectRatio="none" aria-hidden="true">
-              <rect class="sd__track" x="0" y="0" width="100" height="10" />
-              <rect class="sd__before" x="0" y="0" width={s.prob * 100} height="10" />
-              <rect class="sd__after" x="0" y="0" width={s.final * 100} height="10" />
+              <rect class="sd__before" x="0" y="0" width={s.prob * 100} height="2.5" />
+              <rect class="sd__track" x="0" y="4" width="100" height="6" />
+              <rect class="sd__after" x="0" y="4" width={s.final * 100} height="6" />
             </svg>
             <span class="sd__pct">{s.kept ? pct(s.final) : 'fuera'}</span>
             <span class="sd__tally">
@@ -161,8 +162,15 @@ export default function SamplingDial() {
       </ol>
 
       <p class="sd__legend caption">
-        Contorno: probabilidad tras la temperatura. Relleno: lo que queda tras top-k y top-p,
-        repartido de nuevo para que sume 100 %.
+        <span class="sd__key">
+          <span class="sd__swatch sd__swatch--before" aria-hidden="true" />
+          Línea fina: probabilidad tras la temperatura.
+        </span>
+        <span class="sd__key">
+          <span class="sd__swatch sd__swatch--after" aria-hidden="true" />
+          Barra gruesa y porcentaje: lo que queda tras top-k y top-p, repartido de nuevo para que
+          sume 100 %. Es con lo que se sortea.
+        </span>
       </p>
 
       <div class="sd__actions">

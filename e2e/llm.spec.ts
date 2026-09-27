@@ -62,46 +62,53 @@ test.describe('the figures of /como-funciona-un-llm/', () => {
     await expect(last.locator('[data-llm-toggle]')).toHaveText('reanudar');
   });
 
-  test('no animated figure draws outside its viewBox in any frame', async ({ page }) => {
-    await page.goto(PAGE);
-    const svgs = page.locator('[data-llm-fig][data-animated] svg[viewBox]');
-    const count = await svgs.count();
-    for (let i = 0; i < count; i++) {
-      const svg = svgs.nth(i);
-      await svg.scrollIntoViewIfNeeded();
-      const spilled = await svg.evaluate((element) => {
-        const svg = element as SVGSVGElement;
-        const box = svg.viewBox.baseVal;
-        const out: string[] = [];
-        const animations = svg.getAnimations({ subtree: true });
-        for (let step = 0; step <= 10; step++) {
-          for (const animation of animations) {
-            animation.pause();
-            const timing = animation.effect?.getComputedTiming();
-            const duration = Number(timing?.duration ?? 0);
-            const delay = Number(timing?.delay ?? 0);
-            animation.currentTime = delay + (duration * step) / 10;
-          }
-          const frame = svg.getBoundingClientRect();
-          const scale = frame.width / box.width;
-          for (const shape of svg.querySelectorAll('rect, line, circle, path, text, polygon')) {
-            const b = shape.getBoundingClientRect();
-            if (b.width === 0 && b.height === 0) continue;
-            const left = (b.left - frame.left) / scale;
-            const right = (b.right - frame.left) / scale;
-            const top = (b.top - frame.top) / scale;
-            const bottom = (b.bottom - frame.top) / scale;
-            if (left < -1 || top < -1 || right > box.width + 1 || bottom > box.height + 1) {
-              out.push(`${shape.tagName} "${shape.textContent?.slice(0, 20)}" at ${step * 10} %`);
+  for (const width of [1440, 390]) {
+    test(`no animated figure draws outside its viewBox in any frame at ${width} px`, async ({
+      page,
+    }) => {
+      // Some figures draw a second, narrow version for phones; each width measures the one it shows.
+      await page.setViewportSize({ width, height: 900 });
+      await page.goto(PAGE);
+      const svgs = page.locator('[data-llm-fig][data-animated] svg[viewBox]:visible');
+      const count = await svgs.count();
+      expect(count, 'animated figures found').toBeGreaterThan(10);
+      for (let i = 0; i < count; i++) {
+        const svg = svgs.nth(i);
+        await svg.scrollIntoViewIfNeeded();
+        const spilled = await svg.evaluate((element) => {
+          const svg = element as SVGSVGElement;
+          const box = svg.viewBox.baseVal;
+          const out: string[] = [];
+          const animations = svg.getAnimations({ subtree: true });
+          for (let step = 0; step <= 10; step++) {
+            for (const animation of animations) {
+              animation.pause();
+              const timing = animation.effect?.getComputedTiming();
+              const duration = Number(timing?.duration ?? 0);
+              const delay = Number(timing?.delay ?? 0);
+              animation.currentTime = delay + (duration * step) / 10;
+            }
+            const frame = svg.getBoundingClientRect();
+            const scale = frame.width / box.width;
+            for (const shape of svg.querySelectorAll('rect, line, circle, path, text, polygon')) {
+              const b = shape.getBoundingClientRect();
+              if (b.width === 0 && b.height === 0) continue;
+              const left = (b.left - frame.left) / scale;
+              const right = (b.right - frame.left) / scale;
+              const top = (b.top - frame.top) / scale;
+              const bottom = (b.bottom - frame.top) / scale;
+              if (left < -1 || top < -1 || right > box.width + 1 || bottom > box.height + 1) {
+                out.push(`${shape.tagName} "${shape.textContent?.slice(0, 20)}" at ${step * 10} %`);
+              }
             }
           }
-        }
-        return out;
-      });
-      const label = (await svg.getAttribute('aria-label'))?.slice(0, 50);
-      expect(spilled, `${label} draws outside its viewBox`).toEqual([]);
-    }
-  });
+          return out;
+        });
+        const label = (await svg.getAttribute('aria-label'))?.slice(0, 50);
+        expect(spilled, `${label} draws outside its viewBox`).toEqual([]);
+      }
+    });
+  }
 });
 
 test.describe('links from /como-funciona-un-llm/', () => {

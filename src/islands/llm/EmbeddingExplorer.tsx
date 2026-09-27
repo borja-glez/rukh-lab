@@ -20,6 +20,19 @@ const SCALE = 3.5;
 const px = (x: number) => 15 + x * SCALE;
 const py = (y: number) => 10 + y * SCALE;
 
+/**
+ * Where a neighbour's distance goes: the middle of its line, pushed 10 px off it on the upper side
+ * (or the left, for a vertical line), so the digits sit beside the line instead of on a word.
+ */
+function distLabel(a: Word, b: Word): { x: number; y: number } {
+  const [x1, y1, x2, y2] = [px(a.x), py(a.y), px(b.x), py(b.y)];
+  const len = Math.hypot(x2 - x1, y2 - y1) || 1;
+  let nx = -(y2 - y1) / len;
+  let ny = (x2 - x1) / len;
+  if (ny > 0 || (ny === 0 && nx > 0)) [nx, ny] = [-nx, -ny];
+  return { x: (x1 + x2) / 2 + nx * 10, y: (y1 + y2) / 2 + ny * 10 + 4 };
+}
+
 const GROUPS: { name: Word['group']; x: number; y: number }[] = [
   { name: 'animales', x: 4, y: 4 },
   { name: 'personas', x: 54, y: 4 },
@@ -185,11 +198,7 @@ export default function EmbeddingExplorer() {
                   x2={px(n.word.x)}
                   y2={py(n.word.y)}
                 />
-                <text
-                  class="ee__dist"
-                  x={px(from.x) + (px(n.word.x) - px(from.x)) * 0.62}
-                  y={py(from.y) + (py(n.word.y) - py(from.y)) * 0.62 - 4}
-                >
+                <text class="ee__dist" text-anchor="middle" {...distLabel(from, n.word)}>
                   {fmt(n.distance)}
                 </text>
               </g>

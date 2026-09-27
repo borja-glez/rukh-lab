@@ -79,6 +79,13 @@ export default function LoraPatch() {
         Con r = {rank}, la corrección solo puede empujar en {rank}{' '}
         {rank === 1 ? 'dirección' : 'direcciones'} de las 768 posibles de cada matriz.
       </p>
+      <p class="lp__why">
+        <strong>¿Por qué bastan tan pocas?</strong> El modelo ya sabe casi todo lo que necesita; el
+        afinado no le enseña el idioma ni el ajedrez de nuevo, solo lo inclina («juega como alguien
+        de 1500», «contesta en este formato»). Se ha medido que ese cambio cabe en unas pocas
+        direcciones: por eso r = 8 suele rendir casi como afinar la matriz entera. Lo que no cabe
+        ahí es conocimiento nuevo de verdad.
+      </p>
     </div>
   );
 }
