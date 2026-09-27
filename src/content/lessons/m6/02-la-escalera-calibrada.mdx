@@ -510,8 +510,10 @@ Es el <Term id="hash-de-pesos">hash de pesos</Term>. Cada línea tapa una forma 
 con el mismo modelo den hashes distintos, o de que dos modelos distintos den el mismo:
 
 - `sorted(state)`: el orden de inserción del diccionario depende de cómo se construyó el modelo.
-- Nombre, `dtype` y forma entran en el digest antes de los bytes; si no, un modelo con dos capas de
-  la misma forma permutadas sería «el mismo modelo».
+- Nombre, `dtype` y forma entran en el digest antes de los bytes; si no, el digest solo vería un
+  chorro de bytes, y dos estados que lo comparten serían «el mismo modelo» aunque corten ese chorro
+  por otro sitio (dónde acaba un tensor y empieza el siguiente) o lo lean de otra forma (otra
+  forma, otro `dtype`).
 - La cabeza atada se salta solo cuando está atada de verdad. El decoder de M2 comparte la matriz de
   embeddings con la capa de salida (<Term id="tied-embeddings">tied embeddings</Term>); el
   publicador borra la copia y el cargador la vuelve a atar. `torch.equal` comprueba que los dos
@@ -842,12 +844,16 @@ llega en la lección 6, y el último test de `tests/unit/test_eval_suite.py` sig
   el mismo hash y que son modelos distintos. ¿Cuál es el más plausible en este proyecto?
 
   <Solution>
-    Basta con dos tensores de la misma forma intercambiados de nombre: `{"a": t1, "b": t2}` y
-    `{"a": t2, "b": t1}` recorridos en orden alfabético dan la misma concatenación de bytes. El caso
-    plausible aquí es el encoder de M3 con sus tres cabezas de la misma forma: permutarlas da un
-    modelo que predice el resultado donde debería predecir el material, y sin el nombre en el digest
-    el hash no lo vería. El `dtype` tapa otro: el mismo tensor en dos precisiones puede compartir
-    bytes con la mitad de otro.
+    Intercambiar dos tensores de la misma forma no sirve: `{"a": t1, "b": t2}` y
+    `{"a": t2, "b": t1}` recorridos en orden alfabético dan `t1` seguido de `t2` frente a `t2`
+    seguido de `t1`, dos chorros distintos (salvo que `t1` y `t2` sean iguales). Sin la cabecera, lo
+    que colisiona es lo que produce **el mismo chorro de bytes**: (1) mover la frontera entre dos
+    tensores consecutivos, `{"a": t[:6], "b": t[6:]}` frente a `{"a": t[:4], "b": t[4:]}`; (2) los
+    mismos bytes con otra forma, una matriz `[2, 3]` frente a una `[3, 2]`; (3) los mismos bytes con
+    otro `dtype` del mismo tamaño. El tercero es el más plausible en este proyecto, que entrena en
+    bfloat16 y exporta en float16: los dos ocupan dos bytes por número, y un `view` donde tocaba un
+    `to` deja los mismos bits leídos como otros valores. Es otro modelo, y sin el `dtype` en el
+    digest tendría el mismo hash.
   </Solution>
 </Exercise>
 
