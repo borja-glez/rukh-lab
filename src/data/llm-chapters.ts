@@ -32,6 +32,8 @@ export interface Chapter {
   /** Glossary ids listed under the chapter as its vocabulary. */
   terms: string[];
   outside?: OutsideNote[];
+  /** Two or three self-check questions, answered in one or two sentences (inline markdown). */
+  check?: { q: string; a: string }[];
 }
 
 export const CHAPTERS: Chapter[] = [
@@ -46,8 +48,27 @@ export const CHAPTERS: Chapter[] = [
     terms: ['modelo-de-lenguaje', 'token'],
   },
   {
-    id: 'tokens',
+    id: 'redes',
     n: '01',
+    title: 'Antes de nada: qué es una red neuronal',
+    short: 'Redes neuronales',
+    links: [
+      {
+        lesson: 'm2/01-el-decoder',
+        anchor: 'embeddings-por-qué-2-030--512',
+        label: 'M2 · el decoder: dónde viven los 39 millones de números',
+      },
+      {
+        lesson: 'm2/03-la-receta-de-entrenamiento',
+        anchor: 'teoría-justa-los-cinco-números-de-la-receta',
+        label: 'M2 · la receta de entrenamiento',
+      },
+    ],
+    terms: ['capa', 'descenso-de-gradiente', 'perdida'],
+  },
+  {
+    id: 'tokens',
+    n: '02',
     title: 'Del texto a los tokens',
     short: 'Tokens y BPE',
     links: [
@@ -77,7 +98,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'embeddings',
-    n: '02',
+    n: '03',
     title: 'De tokens a vectores',
     short: 'Embeddings',
     links: [
@@ -107,7 +128,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'posiciones',
-    n: '03',
+    n: '04',
     title: 'El orden importa',
     short: 'Posiciones',
     links: [
@@ -122,7 +143,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'atencion',
-    n: '04',
+    n: '05',
     title: 'Atención: quién escucha a quién',
     short: 'Atención',
     links: [
@@ -148,7 +169,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'bloque',
-    n: '05',
+    n: '06',
     title: 'El bloque transformer',
     short: 'El bloque',
     links: [
@@ -164,7 +185,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'arquitecturas',
-    n: '06',
+    n: '07',
     title: 'Decoder, encoder y los dos juntos',
     short: 'Decoder y encoder',
     links: [
@@ -190,7 +211,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'preentrenamiento',
-    n: '07',
+    n: '08',
     title: 'Preentrenar: adivinar lo siguiente, millones de veces',
     short: 'Preentrenamiento',
     links: [
@@ -219,7 +240,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'muestreo',
-    n: '08',
+    n: '09',
     title: 'De números a una palabra: el muestreo',
     short: 'Muestreo',
     links: [
@@ -240,7 +261,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'generacion',
-    n: '09',
+    n: '10',
     title: 'Escribir token a token',
     short: 'Generar y KV cache',
     links: [
@@ -256,7 +277,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'afinado',
-    n: '10',
+    n: '11',
     title: 'Afinar: de loro culto a asistente',
     short: 'Afinado y LoRA',
     links: [
@@ -283,7 +304,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'alineamiento',
-    n: '11',
+    n: '12',
     title: 'Alinear: enseñarle lo que preferimos',
     short: 'Alineamiento',
     links: [
@@ -318,7 +339,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'evaluacion',
-    n: '12',
+    n: '13',
     title: 'Evaluar sin engañarse',
     short: 'Evaluación',
     links: [
@@ -347,7 +368,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'despliegue',
-    n: '13',
+    n: '14',
     title: 'Servirlo: cuantizar y ejecutar',
     short: 'Despliegue',
     links: [
@@ -368,7 +389,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'hoy',
-    n: '14',
+    n: '15',
     title: 'Los LLM de hoy, más allá de Rukh',
     short: 'Más allá',
     links: [
@@ -389,7 +410,7 @@ export const CHAPTERS: Chapter[] = [
   },
   {
     id: 'cierre',
-    n: '15',
+    n: '16',
     title: 'Todo en una línea',
     short: 'Resumen',
     links: [],
