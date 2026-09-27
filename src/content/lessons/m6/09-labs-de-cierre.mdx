@@ -36,7 +36,10 @@ balance de la fase.
 
 <Callout kind="guia" title="Qué tecleas y qué traes">
 
-- **Tecleas**: los cuatro scripts de `labs/m6/`.
+- **Tecleas**: los cuatro scripts de `labs/m6/`. Están al final de la página, en «Los cuatro
+  scripts de `labs/m6`», pero los labs los usan: teclea cada uno antes del lab que lo lanza
+  (`ladder_check.py` y `ladder_floor_export.py` para el lab 1, `parity_cost.py` para el 3 y
+  `puzzles_export.py` para el 6).
 - **Traes del repo**: nada; lo que falte de módulos anteriores, con `rukh pull` (abajo).
 - **Para publicar**: `publish cards` y `publish collection` solo publican en `chorcat` (lab 4); en
   tu cuenta, con `--dry-run` y los publicadores de cada repositorio.
@@ -62,11 +65,14 @@ uv run rukh eval nightly --dry-run
 ```
 
 `pull --module m6` imprime una línea `nombre repositorio -> ruta` por artefacto (los trece modelos,
-las partidas, los puzles y las posiciones de la suite) y no vuelve a descargar lo que ya tienes.
+las partidas, los puzles y las posiciones de la suite) y no vuelve a descargar lo que ya tienes. Si
+no tienes nada, son unos 4 GB: casi 3 de modelos (cinco `medium` de 460 MB cada uno) y casi 1 de
+partidas. El Qwen3 base del baseline y el checkpoint de Karvonen, unos 100 MB, no están en el
+catálogo: se descargan la primera vez que el nightly los mide.
 `engine check` juega 40 <Term id="ply">medias jugadas</Term> de Stockfish a `UCI_Elo` 1400 contra un
 rival aleatorio, y si no encuentra el motor lo dice con un `error:` que nombra el script que lo
-descarga. El `--dry-run` del nightly tiene que listar las doce etapas en `planned` con las rutas que
-acabas de llenar. Los tiempos son los de una RTX 5090 con la máquina tranquila; el mapa entero está
+descarga. El `--dry-run` del nightly tiene que listar las doce etapas en `planned` (once filas de decoder y el
+encoder) con las rutas que acabas de llenar. Los tiempos son los de una RTX 5090 con la máquina tranquila; el mapa entero está
 en `docs/reproducir.md`, sección M6.
 
 </Callout>
@@ -98,6 +104,18 @@ Las cuatro tiradas, con 160 partidas cada una y quince minutos de máquina parad
 | `ladder-time-b`  | 0,1 s         | 1538 (1486-1594) |
 | `ladder-nodes-a` | 200 000 nodos | 1541 (1485-1596) |
 | `ladder-nodes-b` | 200 000 nodos | 1524 (1457-1584) |
+
+Sin GPU, o sin la hora y media de máquina, la ruta corta trae las cuatro evaluaciones del hito y
+regenera solo la figura. `ladder_check.py`, en cambio, juega motor contra motor y no necesita GPU,
+solo unos 35 minutos de CPU:
+
+```bash
+git checkout p6 -- artifacts/eval/ladder-time-a artifacts/eval/ladder-time-b artifacts/eval/ladder-nodes-a artifacts/eval/ladder-nodes-b
+uv run python labs/m6/ladder_floor_export.py --decision time
+```
+
+Deja el mismo `artifacts/web/ladder-floor.json` que la ruta larga, con las cifras de la tabla de
+arriba.
 
 Cero Elo de separación por tiempo y 17 por nodos, las dos muy por debajo del semiancho del intervalo
 (±55). El presupuesto de nodos hace determinista la búsqueda, no al rival, porque `UCI_LimitStrength`
@@ -205,7 +223,11 @@ seconds:    10106
 Dos horas y cuarenta y ocho minutos: unos catorce minutos por etapa de decoder, siete segundos el
 encoder (no juega), cuarenta y dos Qwen, y un fallo: el checkpoint de Karvonen guarda sus tensores
 bajo `model` y no bajo `model_state`, y el hash de pesos de la lección 2 no lo sabía. Con el hash
-arreglado, `rukh eval nightly --only karvonen-8l` lo midió en quince minutos. Las dos filas que no
+arreglado, `rukh eval nightly --only karvonen-8l` lo midió en quince minutos.
+
+Esa salida es la del hito, no la que vas a ver tú. El `weights_sha` que tecleaste en la lección 2 es
+el arreglado, que ya lee `payload.get("model")`, así que en tu tirada `karvonen-8l` sale `measured`
+a la primera y el `--only` no hace falta; cuenta con unos quince minutos más en el total. Las dos filas que no
 están en el catálogo (`small` v1 y el DPO fuera de política) se volvieron a medir a mano el mismo día
 para que ninguna fila de decoder tuviera otra fecha: 1355 (1297-1420) y 1586 (1530-1651). Las dos
 filas del encoder que llevaban el nombre de su carpeta de ejecución se retiran con `rukh eval drop`,
@@ -242,9 +264,26 @@ checkpoint, así que las tres precisiones pasan por la misma máscara, el mismo 
 rescate. ONNX Runtime juega en CPU, y por eso el rival va por nodos: por tiempo, un jugador más lento
 cambiaría también al motor.
 
+El lab lee una exportación de `medium-v4` que ninguna lección anterior hizo (M2 exportó `tiny` y
+`small`, y `rukh pull` baja los pesos, no los ONNX). Primero se exporta, con el mismo comando de M2;
+`--check-parity` escribe el `parity.json` que el script lee, con la paridad de cada precisión sobre
+1 000 posiciones de validación:
+
 ```bash
+uv run rukh export --ckpt checkpoints/medium-v4/best.pt --out artifacts/onnx/medium-v4 --fp16 --int8 --check-parity
 uv run python labs/m6/parity_cost.py --onnx artifacts/onnx/medium-v4 --config configs/eval/ladder-nodes.yaml
 ```
+
+La exportación deja `model.onnx`, `model-fp16.onnx`, `model-int8.onnx` y `parity.json` en
+`artifacts/onnx/medium-v4/`. Sin GPU, o sin 41 minutos de máquina, trae las tres medidas del hito y
+la figura que salió de ellas en vez de jugarlas:
+
+```bash
+git checkout p6 -- artifacts/eval/parity-cost artifacts/web/parity-cost.json
+```
+
+`artifacts/eval/parity-cost/` tiene un JSON por precisión, con el `EloResult` entero, y
+`artifacts/web/parity-cost.json` es el resumen que dibuja la figura de la lección 8.
 
 ```text
 medium-v4 · 20 games per rung · 8 rungs · 200000 nodes
@@ -409,7 +448,7 @@ fp32. La arena, en cambio, solo enfrenta etapas publicadas.
   <Solution>
     Se parecen y no coinciden, por tres motivos: son 50 puzles por tramo y no 2 000, así que el
     ruido de muestreo es de varios puntos; la demo muestrea a la temperatura de la interfaz y la fila
-    `-greedy` a 0,05; y el fp16 es una exportación, con paridad del 99,9 %. Que salgan a pocos puntos
+    `-greedy` a 0,05; y el fp16 es una exportación, con paridad del 99,80 % en `small` (el 99,9 % es el de `medium-v4`). Que salgan a pocos puntos
     comprueba que la demo y el harness hacen la misma pregunta; que salieran iguales sería
     sospechoso.
   </Solution>
@@ -771,6 +810,10 @@ El segundo párrafo del docstring deja escrita la razón del rival por nodos: co
 el rival por reloj, un jugador más lento haría jugar distinto al motor, y la comparación sería entre
 dos Stockfish y no entre tres exportaciones. Es la única medición del proyecto donde los nodos eran la
 opción correcta, y por eso el lab usa `ladder-nodes.yaml` y no el `greedy.yaml` del ejemplo.
+
+Un aviso sobre el primer párrafo: las cifras son buenas, la atribución no. M2 midió la paridad de
+`small` (99,80 % en fp16, 95,40 % en int8); las de `medium-v4` (99,9 % y 95,1 %) las mide la
+exportación del lab 3, con el `--check-parity` que escribe el `parity.json` que el script lee.
 
 ```python title="labs/m6/parity_cost.py"
 from __future__ import annotations
