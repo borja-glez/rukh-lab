@@ -235,7 +235,7 @@ export const labRoutes: Record<string, LabRoute[]> = {
       lab: 'Lab 2',
       what: 'Descargar el tramo bajo que faltaba',
       route: 'con-gpu',
-      clock: '~10 min de red + ~5 de conversión en CPU; no usa GPU',
+      clock: '~10 min de red + ~5 de CPU; lo que cuesta es la descarga, la GPU no se usa',
       gives: 'data/uci-low/, 2,3 M partidas',
     },
     {
@@ -288,8 +288,8 @@ export const labRoutes: Record<string, LabRoute[]> = {
       lab: 'Lab 9',
       what: 'Publicar y encender el selector de la demo',
       route: 'con-gpu',
-      clock: '~26 min por etapa + 12 por exportación',
-      gives: 'los repos del Hub y el selector de la demo',
+      clock: '~26 min por evaluación + 12 por exportación, seis repos',
+      gives: 'seis carpetas en artifacts/publish/ (o seis repos del Hub) y el selector de la demo',
     },
   ],
   'm5/09-labs-de-alineamiento': [

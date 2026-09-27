@@ -46,7 +46,13 @@ números colocados de tres maneras.
 - **Traes del repo**: `git checkout p4 -- configs/train/lora-d4.yaml tests/unit/test_loop.py`
   (`lora-d4.yaml` se enseña por diferencia con `lora-e4.yaml`; `test_loop.py`, que corre la caja
   final, no se enseña).
-- **Referencia**: `p4`.
+- **Si saltas los pliegues**: `lora.py` va la mitad a la vista y la mitad plegado (importaciones,
+  formato del fichero, apilado), y el «Ejecútalo» del recuento y los tests necesitan el fichero
+  entero. Si no vas a teclear los pliegues, trae el fichero **antes** de empezar y lee los bloques
+  visibles contra él, sin teclearlos: `git checkout p4 -- src/rukh/models/lora.py`. Lo mismo con
+  el bucle y los tests, que van plegados enteros: cada pliegue da su comando en la frase de antes.
+- **Referencia**: `p4`. Si tecleas y algo no cuadra, `git diff p4 -- src/rukh/models/lora.py` te
+  dice en qué te diferencias.
 
 </Callout>
 
@@ -86,7 +92,9 @@ no hay un módulo `q_proj` que envolver, sino una `qkv` **fusionada**, y cada ra
 propia `A` y su propia `B`. Compartir una `A` sería más barato y no sería <Term id="lora">LoRA</Term>: cada matriz adaptada tiene que tener su propio subespacio de <Term id="rango">rango</Term> `r`. El segundo: envolver **renombra** los parámetros, así que los
 envoltorios nunca son lo que se guarda.
 
-Las importaciones y la lista de lo que el módulo exporta se pueden saltar en la primera lectura.
+Las importaciones y la lista de lo que el módulo exporta se pueden saltar en la primera lectura, pero
+sin ellas el fichero no importa: si las saltas, trae `lora.py` entero como dice el recuadro del
+principio (`git checkout p4 -- src/rukh/models/lora.py`, antes de teclear nada de él).
 
 <Fold summary="Las importaciones y __all__, la superficie pública del módulo">
 
@@ -191,6 +199,58 @@ el adaptador. Sin ese cociente, un barrido de rangos mediría dos cosas a la vez
 tiene la corrección y cuánto pesa.
 
 ## `LoRALinear`: el envoltorio
+
+El envoltorio usa cuatro piezas de PyTorch que no han salido hasta ahora con este papel (el resto
+está en [el mínimo de PyTorch de M2](/curso/m2/00-pytorch-minimo/)). Antes de leerlo, una LoRA de
+4×4 y rango 1 escrita a mano, para ver las cuatro en diez líneas. Se puede pegar en
+`uv run python`:
+
+```python
+import math
+
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+x = torch.randn(2, 4)                           # dos entradas de 4 números
+w = torch.randn(4, 4).requires_grad_(False)     # el peso congelado de una nn.Linear(4, 4)
+print(torch.allclose(F.linear(x, w), x @ w.T))  # F.linear(x, w) es x @ w.T
+
+a = torch.empty(1, 4)                           # A: r = 1 fila de 4 columnas
+torch.nn.init.kaiming_uniform_(a, a=math.sqrt(5))  # al azar, entre -0,5 y 0,5
+a.requires_grad_(True)                          # entrenable
+b = torch.zeros(4, 1, requires_grad=True)       # B: 4 filas de r = 1, a cero
+
+y = F.linear(x, w) + F.linear(F.linear(x, a), b)  # W x + B (A x)
+print(torch.equal(y, F.linear(x, w)))           # paso 0: B = 0, es el modelo base
+print(a.numel() + b.numel(), "entrenables frente a", w.numel())
+with torch.no_grad():
+    b.fill_(0.5)                                # como si el entrenamiento hubiera movido B
+print(tuple((b @ a).shape), torch.linalg.matrix_rank(b @ a).item())  # 4x4, de rango 1
+```
+
+```text
+True
+True
+8 entrenables frente a 16
+(4, 4) 1
+```
+
+- **`F.linear(x, w)`** es `x @ w.T`: lo que hace una `nn.Linear` sin sesgo, con el peso guardado
+  como (salidas × entradas). `LoRALinear` la llama dos veces seguidas, primero con `A` (que baja de
+  4 a `r` números) y luego con `B` (que sube de `r` a 4).
+- **`requires_grad_(False)`** apaga el gradiente de un tensor: autograd no calcula nada para él y el
+  optimizador no lo mueve. Es todo lo que significa «congelar».
+- **`kaiming_uniform_(a, a=math.sqrt(5))`** rellena `A` con números al azar entre ±1/√(entradas),
+  aquí ±0,5. Es la misma inicialización que PyTorch usa por defecto en una `nn.Linear`; el
+  `a=math.sqrt(5)` es el parámetro que la hace coincidir, no una cifra con significado propio.
+- **`B` a cero** hace que el segundo `print` salga `True`: en el paso 0 la corrección vale
+  exactamente cero y el modelo adaptado es el modelo base.
+
+La última línea es la idea entera: `B A` tiene la forma de `W`, 4×4, pero rango 1, y se entrena con
+8 números en vez de 16. En la consulta de `medium`, de 768×768, con `r = 8` son 12 288 frente a
+589 824.
+El envoltorio real es esto mismo con una `A` y una `B` por rodaja:
 
 ```python title="src/rukh/models/lora.py"
 class LoRALinear(nn.Module):
@@ -444,7 +504,10 @@ los factores, que viven en su propio fichero. Lo que sale tiene los nombres de u
 normal.
 
 Cómo el bucle guarda un checkpoint de LoRA es fontanería del entrenamiento: basta con saber que se
-guardan los pesos fundidos, sin optimizador. Se puede saltar en la primera lectura.
+guardan los pesos fundidos, sin optimizador. Se puede saltar en la primera lectura; el «Ejecútalo»
+del final entrena con LoRA dentro del bucle, así que si lo saltas, trae los dos ficheros:
+`git checkout p4 -- src/rukh/train/loop.py src/rukh/train/checkpoint.py` (el `loop.py` de `p4` ya
+lleva el `init_from` que tecleaste en la lección anterior).
 
 <Fold summary="El guardado: checkpoints de LoRA con los pesos fundidos y sin optimizador">
 
@@ -523,7 +586,10 @@ El parámetro `state` es todo lo que hizo falta cambiar en el guardado, y no hay
 ## Guardar y cargar el adaptador
 
 El formato del fichero del adaptador se puede saltar en la primera lectura: safetensors con las
-claves del modelo base y la configuración al lado.
+claves del modelo base y la configuración al lado. Dos tests lo comprueban, así que si lo saltas,
+trae `lora.py` entero: `git checkout p4 -- src/rukh/models/lora.py` (sustituye lo que llevas
+tecleado por la versión de referencia; si prefieres conservarlo, `git diff p4 --
+src/rukh/models/lora.py` te enseña solo las líneas que faltan).
 
 <Fold summary="save_adapter y load_adapter: safetensors con las rutas del modelo base y su adapter_config.json">
 
@@ -592,8 +658,12 @@ comprueba a mano: un tensor que el modelo no sabe dónde poner pasaría en silen
 
 ## El adaptador como dos tensores
 
-Esta sección existe por la demo y se puede saltar hasta la lección 6; la idea está en el párrafo
-entre los dos pliegues.
+Esta sección existe por la demo: `AdapterLayout`, `adapter_layout` y `stack_adapter` no se usan
+hasta la lección 6, y la idea está en el párrafo entre los dos pliegues. Pero el segundo pliegue
+trae también `adapter_size` y `describe`, que el «Ejecútalo» de justo después importa. Así que o
+tecleas al menos esas dos funciones, o traes el fichero entero:
+`git checkout p4 -- src/rukh/models/lora.py` (o miras con `git diff p4 -- src/rukh/models/lora.py`
+qué te falta, sin tocar lo tuyo).
 
 <Fold summary="AdapterLayout y adapter_layout: la forma de un adaptador apilado">
 
@@ -646,7 +716,7 @@ class AdapterLayout(BaseConfig):
 
 Aquí empieza la parte que existe por la demo. Una entrada de ONNX es **un tensor, no treinta y
 dos**, así que el adaptador se apila en `A (capas, rodajas, r, entrada)` y `B (capas, rodajas, ancho,
-r)`: es la diferencia entre 1,6 MB por estilo y 221 MB por estilo. Apilar exige que todas las capas
+r)`: es la diferencia entre 1,6 MB por estilo y 231 MB por estilo. Apilar exige que todas las capas
 coincidan, y eso cubre la `qkv` fusionada pero no un adaptador que toque el MLP; ese caso se funde y
 se exporta como un modelo normal.
 
@@ -747,13 +817,17 @@ uv run python -c "from rukh.models import MoveDecoder, preset; from rukh.models.
 ```
 
 Tiene que imprimir `LoRA r=8 alpha=16 on [q, v]: 393,216 trainable of 115,513,344 (0.34 %)`. Si el
-primer número sale el doble, alguna rodaja está recibiendo dos parejas de factores.
+primer número sale el doble, alguna rodaja está recibiendo dos parejas de factores. Si sale
+`ImportError: cannot import name 'describe'`, te saltaste el segundo pliegue de arriba sin traer el
+fichero.
 
 </Callout>
 
 ## Las dos piezas que faltan del bucle
 
-Son dos engarces en `loop.py`; se pueden saltar en la primera lectura.
+Son dos engarces en `loop.py`; se pueden saltar en la primera lectura. Sin ellos la configuración
+`lora:` no hace nada, así que si los saltas, trae el fichero (si no lo trajiste ya con el guardado):
+`git checkout p4 -- src/rukh/train/loop.py src/rukh/train/checkpoint.py`.
 
 <Fold summary="El bucle: aplicar lora: de la configuración y rechazar --resume">
 
@@ -902,7 +976,8 @@ Estos tests son la definición operativa de LoRA en este repositorio: cada uno c
 afirmación del método, y si alguno falla, lo que has escrito es otra cosa.
 
 Si quieres entender LoRA por sus propiedades, estos tests son la mejor lectura del fichero; para
-seguir la lección puedes dejarlos plegados.
+seguir la lección puedes dejarlos plegados. El «Ejecútalo» que los sigue los corre, así que si no los
+tecleas, tráelos: `git checkout p4 -- tests/unit/test_lora.py`.
 
 <Fold summary="tests/unit/test_lora.py: identidad al empezar, subespacios por rodaja, fundidos y formato" label="Tests">
 
@@ -1202,7 +1277,11 @@ necesita la envoltura de Hugging Face y está en la lección 5.
 
 </Callout>
 
-<LessonLabs from="m4/10-labs-de-afinado" labs={['Lab 4', 'Lab 7']} />
+<LessonLabs
+  from="m4/10-labs-de-afinado"
+  labs={['Lab 4', 'Lab 7']}
+  note="El Lab 4 se ejecuta ya. El Lab 7 es ejecutable al terminar la lección 6: sus corpus de estilo se construyen en la 4 y su grafo adaptable, en la 6."
+/>
 
 ## Qué has aprendido
 
