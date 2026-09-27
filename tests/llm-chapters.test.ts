@@ -42,16 +42,13 @@ describe('llm chapters', () => {
     }
   });
 
-  it('never start a prose line with a number and a bracket, which Markdown reads as a list', () => {
-    // «(capítulo
-1) no recibe…»: Prettier moved the number to the start of a line, Markdown made
-    // it item 1 of an ordered list and the sentence broke in two.
+  it('never start a prose line with a number that Markdown would read as a list item', () => {
+    // "(una ReLU en cero, capítulo" + newline + "1) no recibe ninguna": Markdown made the second
+    // line item 1 of an ordered list, Prettier rewrote it as "1.", and the sentence broke in two.
+    // A real list item starts with a capital or bold; a sentence cut mid-way starts lowercase.
     for (const file of chapterFiles) {
       const source = readFileSync(resolve(root, 'src/components/llm/chapters', file), 'utf8');
-      expect(source, file).not.toMatch(/^\d+\)\s/m);
-      expect(source, file).not.toMatch(/cap[íi]tulos?
-
-\d/);
+      expect(source, file).not.toMatch(/^\s*\d+[.)] +[a-záéíóúñ]/m);
     }
   });
 
