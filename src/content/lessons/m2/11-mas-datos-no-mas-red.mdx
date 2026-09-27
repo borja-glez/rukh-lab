@@ -43,15 +43,92 @@ división. Es la pregunta que se hace cualquier equipo que preentrena un LLM ant
   subcomando que los baja, `rukh pull`, lo escribes en M6; mientras, usa el de la versión final de `rukh`
   desde un clon aparte, con `RUKH_HOME` apuntando a tu repositorio:
 
+<Tabs labels={['Git Bash', 'PowerShell']}>
+<div slot="tab-0">
+
 ```sh
 git clone https://github.com/borja-glez/rukh ../rukh-main
 cd ../rukh-main && uv sync --extra cpu
 RUKH_HOME=<ruta-a-tu-repo> uv run rukh pull rukh-games-elite medium-v4
 ```
 
+</div>
+<div slot="tab-1">
+
+```powershell
+git clone https://github.com/borja-glez/rukh ../rukh-main
+cd ../rukh-main; uv sync --extra cpu
+$env:RUKH_HOME = '<ruta-a-tu-repo>'; uv run rukh pull rukh-games-elite medium-v4
+Remove-Item Env:RUKH_HOME
+```
+
+</div>
+</Tabs>
+
 `rukh-games-elite` deja `data/elite/games.parquet`, y `medium-v4` deja
 `checkpoints/medium-v4/best.pt`, con nombre estable y sin fecha: úsalo donde los comandos digan
 `checkpoints/medium-v4-<fecha>/best.pt`. Los tiempos de abajo son los de una RTX 5090.
+
+</Callout>
+
+<Callout kind="guia" title="Qué tecleas y qué traes">
+
+- **Tecleas**: nada. Es una lección de lectura y de ejecución: su código no está en `p2`.
+- **Traes del repo**: la etiqueta `p3-elo-1200` entera, en un clon aparte (abajo), y ejecutas ahí
+  los comandos de la lección con tus datos.
+- **Referencia**: `p3-elo-1200`.
+
+</Callout>
+
+<Callout kind="guia" title="El código de esta lección está en `p3-elo-1200`">
+  Las tres ejecuciones de abajo se hicieron con la etiqueta `p3-elo-1200`, que llegó después de `p2`
+  y trae ya el encoder de M3. No basta con traer las configuraciones a tu repositorio: con el código
+  de `p2`, `configs/data/pipeline-v2.yaml` no llega ni a cargar, porque `TokenizeConfig` rechaza las
+  claves que no conoce (`extra="forbid"`, desde M0) y `val_games` y `extra_train_parquets` son nuevas.
+  Lo limpio es un clon en esa etiqueta y `RUKH_HOME` apuntando a tu repositorio, para que datos,
+  tokens y checkpoints caigan en tus carpetas:
+
+<Tabs labels={['Git Bash', 'PowerShell']}>
+<div slot="tab-0">
+
+```sh
+git clone --branch p3-elo-1200 https://github.com/borja-glez/rukh ../rukh-p3e
+cd ../rukh-p3e && uv sync --extra cu128
+export RUKH_HOME=<ruta-a-tu-repo>
+```
+
+</div>
+<div slot="tab-1">
+
+```powershell
+git clone --branch p3-elo-1200 https://github.com/borja-glez/rukh ../rukh-p3e
+cd ../rukh-p3e; uv sync --extra cu128
+$env:RUKH_HOME = '<ruta-a-tu-repo>'
+```
+
+</div>
+</Tabs>
+
+Desde ahí, los comandos de la lección se teclean tal cual: los `--config` se leen del clon y las
+rutas de dentro de los YAML se resuelven bajo `RUKH_HOME`. Las rutas que pasas a mano, como el
+`--model` de la evaluación o el `meta.json` que abre el `python -c` de la caja «Ejecútalo», van con tu
+repositorio delante (`<ruta-a-tu-repo>/checkpoints/…`). Cuando
+acabes, cierra la terminal o borra la variable (`unset RUKH_HOME`; `Remove-Item Env:RUKH_HOME`).
+
+Lo que cambia respecto a `p2`, para leerlo con `git diff p2 p3-elo-1200 -- <fichero>`:
+
+- **Configuraciones nuevas**: `configs/data/pipeline-v2.yaml`, `pipeline-v3.yaml`, `pipeline-v4.yaml`
+  y `pipeline-elite44.yaml`; `configs/train/small-v2.yaml`, `small-v3.yaml`, `medium.yaml`,
+  `medium-v3.yaml` y `medium-v4.yaml`; y `configs/eval/greedy.yaml`.
+- **`src/rukh/data/pipeline.py`**: `TokenizeConfig` cambia `train_month` por `train_months` y gana
+  `val_games` y `extra_train_parquets`.
+- **`src/rukh/tokenize/pack.py`**: el mes de validación se parte en dos (sus `val_games` primeras
+  partidas validan y el resto entrena) y los parquets extra se suman al entrenamiento.
+- **`src/rukh/eval/suite.py` y `elo.py`**: la cabecera de Elo del prompt (`header_elo`) pasa a ser
+  un ajuste de la suite y entra en la clave de la caché, y los cuatro escalones `skill-*` de la
+  escalera llevan su Elo medido en vez del nominal.
+- El resto del diff es sobre todo el encoder de M3 y el DPO de M5: viene en el clon, pero esta
+  lección no lo necesita.
 
 </Callout>
 
@@ -72,6 +149,11 @@ pasadas y pico sobre el mismo material. El hueco que crecía era la firma de **r
 explica por qué `medium`, con el triple de parámetros y los mismos datos, solo compró 84 puntos de
 Elo (1091 frente a 1007, en la escalera sin corregir) con los intervalos solapados. Más red sobre el
 mismo libro recita mejor el libro.
+
+Ese `medium` v1 es `configs/train/medium.yaml` de `p3-elo-1200`: la receta de `small` con el preset
+`medium`, 20 000 pasos sobre los mismos 240 M tokens, `lr: 4.5e-4` y lotes de 32 × 8 (unas dos horas
+en la 5090). No se repite aquí porque solo sirve de contraste; si quieres reproducirlo, es
+`uv run rukh train --config configs/train/medium.yaml` con ese fichero.
 
 Y había 238 millones de tokens parados: el mes de febrero entero era validación, para un bucle que
 evalúa leyendo 640 000. Primera palanca, y sin descargar nada.

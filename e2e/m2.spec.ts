@@ -2,11 +2,13 @@ import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 /**
- * M2 is eleven lessons: the theory, eight of code, the labs, and the corpus work that produced
- * `medium-v4`. This spec walks the four pages that carry something only a browser can check: the
- * opening, the first code lesson it links to, the export lesson where both islands live, and the
- * last lesson, which is the one the cheatsheet hangs off.
+ * M2 is twelve lessons: the PyTorch primer, the theory, eight of code, the labs, and the corpus
+ * work that produced `medium-v4`. This spec walks the pages that carry something only a browser
+ * can check: the primer that opens the module, the theory, the first code lesson it links to, the
+ * export lesson where both islands live, and the last lesson, which is the one the cheatsheet
+ * hangs off.
  */
+const PRIMER = '/curso/m2/00-pytorch-minimo/';
 const THEORY = '/curso/m2/01-el-decoder/';
 const DECODER = '/curso/m2/02-el-decoder-a-mano/';
 const INSIDE = '/curso/m2/07-exportar-a-onnx/';
@@ -43,6 +45,14 @@ test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
   test('the module chains in order and only the last lesson carries the cheatsheet', async ({
     page,
   }) => {
+    /* The primer opens the module: it carries the course map and leads to the theory. */
+    await page.goto(PRIMER);
+    await expect(page.getByRole('heading', { level: 1 })).toContainText('PyTorch mínimo');
+    await expect(page.locator('.prose h2').first()).toHaveText('Qué vas a construir');
+    await expect(page.locator('.cheat')).toHaveCount(0);
+    await page.locator('.lesson__nav-link--next').click();
+    await expect(page).toHaveURL(new RegExp(`${THEORY}$`));
+
     await page.goto(THEORY);
     await expect(page.getByRole('heading', { level: 1 })).toContainText('El decoder');
     await expect(page.locator('.prose h2').first()).toHaveText('Qué vas a construir');
@@ -117,7 +127,7 @@ test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
     await expect(island).not.toHaveAttribute('data-step', before as string);
   });
 
-  for (const lesson of [THEORY, DECODER, INSIDE, LABS, DATA]) {
+  for (const lesson of [PRIMER, THEORY, DECODER, INSIDE, LABS, DATA]) {
     test(`axe: no serious or critical violations on ${lesson}`, async ({ page }) => {
       await page.goto(lesson);
       if (lesson === INSIDE) {
@@ -164,6 +174,17 @@ test.describe('lesson M2, AttentionMap and TrainingReplay', () => {
     await page.goto(INSIDE);
     await hydrated(page, 'data-training-replay');
     await hydrated(page, 'data-attention-map');
+    const fits = await page.evaluate(
+      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    );
+    expect(fits, 'page must not scroll horizontally').toBe(true);
+  });
+
+  test('the primer fits 390px: its shape tables scroll inside their frame, not the page', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(PRIMER);
     const fits = await page.evaluate(
       () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
     );

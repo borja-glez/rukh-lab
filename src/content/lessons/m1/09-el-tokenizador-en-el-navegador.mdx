@@ -48,6 +48,18 @@ fixture de Python.
 
 </Callout>
 
+<Callout kind="guia" title="Qué tecleas y qué traes">
+
+- **Tecleas**, en tu clon de `rukh-web` (el de M0): `src/lib/chess-lm/tokenizer.ts`, `san-chars.ts`,
+  `bpe.ts` e `index.ts`, y `tests/parity.test.ts`.
+- **Traes del repo**: la versión de M1 de `scripts/sync-tokenizer.mjs` (plegada abajo; tu clon tiene
+  la de M0). Dentro de `rukh-web`: `git checkout 9be992c -- scripts/sync-tokenizer.mjs`. Los tres
+  JSON los copia ese script desde tu `rukh`. Si quieres también la suite de unidad del tokenizador,
+  que la lección no recorre: `git checkout 9be992c -- tests/tokenizer.test.ts`.
+- **Referencia**: el commit `9be992c` de `rukh-web`.
+
+</Callout>
+
 ## La estrategia: una fixture y dos suites
 
 El vocabulario UCI se reimplementa copiando el orden de la enumeración. El BPE depende de los datos,
@@ -599,6 +611,10 @@ export function loadBpe(json: BpeFile): BpeTokenizer {
 
 <Src file="src/lib/chess-lm/bpe.ts" repo="rukh-web" tag="9be992c" lines="172-184" />
 
+El `index.ts` solo reexporta; puedes saltarlo.
+
+<Fold summary="src/lib/chess-lm/index.ts: la superficie pública del paquete">
+
 {/* prettier-ignore */}
 ```ts title="src/lib/chess-lm/index.ts"
 export {
@@ -635,7 +651,14 @@ export type { BpeAddedToken, BpeFile } from './bpe';
 `index.ts` enumera a mano la superficie pública, sin `export *`: lo que no está en la lista es
 interno, y se puede cambiar sin preguntarse quién lo usa.
 
+</Fold>
+
 ## El test de paridad
+
+El test compara contra la fixture de Python; léelo al teclearlo, la idea está en el párrafo que lo
+cierra.
+
+<Fold summary="tests/parity.test.ts: los ids de Python contra los de TypeScript, partida a partida" label="Tests">
 
 {/* prettier-ignore */}
 ```ts title="tests/parity.test.ts"
@@ -742,11 +765,124 @@ La primera comprobación es la más fuerte: los 2 030 tokens que exportó Python
 construye TypeScript, en orden. Las tres últimas comparan los ids de cada esquema partida a partida,
 con `game ${i}` en el mensaje para que el fallo diga cuál.
 
+</Fold>
+
 Este test no entrena, no descarga y no llama a Python: compara con un fichero que Python escribió y
 que está versionado. **La paridad se comprueba contra un artefacto, no contra un proceso.**
 
+<Fold summary="Código completo: scripts/sync-tokenizer.mjs">
+
+{/* prettier-ignore */}
+```js title="scripts/sync-tokenizer.mjs"
+// Syncs the tokenizer artifacts (fixed UCI vocabulary, trained BPE model and the Python parity
+// fixture) into src/lib/chess-lm/. By default they are copied from the ML repo checked out next
+// to this one; `--from <baseUrl>` downloads them instead (e.g. from the Hugging Face Hub).
+// Usage: pnpm sync:tokenizer [--from <baseUrl-or-dir>]
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const localSource = '../rukh/artifacts/tokenizer';
+const HUB_SOURCE = 'https://huggingface.co/chorcat/rukh-tokenizer/resolve/main';
+const files = ['vocab.json', 'bpe.json', 'fixtures/games.json'];
+
+const VOCAB_SIZE = 2030;
+const FIXTURE_GAMES = 20;
+const FIXTURE_KEYS = [
+  'id',
+  'uci',
+  'san',
+  'white_elo',
+  'black_elo',
+  'result',
+  'uci_ids',
+  'san_ids',
+  'bpe_ids',
+];
+
+/**
+ * Rejects a file that parses as JSON but is not the artifact we expect, so a half-written or
+ * stale export fails here instead of silently landing in src/lib/chess-lm/.
+ */
+function validate(name, data) {
+  const fail = (why) => {
+    throw new Error(`${name}: ${why}`);
+  };
+  if (name === 'vocab.json') {
+    if (!Array.isArray(data?.tokens)) fail('no `tokens` array');
+    if (data.tokens.length !== VOCAB_SIZE) {
+      fail(`tokens.length is ${data.tokens.length}, expected ${VOCAB_SIZE}`);
+    }
+    if (!data.tokens.every((token) => typeof token === 'string')) fail('tokens are not strings');
+  }
+  if (name === 'bpe.json') {
+    const model = data?.model;
+    if (!model) fail('no `model` object');
+    if (!model.vocab || typeof model.vocab !== 'object') fail('no `model.vocab` object');
+    if (!Array.isArray(model.merges) || model.merges.length === 0) fail('no `model.merges` list');
+  }
+  if (name === 'fixtures/games.json') {
+    const games = Array.isArray(data) ? data : data?.games;
+    if (!Array.isArray(games)) fail('not an array of games');
+    if (games.length !== FIXTURE_GAMES) {
+      fail(`${games.length} games, expected ${FIXTURE_GAMES}`);
+    }
+    games.forEach((game, i) => {
+      const missing = FIXTURE_KEYS.filter((key) => game?.[key] === undefined);
+      if (missing.length > 0) fail(`game ${i} is missing ${missing.join(', ')}`);
+    });
+  }
+}
+
+const args = process.argv.slice(2);
+const fromIndex = args.indexOf('--from');
+let source = localSource;
+if (fromIndex >= 0) {
+  source = args[fromIndex + 1] ?? HUB_SOURCE;
+  if (source.startsWith('--')) source = HUB_SOURCE;
+}
+const isUrl = /^https?:\/\//.test(source);
+
+async function read(name) {
+  if (isUrl) {
+    const url = `${source.replace(/\/$/, '')}/${name}`;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+    return response.text();
+  }
+  const path = resolve(root, source, name);
+  if (!existsSync(path)) throw new Error(`${path}: file not found`);
+  return readFileSync(path, 'utf8');
+}
+
+try {
+  for (const name of files) {
+    const text = await read(name);
+    validate(name, JSON.parse(text)); // fail early on a truncated download or a stale export
+    const target = resolve(root, 'src/lib/chess-lm', name);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, text.endsWith('\n') ? text : `${text}\n`);
+    console.log(`synced ${name} (${text.length} bytes)`);
+  }
+  console.log(`tokenizer synced from ${source}`);
+} catch (error) {
+  console.error(`sync:tokenizer failed: ${error instanceof Error ? error.message : error}`);
+  console.error(
+    `Expected ${files.join(', ')} under ${source}. Run \`rukh data tokenize --export-fixture\` ` +
+      `in ../rukh first, or pass --from ${HUB_SOURCE}.`,
+  );
+  process.exit(1);
+}
+```
+
+<Src file="scripts/sync-tokenizer.mjs" repo="rukh-web" tag="9be992c" lines="1-100" />
+
+</Fold>
+
 <Callout kind="ejecuta" title="La paridad, comprobada">
-  En `rukh-web`, copia `scripts/sync-tokenizer.mjs` del enlace de arriba y ejecútalo: lee
+  En `rukh-web`, trae `scripts/sync-tokenizer.mjs` (plegado justo encima) con
+  `git checkout 9be992c -- scripts/sync-tokenizer.mjs` y ejecútalo: lee
   `../rukh/artifacts/tokenizer/`, así que los dos repositorios tienen que estar uno al lado del otro,
   como desde M0. Después pasa el test de paridad:
 
@@ -811,7 +947,8 @@ es lo que hace `san_to_uci` en Python al devolver `None`.
   `UciTokenizer.encodeGame reproduces uci_ids` en las veinte partidas, porque todas llevan dos
   tokens de Elo. Es un fallo ruidoso.
 
-Con el orden de las promociones cambiado falla el primer test con un diff de los 176 últimos tokens,
+Con el orden de las promociones cambiado falla el primer test con un diff en 88 de los 176 últimos tokens (en
+cada grupo de cuatro promociones, la torre y el alfil cambian de sitio),
 y `encodeGame` solo falla en las partidas de la fixture que tienen una promoción. Si la fixture
 fuesen veinte partidas normales, ese segundo test pasaría y el único que lo detectaría sería el
 primero.

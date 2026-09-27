@@ -19,11 +19,11 @@ keywords:
   - polars
 artifacts:
   - kind: dataset
-    label: chorcat/rukh-puzzles
-    href: https://huggingface.co/datasets/chorcat/rukh-puzzles
+    label: chorcat/rukh-puzzles-split
+    href: https://huggingface.co/datasets/chorcat/rukh-puzzles-split
   - kind: dataset
-    label: chorcat/rukh-dpo-pairs
-    href: https://huggingface.co/datasets/chorcat/rukh-dpo-pairs
+    label: chorcat/rukh-pairs-dpo
+    href: https://huggingface.co/datasets/chorcat/rukh-pairs-dpo
 ---
 
 ## Qué vas a construir
@@ -39,6 +39,15 @@ camino.
 El segundo son los <Term id="par-de-preferencia">pares de preferencia</Term> para el <Term id="dpo">DPO</Term> de M5: decenas de miles de tríos "posición, jugada buena, jugada mala" que
 salen de la columna `pvs` de la lección anterior sin ejecutar Stockfish. Lo único delicado es el
 signo. Son dos ficheros.
+
+<Callout kind="guia" title="Qué tecleas y qué traes">
+
+- **Tecleas**: `src/rukh/data/puzzles.py` y `pairs.py`, y los tests `test_puzzles.py` y
+  `test_pairs.py` (este, plegado).
+- **Traes del repo**: nada.
+- **Referencia**: `p1`.
+
+</Callout>
 
 ## `puzzles.py`: un banco de test que no se mueve
 
@@ -176,6 +185,18 @@ cien mil puzles nuevos y repites el paso, los que estaban en test siguen en test
 depende de los demás. Con un barajado, cada ejecución reparte de nuevo y el banco de test de M6 no es
 el de M2. La semilla va dentro del hash: cambiarla da una partición alternativa entera, y
 concatenar texto no desborda como sumar.
+
+<Callout kind="teoria" title="Qué es polars, en SQL">
+  **polars** es una librería de tablas en memoria (un _dataframe_), escrita en Rust: la usas como
+  usarías un `SELECT` sobre una tabla local. Cada `pl.col(...)` es una expresión, no un valor, y
+  `split_frame` se traduce casi palabra por palabra: `with_columns(... .alias("band"))` es `SELECT
+  *, … AS band`; `pl.int_range(pl.len()).over("band")` es `ROW_NUMBER() OVER (PARTITION BY band
+  ORDER BY key) - 1`, y `pl.when().then().otherwise()` es un `CASE WHEN`. `map_elements` es la
+  excepción: llama a una función de Python fila a fila, lento pero inevitable para un hash. La
+  versión perezosa, `pl.scan_parquet(...)… .collect()`, no lee nada hasta el `collect()`; antes
+  planifica la consulta entera y solo trae las columnas y filas que hacen falta, como el{' '}
+  <Term id="predicate-pushdown">predicado empujado</Term> de DuckDB.
+</Callout>
 
 Después se ordena por `(band, key)`, se numera dentro de cada tramo y se reparte: los `n_test`
 primeros a test, los `n_train` siguientes a entrenamiento y el resto fuera. Salir del mismo orden
@@ -488,6 +509,11 @@ prefijo de jugadas que llevó a cada posición se hace en M5, donde se necesita.
 
 ## Los tests de los puzles
 
+Los tests fijan el contrato del banco de puzles; léelos al teclearlos, no hacen falta para seguir la
+lección.
+
+<Fold summary="tests/unit/test_puzzles.py: filtros, reparto estable y la misma semilla, el mismo banco" label="Tests">
+
 ```python title="tests/unit/test_puzzles.py"
 """Tests for rukh.data.puzzles: filters, bands and the deterministic disjoint split."""
 
@@ -605,14 +631,204 @@ Este comprueba las dos caras del determinismo: con la misma semilla, particiones
 un test distinto. La segunda mitad es la que no se suele escribir, y la única que detectaría una
 `split_key` que ignorase la semilla.
 
+</Fold>
+
+<Fold summary="Código completo: tests/unit/test_pairs.py">
+
+```python title="tests/unit/test_pairs.py"
+"""Tests for rukh.data.pairs: mover-relative margins, mates, legality and phase balance."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import chess
+import polars as pl
+import pytest
+
+from rukh.data import evals as evals_module
+from rukh.data.evals import EvalsConfig
+from rukh.data.pairs import PairsConfig, balance, make_pair, run, score_mover
+
+pytestmark = pytest.mark.unit
+
+WHITE = "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -"
+BLACK = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -"
+
+
+def _pv(
+    move: str, cp: int | None = None, mate: int | None = None, depth: int = 30
+) -> dict[str, object]:
+    return {"move": move, "cp": cp, "mate": mate, "depth": depth}
+
+
+def test_score_mover_sign_and_mate() -> None:
+    assert score_mover(150, None, "w") == 150
+    assert score_mover(150, None, "b") == -150
+    assert score_mover(None, 2, "w") == 9_998
+    assert score_mover(None, 2, "b") == -9_998
+    assert score_mover(None, -1, "b") == 9_999
+    assert score_mover(None, None, "w") is None
+
+
+def test_make_pair_white_and_black_perspective() -> None:
+    pair = make_pair(WHITE, [_pv("g1f3", 40), _pv("b1c3", 30), _pv("f2f4", -70)], 100)
+    assert pair is not None
+    assert (pair["chosen"], pair["rejected"]) == ("g1f3", "f2f4")
+    assert (pair["cp_chosen"], pair["cp_rejected"]) == (40, -70)
+    # For Black a lower cp is better: -20 beats 90 by 110.
+    pair = make_pair(BLACK, [_pv("e7e5", -20), _pv("c7c5", -10), _pv("f7f5", 90)], 100)
+    assert pair is not None
+    assert (pair["chosen"], pair["rejected"]) == ("e7e5", "f7f5")
+    assert (pair["cp_chosen"], pair["cp_rejected"]) == (-20, 90)
+
+
+def test_make_pair_margin_and_mates() -> None:
+    assert make_pair(WHITE, [_pv("g1f3", 40), _pv("b1c3", -50)], 100) is None
+    pair = make_pair(WHITE, [_pv("g1f3", None, 2), _pv("b1c3", 300)], 100)
+    assert pair is not None and pair["chosen"] == "g1f3" and pair["cp_chosen"] == 9_998
+    pair = make_pair(BLACK, [_pv("e7e5", None, -3), _pv("c7c5", -400)], 100)
+    assert pair is not None and pair["chosen"] == "e7e5" and pair["cp_chosen"] == -9_997
+    assert pair["rejected"] == "c7c5"
+    # A mate in 1 outranks a mate in 5, but the margin between them is only 4 centipawns.
+    assert make_pair(WHITE, [_pv("g1f3", None, 5), _pv("b1c3", None, 1)], 100) is None
+    # Depth outranks the score: the deepest line is chosen, a shallow better one is no pair.
+    assert make_pair(WHITE, [_pv("g1f3", 900, depth=12), _pv("b1c3", 40, depth=30)], 100) is None
+    pair = make_pair(WHITE, [_pv("g1f3", 40, depth=30), _pv("b1c3", -400, depth=12)], 100)
+    assert pair is not None and pair["chosen"] == "g1f3" and pair["rejected"] == "b1c3"
+    assert make_pair(WHITE, [_pv("g1f3", 40)], 100) is None
+
+
+def test_make_pair_rejects_illegal_moves() -> None:
+    assert make_pair(WHITE, [_pv("e1e5", 40), _pv("b1c3", -200)], 100) is None
+    assert make_pair(WHITE, [_pv("g1f3", 40), _pv("e4e6", -200)], 100) is None
+    assert make_pair("not a fen", [_pv("g1f3", 40), _pv("b1c3", -200)], 100) is None
+
+
+def test_balance_uses_smallest_phase() -> None:
+    frame = pl.DataFrame(
+        {
+            "fen": [f"f{i}" for i in range(9)],
+            "chosen": ["a"] * 9,
+            "rejected": ["b"] * 9,
+            "cp_chosen": [0] * 9,
+            "cp_rejected": [0] * 9,
+            "phase": ["opening"] * 4 + ["middlegame"] * 3 + ["endgame"] * 2,
+        }
+    )
+    out = balance(frame, max_per_phase=10, seed=1)
+    assert out.group_by("phase").len()["len"].to_list() == [2, 2, 2]
+    assert balance(frame, max_per_phase=1, seed=1).height == 3
+    assert balance(frame.filter(pl.col("phase") != "endgame"), 10, 1).height == 0
+
+
+def _evals_parquet(path: Path) -> None:
+    board = chess.Board()
+    fens, phases, pvs = [], [], []
+    moves = "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 d7d6 c2c3 e8g8"
+    for ply, move in enumerate(moves.split(), start=1):
+        board.push_uci(move)
+        legal = [m.uci() for m in list(board.legal_moves)[:3]]
+        sign = 1 if board.turn == chess.WHITE else -1
+        fens.append(" ".join(board.fen().split()[:4]))
+        phases.append("opening" if ply <= 10 else "middlegame" if ply <= 13 else "endgame")
+        pvs.append([_pv(legal[0], sign * 60), _pv(legal[1], sign * 20), _pv(legal[2], -sign * 90)])
+    pl.DataFrame({"fen": fens, "phase": phases, "pvs": pvs}).write_parquet(path.as_posix())
+
+
+def test_run_writes_balanced_pairs(rukh_home: Path) -> None:
+    evals = rukh_home / "data" / "evals" / "positions-eval.parquet"
+    evals.parent.mkdir(parents=True)
+    _evals_parquet(evals)
+    manifest = run(PairsConfig(max_per_phase=2))
+    frame = pl.read_parquet((rukh_home / "data" / "pairs" / "pairs.parquet").as_posix())
+    assert frame.columns == ["fen", "chosen", "rejected", "cp_chosen", "cp_rejected", "phase"]
+    assert manifest.counts["candidates"] == 16
+    assert manifest.counts["opening"] == 2
+    assert manifest.counts["middlegame"] == 2 and manifest.counts["endgame"] == 2
+    assert frame.height == 6
+    for fen, chosen, rejected, cp_c, cp_r, _ in frame.iter_rows():
+        board = chess.Board(fen + " 0 1")
+        legal = {m.uci() for m in board.legal_moves}
+        assert chosen in legal and rejected in legal and chosen != rejected
+        mover = 1 if board.turn == chess.WHITE else -1
+        assert mover * (cp_c - cp_r) >= 100
+
+
+def test_chosen_is_the_consolidated_best_move(
+    rukh_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``pairs`` and the ``evals`` consolidation must agree, mates included."""
+    board = chess.Board()
+    board.push_uci("f2f3")
+    board.push_uci("e7e5")
+    board.push_uci("g2g4")  # 2...Qh4# is mate in 1 for Black
+    mate_fen = " ".join(board.fen().split()[:4])
+    quiet = " ".join(chess.Board().fen().split()[:4])
+    quiet_moves = [m.uci() for m in list(chess.Board().legal_moves)[:3]]
+    rows = [
+        # Black to move: the mate in 1 must win over the deeper, better-looking cp line.
+        (mate_fen, "d8h4", 12, None, -1),
+        (mate_fen, "d7d5", 40, -300, None),
+        (mate_fen, "b8c6", 40, 200, None),
+        # White to move: deepest line first, then the best cp.
+        (quiet, quiet_moves[0], 40, 30, None),
+        (quiet, quiet_moves[1], 40, -200, None),
+        (quiet, quiet_moves[2], 12, 900, None),
+    ]
+    remote = rukh_home / "remote.parquet"
+    pl.DataFrame(
+        [
+            {
+                "fen": fen,
+                "line": f"{move} a7a6",
+                "depth": depth,
+                "knodes": 10,
+                "cp": cp,
+                "mate": mate,
+            }
+            for fen, move, depth, cp, mate in rows
+        ]
+    ).write_parquet(remote.as_posix())
+    positions = rukh_home / "data" / "positions" / "positions.parquet"
+    positions.parent.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "fen4": [mate_fen, quiet],
+            "game_id": [1, 2],
+            "ply": [3, 0],
+            "last_move": ["g2g4", "e2e4"],
+            "result": ["0-1", "1-0"],
+            "phase": ["opening", "opening"],
+            "n_seen": [1, 1],
+        }
+    ).write_parquet(positions.as_posix())
+    monkeypatch.setattr(evals_module, "_source", lambda cfg, index: remote.as_posix())
+    evals_module.run(EvalsConfig(n_files=1), files="0")
+
+    consolidated = pl.read_parquet(
+        (rukh_home / "data" / "evals" / "positions-eval.parquet").as_posix()
+    )
+    assert consolidated.height == 2
+    for row in consolidated.to_dicts():
+        pair = make_pair(row["fen"], row["pvs"], 100)
+        assert pair is not None, row["fen"]
+        assert pair["chosen"] == row["best_move"]
+    best_by_fen = {r["fen"]: r["best_move"] for r in consolidated.to_dicts()}
+    assert best_by_fen[mate_fen] == "d8h4"
+```
+
+<Src file="tests/unit/test_pairs.py" tag="p1" lines="1-180" />
+
+</Fold>
+
 <Callout kind="ejecuta" title="Descomenta los dos pasos y pasa sus tests">
   Con `puzzles.py` y `pairs.py` escritos, descomenta en `pipeline.py` y `pipeline.yaml` lo de estos
   dos pasos: las importaciones de `PairsConfig` y `PuzzlesConfig`, sus dos campos y las secciones
   `puzzles:` y `pairs:`. Borra la `DUCKDB_STEPS` provisional y descomenta la original, que ya tiene
   sus cuatro pasos. Solo queda comentado `publish`, hasta «Publicar el dataset».
 
-Pasa los tests de los puzles y copia también
-[`tests/unit/test_pairs.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_pairs.py):
+Pasa los tests de los puzles y teclea también `tests/unit/test_pairs.py`, plegado justo encima:
 es el catálogo de casos de la caja del signo —el margen de las negras escrito dos veces, con un
 mate y con centipeones, el mate que gana a cualquier ventaja material, la jugada ilegal que
 descarta el par, el equilibrado por fase— y un último test que comprueba que la elegida es la
@@ -650,7 +866,8 @@ pequeños; los definitivos salen cuando el join de la lección anterior tenga su
   Con `data/pairs/pairs.parquet` generado, escribe una consulta que se quede con los pares en los que
   le toca mover a las negras y compruebe la relación entre `cp_chosen` y `cp_rejected`. ¿Cuál tiene
   que ser? Después escribe la misma consulta para las blancas. ¿Qué consulta única comprobaría las
-  dos a la vez?
+  dos a la vez? (Se ejecutan como en la lección anterior: en `consulta.sql`, con
+  `uv run python -c "import duckdb, pathlib; print(duckdb.sql(pathlib.Path('consulta.sql').read_text()))"`.)
 
 <Solution>
   El turno está en el segundo campo del FEN: `split_part(fen, ' ', 2) = 'b'`. Para las negras,
@@ -671,6 +888,8 @@ Guárdate la consulta: es la que ejecutarías el día que el DPO de M5 no mejore
 
 </Solution>
 </Exercise>
+
+<LessonLabs from="m1/10-labs-del-pipeline" labs={['Lab 6']} />
 
 ## Qué has aprendido
 

@@ -37,6 +37,15 @@ Son tres ficheros: `src/rukh/data/uci.py` (la conversión), `src/rukh/data/paral
 entre procesos) y `src/rukh/data/db.py` (la conexión), más dos ficheros de test que fijan el
 contrato.
 
+<Callout kind="guia" title="Qué tecleas y qué traes">
+
+- **Tecleas**: `src/rukh/data/uci.py`, `parallel.py` y `db.py`, sus tests (`test_uci.py` y
+  `test_parallel.py`) y tres cambios pequeños en `.gitignore`, `fetch.py` y `paths.py`.
+- **Traes del repo**: nada.
+- **Referencia**: `p1`. Partes de tu repositorio al terminar M0, con `data/raw/` descargado.
+
+</Callout>
+
 ## `uci.py`: el fichero que convierte
 
 Empieza por la cabecera: los esquemas y las seis expresiones regulares de la limpieza.
@@ -455,6 +464,12 @@ de Hugging Face. `sha256_file`, por su parte, lee en trozos de 1 MiB para no car
 
 Este fichero existe por un fallo concreto: el pool de la biblioteca estándar se adelanta.
 
+Lo que sigue es ingeniería de procesos, no de modelos: en la primera lectura basta con saber que
+`run_batches` reparte los lotes entre núcleos sin adelantarse. Despliégalo cuando vayas a
+escribirlo.
+
+<Fold summary="parallel.py: un pool de spawn que no lee más lotes de los que puede procesar">
+
 ```python title="src/rukh/data/parallel.py"
 """Bounded fan-out over a ``spawn`` process pool.
 
@@ -490,6 +505,15 @@ class Pool(Protocol):
 
 Los dos `Protocol` declaran los únicos dos métodos del pool que hacen falta, y así el test puede
 probar la cola con un pool falso, sin lanzar un solo proceso.
+
+<Callout kind="teoria" title="Python que aparece aquí: `Protocol` y genéricos">
+  Un `Protocol` es una `interface` de TypeScript: tipado estructural, así que cualquier objeto con
+  un método `get()` que devuelva `R` cumple `AsyncResult[R]` sin heredar de nada.
+  `class AsyncResult[R]` y `def imap_bounded[J, R]` son los genéricos de la PEP 695:
+  `AsyncResult<R>` e `imapBounded<J, R>` en tu idioma, donde `J` es el tipo de un trabajo y `R` el
+  de su resultado. Igual que en TypeScript, nada de esto existe al ejecutar: es para el editor y
+  para quien lee.
+</Callout>
 
 ```python title="src/rukh/data/parallel.py"
 def imap_bounded[J, R](
@@ -552,7 +576,14 @@ La ruta paralela la comprueba un único test aparte.
 `get_context("spawn")` fija el método de arranque en todas las plataformas, así que una función que
 no se puede serializar falla también en la CI de Linux.
 
+</Fold>
+
 ## `db.py`: una conexión configurada, no la de fábrica
+
+La conexión configurada es fontanería del pipeline, y puedes saltarla en la primera lectura; el
+«Ejecútalo» de abajo comprueba que la escribiste bien.
+
+<Fold summary="db.py, la ruta de descarga y resolve(): una conexión de DuckDB con memoria, hilos y temporales fijados">
 
 ```python title="src/rukh/data/db.py"
 """One configured DuckDB connection for the whole pipeline.
@@ -704,12 +735,14 @@ Convierte `out_dir: data/uci` en una ruta absoluta bajo `root()`, que es lo que 
 mueve. Todas las rutas del pipeline pasan por aquí, y por eso un test puede apuntar el proyecto
 entero a un directorio temporal con una variable de entorno.
 
+</Fold>
+
 <Callout kind="ejecuta" title="La conexión, configurada">
   Con `db.py` y el `resolve` de `paths.py` escritos, abre una conexión y pregúntale a DuckDB qué
   ajustes tiene:
 
 ```sh
-uv run python -c "from rukh.data.db import connect; con = connect(); print(con.execute(\"SELECT current_setting('temp_directory'), current_setting('memory_limit'), current_setting('threads')\").fetchone())"
+uv run python -c "from rukh.data.db import connect; con = connect(); print(con.execute('SELECT current_setting(?), current_setting(?), current_setting(?)', ['temp_directory', 'memory_limit', 'threads']).fetchone())"
 ```
 
 El primer valor tiene que ser la ruta de `data/duckdb-tmp` dentro de tu repositorio (y el
@@ -720,8 +753,13 @@ DuckDB (unos 29,8 GiB para los 32 GB por defecto) y los hilos, tantos como núcl
 
 ## Los tests: el contrato de la conversión
 
-En `tests/unit/test_uci.py`, cada una de las cinco partidas de arriba cubre un caso que rompe
+En `tests/unit/test_uci.py`, cada una de las cinco partidas del bloque siguiente cubre un caso que rompe
 implementaciones.
+
+Los tests fijan el contrato de `uci.py`; léelos al teclearlos, no hacen falta para seguir la
+lección.
+
+<Fold summary="tests/unit/test_uci.py: las cinco partidas que rompen una conversión ingenua" label="Tests">
 
 ```python title="tests/unit/test_uci.py"
 """Tests for rukh.data.uci: movetext cleaning, SAN to UCI, ply filters and month conversion."""
@@ -944,7 +982,11 @@ Los dos últimos usan la fixture `rukh_home` de M0 para escribir un `data/raw/` 
 directorio temporal. El último invoca la CLI de verdad con `CliRunner` y `--json`: garantiza que el
 comando existe, que acepta `--config` y que devuelve el manifiesto.
 
+</Fold>
+
 ## El test del pool: cómo se prueba la contrapresión
+
+<Fold summary="tests/unit/test_parallel.py: comprobar que el pool no se adelanta" label="Tests">
 
 ```python title="tests/unit/test_parallel.py"
 """Tests for rukh.data.parallel: the feeder never runs ahead of the consumer."""
@@ -1049,6 +1091,8 @@ Y este comprueba lo mismo sobre un pool de `spawn` real con dos procesos, con ma
 el trabajo que se está enviando cuenta. Cuesta segundos, y paga: que doce lotes no se materialicen
 los doce no se puede comprobar con un pool falso, donde el orden es trivialmente correcto.
 
+</Fold>
+
 <Callout kind="ejecuta" title="Los tests de la conversión y del pool">
   Con los tres ficheros y sus dos tests escritos, pasa los dos ficheros. El último test de
   `test_uci.py` invoca `rukh data uci`, un comando que carga el `pipeline.py` de la lección
@@ -1104,6 +1148,8 @@ usa: un test verde sobre código muerto es lo que el segundo test existe para ev
 </Solution>
 </Exercise>
 
+<LessonLabs from="m1/10-labs-del-pipeline" labs={['Lab 1', 'Lab 2']} />
+
 ## Qué has aprendido
 
 Has escrito el primer paso del pipeline: la limpieza del `movetext` en el orden correcto, la
@@ -1117,4 +1163,4 @@ tests/unit/test_parallel.py` pasa los doce casos en menos de diez segundos, el �
 escribas la CLI y el `pipeline.py` en la lección siguiente.
 
 Lo siguiente es el orquestador: nueve pasos como este comparten un único YAML y una sección de
-DuckDB, y la CLI gana ocho subcomandos nuevos.
+DuckDB, y la CLI gana siete subcomandos nuevos.

@@ -39,6 +39,20 @@ Rukh. Ninguno produce una fila de la tabla, pero deciden si las filas se pueden 
 
 Y una deuda de M5: el fichero de prompts del DPO, que nadie podía regenerar.
 
+<Callout kind="guia" title="Qué tecleas y qué traes">
+
+- **Tecleas**: `configs/eval/ladder-time.yaml` y `ladder-nodes.yaml`, y los cambios que la lección
+  enseña en `infer/game.py`, `eval/elo.py`, `eval/suite.py`, `eval/cache.py` y `data/pairs.py`, más
+  los dos tests nuevos de `test_cache.py`.
+- **Traes del repo**: los tests que la lección describe sin recorrer, enteros:
+  `git checkout p6 -- tests/unit/test_pairs.py tests/unit/test_cache.py tests/unit/test_eval_suite.py`.
+- **Todavía no pasa todo**: `resolve_model` ya llama a `resolve_run`, que llega en la lección 6.
+  Hasta entonces pasan los tests de `pairs` y de `cache`; la suite entera, al final de la lección 6.
+- **Referencia**: `p6`. Partes de tu repositorio al terminar M5. Si un test falla por algo que la
+  lección no enseña, `git diff p6 -- <fichero>` te dice qué te falta.
+
+</Callout>
+
 ## Dos configuraciones que no miden un modelo
 
 La lección 1 contó que `medium-elo`, medido dos veces con la misma semilla, dio 1498 y 1558. El
@@ -510,8 +524,10 @@ Es el <Term id="hash-de-pesos">hash de pesos</Term>. Cada línea tapa una forma 
 con el mismo modelo den hashes distintos, o de que dos modelos distintos den el mismo:
 
 - `sorted(state)`: el orden de inserción del diccionario depende de cómo se construyó el modelo.
-- Nombre, `dtype` y forma entran en el digest antes de los bytes; si no, un modelo con dos capas de
-  la misma forma permutadas sería «el mismo modelo».
+- Nombre, `dtype` y forma entran en el digest antes de los bytes; si no, el digest solo vería un
+  chorro de bytes, y dos estados que lo comparten serían «el mismo modelo» aunque corten ese chorro
+  por otro sitio (dónde acaba un tensor y empieza el siguiente) o lo lean de otra forma (otra
+  forma, otro `dtype`).
 - La cabeza atada se salta solo cuando está atada de verdad. El decoder de M2 comparte la matriz de
   embeddings con la capa de salida (<Term id="tied-embeddings">tied embeddings</Term>); el
   publicador borra la copia y el cargador la vuelve a atar. `torch.equal` comprueba que los dos
@@ -596,6 +612,11 @@ El último cambio es una deuda de M5. `configs/train/dpo-*.yaml`, `grpo.yaml` y 
 reward model leen `data/pairs/dpo-prompts.parquet`, pero ese fichero lo había producido un cruce de
 una sola vez que no estaba en el repositorio. El par es un <Term id="fen">FEN</Term>, y el decoder
 no sabe leer un FEN: necesita la secuencia de jugadas que llegó a la posición.
+
+El cruce es ingeniería de datos con polars y no toca la escalera; se puede saltar en la primera
+lectura y volver a él cuando lo teclees.
+
+<Fold summary="data/pairs.py: cruzar los pares con las partidas para escribir dpo-prompts.parquet">
 
 ```python title="src/rukh/data/pairs.py"
 LOGGER = logging.getLogger(__name__)
@@ -735,6 +756,8 @@ con «esta versión no lo contaba».
 El fichero nuevo entra en la lista de hashes del manifiesto; la lección 5 lo añade a los patrones
 que se suben al Hub.
 
+</Fold>
+
 <Callout kind="ejecuta" title="Los prompts, con datos de juguete y con los de verdad">
   `tests/unit/test_pairs.py` gana un `_games_parquet` que escribe una partida convertida con el
   mismo formato por meses que `rukh data uci`, un test que comprueba las diez columnas y los
@@ -756,6 +779,8 @@ y, ahora sí, `dpo-prompts.parquet` a su lado: en `counts` tienen que aparecer `
 ## Los dos tests que fijan las decisiones
 
 Dos tests fijan las decisiones de la caché y del rival.
+
+<Fold summary="tests/unit/test_cache.py: la tabla de verdad de la clave y el rival sin motor" label="Tests">
 
 ```python title="tests/unit/test_cache.py"
 def test_one_key_per_family_so_more_games_reuse_the_ones_already_played() -> None:
@@ -808,6 +833,8 @@ que solo comprobara que configuraciones distintas dan claves distintas no habrí
 porque el error era que sí las daban. El segundo es el de `__new__` sin `__init__`, que corre en la
 CI sin motor.
 
+</Fold>
+
 <Callout kind="ejecuta" title="La caché y el rival, sin motor">
   Con los dos tests escritos, pasa el fichero entero:
 
@@ -842,14 +869,20 @@ llega en la lección 6, y el último test de `tests/unit/test_eval_suite.py` sig
   el mismo hash y que son modelos distintos. ¿Cuál es el más plausible en este proyecto?
 
   <Solution>
-    Basta con dos tensores de la misma forma intercambiados de nombre: `{"a": t1, "b": t2}` y
-    `{"a": t2, "b": t1}` recorridos en orden alfabético dan la misma concatenación de bytes. El caso
-    plausible aquí es el encoder de M3 con sus tres cabezas de la misma forma: permutarlas da un
-    modelo que predice el resultado donde debería predecir el material, y sin el nombre en el digest
-    el hash no lo vería. El `dtype` tapa otro: el mismo tensor en dos precisiones puede compartir
-    bytes con la mitad de otro.
+    Intercambiar dos tensores de la misma forma no sirve: `{"a": t1, "b": t2}` y
+    `{"a": t2, "b": t1}` recorridos en orden alfabético dan `t1` seguido de `t2` frente a `t2`
+    seguido de `t1`, dos chorros distintos (salvo que `t1` y `t2` sean iguales). Sin la cabecera, lo
+    que colisiona es lo que produce **el mismo chorro de bytes**: (1) mover la frontera entre dos
+    tensores consecutivos, `{"a": t[:6], "b": t[6:]}` frente a `{"a": t[:4], "b": t[4:]}`; (2) los
+    mismos bytes con otra forma, una matriz `[2, 3]` frente a una `[3, 2]`; (3) los mismos bytes con
+    otro `dtype` del mismo tamaño. El tercero es el más plausible en este proyecto, que entrena en
+    bfloat16 y exporta en float16: los dos ocupan dos bytes por número, y un `view` donde tocaba un
+    `to` deja los mismos bits leídos como otros valores. Es otro modelo, y sin el `dtype` en el
+    digest tendría el mismo hash.
   </Solution>
 </Exercise>
+
+<LessonLabs from="m6/09-labs-de-cierre" labs={['Lab 1']} />
 
 ## Qué has aprendido
 

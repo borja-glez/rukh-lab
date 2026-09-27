@@ -38,6 +38,19 @@ dataset. Es la <Term id="manifiesto">procedencia</Term> convertida en documentac
 a mano y que por eso no se queda vieja, igual que valdría para la ficha de un modelo en un registro
 interno. Son un fichero de Python, una plantilla y el comando que los junta.
 
+<Callout kind="guia" title="Qué tecleas y qué traes">
+
+- **Tecleas**: las tres dependencias nuevas de `pyproject.toml`, `src/rukh/data/publish.py`, la
+  plantilla `src/rukh/data/cards/dataset.md.jinja`, el subcomando `publish` de `cli.py` y
+  `test_publish.py` (plegado).
+- **Traes del repo**: `artifacts/tokenizer/README.md`, la card del tokenizador, que es texto escrito
+  a mano: `git checkout p1 -- artifacts/tokenizer/README.md`.
+- **Para publicar de verdad**: una cuenta de Hugging Face y tu usuario en `publish.owner` (al final
+  de la lección). Sin ellas, todo funciona con `--dry-run`.
+- **Referencia**: `p1`.
+
+</Callout>
+
 ## Tres dependencias nuevas
 
 ```toml title="pyproject.toml"
@@ -124,6 +137,12 @@ Hay dos licencias. `LICHESS_CC0` cubre lo que deriva del volcado público de Lic
 no publica una licencia explícita aunque su contenido venga de Lichess, así que `ELITE_LICENSE` dice
 "CC0 de facto" y pide citar a los dos: poner "CC0" a secas sería afirmar algo que el tercero no ha
 dicho. `UCI_COLUMNS` documenta una sola vez las columnas que comparten tres datasets.
+
+El resto del registro es plomería del Hub: qué ficheros sube cada dataset, cómo se rellena la card y
+en qué orden van las llamadas de red. Puedes saltarlo en la primera lectura y quedarte con la idea
+del recuadro de debajo.
+
+<Fold summary="publish.py, el resto: el registro de los seis datasets, la card desde el manifiesto y la subida">
 
 ```python title="src/rukh/data/publish.py"
 class DatasetSpec(BaseModel):
@@ -565,6 +584,9 @@ En `publish` importa el orden. Primero comprueba que hay ficheros que subir, par
 repositorio vacío en el Hub. Después escribe la card en disco siempre, se vaya a subir o no, y eso es
 lo que hace útil `--dry-run`. Por último, las tres llamadas de red: crear el repositorio con
 `exist_ok=True` (publicar dos veces actualiza), subir los datos y subir la card la última. Si algo se
+
+</Fold>
+
 corta, queda a medias la subida de datos, no una documentación de datos que no están.
 
 <Transfer concept="La documentación se genera del artefacto, no se escribe al lado" where="Un modelo en un registro, un esquema de API, un dataset interno, un informe de evaluación.">
@@ -701,6 +723,8 @@ conversión y, bajo `raw`, los filtros de la descarga de M0. El `rukh_version` d
 
 ## El comando
 
+<Fold summary="cli.py: el subcomando rukh data publish con --list y --dry-run">
+
 ```python title="src/rukh/cli.py"
 @data_app.command("publish")
 def data_publish(
@@ -749,20 +773,249 @@ def data_publish(
 salen como un mensaje y un código 1, igual que `engine check` en M0. La línea `mode:` te recuerda si
 pusiste `--dry-run`.
 
+</Fold>
+
 Es el único paso en el que intervienes tú: necesita un `HF_TOKEN` con permiso de escritura. El flujo
 normal es `--dry-run`, abrir `data/publish/<nombre>/README.md`, comprobar que filtros y conteos son
 los que esperabas, y repetir sin la bandera.
 
+<Fold summary="Código completo: tests/unit/test_publish.py">
+
+```python title="tests/unit/test_publish.py"
+"""Tests for rukh.data.publish: registry, card rendering and network-free dry runs."""
+
+from __future__ import annotations
+
+import json
+import shutil
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from rukh.cli import app
+from rukh.data import publish as publish_module
+from rukh.data.manifest import FileHash, Manifest
+from rukh.data.publish import (
+    DATASETS,
+    PublishConfig,
+    publish,
+    render_card,
+    size_category,
+)
+
+pytestmark = pytest.mark.unit
+
+EXPECTED = {
+    "rukh-games-1800",
+    "rukh-games-elite",
+    "rukh-elo-bins",
+    "rukh-positions-eval",
+    "rukh-puzzles-split",
+    "rukh-pairs-dpo",
+    "rukh-tokenizer",
+}
+
+
+def test_registry_covers_six_datasets_and_tokenizer() -> None:
+    assert set(DATASETS) == EXPECTED
+    assert DATASETS["rukh-tokenizer"].repo_type == "model"
+    assert all(s.repo_type == "dataset" for n, s in DATASETS.items() if n != "rukh-tokenizer")
+    for spec in DATASETS.values():
+        assert spec.license == "cc0-1.0"
+        assert "manifest.json" in spec.patterns or spec.repo_type == "model"
+        # The Hub card spec only accepts `original` and `extended|<id>` here.
+        assert spec.source_datasets == ["original"]
+    assert {n for n, s in DATASETS.items() if s.large} == {"rukh-games-1800", "rukh-elo-bins"}
+
+
+def test_size_category() -> None:
+    assert size_category(0) == "n<1K"
+    assert size_category(5_000) == "1K<n<10K"
+    assert size_category(250_000) == "100K<n<1M"
+    assert size_category(3_000_000) == "1M<n<10M"
+
+
+def _manifest(counts: dict[str, int]) -> Manifest:
+    return Manifest(
+        dataset="Lichess/standard-chess-games",
+        months=["2025-01", "2025-02"],
+        filters={"min_elo": 1800, "terminations": ["Normal", "Time forfeit"]},
+        counts=counts,
+        files=[FileHash(path="games.parquet", sha256="ab" * 32, bytes=123)],
+        created_at=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+    )
+
+
+def _fail_api():  # type: ignore[no-untyped-def]
+    raise AssertionError("HfApi must not be used in a dry run")
+
+
+def test_render_card_has_mandatory_metadata() -> None:
+    card = render_card(DATASETS["rukh-games-1800"], _manifest({"2025-01": 4, "2025-02": 6}), "x")
+    head, body = card.split("---\n", 2)[1:]
+    assert "license: cc0-1.0" in head
+    assert "task_categories:\n  - text-generation" in head
+    assert "size_categories:\n  - n<1K" in head
+    assert "source_datasets:\n  - original" in head
+    assert "pretty_name: Rukh games 1800+" in head
+    assert "# x/rukh-games-1800" in body
+    assert "Rows: **10**" in body
+    assert "| `game_id` |" in body and "| `uci` |" in body
+    assert '"min_elo": 1800' in body
+    assert "months 2025-01, 2025-02" in body
+    assert "2026-09-18" in body
+    assert "Lichess" in body
+
+
+def test_render_card_excludes_helper_counts() -> None:
+    card = render_card(
+        DATASETS["rukh-pairs-dpo"],
+        _manifest({"opening": 2, "middlegame": 2, "endgame": 2, "candidates": 99}),
+        "chorcat",
+    )
+    assert "Rows: **6**" in card
+
+
+def test_dry_run_writes_card_without_network(
+    rukh_home: Path, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(publish_module, "_api", _fail_api)
+    out = rukh_home / "data" / "pairs"
+    out.mkdir(parents=True)
+    shutil.copy(repo_root / "tests" / "fixtures" / "games.parquet", out / "pairs.parquet")
+    (out / "manifest.json").write_text(
+        _manifest({"opening": 1, "middlegame": 1, "endgame": 1}).model_dump_json(), "utf-8"
+    )
+    result = publish("rukh-pairs-dpo", PublishConfig(), dry_run=True)
+    assert result.dry_run and result.repo_id == "chorcat/rukh-pairs-dpo"
+    assert result.files == ["pairs.parquet", "manifest.json"]
+    assert result.rows == 3
+    card = rukh_home / "data" / "publish" / "rukh-pairs-dpo" / "README.md"
+    assert card.is_file() and card.as_posix() == result.card_path
+    assert "chosen" in card.read_text("utf-8")
+
+
+def test_dry_run_tokenizer_uses_artifact_readme(
+    rukh_home: Path, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(publish_module, "_api", _fail_api)
+    shutil.copytree(repo_root / "artifacts" / "tokenizer", rukh_home / "artifacts" / "tokenizer")
+    result = publish("rukh-tokenizer", PublishConfig(), dry_run=True)
+    assert result.repo_type == "model"
+    assert set(result.files) == {"vocab.json", "bpe.json", "fixtures/games.json", "README.md"}
+    card = Path(result.card_path).read_text("utf-8")
+    assert card.startswith("---\nlicense: cc0-1.0")
+    assert "## Scheme 1: fixed UCI vocabulary" in card
+
+
+class FakeApi:
+    """Records the calls ``publish`` makes; ``calls`` is shared by every instance."""
+
+    calls: list[tuple[str, dict[str, object]]] = []
+    has_large: bool = True
+
+    def __init__(self) -> None:
+        if not FakeApi.has_large:
+            # A huggingface_hub without upload_large_folder must still work.
+            self.upload_large_folder = None  # type: ignore[assignment]
+
+    def create_repo(self, repo_id: str, **kwargs: object) -> None:
+        FakeApi.calls.append(("create_repo", {"repo_id": repo_id, **kwargs}))
+
+    def upload_file(self, **kwargs: object) -> None:
+        FakeApi.calls.append(("upload_file", kwargs))
+
+    def upload_folder(self, **kwargs: object) -> None:
+        FakeApi.calls.append(("upload_folder", kwargs))
+
+    def upload_large_folder(self, **kwargs: object) -> None:
+        FakeApi.calls.append(("upload_large_folder", kwargs))
+
+
+@pytest.fixture
+def fake_api(monkeypatch: pytest.MonkeyPatch) -> type[FakeApi]:
+    FakeApi.calls = []
+    FakeApi.has_large = True
+    monkeypatch.setattr(publish_module, "_api", FakeApi)
+    return FakeApi
+
+
+def test_publish_uploads_the_folder_in_one_commit(
+    rukh_home: Path, repo_root: Path, fake_api: type[FakeApi]
+) -> None:
+    shutil.copytree(repo_root / "artifacts" / "tokenizer", rukh_home / "artifacts" / "tokenizer")
+    result = publish("rukh-tokenizer", PublishConfig(owner="someone"), dry_run=False)
+    assert not result.dry_run
+    assert fake_api.calls[0] == (
+        "create_repo",
+        {"repo_id": "someone/rukh-tokenizer", "repo_type": "model", "exist_ok": True},
+    )
+    assert [c[0] for c in fake_api.calls] == ["create_repo", "upload_folder", "upload_file"]
+    folder = fake_api.calls[1][1]
+    assert folder["folder_path"] == str(rukh_home / "artifacts" / "tokenizer")
+    assert folder["allow_patterns"] == DATASETS["rukh-tokenizer"].patterns
+    assert folder["ignore_patterns"] == ["README.md"]
+    assert folder["repo_type"] == "model"
+    assert fake_api.calls[2][1]["path_in_repo"] == "README.md"
+
+
+def test_publish_uses_upload_large_folder_for_the_big_datasets(
+    rukh_home: Path, repo_root: Path, fake_api: type[FakeApi]
+) -> None:
+    out = rukh_home / "data" / "elo-bins"
+    out.mkdir(parents=True)
+    shutil.copy(repo_root / "tests" / "fixtures" / "games.parquet", out / "games.parquet")
+    (out / "manifest.json").write_text(_manifest({"1800": 4}).model_dump_json(), "utf-8")
+    publish("rukh-elo-bins", PublishConfig(), dry_run=False)
+    assert [c[0] for c in fake_api.calls] == ["create_repo", "upload_large_folder", "upload_file"]
+    assert "commit_message" not in fake_api.calls[1][1]
+
+    # Without upload_large_folder in huggingface_hub it falls back to upload_folder.
+    FakeApi.calls = []
+    FakeApi.has_large = False
+    publish("rukh-elo-bins", PublishConfig(), dry_run=False)
+    assert [c[0] for c in fake_api.calls] == ["create_repo", "upload_folder", "upload_file"]
+
+
+def test_publish_unknown_or_missing(rukh_home: Path) -> None:
+    with pytest.raises(KeyError):
+        publish("nope", PublishConfig(), dry_run=True)
+    with pytest.raises(FileNotFoundError):
+        publish("rukh-elo-bins", PublishConfig(), dry_run=True)
+
+
+def test_cli_publish_dry_run(
+    rukh_home: Path, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(publish_module, "_api", _fail_api)
+    shutil.copytree(repo_root / "artifacts" / "tokenizer", rukh_home / "artifacts" / "tokenizer")
+    result = CliRunner().invoke(
+        app, ["data", "publish", "--name", "rukh-tokenizer", "--dry-run", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["repo_id"] == "chorcat/rukh-tokenizer" and payload["dry_run"] is True
+    listed = CliRunner().invoke(app, ["data", "publish", "--list"])
+    assert listed.exit_code == 0
+    assert "rukh-pairs-dpo" in listed.output
+```
+
+<Src file="tests/unit/test_publish.py" tag="p1" lines="1-218" />
+
+</Fold>
+
 <Callout kind="ejecuta" title="La publicación, sin red, y la suite entera">
-  Copia [`tests/unit/test_publish.py`](https://github.com/borja-glez/rukh/blob/p1/tests/unit/test_publish.py):
+  Teclea `tests/unit/test_publish.py`, plegado justo encima:
   cambia `_api` por un doble que registra las llamadas y comprueba que los siete nombres del registro
   están completos (falla en cuanto una entrada nueva se deja un campo), que la card lleva la cabecera
   YAML, los hashes y los filtros, que `--dry-run` no toca la red y que los dos datasets grandes van
   por `upload_large_folder`. Tres de sus casos publican el tokenizador, cuya card es
-  `artifacts/tokenizer/README.md`, un texto escrito a mano: descárgalo también.
+  `artifacts/tokenizer/README.md`, un texto escrito a mano: tráelo también de `p1`.
 
 ```sh
-curl -L -o artifacts/tokenizer/README.md https://github.com/borja-glez/rukh/raw/p1/artifacts/tokenizer/README.md
+git checkout p1 -- artifacts/tokenizer/README.md
 uv run rukh data --help
 uv run pytest -m unit -q tests/unit/test_publish.py
 uv run pytest -m unit -q
@@ -774,6 +1027,56 @@ La ayuda lista por fin los diez subcomandos del grupo: `fetch`, `uci`, `tokenize
 Stockfish deseleccionados, y ninguno necesita red.
 
 </Callout>
+
+## Publicar en tu cuenta de Hugging Face
+
+Los datasets del curso viven en `chorcat`, la cuenta de su autor, y ahí no puedes escribir. Para que
+los tuyos salgan con tu nombre hacen falta cuatro cosas, y ninguna toca el código.
+
+**La cuenta.** Crea una gratuita en [huggingface.co/join](https://huggingface.co/join). Tu nombre de
+usuario es el _owner_: los repositorios quedarán como `<tu-usuario>/rukh-games-1800`.
+
+**El token.** En [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens), crea uno
+de tipo **Write**. Es una contraseña: no va en el repositorio ni en ningún YAML.
+
+**El login.** `hf` es la línea de comandos de `huggingface_hub`, que ya es dependencia del proyecto,
+así que se lanza con `uv run` desde la raíz del repositorio, igual en Git Bash que en PowerShell:
+
+```sh
+uv run hf auth login
+uv run hf auth whoami
+```
+
+El primero te pide el token (con `--token <token>` se lo das directamente) y lo guarda en tu carpeta
+de usuario, en `.cache/huggingface/token`, que es donde lo busca el `HfApi()` de `_api`. El segundo
+tiene que imprimir tu usuario. Si prefieres no guardar nada en disco, pon el token en la variable
+`HF_TOKEN` solo para la sesión: `export HF_TOKEN=hf_…` en Git Bash, `$env:HF_TOKEN = 'hf_…'` en
+PowerShell.
+
+**El owner.** `rukh data publish` no pregunta a quién publica: lo lee de la sección `publish:` de
+`configs/data/pipeline.yaml`, que en `p1` dice `owner: chorcat`. Cambia esa línea por tu usuario. Es
+una diferencia tuya con `p1` que `git diff p1` te enseñará siempre, y a propósito. Si algún día
+publicas con otro YAML (`--config`), cambia también su sección `publish:`. Con `chorcat` y tu token, la subida falla por permisos:
+el Hub no deja escribir en la cuenta de otro.
+
+Con eso, primero en seco y después de verdad:
+
+```sh
+uv run rukh data publish --name rukh-games-1800 --dry-run
+uv run rukh data publish --name rukh-games-1800
+```
+
+En el primero, la línea `repo:` tiene que decir `<tu-usuario>/rukh-games-1800`; si dice `chorcat`,
+el YAML no es el que crees. Los seis datasets son `rukh-games-1800`, `rukh-games-elite`,
+`rukh-elo-bins`, `rukh-positions-eval`, `rukh-puzzles-split` y `rukh-pairs-dpo`, más el tokenizador,
+`rukh-tokenizer`; cada uno se publica con su `--name` cuando su paso ha terminado, así que los de los
+pasos largos (`evals`, `elite`) llegan con los labs del módulo. `rukh-games-1800` sube casi un giga:
+`upload_large_folder` lo reanuda si se corta.
+
+Si no quieres publicar, no pierdes nada: `--dry-run` deja la card en `data/publish/<nombre>/README.md`
+y la lista de ficheros, sin tocar la red, y ningún módulo posterior lee tus datasets del Hub. M2 a M6
+trabajan con lo que hay en `data/`, y lo publicado del curso sigue en `chorcat` por si necesitas
+bajarlo.
 
 <Exercise n="01" title="Lee una card antes de publicarla">
   Ejecuta `uv run rukh data publish --list` y después
@@ -800,6 +1103,8 @@ veces más grande de lo que es.
 </Solution>
 </Exercise>
 
+<LessonLabs from="m1/10-labs-del-pipeline" labs={['Lab 6']} />
+
 ## Qué has aprendido
 
 Tu pipeline de datos ya es algo que otra persona puede descargar y entender: un registro de siete
@@ -809,7 +1114,8 @@ subida que se ensaya sin red y se reanuda si se corta.
 **Cómo se mide**: `uv run rukh data publish --list` imprime los siete, y
 `uv run rukh data publish --name <nombre> --dry-run` deja en `data/publish/<nombre>/README.md` una
 card cuya sección de filtros es el `manifest.json` del paso, tal cual. Con `HF_TOKEN`, el mismo
-comando sin `--dry-run` deja el repositorio en `huggingface.co/chorcat/<nombre>`.
+comando sin `--dry-run` deja el repositorio en `huggingface.co/datasets/<tu-usuario>/<nombre>` (o en
+`huggingface.co/<tu-usuario>/rukh-tokenizer`, que es un repositorio de modelo).
 
 Lo siguiente es la otra implementación del tokenizador, la de TypeScript del navegador, y la fixture
 que comprueba que las dos dicen lo mismo.

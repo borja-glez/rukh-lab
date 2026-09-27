@@ -6,7 +6,7 @@ description:
   de la tabla única. Con la tirada real de `small` y la escalera torcida que la invalidó.'
 module: m2
 order: 6
-duration: 270
+duration: 290
 runtime: 40
 level: avanzado
 status: vigente
@@ -37,6 +37,151 @@ un intervalo de confianza que no miente.
 
 Al final tendrás la fila de `small` y la lección más cara del módulo: un banco de pruebas es código
 sin tests mientras nadie lo mida, y el de este proyecto estuvo mal calibrado a la vista de todos.
+
+<Callout kind="guia" title="Qué tecleas y qué traes">
+
+- **Tecleas**: `src/rukh/eval/elo.py`, `suite.py`, `report.py` e `__init__.py`,
+  `configs/eval/quick.yaml` y `full.yaml`, y el subcomando `eval` de `cli.py`.
+- **Traes del repo**: los tres tests del harness, que la lección resume sin recorrerlos: `git
+checkout p2 -- tests/unit/test_elo.py tests/unit/test_eval_suite.py tests/unit/test_report.py`.
+- **Referencia**: `p2`.
+
+</Callout>
+
+## Estadística justa
+
+Desde aquí, cada número del curso lleva un margen al lado, y M3, M4, M5 y M6 comparan márgenes para
+decidir. Son siete ideas, con cuentas que se hacen a mano; si en un módulo posterior una frase habla
+de σ, de un bootstrap o de 3,84, remite aquí.
+
+### Una moneda: desviación y error típico
+
+Una moneda da 1 (cara) o 0 (cruz), con media 0,5. Cuánto se aparta cada tirada de esa media es su
+**desviación típica**, `σ = √(p · (1 − p))`, que para una moneda justa vale 0,5. La media de `n`
+tiradas se mueve mucho menos que una tirada suelta: su <Term id="error-tipico">error típico</Term> es
+`σ / √n`. Con 100 tiradas, `0,5 / 10 = 0,05`. Una partida es una moneda trucada que puede caer 1, ½
+o 0, y la puntuación media contra un rival es la media de esas tiradas.
+
+### El intervalo del 95 %
+
+Un <Term id="intervalo-de-confianza">intervalo de confianza</Term> del 95 % es la media ±1,96 errores
+típicos: para la moneda de 100 tiradas, `0,5 ± 0,098`, de 0,40 a 0,60. Leído al revés, un 58 % de
+caras en 100 tiradas no distingue una moneda justa de una trucada. Y como el error va con la raíz,
+cuatro veces más tiradas solo reducen el margen a la mitad: 400 tiradas dan ±0,049.
+
+### Bootstrap a mano, con cinco partidas
+
+La fórmula de arriba supone que la media se reparte como una campana. El <Term id="bootstrap">bootstrap</Term> no supone nada: mete las partidas jugadas en un saco, saca
+tantas como había **devolviendo cada una** (así alguna sale dos veces y otra ninguna), calcula la
+media, y repite miles de veces. Cuánto bailan esas medias es cuánto bailaría la tuya si repitieras
+la tanda:
+
+```python
+import numpy as np
+
+results = np.array([1, 0, 1, 0.5, 1])        # cinco partidas: 3,5 de 5
+rng = np.random.default_rng(0)
+resamples = results[rng.integers(0, 5, size=(10_000, 5))]
+means = resamples.mean(axis=1)
+print(resamples[:3])
+print(means[:3])
+print(np.percentile(means, [2.5, 97.5]))
+```
+
+```text
+[[1.  0.5 1.  0.  0. ]
+ [1.  1.  1.  1.  1. ]
+ [0.5 1.  1.  0.5 1. ]]
+[0.5 1.  0.8]
+[0.3 1. ]
+```
+
+Tres remuestreos de cinco, con medias 0,5, 1,0 y 0,8 frente al 0,7 real; el intervalo son los
+percentiles 2,5 y 97,5 de las diez mil medias, de 0,3 a 1,0. Con cinco partidas el intervalo cubre
+casi todo lo posible, y es lo honesto. El harness hace esto mismo, pero reajustando el Elo en cada
+remuestreo en vez de hacer una media.
+
+### La curva logística y qué es «ajustar»
+
+La fórmula del Elo, `P = 1 / (1 + 10^((rival − modelo) / 400))`, es una curva en S que convierte una
+diferencia de puntos en una probabilidad de puntuar. **Ajustarla** es elegir el Elo del modelo que
+hace más probables los resultados que ya pasaron: se calcula la log-verosimilitud, la suma de
+`s · log P + (1 − s) · log(1 − P)` sobre las partidas, y se busca el Elo que la hace máxima. Eso es
+una <Term id="regresion-logistica">regresión logística</Term> con un solo parámetro.
+
+Con tres partidas —gana a un rival de 1500, entabla con otro de 1500 y pierde con uno de 1800— la
+log-verosimilitud vale −1,550 si el modelo fuera de 1500, −1,455 si fuera de 1600 y −1,571 si fuera
+de 1700. El máximo está cerca de 1600, y probar Elos de cincuenta en cincuenta sería lento y poco
+preciso.
+
+### Newton, un paso a mano
+
+Newton llega al máximo en dos o tres pasos usando la pendiente y la curvatura de la
+log-verosimilitud. Con `c = ln(10) / 400 = 0,005756`, cada paso suma `Σ(s − p) / (c · Σ p(1 − p))`.
+Desde 1500, las probabilidades de puntuar son 0,5, 0,5 y 0,151; `Σ(s − p) = 0,5 + 0 − 0,151 = 0,349`
+y `Σ p(1 − p) = 0,25 + 0,25 + 0,128 = 0,628`. El paso es `0,349 / (0,005756 · 0,628) = 96,5`, y el
+Elo pasa a 1596,5. El segundo paso corrige dos puntos y ya no se mueve:
+
+```python
+import math
+
+c = math.log(10) / 400
+opponents = [1500, 1500, 1800]
+scores = [1, 0.5, 0]                  # victoria, tablas, derrota
+elo = 1500.0
+for step in range(3):
+    p = [1 / (1 + 10 ** ((o - elo) / 400)) for o in opponents]
+    grad = sum(s - q for s, q in zip(scores, p))
+    curv = sum(q * (1 - q) for q in p)
+    elo += grad / (c * curv)
+    print(step, [round(q, 3) for q in p], round(elo, 1))
+```
+
+```text
+0 [0.5, 0.5, 0.151] 1596.5
+1 [0.635, 0.635, 0.237] 1594.5
+2 [0.633, 0.633, 0.235] 1594.5
+```
+
+`Σ(s − p)` es «cuánto mejor le fue de lo que la curva esperaba»: positivo, el Elo sube. `Σ p(1 − p)`
+es cuánta información aportan las partidas, máxima contra un rival igualado. Es el `elo.py` de más
+abajo, sin la vectorización.
+
+### Cuántas partidas hacen falta
+
+Para decir que dos modelos puntúan distinto, sus dos intervalos no deberían tocarse. Cerca del 50 %,
+cada uno mide `±1,96 · 0,5 / √n = ±0,98 / √n` con `n` partidas por modelo, así que dejan de tocarse
+cuando la diferencia supera el doble, `Δp > 1,96 / √n`. Despejando:
+
+```text
+n > 1,96² / (Δp)² = 3,84 / (Δp)²
+```
+
+partidas **por modelo**. Para distinguir una moneda del 50 % de una del 55 % (`Δp = 0,05`) hacen
+falta 1 536 tiradas de cada una; para una del 60 %, 384. Es la cuenta que M4 y M5 hacen antes de
+lanzar un experimento, y la que distingue «faltan partidas» de «no hay diferencia» (la <Term id="potencia-estadistica">potencia estadística</Term>).
+
+### Pearson y Spearman
+
+Las dos miden si un número predicho acompaña al real, de −1 a 1. Pearson mide si los puntos caen en
+una recta, así que le importa la escala; Spearman es Pearson sobre las posiciones en la clasificación
+(los rangos), así que solo mide si el orden coincide. Discrepan cuando el orden está bien y la escala
+mal, que es justo lo que M3 y M5 necesitan detectar:
+
+```python
+import numpy as np
+
+pred = np.array([1, 2, 3, 4, 5.0])
+real = np.array([1, 2, 3, 4, 50.0])            # el mismo orden, otra escala
+ranks = lambda a: a.argsort().argsort()
+print(round(np.corrcoef(pred, real)[0, 1], 3))                # Pearson
+print(round(np.corrcoef(ranks(pred), ranks(real))[0, 1], 3))  # Spearman
+```
+
+```text
+0.743
+1.0
+```
 
 ## Teoría justa: de partidas a un número
 
@@ -542,6 +687,11 @@ al bando que iba perdiendo, y con un modelo que se queda sin contexto en las par
 sesgo apunta siempre al mismo lado. El registro guarda cómo se adjudicó, para que el informe diga
 cuántas partidas no terminaron en el tablero.
 
+Jugar las partidas es orquestación alrededor del motor; el ajuste de arriba es lo que produce el
+número. Puedes saltarlo en la primera lectura.
+
+<Fold summary="play_rung: jugar un escalón contra Stockfish, con caché, colores alternos y semilla por partida">
+
 ```python title="src/rukh/eval/elo.py"
 def play_rung(
     model: MoveDecoder,
@@ -601,6 +751,8 @@ Cuatro decisiones al jugar un escalón:
    determinista saldría veinte veces la misma partida.
 4. El motor se cierra en un `finally`, y el mismo motor adjudica en `record_of`.
 
+</Fold>
+
 <Callout kind="ejecuta" title="El ajuste, con números que puedes hacer a mano">
   `fit_elo` y `separation` no necesitan motor ni modelo. Compruébalos con tres casos cuya respuesta
   sabes de antemano:
@@ -616,6 +768,10 @@ El primero imprime `1500.0`: una victoria y una derrota contra 1500 es rendir al
 tercero, `wins None`: todas ganadas es una tirada separada; una tabla ya es un contraejemplo.
 
 </Callout>
+
+Queda el bucle que recorre los escalones, sin ninguna decisión nueva:
+
+<Fold summary="play_rungs: recorrer todos los escalones y juntar sus partidas">
 
 ```python title="src/rukh/eval/elo.py"
 def play_rungs(
@@ -648,6 +804,8 @@ def play_rungs(
 
 <Src file="src/rukh/eval/elo.py" tag="p2" lines="382-407" />
 
+</Fold>
+
 ## `suite.py`: ensamblarlo todo
 
 ```python title="src/rukh/eval/suite.py"
@@ -671,6 +829,11 @@ Dos principios. **Nada es obligatorio en tiempo de ejecución**: lo que falta (u
 puzles, Stockfish) se convierte en una nota del informe, porque una evaluación parcial que dice lo
 que no pudo medir es más útil que ninguna. Y la suite corre en la GPU si la hay, o diez mil pasadas
 y unos cientos de partidas se van a horas.
+
+Lo que sigue hasta `evaluate` es la configuración y el ensamblaje de la suite. No cambia ninguna
+métrica y puedes saltarlo en la primera lectura; la función que las llama todas está justo debajo.
+
+<Fold summary="suite.py, las piezas: advertencias, EvalConfig, SuiteResult, las muestras y la carga de un modelo local o del Hub">
 
 ```python title="src/rukh/eval/suite.py"
 from __future__ import annotations
@@ -995,6 +1158,8 @@ def _legality_note(cfg: EvalConfig) -> str:
 
 <Src file="src/rukh/eval/suite.py" tag="p2" lines="275-288" />
 
+</Fold>
+
 ```python title="src/rukh/eval/suite.py"
 def evaluate(
     ckpt: Path | str,
@@ -1073,6 +1238,10 @@ El `result.notes = notes` de la penúltima línea no sobra: Pydantic copia la li
 modelo, y sin esa línea las notas de los puzles y del Elo se quedarían fuera. No rompería nada;
 publicaría un informe sin la mitad de sus advertencias, que es el tipo de fallo que más cuesta ver.
 
+El resto de `suite.py` escribe las notas y guarda el resultado; se puede saltar.
+
+<Fold summary="suite.py, el final: las notas del Elo y el guardado de results.json">
+
 ```python title="src/rukh/eval/suite.py"
 def _elo_notes(elo: EloResult | None, cfg: EvalConfig, notes: list[str]) -> None:
     """Everything the Elo number has to be read with, in words."""
@@ -1138,7 +1307,14 @@ def run_suite(
 
 <Src file="src/rukh/eval/suite.py" tag="p2" lines="391-407" />
 
+</Fold>
+
 ## `report.py`: una fila para la web, un informe para leer
+
+`report.py` convierte el resultado en una fila de la tabla única y en un informe legible. Es
+presentación, no medida: puedes saltarlo y quedarte con el párrafo de debajo.
+
+<Fold summary="report.py: la fila de la tabla única (upsert por stage) y el informe en Markdown">
 
 ```python title="src/rukh/eval/report.py"
 """Reporting: ``report.md`` and ``results.json`` per model, one shared row for the web.
@@ -1494,12 +1670,19 @@ def write_report(
 
 <Src file="src/rukh/eval/report.py" tag="p2" lines="270-298" />
 
+</Fold>
+
 Casi todo es construir cadenas; lo que importa es qué se imprime siempre. Los titulares llevan las
 ocho métricas aunque cinco sean `n/a`, la legalidad lleva su definición con la temperatura real, y
 las partidas cortadas se cuentan aunque sean cero. Un informe que omite lo vacío te obliga a recordar
 qué debería haber; uno que imprime `n/a` se lee solo.
 
 ## El paquete y las dos suites
+
+Los reexportes del paquete y las dos suites en YAML son fontanería: `quick` usa una décima parte de
+las muestras de `full`, y la tabla se escribe desde `full`.
+
+<Fold summary="rukh/eval/__init__.py y las configuraciones full.yaml y quick.yaml">
 
 ```python title="src/rukh/eval/__init__.py"
 """Evaluation harness: legality, next-move accuracy, puzzles, Elo, cache and reporting."""
@@ -1681,7 +1864,14 @@ comentario de `quick.yaml` evita el malentendido: sus números son ruidosos a pr
 escribe desde `full`. Que pide 100 partidas por escalón, 800 en total: horas de partidas, y la razón
 de que exista la caché.
 
+</Fold>
+
 ## El comando
+
+El subcomando `rukh eval` solo carga el modelo, llama a la suite y escribe los ficheros; se puede
+saltar en la primera lectura.
+
+<Fold summary="cli.py: el subcomando rukh eval, con --model, --stage y --suite">
 
 ```python title="src/rukh/cli.py"
 @app.command("eval")
@@ -1759,6 +1949,8 @@ fila, lo que permite evaluar los mismos pesos con dos muestreos y obtener dos fi
 notas se imprimen también en la consola: una advertencia que solo está en un fichero que nadie abre
 no avisa a nadie.
 
+</Fold>
+
 <Callout kind="ejecuta" title="El harness, antes de la primera suite">
   Con el paquete `rukh.eval` completo, pasa los tests del harness y comprueba que el comando
   responde:
@@ -1770,6 +1962,7 @@ uv run rukh eval --help
 uv run rukh eval --model no-existe.pt --suite quick
 ```
 
+Los tres ficheros de test los trajiste de `p2` con el comando del principio de la lección.
 [`test_elo.py`](https://github.com/borja-glez/rukh/blob/p2/tests/unit/test_elo.py) comprueba que
 el ajuste recupera un Elo conocido, que el intervalo lo contiene y que una tirada separada sale con
 su cota;
@@ -1791,10 +1984,12 @@ La suite de verdad necesita GPU (en CPU son horas), Stockfish y el mes de valida
 Primero, la suite rápida sobre `tiny`, que es el contraejemplo del módulo.
 
 ```bash title="Terminal"
-uv run rukh eval --model checkpoints/tiny-<fecha>/best.pt --suite quick
+uv run rukh eval --model checkpoints/tiny-<fecha>/best.pt --suite quick --stage tiny
 ```
 
-El informe que escribió esa ejecución, `artifacts/eval/tiny/report.md`, real y sin recortar:
+Sin `--stage`, la fila se llamaría como la carpeta del checkpoint (`tiny-20260919-061533`) y el
+informe iría a `artifacts/eval/tiny-20260919-061533/`. El que escribió esa ejecución,
+`artifacts/eval/tiny/report.md`, real y sin recortar:
 
 ```markdown
 # Evaluation of `tiny`
@@ -1872,8 +2067,37 @@ de tubería en tres minutos en vez de en cuarenta.
 
 ### `small`, la suite completa
 
+La tirada de referencia no usó `full.yaml` tal cual, sino una copia recortada con el muestreo casi
+determinista. En `p2` no está en el repo (llega en `p3-elo-1200`, con un campo más que `p2` aún no
+conoce), así que créala tú en `configs/eval/greedy.yaml`:
+
+```yaml
+# full.yaml, recortada: 1 000 posiciones, 20 partidas por escalón y muestreo casi determinista.
+games: data/uci/year=2025/month=02/games.parquet
+puzzles: data/puzzles/puzzles.parquet
+puzzle_split: test
+legality_positions: 1000
+accuracy_positions: 1000
+position_pool: 20000
+puzzles_per_band: 2000
+elo_games: 20
+elo_move_time: 0.1
+bootstrap: 500
+temperature: 0.05
+top_k: 1
+block: 200
+seed: 42
+out_dir: artifacts/eval
+web_results: artifacts/web/results.json
+cache_db: artifacts/eval/cache-greedy.sqlite
+track: false
+```
+
+`--suite full` sigue diciendo qué suite es (y es lo que imprime la salida); `--config` cambia los
+números con los que se ejecuta:
+
 ```bash title="Terminal"
-uv run rukh eval --model checkpoints/small-<fecha>/best.pt --suite full --stage small-greedy
+uv run rukh eval --model checkpoints/small-<fecha>/best.pt --suite full --config configs/eval/greedy.yaml --stage small-greedy
 ```
 
 Salida real de la ejecución de referencia (RTX 5090):
@@ -1902,8 +2126,8 @@ los mismos pesos cumplen el listón de 1200 jugando a lo seguro y no jugando com
 del par modelo más muestreo, no del fichero, y en un LLM de texto pasa lo mismo con cualquier
 benchmark.
 
-`over 160 games`, no 800: esta tirada usó una copia recortada de `full.yaml` (1 000 posiciones, 20
-partidas por escalón), de ahí un ±68 y no el ±24 que darían 800. Dos evaluaciones solo se
+`over 160 games`, no 800: es la copia recortada de arriba (1 000 posiciones, 20 partidas por
+escalón), de ahí un ±90 y no el ±40 que darían 800. Dos evaluaciones solo se
 comparan con la misma configuración, y por eso el `config` entero viaja en `results.json`.
 
 `puzzles: 0.0107` es sobre todo el handicap de la lección anterior: en `p2` el prompt es la línea del

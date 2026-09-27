@@ -40,6 +40,24 @@ sin descargar otro modelo, y desde una ejecución hasta un repositorio del Hub c
 qué cambió el adaptador y qué costó. Lo une todo una decisión: **la corrección no se funde con los
 pesos**.
 
+<Callout kind="guia" title="Qué tecleas y qué traes">
+
+- **Tecleas**: `src/rukh/export/adapter.py` y `publish/adapter.py` enteros,
+  `test_export_adapter.py`, las dos plantillas nuevas (`adapter.md.jinja`, `qwen-adapter.md.jinja`)
+  y los cambios de `quantize.py`, `parity.py` y la CLI que enseña la lección.
+- **Traes del repo**: los tres ficheros de los que la lección enseña solo una parte, y los tests que
+  no enseña: los comandos de abajo. Los fragmentos de `export/__init__.py` y `publish/model.py` son
+  para leer: explican lo que el checkout ya te deja escrito.
+- **Para publicar en tu cuenta**: `--repo <tu-usuario>/…` (al final de la lección).
+- **Referencia**: `p4`.
+
+```sh
+git checkout p4 -- src/rukh/export/__init__.py src/rukh/export/onnx.py src/rukh/publish/model.py
+git checkout p4 -- tests/unit/test_publish_adapter.py tests/unit/test_publish_model.py tests/unit/test_export.py
+```
+
+</Callout>
+
 ## Por qué el adaptador no se funde antes de exportar
 
 Fundir un adaptador y exportar el resultado es la manera obvia de servir un estilo, y tira por la
@@ -49,6 +67,12 @@ darle en cada llamada los del estilo que toque. Es lo que hacen los servidores d
 cientos de adaptadores sobre una misma base.
 
 <AdapterSwap />
+
+Casi todo `export/adapter.py` es la mecánica de ONNX que hace posible esa idea, y está plegado: se
+puede saltar en la primera lectura sin perder el hilo. Lo que queda a la vista son las tres
+propiedades que se prueban, dónde vive la escala y el `forward` que reparte los factores.
+
+<Fold summary="export/adapter.py: el docstring del módulo y sus importaciones">
 
 ```python title="src/rukh/export/adapter.py"
 """Exporting the decoder with its LoRA factors as **inputs of the graph**.
@@ -133,11 +157,15 @@ __all__ = [
 
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="1-78" />
 
+</Fold>
+
 Las tres propiedades del docstring tienen test. **Los ceros son el modelo base**, hasta el último bit
 de `float32`, así que el fichero adaptable sustituye al ordinario en vez de ser una segunda copia.
 Otro adaptador cambia los logits sin tocar el fichero. Y hay <Term id="paridad">paridad</Term> con
 PyTorch: el mismo adaptador por `apply_lora` y por este grafo da la misma jugada siguiente. El
 fichero no reimplementa ni el exportador ni el adaptador: los compone.
+
+<Fold summary="AdapterLayout en el grafo: qué forma tienen las dos entradas nuevas">
 
 ```python title="src/rukh/export/adapter.py"
 A_INPUT = "lora_a"
@@ -169,6 +197,8 @@ def browser_lora(cfg: LoraConfig) -> LoraConfig:
 ```
 
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="80-105" />
+
+</Fold>
 
 La corrección es `(alpha/r)·B·A`, y ese factor tiene que vivir en un solo sitio. En el grafo, todo
 adaptador tendría que haberse entrenado con el mismo `alpha` y el mismo `r`, sin nada contra lo que
@@ -288,6 +318,8 @@ def _module(root: nn.Module, path: str) -> nn.Module:
 `AdaptableDecoder.forward` es toda la idea: antes de correr el modelo, reparte las capas de `lora_a`
 y `lora_b` por sus casillas. Durante el trazado eso se convierte en conexiones del grafo; en
 ejecución, en dos entradas más.
+
+<Fold summary="Exportar el grafo adaptable y escribir el búfer plano del navegador">
 
 ```python title="src/rukh/export/adapter.py"
 def zero_inputs(layout: AdapterLayout) -> dict[str, Any]:
@@ -528,7 +560,14 @@ def restore_lora_modules(model: MoveDecoder, cfg: LoraConfig) -> int:
 
 <Src file="src/rukh/export/adapter.py" tag="p4" lines="394-408" />
 
+</Fold>
+
 ### El exportador, desde la línea de comandos
+
+El engarce con la CLI y la comprobación de paridad son fontanería; se pueden saltar y lanzar
+directamente el comando de abajo.
+
+<Fold summary="export/__init__.py: el exportador y la paridad con adaptador">
 
 ```python title="src/rukh/export/__init__.py"
     """Export, quantize and check one checkpoint in a single pass.
@@ -639,6 +678,8 @@ def _adapter_parity(
 de pesos que espera `load_adapter`. Y `_adapter_parity` sostiene todo lo demás: el mismo adaptador en
 PyTorch y en el grafo tiene que elegir la misma jugada en mil posiciones de validación.
 
+</Fold>
+
 ```bash title="Terminal"
 uv run rukh export --ckpt checkpoints/medium-v4-<fecha>/best.pt --out artifacts/onnx/medium-lora --fp16 --int8 --check-parity --positions 1000 --adapter-inputs --adapter checkpoints/lora-e4-<fecha>
 ```
@@ -646,6 +687,10 @@ uv run rukh export --ckpt checkpoints/medium-v4-<fecha>/best.pt --out artifacts/
 Unos quince minutos.
 
 ### Los tests del grafo adaptable
+
+Los doce tests del grafo se pueden dejar plegados; el error que encontraron está justo debajo.
+
+<Fold summary="tests/unit/test_export_adapter.py: ceros que son el modelo base, dos adaptadores que dan dos respuestas" label="Tests">
 
 ```python title="tests/unit/test_export_adapter.py"
 """The adaptable graph: zeros are the base model, and the factors really are inputs."""
@@ -920,6 +965,8 @@ comprueba la funcionalidad, no la estructura: que el adaptador siga cambiando la
 en int8, porque nada garantiza que los conversores dejen en paz dos multiplicaciones cuyas entradas
 vienen de fuera del grafo.
 
+</Fold>
+
 <Callout kind="roto" title="Un valor por defecto de la especificación que rompió el fp16">
   El grafo `float32` cargaba y el fp16, el que se sirve, se negaba: `Type Error: Type
   (tensor(float16)) of output arg (val_20) of node (node_ConstantOfShape_18) does not match expected
@@ -931,6 +978,8 @@ vienen de fuera del grafo.
 </Callout>
 
 ### La corrección del fp16, entera
+
+<Fold summary="quantize.py y parity.py: el atributo value explícito y la paridad con dos entradas más">
 
 ```python title="src/rukh/export/quantize.py"
 def _align_constant_outputs(model: object) -> int:
@@ -1011,6 +1060,8 @@ La comprobación de paridad gana un `extra` para las dos entradas nuevas, con un
 modelo del lado de PyTorch tiene que llevar ya cargado el mismo adaptador, o se mediría el adaptador
 y no la exportación.
 
+</Fold>
+
 <Callout kind="ejecuta" title="El grafo adaptable, sobre un decoder de juguete">
   Con `export/adapter.py`, la corrección de `quantize.py` y el `extra` de `parity.py` en su sitio,
   los doce tests del grafo adaptable ya pasan. Ojo: este fichero no lleva la marca `unit`, así que
@@ -1026,6 +1077,11 @@ salen como saltados, falta `onnxruntime` en el entorno.
 </Callout>
 
 ## `publish/adapter.py`: un adaptador no es un modelo
+
+El publicador es fontanería del Hub y se puede saltar en la primera lectura; las dos ideas que lo
+gobiernan están a la vista entre los pliegues.
+
+<Fold summary="publish/adapter.py: el docstring y las importaciones">
 
 ```python title="src/rukh/publish/adapter.py"
 """Publishing a LoRA adapter, which is not a model and must not pretend to be one.
@@ -1074,9 +1130,13 @@ ADAPTER_CARD_TEMPLATE = "adapter.md.jinja"
 
 <Src file="src/rukh/publish/adapter.py" tag="p4" lines="1-42" />
 
+</Fold>
+
 Un adaptador, por sí solo, no hace nada: sin el checkpoint base exacto es un taco de notas adhesivas
 sin libro. Por eso su card empieza por el modelo base y el comando que lo carga, y publica lo que el
 adaptador **cambió**. Publicarlo con el Elo del modelo base sería publicar el número de otro.
+
+<Fold summary="AdapterCost y AdapterEffect: lo que se mide del adaptador">
 
 ```python title="src/rukh/publish/adapter.py"
 class AdapterCost(BaseConfig):
@@ -1149,11 +1209,15 @@ def adapter_params(lora: LoraConfig, n_layer: int, d_model: int) -> int:
 
 <Src file="src/rukh/publish/adapter.py" tag="p4" lines="45-110" />
 
+</Fold>
+
 `AdapterCost` mide lo mismo en el modelo base y en el adaptado, con la misma suite y semilla: un
 estilo que cambia la apertura es fácil; uno que cambia la apertura **y nada más** solo es una
 afirmación si el «nada más» está medido. `AdapterEffect` lee la probabilidad de la apertura
 directamente de la softmax, sin muestreo: contar aperturas de auto-partidas añadiría ruido, y un
 número publicado que se mueve entre ejecuciones invita a promediarlo.
+
+<Fold summary="Montar la carpeta que se sube, y la card de Qwen con su cota de Elo">
 
 ```python title="src/rukh/publish/adapter.py"
 def publish_adapter(
@@ -1391,6 +1455,8 @@ Cuando se pierden todas las partidas no hay intervalo sino una cota: la card de 
 Hub conoce ese formato, y reescribirla al nuestro la haría inservible con las dos líneas de `peft`
 que cualquier lector escribiría.
 
+</Fold>
+
 <Transfer
   concept="Respetar el formato del ecosistema al que publicas"
   where="Publicar un paquete, un esquema OpenAPI, un plugin, un dataset: el destino tiene convenciones y romperlas cuesta a todos menos a ti."
@@ -1404,6 +1470,10 @@ que cualquier lector escribiría.
 
 Las cards se generan con Jinja a partir de la ejecución y de la evaluación. La de un adaptador va
 entera porque su estructura es la política de publicación del proyecto.
+
+Las dos plantillas se pueden saltar en la primera lectura.
+
+<Fold summary="Las plantillas Jinja adapter.md.jinja y qwen-adapter.md.jinja">
 
 {/* prettier-ignore */}
 ````md title="src/rukh/data/cards/adapter.md.jinja"
@@ -1616,10 +1686,16 @@ Not evaluated yet.
 
 <Src file="src/rukh/data/cards/qwen-adapter.md.jinja" tag="p4" lines="49-80" />
 
+</Fold>
+
 ## El publicador de modelos: la card no puede llevar el número de otro
 
 Los trozos de `publish/model.py` que ponen en la card de un modelo condicionado lo que hace su
 cabecera, y los que impiden publicar las métricas de otro checkpoint.
+
+Son dos guardas del publicador de modelos; se pueden saltar.
+
+<Fold summary="publish/model.py: el barrido de cabeceras en la card y check_eval_matches">
 
 ```python title="src/rukh/publish/model.py"
 def demo_link(cfg: ModelPublishConfig, repo_id: str) -> tuple[str, bool]:
@@ -1750,7 +1826,66 @@ métricas de checkpoints distintos y nada lo diría. Compara el `sha256` del fic
 incluso dos ficheros con pesos idénticos; el falso positivo cuesta volver a evaluar, el falso
 negativo cuesta una card mentirosa.
 
+</Fold>
+
+El `--effect` del adaptador es un fichero que ningún subcomando escribe: se monta a mano con dos
+lecturas, y por eso en `p4` está versionado en el repositorio. `share_*` y `entropy_*` son lo que
+imprime `rukh eval openings` sobre la base y sobre el adaptador (el subcomando llega en la lección
+siguiente, así que este paso se hace al terminarla);
+`cost` son la legalidad, el top-1 y los puzles de la suite, leídos en la fila de `medium-v4` y en la
+del modelo con el adaptador fundido; `train_games` y `predicate` salen del manifiesto del recorte de
+estilo (lección 4). El de `lora-e4`:
+
+```json title="artifacts/publish/effects/lora-e4.json"
+{
+  "first_move": "e2e4",
+  "share_before": 0.5964496731758118,
+  "share_after": 0.9984527826309204,
+  "entropy_before": 1.769469157122429,
+  "entropy_after": 0.02094167262476914,
+  "train_games": 200000,
+  "predicate": "split_part(uci, ' ', 1) = 'e2e4' AND white_elo >= 1800 AND black_elo >= 1800",
+  "cost": [
+    {
+      "metric": "Legality without the mask, argmax",
+      "base": 0.998,
+      "adapted": 0.998,
+      "unit": "percent"
+    },
+    {
+      "metric": "Top-1 next move",
+      "base": 0.544,
+      "adapted": 0.547,
+      "unit": "percent"
+    },
+    {
+      "metric": "Puzzles solved",
+      "base": 0.375,
+      "adapted": 0.37816666666666665,
+      "unit": "percent"
+    }
+  ]
+}
+```
+
+<Src file="artifacts/publish/effects/lora-e4.json" tag="p4" />
+
 ```bash title="Terminal"
+uv run rukh eval openings --model checkpoints/medium-v4-<fecha>/best.pt --against checkpoints/lora-e4-<fecha>/step-1500.pt
+uv run rukh eval --model checkpoints/lora-e4-<fecha>/step-1500.pt --config configs/eval/greedy.yaml --stage lora-e4
+```
+
+El primero da las probabilidades y las entropías; el segundo, unos 26 minutos, la columna `adapted`
+de `cost` (la de `base` es la fila de `medium-v4` que ya tienes). Copia los números a
+`artifacts/publish/effects/lora-e4.json` con la forma de arriba; si solo quieres ver la card, trae
+los dos ficheros del repositorio con `git checkout p4 -- artifacts/publish/effects/`. `AdapterEffect`
+valida el JSON al cargarlo, así que un campo mal escrito falla antes de publicar nada.
+
+El grafo adaptable de más arriba se publica como un modelo más: son los pesos de
+`medium-v4` con los factores como entradas, y su card lee la evaluación de la base.
+
+```bash title="Terminal"
+uv run rukh publish model --ckpt checkpoints/medium-v4-<fecha>/best.pt --repo chorcat/rukh-medium-lora --stage medium-v4-greedy --onnx artifacts/onnx/medium-lora --dry-run
 uv run rukh publish adapter --run checkpoints/lora-e4-<fecha> --repo chorcat/rukh-lora-e4 --base chorcat/rukh-medium --effect artifacts/publish/effects/lora-e4.json --dry-run
 uv run rukh publish qwen --run checkpoints/qwen3-pgn-qlora --repo chorcat/rukh-qwen3-pgn-qlora --dry-run
 ```
@@ -1758,7 +1893,20 @@ uv run rukh publish qwen --run checkpoints/qwen3-pgn-qlora --repo chorcat/rukh-q
 Con `--dry-run` la carpeta entera queda en `artifacts/publish/` y la card se puede leer antes de
 subir nada; sin él hace falta `HF_TOKEN`.
 
+Los `--repo` de arriba son los del curso, en `chorcat`, donde no puedes escribir. Para publicar en tu
+cuenta no hay que tocar código: un `--repo` con barra se usa tal cual y manda sobre el dueño por
+defecto de `ModelPublishConfig` (`repo if "/" in repo else f"{cfg.owner}/{repo}"`), así que basta con
+`--repo <tu-usuario>/rukh-lora-e4` o `--repo <tu-usuario>/rukh-qwen3-pgn-qlora`, y la carpeta en seco
+queda en `artifacts/publish/<tu-usuario>/…`. `--base` es el modelo sobre el que se monta el
+adaptador: `chorcat/rukh-medium` si usas el del curso, `<tu-usuario>/rukh-medium` si publicaste el
+tuyo. La card sigue citando los datasets y los adaptadores del curso (`chorcat/…`) en sus metadatos y
+en un párrafo de la plantilla; si quieres que apunten a los tuyos, edita el `README.md` de la carpeta
+antes de quitar `--dry-run`. La cuenta, el token y `uv run hf auth login` están en
+[«Publicar el dataset»](/curso/m1/08-publicar-el-dataset/) de M1.
+
 ## Los dos subcomandos de publicación
+
+<Fold summary="cli.py: los dos subcomandos de publicación">
 
 ```python title="src/rukh/cli.py"
 @publish_app.command("qwen")
@@ -1804,6 +1952,8 @@ def publish_qwen_cmd(
 `--dry-run` lo dice en la salida en vez de callarse: un comando que sube ficheros y uno que no deben
 distinguirse sin recordar qué banderas se escribieron.
 
+</Fold>
+
 <Callout kind="ejecuta" title="Publicar en seco">
   Los tests de `publish/adapter.py` fijan los contratos de esta sección: una card no toma prestado
   el Elo del modelo base, el recuento de parámetros sale de la fórmula y la carpeta lleva los cinco
@@ -1820,6 +1970,8 @@ de la propia carpeta de `peft`— y la lista de ficheros que se subirían. Abre 
 evaluación de ensayo, la sección «Results» lleva sus números; si no, dice «Not evaluated yet».
 
 </Callout>
+
+<LessonLabs from="m4/10-labs-de-afinado" labs={['Lab 7', 'Lab 9']} />
 
 ## Qué has aprendido
 

@@ -38,6 +38,21 @@ Aquí es donde una etiqueta mal construida o un reparto mal hecho producen núme
 significan nada. Lo que se decide —cómo se etiqueta, cómo se reparte y qué se congela— es lo mismo
 que decidirías al afinar un BERT para clasificar tickets de soporte.
 
+<Callout kind="guia" title="Qué tecleas y qué traes">
+
+- **Tecleas**: `src/rukh/data/labels.py`, `src/rukh/train/heads.py`, los cambios de `checkpoint.py`,
+  `configs/train/encoder-heads.yaml` y el subcomando `train heads` de `cli.py`.
+- **Traes del repo**: el comando de debajo. De `__init__.py`, de la configuración de jugadas y de
+  los dos tests la lección enseña las partes que deciden; `helpers_labels.py`, la partida de juguete
+  que comparten los tests, no aparece.
+- **Referencia**: `p3`.
+
+```sh
+git checkout p3 -- src/rukh/train/__init__.py configs/train/encoder-heads-moves.yaml tests/unit/test_labels.py tests/unit/test_heads.py tests/unit/helpers_labels.py
+```
+
+</Callout>
+
 ## `labels.py`: las 438 093 posiciones etiquetadas
 
 ```python title="src/rukh/data/labels.py"
@@ -94,6 +109,11 @@ validación, un modelo que memoriza partidas puntúa igual de bien que uno que e
 **ninguna cifra del informe lo delata**. Es la misma trampa que repartir por fragmentos los trozos de
 un mismo documento al evaluar un RAG.
 
+Las columnas que se leen y el índice de cada resultado son contabilidad del fichero, y puedes
+saltarlas en la primera lectura.
+
+<Fold summary="SOURCE_COLUMNS y RESULT_CLASSES: qué columnas se leen y qué índice lleva cada resultado">
+
 ```python title="src/rukh/data/labels.py"
 from __future__ import annotations
 
@@ -126,6 +146,8 @@ SOURCE_COLUMNS = ["fen", "game_id", "ply", "last_move", "result", "phase", "cp",
 catorce lee solo esas ocho del disco, la gracia del formato columnar. Y `RESULT_CLASSES` fija en un
 solo sitio qué índice es cada resultado: un `0` que significa blancas aquí y tablas en el informe es
 un bug que solo se nota mirando una matriz de confusión.
+
+</Fold>
 
 ```python title="src/rukh/data/labels.py"
 class LabelsConfig(BaseConfig):
@@ -255,6 +277,12 @@ con las negras a mover, el `score_mover` es +250. `loss_cp = 50 + 250 = 300`: ti
 El `how="left"` es la otra decisión. Una posición cuyo predecesor no está en la tabla —el primer ply,
 o un FEN que se dedupó en otra partida— acaba con un `blunder` nulo, nunca con un cero.
 
+Con el signo resuelto, el resto de la tabla es ensamblarla con polars: repartir por partida, unir y
+leer solo las partidas que hacen falta. Es ingeniería de datos y se puede saltar en la primera
+lectura.
+
+<Fold summary="build_labels y read_games: el ensamblado con polars y el join semi que lee solo las partidas etiquetadas">
+
 ```python title="src/rukh/data/labels.py"
     games = joined.select("game_id").unique().sort("game_id")
     split = pl.DataFrame(
@@ -342,6 +370,8 @@ partidas solo se leen las que llevan alguna etiqueta. Un `read_parquet` seguido 
 los dos meses enteros a memoria. Y es `semi` y no `inner` porque no duplica filas: con un `inner`,
 una partida con tres posiciones etiquetadas aparecería tres veces.
 
+</Fold>
+
 ```python title="src/rukh/data/labels.py"
 def label_subsets(frame: pl.DataFrame, fractions: list[float]) -> dict[float, pl.DataFrame]:
     """Nested subsets for the label-count curve: 10 % is inside 25 %, inside 50 %, inside 100 %.
@@ -379,6 +409,10 @@ fijo garantiza el anidamiento por construcción. `counts` publica tres denominad
 (posiciones, posiciones con etiqueta de error y errores), porque una métrica calculada sobre el
 denominador equivocado es otra métrica.
 
+El manifiesto registra con qué se construyó la tabla; fontanería de M0, saltable.
+
+<Fold summary="El manifiesto de la tabla supervisada">
+
 ```python title="src/rukh/data/labels.py"
 def run(cfg: LabelsConfig) -> Manifest:
     """Write ``out_dir/positions-labels.parquet`` plus the manifest, and return the manifest."""
@@ -414,6 +448,8 @@ El <Term id="manifiesto">manifiesto</Term> de M0 aplicado a la tabla supervisada
 etiquetas son una función pura del fichero de evaluaciones y de estas claves, dos tablas con el
 mismo manifiesto son la misma tabla. El reparto también está ahí, para que «el 10 % de validación»
 sea un hecho registrado y no una afirmación.
+
+</Fold>
 
 ## `heads.py`: los tres modos y la curva
 
@@ -459,6 +495,12 @@ Both input schemes can be fine-tuned here, which is what makes the spec's compar
 
 «`full`: best numbers» es la expectativa habitual, escrita antes de medir; la lección 11 la pone a
 prueba.
+
+Lo que va de aquí a `freeze_encoder` convierte la tabla en lotes. La idea que conviene llevarse sin
+desplegarlo: una etiqueta ausente viaja como **una máscara y un relleno**, y la pérdida mira la
+máscara antes que el valor. El resto se puede saltar en la primera lectura.
+
+<Fold summary="El dataset, el recorte de la secuencia, el lote, el DataLoader y la configuración de la tirada">
 
 ```python title="src/rukh/train/heads.py"
 from __future__ import annotations
@@ -755,6 +797,8 @@ class HeadsResult(BaseConfig):
 Cada resultado lleva la fracción y los conteos junto a las métricas: así cada punto de la curva sabe
 cuántas etiquetas vio.
 
+</Fold>
+
 ```python title="src/rukh/train/heads.py"
 def freeze_encoder(model: MultiHead, mode: Mode, last_n: int = 2) -> int:
     """Apply a fine-tuning mode and return how many encoder tensors stay trainable."""
@@ -816,6 +860,11 @@ regularización.
   tres se manifiestan igual: un tronco que «no se movía» y ya no es el que se preentrenó. Vale para
   cualquier afinado parcial, incluido el de un LLM con adaptadores.
 </Callout>
+
+Tres piezas de montaje antes de la evaluación: recortar el entrenamiento para la curva, rechazar un
+checkpoint de otro esquema y compilar. Saltables en la primera lectura.
+
+<Fold summary="build_frames, la comprobación de esquema y el sondeo de compilación">
 
 ```python title="src/rukh/train/heads.py"
 def build_frames(cfg: HeadsConfig) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -900,6 +949,8 @@ El sondeo de compilación de la lección 5, ahora con las primeras filas del pro
 las dos configuraciones del hito traen `compile: false`: en casillas no hay trabajo suficiente para
 amortizar la compilación, y en jugadas cada longitud de lote nueva provoca una recompilación.
 
+</Fold>
+
 ```python title="src/rukh/train/heads.py"
 @torch.no_grad()
 def evaluate_heads(
@@ -950,6 +1001,15 @@ no para publicar. `val/blunder_acc` divide entre las filas con etiqueta, y es la
 del módulo: con los errores al 3,72 %, un detector que conteste siempre «no hay error» saca 96,3 %.
 La lección 8 la desmonta. Y `> 0` sobre el logit es umbralizar en 0,5 sin pasar por el sigmoide.
 
+Si precisión, F1 o AUC te suenan a chino, la cartilla de métricas de la
+[lección 1](/curso/m3/01-el-encoder/) las presenta con una matriz de juguete, y la
+[lección 8](/curso/m3/08-medir-sin-enganarse/) las aplica a estas cabezas.
+
+El bucle de afinado ensambla lo anterior. Puedes saltarlo, pero no el orden que fija, contado justo
+debajo.
+
+<Fold summary="train_heads, primera parte: datos, modelo, congelado, optimizador y compilación">
+
 ```python title="src/rukh/train/heads.py"
 def train_heads(
     cfg: HeadsConfig, resume: Path | None = None, device: str | None = None
@@ -995,11 +1055,18 @@ def train_heads(
 
 <Src file="src/rukh/train/heads.py" tag="p3" lines="417-423" />
 
+</Fold>
+
 En el bloque anterior, el orden de las líneas es el contenido. `freeze_encoder` va antes de
 construir el optimizador, para que `param_groups` deje fuera el tronco congelado. Y
 `set_training_mode` va después de `maybe_compile`, porque la compilación ejecuta un paso de sondeo y
 el modo tiene que quedar fijado al final. El `shuffle=False` de validación hace que los primeros
 lotes sean los mismos en todas las evaluaciones de la tirada.
+
+El resto del bucle es registro y guardado, con una línea que importa y que se cuenta después del
+pliegue.
+
+<Fold summary="train_heads, el resto: registro en MLflow, el paso, la evaluación y los checkpoints">
 
 ```python title="src/rukh/train/heads.py"
     params = {
@@ -1132,10 +1199,17 @@ que permitirá ver en la lección 11 cómo una sube mientras otra baja.
 El `return` va fuera del `with start_run(...)` para que cada ejecución de MLflow esté cerrada antes
 de que `label_curve` lance la siguiente.
 
+</Fold>
+
 La llamada a `set_training_mode` que sigue a `evaluate_heads` arregla un bug real: `evaluate_heads`
 termina con `model.train()`, y `train()` sobre el modelo entero **despierta el encoder congelado**.
 Sin esa línea, desde la primera evaluación el tronco volvería a aplicar dropout. No lanza, no cambia
 ninguna forma, y solo se nota en que el probe sale un poco peor de lo que debería.
+
+`label_curve` repite la tirada para cada fracción de etiquetas y guarda los cuatro puntos; se puede
+saltar en la primera lectura.
+
+<Fold summary="label_curve: una tirada por fracción y la curva guardada dentro de cada checkpoint">
 
 ```python title="src/rukh/train/heads.py"
 def label_curve(
@@ -1183,7 +1257,14 @@ publique. La regla del docstring vale fuera de aquí: **un número que solo ha e
 de registro es un número que nadie puede poner en una tabla**. Si la curva viviera solo en MLflow,
 publicar el modelo la dejaría atrás.
 
+</Fold>
+
 ## Los checkpoints, cuando hay tres clases de modelo
+
+Los cargadores son fontanería de un repositorio que ya tiene tres clases de modelo, y se pueden
+saltar en la primera lectura; el «Ejecútalo» de debajo comprueba que están bien.
+
+<Fold summary="checkpoint.py y el __init__: la cabeza atada, la escritura atómica y deducir el tipo de modelo de sus pesos">
 
 ```python title="src/rukh/train/checkpoint.py"
 BEST_NAME = "best.pt"
@@ -1396,6 +1477,8 @@ __all__ = [
 La superficie pública del paquete después del módulo: tres bucles donde había uno, y cinco
 cargadores de checkpoint.
 
+</Fold>
+
 <Callout kind="ejecuta" title="El preentrenamiento ya se puede probar">
   Con este `__init__.py`, `rukh.train` exporta por fin `MmmConfig`, `train_mmm` y `load_encoder`, así
   que los tests del enmascarado de la lección anterior, y el comando `rukh train encoder` que los usa,
@@ -1473,7 +1556,8 @@ log_every: 10
 
 Frente al preentrenamiento, `lr` es el doble (tres capas lineales toleran un paso mucho mayor que
 quince millones de pesos) y `weight_decay` la décima parte (tres capas lineales con 438 093
-etiquetas apenas pueden sobreajustar). Cuatro mil pasos de 256 son unas 2,3 épocas.
+etiquetas apenas pueden sobreajustar). Cuatro mil pasos de 256 son 1 024 000 ejemplos, unas 2,3
+épocas sobre esas 438 093 filas, que ya son solo las de entrenamiento.
 
 De la configuración del esquema de jugadas solo cambian cinco valores:
 
@@ -1516,7 +1600,42 @@ compile: false # variable-length prefixes recompile on every new shape; not wort
 
 ## Los tests
 
+Los tests fijan el signo de la etiqueta, el nulo que no es cero y el reparto sin fuga; léelos al
+teclearlos.
+
+<Fold summary="tests/unit/test_labels.py y test_heads.py: el signo, el nulo, la fuga y el probe que no se mueve" label="Tests">
+
 ```python title="tests/unit/test_labels.py"
+"""Tests for rukh.data.labels: the blunder sign, the split by game and the nested subsets."""
+
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import polars as pl
+import pytest
+
+from rukh.data.labels import (
+    LABELS_FILE,
+    RESULT_CLASSES,
+    VALUE_EDGES,
+    LabelsConfig,
+    build_labels,
+    counts,
+    game_moves,
+    game_split,
+    label_subsets,
+    run,
+)
+from rukh.data.uci import sha256_file
+
+pytestmark = pytest.mark.unit
+
+WHITE_TO_MOVE = "8/8/8/8/8/8/8/8 w - -"
+BLACK_TO_MOVE = "8/8/8/8/8/8/8/8 b - -"
+
+
 def position(
     game_id: int,
     ply: int,
@@ -1540,10 +1659,15 @@ def position(
         "best_move": "e2e4",
         "depth": 20,
     }
+
+
+def rows_to_frame(rows: list[dict[str, object]]) -> pl.DataFrame:
+    return pl.DataFrame(rows)
 ```
 
-<Src file="tests/unit/test_labels.py" tag="p3" lines="31-53" />
+<Src file="tests/unit/test_labels.py" tag="p3" lines="1-57" />
 
+`position` fabrica una fila de `positions-eval.parquet` y `rows_to_frame` la convierte en tabla.
 El comentario es la regla de paridad de la que depende todo el fichero: en plies pares mueven las
 blancas, así que la jugada que llevó a una posición de ply par fue de las negras.
 
@@ -1605,6 +1729,48 @@ def test_the_blunder_threshold_is_configurable() -> None:
 «A null is not a zero», como comentario y como aserción: es la propiedad más fácil de romper (basta
 un `fill_null(0)` una línea antes de donde toca) y la que más daño hace.
 
+Los tres siguientes fijan las otras dos etiquetas: un mate cuenta como una evaluación enorme y
+satura el valor en ±1, el valor es la `tanh` acotada de los centipeones desde el lado blanco, y la
+clase de resultado sale de la partida (una partida sin terminar, `*`, se descarta en vez de
+adivinarse).
+
+```python title="tests/unit/test_labels.py"
+def test_a_mate_counts_as_a_score_and_saturates_the_value() -> None:
+    rows = rows_to_frame([position(2, 2, cp=None, mate=3), position(2, 3, cp=None, mate=-1)])
+    frame = build_labels(LabelsConfig(), rows).sort("ply")
+    assert frame["cp"].to_list() == [10_000 - 3, -10_000 + 1]
+    assert math.isclose(frame["value"][0], 1.0, abs_tol=1e-6)
+    assert math.isclose(frame["value"][1], -1.0, abs_tol=1e-6)
+    assert frame["value_bucket"].to_list() == [4, 0]
+
+
+def test_value_is_the_bounded_tanh_of_the_centipawns_from_whites_side() -> None:
+    rows = rows_to_frame([position(3, ply, cp=cp) for ply, cp in enumerate([-400, 0, 400], 2)])
+    frame = build_labels(LabelsConfig(), rows).sort("ply")
+    assert [round(v, 4) for v in frame["value"].to_list()] == [
+        round(math.tanh(-1.0), 4),
+        0.0,
+        round(math.tanh(1.0), 4),
+    ]
+    assert VALUE_EDGES == (-200, -50, 50, 200)
+    buckets = build_labels(
+        LabelsConfig(),
+        rows_to_frame([position(4, p, cp=cp) for p, cp in enumerate([-300, -100, 0, 100, 300], 2)]),
+    ).sort("ply")
+    assert buckets["value_bucket"].to_list() == [0, 1, 2, 3, 4]
+
+
+def test_the_result_class_follows_the_game_it_came_from() -> None:
+    rows = rows_to_frame(
+        [position(5, 2, result=r) for r in ("1-0", "0-1", "1/2-1/2")] + [position(5, 3, result="*")]
+    )
+    frame = build_labels(LabelsConfig(), rows)
+    assert RESULT_CLASSES == {"1-0": 0, "1/2-1/2": 1, "0-1": 2}
+    assert sorted(frame["result_class"].to_list()) == [0, 1, 2]  # "*" is dropped, not guessed
+```
+
+<Src file="tests/unit/test_labels.py" tag="p3" lines="104-135" />
+
 ```python title="tests/unit/test_labels.py"
 def test_the_split_is_by_game_and_never_shares_a_game_id() -> None:
     rows = rows_to_frame([position(game, ply) for game in range(200) for ply in (2, 3, 4)])
@@ -1658,6 +1824,132 @@ def test_the_label_curve_uses_nested_subsets() -> None:
 Entre conjuntos de Python, `<` es «subconjunto propio», así que una línea comprueba el anidamiento
 entero.
 
+Los dos últimos miran fuera de la función pura: `run` escribe el parquet y un manifiesto que lleva
+el sha256 de la tabla de origen, y `game_moves` vuelve a las partidas de P1 con una fila por partida,
+nunca una por posición.
+
+```python title="tests/unit/test_labels.py"
+def test_run_writes_the_parquet_and_a_manifest(rukh_home: Path) -> None:
+    source = rukh_home / "evals" / "positions-eval.parquet"
+    source.parent.mkdir(parents=True)
+    toy_frame().write_parquet(source)
+    cfg = LabelsConfig(positions_eval="evals/positions-eval.parquet", out_dir="labels")
+    manifest = run(cfg)
+    written = rukh_home / "labels" / LABELS_FILE
+    assert written.is_file()
+    assert manifest.counts["positions"] == 4
+    assert manifest.counts["blunder_labelled"] == 2
+    assert manifest.counts["blunders"] == 1
+    assert manifest.filters["split"]["by"] == "game_id"
+    assert (rukh_home / "labels" / "manifest.json").is_file()
+    assert counts(pl.read_parquet(written))["positions"] == 4
+    # The labels are a pure function of the source file; its digest is what identifies them.
+    assert manifest.filters["positions_eval_sha256"] == sha256_file(source)
+
+
+def test_game_moves_reads_one_row_per_game_and_only_the_labelled_ones(rukh_home: Path) -> None:
+    """The join back to the P1 games: by game, semi-joined, and never per position."""
+    games = rukh_home / "uci" / "year=2025" / "month=01" / "games.parquet"
+    games.parent.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "game_id": [1, 2, 3],
+            "uci": ["e2e4 e7e5", "d2d4 d7d5", "c2c4 c7c5"],
+            "n_plies": [2, 2, 2],
+            "white_elo": [1850, 1900, 2000],
+            "black_elo": [1860, 1910, 2010],
+            "result": ["1-0", "0-1", "1/2-1/2"],
+        }
+    ).write_parquet(games)
+    labelled = pl.DataFrame({"game_id": [1, 1, 3]})  # two positions of game 1, none of game 2
+    found = game_moves(labelled, "uci")
+    assert sorted(found["game_id"].to_list()) == [1, 3]
+    assert found.height == 2  # one row per game, never one per position
+    assert set(found.columns) == {"game_id", "uci", "white_elo", "black_elo"}
+    assert found.filter(pl.col("game_id") == 1)["uci"][0] == "e2e4 e7e5"
+```
+
+<Src file="tests/unit/test_labels.py" tag="p3" lines="178-215" />
+
+Los tests que construyen etiquetas a partir de una partida jugada de verdad —los de la evaluación
+de la lección 8 y el ejercicio de esta— leen sus filas de un módulo de ayuda, no de un
+`conftest.py`: la partida del error de dama, sus filas con evaluaciones y las líneas UCI que la
+acompañan.
+
+```python title="tests/unit/helpers_labels.py"
+"""Rows of ``positions-eval.parquet`` for the tests that build labels out of a real game.
+
+Not a ``conftest.py`` and not a package: ``tests/`` has no ``__init__.py`` on purpose (pytest
+inserts ``tests/unit`` on ``sys.path``, so ``from helpers_labels import ...`` works and
+``from tests.unit...`` does not), and these are plain constructors rather than fixtures because
+they are called with arguments and outside of a test as often as inside one.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import chess
+import polars as pl
+
+GAME = ("e4", "e5", "Qh5", "Nc6", "Qxf7+", "Kxf7", "Nf3", "Nf6")
+"""1.e4 e5 2.Qh5 Nc6 3.Qxf7+?? Kxf7: a real queen blunder inside a real game."""
+
+
+def game_rows(game_id: int, sans: tuple[str, ...], scores: list[int]) -> list[dict[str, Any]]:
+    """One row of ``positions-eval.parquet`` per ply of a game actually played on a board."""
+    board = chess.Board()
+    rows: list[dict[str, Any]] = []
+    for ply, san in enumerate(sans, start=1):
+        move = board.parse_san(san)
+        board.push(move)
+        rows.append(
+            {
+                "fen": " ".join(board.fen().split(" ")[:4]),
+                "game_id": game_id,
+                "ply": ply,
+                "last_move": move.uci(),
+                "result": "0-1",
+                "phase": "opening",
+                "cp": scores[ply - 1],
+                "mate": None,
+                "n_seen": 1,
+                "best_move": move.uci(),
+                "depth": 20,
+            }
+        )
+    return rows
+
+
+def source_frame() -> pl.DataFrame:
+    """Two copies of the same game, so both sides of the by-game split have rows."""
+    scores = [20, 10, 30, 15, -850, -900, -880, -870]
+    return pl.DataFrame(game_rows(1, GAME, scores) + game_rows(2, GAME, scores))
+
+
+def game_moves_frame() -> pl.DataFrame:
+    """The ``data/uci`` rows matching ``source_frame``: one ``uci`` string per game."""
+    board = chess.Board()
+    uci = []
+    for san in GAME:
+        move = board.parse_san(san)
+        board.push(move)
+        uci.append(move.uci())
+    line = " ".join(uci)
+    return pl.DataFrame(
+        {
+            "game_id": [1, 2],
+            "uci": [line, line],
+            "n_plies": [len(uci), len(uci)],
+            "white_elo": [1850, 1850],
+            "black_elo": [1900, 1900],
+            "result": ["0-1", "0-1"],
+        }
+    )
+```
+
+<Src file="tests/unit/helpers_labels.py" tag="p3" lines="1-69" />
+
 ```python title="tests/unit/test_heads.py"
 @pytest.mark.parametrize("mode", ["probe", "last-n", "full"])
 def test_the_mode_decides_what_is_allowed_to_move(mode: str) -> None:
@@ -1694,25 +1986,323 @@ El primero calcula los tensores entrenables esperados contándolos en vez de esc
 que sigue siendo correcto si el bloque gana un parámetro. El segundo no mira ningún peso y, aun así,
 decide si el probe mide lo que dice medir.
 
+El resto de `test_heads.py` corre el bucle entero sobre un `positions-eval.parquet` de juguete.
+`eval_rows` lo construye con las cuatro posiciones de la lección 4, cuyas etiquetas sí se pueden
+aprender de las piezas; la fixture lo escribe en el `RUKH_HOME` temporal, y `toy_heads_config`
+reduce la receta a cuatro pasos en CPU.
+
+```python title="tests/unit/test_heads.py"
+def eval_rows(games: int = 40, plies: tuple[int, ...] = (1, 2, 3, 4)) -> pl.DataFrame:
+    """A toy ``positions-eval.parquet`` whose labels are a function of the position."""
+    return pl.DataFrame(
+        [
+            {
+                "fen": fen_at(ply),
+                "game_id": game,
+                "ply": ply,
+                "last_move": "e2e4",
+                "result": BOARD_RESULT[ply % 4],
+                "phase": "middlegame",
+                "cp": BOARD_CP[ply % 4],
+                "mate": None,
+                "best_move": "e2e4",
+            }
+            for game in range(games)
+            for ply in plies
+        ]
+    )
+
+
+@pytest.fixture
+def labels_source(rukh_home: Path) -> str:
+    path = rukh_home / "evals" / "positions-eval.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    eval_rows().write_parquet(path)
+    return "evals/positions-eval.parquet"
+
+
+def toy_heads_config(labels_source: str, **overrides: object) -> HeadsConfig:
+    cfg = HeadsConfig(
+        model=TOY,
+        labels={"positions_eval": labels_source, "out_dir": "labels", "val_fraction": 0.25},
+        batch_size=8,
+        grad_accum=1,
+        lr=1e-2,
+        warmup=1,
+        max_steps=4,
+        precision="fp32",
+        compile=False,
+        eval_every=2,
+        eval_batches=2,
+        ckpt_every=4,
+        log_every=1,
+        run_name="toy-heads",
+        unique_run_name=False,
+    )
+    return cfg.model_copy(update=dict(overrides))
+```
+
+<Src file="tests/unit/test_heads.py" tag="p3" lines="56-103" />
+
+Con eso, los tests del bucle: que un ítem del dataset son 69 tokens y tres etiquetas, que una tirada
+en modo `probe` deja todos los tensores del encoder idénticos con `torch.equal` mientras las cabezas
+se mueven, que ocho pasos bajan la pérdida y escriben el checkpoint, que la curva entrena una tirada
+por fracción, que la configuración rechaza un encoder del otro esquema y que el YAML que se
+distribuye se carga.
+
+```python title="tests/unit/test_heads.py"
+def test_the_dataset_turns_a_row_into_69_tokens_and_three_labels(labels_source: str) -> None:
+    cfg = toy_heads_config(labels_source)
+    train, val = build_frames(cfg)
+    dataset = LabelledPositions(train)
+    item = dataset[0]
+    assert item["idx"].shape == (SQUARE_TOKENS,)
+    assert item["value"].dtype == torch.float32
+    assert item["result"].dtype == torch.int64
+    assert item["blunder_mask"].dtype == torch.bool
+    assert len(dataset) == train.height and val.height
+    with pytest.raises(ValueError, match="needs the games of the labelled rows"):
+        LabelledPositions(train, "moves")
+
+
+def test_probe_leaves_the_encoder_bit_identical(rukh_home: Path, labels_source: str) -> None:
+    torch.manual_seed(0)
+    pretrained = PositionEncoder(TOY)
+    before = {key: value.clone() for key, value in pretrained.state_dict().items()}
+    ckpt = save_checkpoint(
+        rukh_home / "encoder.pt",
+        step=0,
+        model=pretrained,
+        optimizer=None,
+        cfg={},
+        model_cfg=TOY.model_dump(mode="json"),
+    )
+
+    result = train_heads(toy_heads_config(labels_source, encoder_ckpt="encoder.pt"), device="cpu")
+    after = load_checkpoint(Path(result.checkpoint))["model_state"]
+    for key, value in before.items():
+        assert torch.equal(after[f"encoder.{key}"], value), key
+    fresh = MultiHead(pretrained)
+    assert any(
+        not torch.equal(after[f"{name}.proj.weight"], getattr(fresh, name).proj.weight)
+        for name in HEADS
+    )  # the heads did move
+    assert result.mode == "probe" and result.train_labels > 0
+    assert "val/loss" in result.metrics
+
+    full_cfg = toy_heads_config(
+        labels_source, encoder_ckpt="encoder.pt", mode="full", run_name="toy-full"
+    )
+    moved = train_heads(full_cfg, device="cpu")
+    full = load_checkpoint(Path(moved.checkpoint))["model_state"]
+    assert not torch.equal(full["encoder.blocks.0.mlp.fc.weight"], before["blocks.0.mlp.fc.weight"])
+    assert ckpt.is_file()
+
+
+def test_a_short_run_lowers_the_loss_and_writes_a_checkpoint(
+    rukh_home: Path, labels_source: str
+) -> None:
+    result = train_heads(toy_heads_config(labels_source, mode="full", max_steps=8), device="cpu")
+    out = rukh_home / "checkpoints" / "toy-heads"
+    assert Path(result.checkpoint) == out / "step-8.pt"
+    assert (out / "best.pt").is_file()
+    assert result.metrics["val/result_acc"] >= 0.0
+    assert 0.0 <= result.metrics["val/blunder_acc"] <= 1.0
+
+    import mlflow
+
+    from rukh.tracking import tracking_uri
+
+    mlflow.set_tracking_uri(tracking_uri())
+    runs = mlflow.search_runs(experiment_names=["rukh"], output_format="list")
+    run_id = max(runs, key=lambda r: r.info.start_time).info.run_id
+    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri())
+    losses = [p.value for p in client.get_metric_history(run_id, "train/loss")]
+    assert len(losses) == 8
+    assert sum(losses[4:]) / 4 < sum(losses[:4]) / 4  # noisy by the batch, down on average
+    for name in HEADS:
+        assert client.get_metric_history(run_id, f"train/{name}_loss")
+
+
+def test_the_label_curve_trains_one_run_per_fraction(rukh_home: Path, labels_source: str) -> None:
+    cfg = toy_heads_config(labels_source, max_steps=2, ckpt_every=2, eval_every=2)
+    results = label_curve(cfg, [0.5, 1.0], device="cpu")
+    assert [result.fraction for result in results] == [0.5, 1.0]
+    assert results[0].train_labels < results[1].train_labels
+    assert results[0].val_labels == results[1].val_labels  # the same held-out games
+    assert {Path(result.checkpoint).parent.name for result in results} == {
+        "toy-heads-50",
+        "toy-heads-100",
+    }
+
+
+def test_the_config_refuses_a_mismatched_encoder(rukh_home: Path, labels_source: str) -> None:
+    torch.manual_seed(0)
+    moves = PositionEncoder(EncoderConfig(input="moves", n_layer=2, n_head=2, d_model=32))
+    save_checkpoint(
+        rukh_home / "moves.pt",
+        step=0,
+        model=moves,
+        optimizer=None,
+        cfg={},
+        model_cfg=moves.cfg.model_dump(mode="json"),
+    )
+    cfg = toy_heads_config(labels_source, encoder_ckpt="moves.pt")
+    with pytest.raises(ValueError, match="was trained on the 'moves' scheme"):
+        train_heads(cfg, device="cpu")
+    with pytest.raises(ValueError):
+        HeadsConfig(fraction=0.0)  # a run on no labels at all is a mistake, not a corner case
+
+
+def test_cli_train_heads_reads_the_shipped_config(repo_root: Path) -> None:
+    from typer.testing import CliRunner
+
+    from rukh.cli import app
+    from rukh.config import load_yaml
+
+    cfg = load_yaml(repo_root / "configs" / "train" / "encoder-heads.yaml", HeadsConfig)
+    assert cfg.mode == "probe" and cfg.input == "squares"
+    assert cfg.curve == [0.1, 0.25, 0.5, 1.0]
+    assert cfg.labels.blunder_cp == 100 and cfg.labels.value_scale == 400.0
+    result = CliRunner().invoke(app, ["train", "heads", "--help"])
+    assert result.exit_code == 0, result.output
+    for option in ("--config", "--mode", "--fraction", "--curve"):
+        assert option in result.output
+```
+
+<Src file="tests/unit/test_heads.py" tag="p3" lines="188-304" />
+
+La última sección del fichero cubre la entrada `moves`: un ítem es la cabecera de Elo más el prefijo
+de la partida hasta ese ply, un prefijo más largo que el bloque se recorta por las jugadas más
+antiguas y conserva la cabecera, el relleno no llega a las cabezas y cada esquema solo carga su
+propio encoder preentrenado.
+
+```python title="tests/unit/test_heads.py"
+# --- the `moves` scheme: the line that reached the position ------------------------------------
+
+GAME_UCI = "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6"
+"""Eight real half-moves, so a prefix of any ply in ``eval_rows`` exists."""
+
+
+def toy_games(frame: pl.DataFrame) -> pl.DataFrame:
+    """The ``rukh.data.labels.game_moves`` frame for ``eval_rows``: one line per game."""
+    games = sorted({int(game) for game in frame["game_id"].to_list()})
+    return pl.DataFrame(
+        {
+            "game_id": games,
+            "uci": [GAME_UCI] * len(games),
+            "white_elo": [1850] * len(games),
+            "black_elo": [1920] * len(games),
+        }
+    )
+
+
+def test_a_moves_item_is_the_header_plus_the_prefix_of_the_game(labels_source: str) -> None:
+    from rukh.tokenize.uci_vocab import UciTokenizer, elo_token
+
+    cfg = toy_heads_config(labels_source, input="moves", block=200)
+    train, _val = build_frames(cfg)
+    dataset = LabelledPositions(train, "moves", toy_games(train), cfg.block)
+    tok = UciTokenizer()
+    for index in range(min(8, len(dataset))):
+        ids = dataset.tokens(index)
+        ply = dataset.plies[index]
+        assert tok.decode(ids[:3]) == ["<bos>", elo_token(1850, "w"), elo_token(1920, "b")]
+        # ``ply`` counts the move that led to this position, so it is inside the prefix.
+        assert tok.decode(ids[3:]) == GAME_UCI.split()[:ply]
+        assert len(ids) == 3 + ply
+
+
+def test_a_prefix_longer_than_the_block_is_cropped_after_the_header(labels_source: str) -> None:
+    from rukh.tokenize.uci_vocab import UciTokenizer
+
+    cfg = toy_heads_config(labels_source, input="moves", block=5)
+    train, _val = build_frames(cfg)
+    dataset = LabelledPositions(train, "moves", toy_games(train), cfg.block)
+    tok = UciTokenizer()
+    longest = max(range(len(dataset)), key=lambda index: dataset.plies[index])
+    ply = dataset.plies[longest]
+    assert ply + 3 > cfg.block  # otherwise this test is not testing the crop
+    ids = dataset.tokens(longest)
+    assert len(ids) == cfg.block
+    # The Elo conditioning survives the crop and the *oldest* moves are the ones dropped.
+    assert tok.decode(ids[:3])[0] == "<bos>"
+    assert tok.decode(ids[3:]) == GAME_UCI.split()[:ply][-(cfg.block - 3) :]
+
+
+def test_padding_does_not_reach_the_heads(labels_source: str) -> None:
+    from rukh.train.heads import collate
+
+    cfg = toy_heads_config(labels_source, input="moves", block=200)
+    train, _val = build_frames(cfg)
+    dataset = LabelledPositions(train, "moves", toy_games(train), cfg.block)
+    short = min(range(len(dataset)), key=lambda index: dataset.plies[index])
+    long = max(range(len(dataset)), key=lambda index: dataset.plies[index])
+    assert dataset.plies[short] < dataset.plies[long]
+
+    torch.manual_seed(0)
+    model = MultiHead(
+        PositionEncoder(EncoderConfig(input="moves", n_layer=2, n_head=2, d_model=32, dropout=0.0))
+    ).eval()
+    padded = collate([dataset[short], dataset[long]])
+    alone = collate([dataset[short]])
+    assert bool(padded["attention_mask"][0, dataset.plies[short] + 3 :].eq(False).all())
+    with torch.no_grad():
+        mixed = model(padded["idx"], padded["attention_mask"])
+        tight = model(alone["idx"], alone["attention_mask"])
+    for head in HEADS:
+        assert torch.allclose(mixed[head][:1], tight[head], atol=1e-6)
+
+
+def test_each_scheme_only_loads_its_own_pretrained_encoder(
+    rukh_home: Path, labels_source: str
+) -> None:
+    from rukh.train.heads import load_encoder_for
+
+    torch.manual_seed(0)
+    for scheme in ("moves", "squares"):
+        encoder = PositionEncoder(
+            EncoderConfig(input=scheme, n_layer=2, n_head=2, d_model=32, block=200)
+        )
+        save_checkpoint(
+            rukh_home / f"{scheme}.pt",
+            step=0,
+            model=encoder,
+            optimizer=None,
+            cfg={},
+            model_cfg=encoder.cfg.model_dump(mode="json"),
+        )
+    where = torch.device("cpu")
+    for scheme, other in (("moves", "squares"), ("squares", "moves")):
+        cfg = toy_heads_config(labels_source, input=scheme, encoder_ckpt=f"{scheme}.pt")
+        assert load_encoder_for(cfg, where).cfg.input == scheme
+        wrong = cfg.model_copy(update={"encoder_ckpt": f"{other}.pt"})
+        with pytest.raises(ValueError, match=f"was trained on the {other!r} scheme"):
+            load_encoder_for(wrong, where)
+```
+
+<Src file="tests/unit/test_heads.py" tag="p3" lines="307-407" />
+
+</Fold>
+
 <Callout kind="ejecuta" title="Las etiquetas y las cabezas, en verde">
-  Con `labels.py`, `heads.py` y sus tests escritos, pasa los dos ficheros. El `test_heads.py`
-  completo del tag `p3` añade a los de arriba los que corren el bucle entero sobre un
-  `positions-eval.parquet` de juguete: que un ítem del dataset son 69 tokens y tres etiquetas, que
-  una tirada en modo `probe` deja todos los tensores del encoder idénticos con `torch.equal`
-  mientras las cabezas se mueven, que ocho pasos bajan la pérdida y escriben el checkpoint, y que la
-  curva entrena una tirada por fracción.
+  Con `labels.py`, `heads.py`, `helpers_labels.py` y los dos ficheros de tests escritos, pásalos.
 
 ```sh
 uv run pytest -m unit -q tests/unit/test_labels.py tests/unit/test_heads.py
 ```
 
-Tiene que dar `30 passed` con los dos ficheros completos (once de las etiquetas y diecinueve casos
+Tiene que dar `30 passed` (once de las etiquetas y diecinueve casos
 de las cabezas, contando los tres modos del `parametrize`), sin GPU y sin datos reales: las tablas
 son de juguete y se escriben en un `RUKH_HOME` temporal.
 
 </Callout>
 
 ## El subcomando
+
+El subcomando es CLI y se puede saltar; la tirada de humo de debajo lo usa.
+
+<Fold summary="rukh train heads: la tirada suelta y la curva en un subcomando">
 
 ```python title="src/rukh/cli.py"
 @train_app.command("heads")
@@ -1778,6 +2368,8 @@ La curva y la tirada suelta devuelven la misma forma, una lista de resultados, a
 imprime es uno solo. Un `--mode` inválido sale con código 2, el que typer usa para un mal uso del
 comando, y un error de datos con 1: la distinción importa en un script que encadena comandos.
 
+</Fold>
+
 <Callout kind="ejecuta" title="Una tirada corta de las cabezas, con datos de verdad">
   El comando ya responde. Antes de los afinados de cuatro mil pasos de los labs, una tirada de humo
   sobre el esquema de casillas, que no depende de ningún checkpoint (`encoder_ckpt: null`). Necesita
@@ -1815,6 +2407,8 @@ siendo del 3-4 % y el modelo aprendería a detectar lo contrario de lo que dice 
 
 </Solution>
 </Exercise>
+
+<LessonLabs from="m3/11-labs-del-encoder" labs={['Lab 2', 'Lab 3', 'Lab 3b']} />
 
 ## Qué has aprendido
 
