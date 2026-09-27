@@ -146,6 +146,14 @@ significado en silencio.
 El fichero ya existía desde M1 y este hito lo cambia en dos sitios: el filtro gana un tope y la
 descarga cambia de estrategia. La razón de lo segundo está en el docstring del módulo:
 
+Todo `fetch.py` y el `db.py` que lo acompaña son fontanería de descarga, y los pliegues de esta
+sección se pueden saltar en la primera lectura. Lo que cuenta para el afinado cabe en una frase: el
+filtro gana un techo de Elo (`max_elo`) para bajar solo la banda 1000-1799, y los meses se bajan
+shard a shard porque leerlos en remoto acababa en `HTTP 429`. El «Ejecútalo» del final comprueba lo
+que escribas.
+
+<Fold summary="Por qué los meses se bajan shard a shard y no se leen en remoto por hf://">
+
 ```python title="src/rukh/data/fetch.py"
 The months are read **shard by shard, downloaded first**, not streamed over ``hf://``. Streaming
 was the original design and it is the obvious one: DuckDB reads the remote parquet directly and
@@ -169,10 +177,14 @@ son 72 <Term id="shard">shards</Term> de un gigabyte, leerlos en remoto son mile
 rango contra un mismo servidor, y el servidor contesta `HTTP 429`. Pedir pocos ficheros grandes
 termina; pedir miles de trozos pequeños, no.
 
+</Fold>
+
 ### La otra mitad de la respuesta al `429`
 
 Quedan las conexiones de DuckDB que siguen leyendo por `hf://`. Eso vive en `src/rukh/data/db.py`,
 el módulo que fabrica todas las conexiones del pipeline.
+
+<Fold summary="db.py: reintentos, tiempos de espera y token para las lecturas por hf://">
 
 ```python title="src/rukh/data/db.py"
 Finally, it signs the requests to ``hf://``. Reading a month of Lichess means a few hundred range
@@ -271,7 +283,11 @@ def connect(cfg: DuckDbConfig | None = None) -> duckdb.DuckDBPyConnection:
 Una sola fábrica de conexiones permite que un ajuste como este llegue a los ocho pasos del pipeline
 cambiando un fichero.
 
+</Fold>
+
 ### El tope de Elo, en la configuración
+
+<Fold summary="FetchConfig: el campo max_elo, el nuevo sentido de limit y su validador">
 
 ```python title="src/rukh/data/fetch.py"
 class FetchConfig(BaseConfig):
@@ -334,7 +350,11 @@ de setenta y dos. `keep_shards` está apagado porque dejarlos cuesta 72 GB por m
 rechaza un techo por debajo del suelo al principio, en vez de dejar que aparezca como un `COPY` de
 cero filas.
 
+</Fold>
+
 ### El filtro se construye una vez
+
+<Fold summary="where_clause: un solo predicado para el ensayo y para cada shard">
 
 ```python title="src/rukh/data/fetch.py"
 def where_clause(cfg: FetchConfig) -> str:
@@ -362,7 +382,11 @@ La condición `WHERE` se construye aparte y se usa dos veces: en la consulta que
 contra cada shard descargado. Con dos copias del predicado, la del ensayo se quedaría atrás en la
 primera edición y nadie lo notaría, porque las dos seguirían siendo SQL válido.
 
+</Fold>
+
 ### Un shard a la vez
+
+<Fold summary="La descarga por shards: bajar, filtrar a una parte, borrar y reanudar">
 
 ```python title="src/rukh/data/fetch.py"
 def month_shards(cfg: FetchConfig, month: str) -> list[str]:
@@ -530,6 +554,8 @@ Un fichero de cero bytes, lo que deja un `COPY` que murió a medias, no cuenta c
 En el bucle principal, un mes que ya está en disco se cuenta en vez de volver a descargarse. El
 manifiesto registra lo mismo en las dos ramas (hash y tamaño), así que una descarga en tres tandas
 produce el mismo manifiesto que una de una sola.
+
+</Fold>
 
 <Callout kind="ejecuta" title="El descargador, sin red">
   Antes de bajar un solo shard, pasa los tests de `fetch.py` y pide el plan de la descarga de la
@@ -764,6 +790,11 @@ plana por muy sesgada que esté la fuente y el de los identificadores en el bord
 
 ### La configuración del corpus plano
 
+La configuración entera se puede saltar; las tres claves que son el experimento se explican debajo
+del pliegue.
+
+<Fold summary="configs/data/pipeline-low.yaml entero">
+
 {/* prettier-ignore */}
 ```yaml title="configs/data/pipeline-low.yaml"
 # The P4 corpus: the 1000-1799 band that `pipeline-v4.yaml` never had, converted and balanced.
@@ -818,10 +849,16 @@ tokenize:
 
 <Src file="configs/data/pipeline-low.yaml" tag="p4" lines="1-48" />
 
+</Fold>
+
 En la sección `tokenize`, tres claves son el experimento. `train_months: []` deja entrar solo la
 muestra equilibrada (`extra_train_parquets`). `val_month` y `val_games` son los de todas las demás
 ejecuciones, para que las pérdidas se puedan comparar. Y `val_remainder_trains: false` tiene su
 propia sección más abajo.
+
+Los otros dos ficheros de datos del módulo son variaciones del mismo patrón; se pueden saltar.
+
+<Fold summary="Las configuraciones del corpus de maestros y del mes de más">
 
 El otro corpus que usa este módulo es el de maestros, el del segundo afinado:
 
@@ -878,10 +915,17 @@ duckdb:
 y el dataloader necesita núcleos; ocho hilos provocaron tres `429` seguidos. El comentario al lado es
 lo que evita que ese 3 sea un número mágico.
 
+</Fold>
+
 ## `pack.py`: rebanadas de partidas
 
 El empaquetador leía meses enteros, y un mes era o entrenamiento o validación. La solución es un tipo
 de tres campos.
+
+`pack.py` aprende a leer rebanadas de un parquet en vez de meses enteros. La mecánica está plegada y
+se puede saltar; lo que importa para el experimento es la regla del bloque que sigue al pliegue.
+
+<Fold summary="pack.py: la rebanada (parquet, skip, take) y cómo se empaqueta una lista de ellas">
 
 ```python title="src/rukh/tokenize/pack.py"
 @dataclass(frozen=True)
@@ -1017,6 +1061,8 @@ descripción en el esquema. Es un error real del repositorio en el tag `p4`. Un 
 es una convención y no sintaxis, así que moverlo una línea lo anula sin que ninguna herramienta lo
 note.
 
+</Fold>
+
 ```python title="src/rukh/tokenize/pack.py"
 def split_sources(cfg: TokenizeConfig) -> dict[str, list[GameSlice]]:
     """The parquet slices behind each split, as ``pack_scheme`` will read them.
@@ -1062,6 +1108,8 @@ encima del reparto plano y lo deshace sin decir nada. `val_remainder_trains: fal
 validación de siempre y deja el entrenamiento en el corpus equilibrado y nada más. Una opción por
 defecto que mejora el caso normal tiene que poder apagarse.
 
+<Fold summary="La función que decide qué rebanadas van a cada split">
+
 ```python title="src/rukh/tokenize/pack.py"
 def pack_scheme(cfg: TokenizeConfig, scheme: str, bpe: Tokenizer | None = None) -> list[Path]:
     """Pack the ``train`` and ``val`` splits under ``out_dir/<scheme>/{train,val}``."""
@@ -1078,6 +1126,8 @@ def pack_scheme(cfg: TokenizeConfig, scheme: str, bpe: Tokenizer | None = None) 
 
 Separar la función que decide qué se empaqueta de la que lo empaqueta permite probar la primera sin
 escribir un solo `.npy`.
+
+</Fold>
 
 <Callout kind="ejecuta" title="Las rebanadas y el reparto de los splits">
   El empaquetador y su configuración ya están completos. Sus tests corren sobre el parquet de
@@ -1098,6 +1148,10 @@ entrenamiento.
 
 El corpus de M2 dejó un fallo que aparece cuando el número de partidas crece, y la corrección vive
 aquí:
+
+Es un arreglo de multiprocessing en Windows, no de afinado, y se puede saltar en la primera lectura.
+
+<Fold summary="loader.py: el dataset que se serializa sin sus arrays">
 
 ```python title="src/rukh/tokenize/loader.py"
     def __init__(self, directory: Path, block: int = 200, start_at_game: bool = True) -> None:
@@ -1140,6 +1194,8 @@ murió con `UnpicklingError: pickle data was truncated` antes de dar un paso. La
 
 En M2 se mapeó `tokens`, el array grande, que era el que preocupaba; el que rompió fue `starts`, el
 índice pequeño, que crece con el número de partidas igual que el grande.
+
+</Fold>
 
 <Callout kind="ejecuta" title="El dataset viaja sin sus arrays">
   Los tests del cargador incluyen el de esta corrección:
@@ -1455,6 +1511,8 @@ uv run rukh train --config configs/train/medium-elo.yaml
 
 El afinado son 3 800 pasos y 19,5 minutos; el de maestros, con `pipeline-masters.yaml` y
 `medium-masters.yaml`, 20,7.
+
+<LessonLabs from="m4/10-labs-de-afinado" labs={['Lab 1', 'Lab 2', 'Lab 3']} />
 
 ## Qué has aprendido
 
