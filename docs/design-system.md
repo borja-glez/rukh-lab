@@ -77,25 +77,36 @@ Las fuentes las sirve la API de fuentes de Astro (`fontProviders.fontsource()`),
 
 ## Componentes
 
-| Componente           | Qué es                                                                                                                        | Notas                                                                                        |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `Header`             | Cabecera fija de 56 px: marca `rukh · lab`, navegación (Curso · Glosario · Cheatsheets · Proyecto) y enlace "Jugar" a la demo | Glosario y Cheatsheets se ocultan bajo 720 px (siguen en el pie). Elementos de 44 px de alto |
-| `Footer`             | Marca, enlaces internos y externos (demo, GitHub, Hugging Face), licencias                                                    | Rejilla de dos columnas; una en móvil                                                        |
-| `Rail`               | Rail vertical con un tick por sección, activado por `IntersectionObserver`                                                    | Solo en lecciones y desde 1100 px; `aria-hidden`                                             |
-| `SectionHead`        | `NN / etiqueta ———— // tipo`                                                                                                  | Igual que el portfolio                                                                       |
-| `FigureFrame`        | Marco con cuatro ticks en las esquinas y fondo `--frame-bg`                                                                   | Usado por `Figure` (MDX) y tarjetas de resultados                                            |
-| `ThemeToggle`        | Dos botones (claro/oscuro) en píldora                                                                                         | `aria-pressed` sincronizado por `theme.ts`                                                   |
-| Botones (`.btn`)     | Píldora de 44 px mínimo; `--primary` (tinta sobre papel), `--secondary` (borde), `--small`                                    | `aria-pressed='true'` en secundario pinta `--ok` (lección completada)                        |
-| Etiquetas (`.label`) | Monoespaciada, 11 px, mayúsculas, `--muted`; variantes `--ink`, `--accent`, `--plain`                                         | `.caption` es la misma familia sin mayúsculas                                                |
-| Chips (`.chip`)      | Estado de módulo o lección: `--live` (verde), `--draft` (ámbar)                                                               | Monoespaciada                                                                                |
-| `.section__title`    | Título de sección grande, peso 500, interletrado −0.035em                                                                     | `--narrow` limita a 22ch                                                                     |
-| `.prose`             | Prosa de lección al ancho de lectura (`--measure`), `h2` con regla superior, tablas con cabecera en mono                      | Los componentes MDX viven dentro                                                             |
+| Componente           | Qué es                                                                                                                                        | Notas                                                                                                                                                                                     |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Header`             | Cabecera fija de 56 px: marca `rukh · lab`, navegación (Curso · Cómo funciona · Glosario · Cheatsheets · Proyecto) y enlace "Jugar" a la demo | Cheatsheets y Proyecto se ocultan bajo 900 px, donde Cómo funciona pasa a decir LLM; Cómo funciona y Glosario se ocultan bajo 720 px (todos siguen en el pie). Elementos de 44 px de alto |
+| `Footer`             | Marca, enlaces internos y externos (demo, GitHub, Hugging Face), licencias                                                                    | Rejilla de dos columnas; una en móvil                                                                                                                                                     |
+| `Rail`               | Rail vertical con un tick por sección, activado por `IntersectionObserver`                                                                    | Solo en lecciones y desde 1100 px; `aria-hidden`                                                                                                                                          |
+| `SectionHead`        | `NN / etiqueta ———— // tipo`                                                                                                                  | Igual que el portfolio                                                                                                                                                                    |
+| `FigureFrame`        | Marco con cuatro ticks en las esquinas y fondo `--frame-bg`                                                                                   | Usado por `Figure` (MDX) y tarjetas de resultados                                                                                                                                         |
+| `ThemeToggle`        | Dos botones (claro/oscuro) en píldora                                                                                                         | `aria-pressed` sincronizado por `theme.ts`                                                                                                                                                |
+| Botones (`.btn`)     | Píldora de 44 px mínimo; `--primary` (tinta sobre papel), `--secondary` (borde), `--small`                                                    | `aria-pressed='true'` en secundario pinta `--ok` (lección completada)                                                                                                                     |
+| Etiquetas (`.label`) | Monoespaciada, 11 px, mayúsculas, `--muted`; variantes `--ink`, `--accent`, `--plain`                                                         | `.caption` es la misma familia sin mayúsculas                                                                                                                                             |
+| Chips (`.chip`)      | Estado de módulo o lección: `--live` (verde), `--draft` (ámbar)                                                                               | Monoespaciada                                                                                                                                                                             |
+| `.section__title`    | Título de sección grande, peso 500, interletrado −0.035em                                                                                     | `--narrow` limita a 22ch                                                                                                                                                                  |
+| `.prose`             | Prosa de lección al ancho de lectura (`--measure`), `h2` con regla superior, tablas con cabecera en mono                                      | Los componentes MDX viven dentro                                                                                                                                                          |
 
 ## Componentes MDX (lecciones)
 
 `Callout` (`teoria`, `mundo-real`, `entrevista`, `hoy`, `roto`, `ejecuta`), `Exercise`, `Solution`, `Term`,
 `Figure`, `Tabs`, `NotebookLink`, `ModelBadge`, `ResultsTable`, `DemoEmbed`. Registro en
 `src/components/mdx/index.ts`; plantilla y uso en `docs/runbooks/lessons.md`.
+
+## Página «Cómo funciona un LLM»
+
+`/como-funciona-un-llm/` cuenta el curso de corrido y sin código. Cada capítulo es un `.mdx` en
+`src/components/llm/chapters/` envuelto en `Chapter` (título numerado y caja «En el curso, con Rukh»
+generada desde `src/data/llm-chapters.ts`), con un `Simile` («En la vida real») y figuras en
+`LlmFigure`. Sus figuras (`src/components/llm/figures/`) llevan la animación en su propio `<style>`,
+declarada solo bajo `prefers-reduced-motion: no-preference`: el dibujo sin animación es la figura
+estática. `src/scripts/llm-page.ts` las retiene hasta que entran en pantalla y da el botón de pausa;
+`src/styles/llm.css` solo carga en esa página. Los widgets son islas Preact en `src/islands/llm/`
+con su CSS en `src/styles/llm/`.
 
 ## Divergencias respecto al portfolio
 
