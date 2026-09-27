@@ -51,7 +51,15 @@ test.describe('content security policy', () => {
     page.on('console', (message) => {
       if (message.text().includes('Content Security Policy')) cspMessages.push(message.text());
     });
-    for (const path of ['/', '/curso/', LESSON, '/glosario/', '/cheatsheets/', '/proyecto/']) {
+    for (const path of [
+      '/',
+      '/curso/',
+      LESSON,
+      '/glosario/',
+      '/cheatsheets/',
+      '/proyecto/',
+      '/como-funciona-un-llm/',
+    ]) {
       await page.goto(path);
       await page.waitForLoadState('networkidle');
     }
