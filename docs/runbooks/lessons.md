@@ -75,6 +75,21 @@ tests/unit/test_<pieza>.py`), antes de lanzar algo largo (el `--dry-run`, una co
 - Un bloque de código dentro de la caja va sin sangría y con una línea en blanco antes de
   `</Callout>`, como en el resto de callouts con código.
 
+## «Qué tecleas y qué traes» y el shell
+
+Toda lección con código abre, justo después de «Qué vas a construir», con una
+`<Callout kind="guia" title="Qué tecleas y qué traes">` de tres o cuatro puntos en lista: **Tecleas**
+(los ficheros que la lección enseña), **Traes del repo** (lo que el curso no hace teclear, con el
+comando exacto: `git checkout pN -- <rutas>`, que funciona igual en Git Bash y en PowerShell porque
+el lector añadió `ref` como remoto en M0) y **Referencia** (la etiqueta). Una lección de lectura (las
+de `rukh-web`) lo dice en el primer punto. Un fichero que no se muestra no se «copia de GitHub»: o se
+pliega entero con `<Fold summary="…">` o se trae con `git checkout`.
+
+El shell del curso es Git Bash, declarado en M0. Donde un comando cambia en PowerShell 7 (una
+variable de entorno delante del comando, `mkdir -p`, `curl`, `\` al final de línea, `ls -…`, `sed`),
+van las dos versiones en `<Tabs labels={['Git Bash', 'PowerShell']}>`; si existe una forma que valga
+para los dos (un `python -c` sin comillas escapadas, `git checkout` en vez de `curl`), mejor esa.
+
 ## Plantilla
 
 ````mdx

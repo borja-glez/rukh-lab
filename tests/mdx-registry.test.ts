@@ -22,6 +22,7 @@ const REQUIRED = [
   'ResultsTable',
   'DemoEmbed',
   'Src',
+  'Fold',
 ] as const;
 
 describe('MDX component registry', () => {
