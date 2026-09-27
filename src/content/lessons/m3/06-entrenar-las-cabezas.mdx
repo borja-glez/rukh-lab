@@ -94,6 +94,11 @@ validación, un modelo que memoriza partidas puntúa igual de bien que uno que e
 **ninguna cifra del informe lo delata**. Es la misma trampa que repartir por fragmentos los trozos de
 un mismo documento al evaluar un RAG.
 
+Las columnas que se leen y el índice de cada resultado son contabilidad del fichero, y puedes
+saltarlas en la primera lectura.
+
+<Fold summary="SOURCE_COLUMNS y RESULT_CLASSES: qué columnas se leen y qué índice lleva cada resultado">
+
 ```python title="src/rukh/data/labels.py"
 from __future__ import annotations
 
@@ -126,6 +131,8 @@ SOURCE_COLUMNS = ["fen", "game_id", "ply", "last_move", "result", "phase", "cp",
 catorce lee solo esas ocho del disco, la gracia del formato columnar. Y `RESULT_CLASSES` fija en un
 solo sitio qué índice es cada resultado: un `0` que significa blancas aquí y tablas en el informe es
 un bug que solo se nota mirando una matriz de confusión.
+
+</Fold>
 
 ```python title="src/rukh/data/labels.py"
 class LabelsConfig(BaseConfig):
@@ -255,6 +262,12 @@ con las negras a mover, el `score_mover` es +250. `loss_cp = 50 + 250 = 300`: ti
 El `how="left"` es la otra decisión. Una posición cuyo predecesor no está en la tabla —el primer ply,
 o un FEN que se dedupó en otra partida— acaba con un `blunder` nulo, nunca con un cero.
 
+Con el signo resuelto, el resto de la tabla es ensamblarla con polars: repartir por partida, unir y
+leer solo las partidas que hacen falta. Es ingeniería de datos y se puede saltar en la primera
+lectura.
+
+<Fold summary="build_labels y read_games: el ensamblado con polars y el join semi que lee solo las partidas etiquetadas">
+
 ```python title="src/rukh/data/labels.py"
     games = joined.select("game_id").unique().sort("game_id")
     split = pl.DataFrame(
@@ -342,6 +355,8 @@ partidas solo se leen las que llevan alguna etiqueta. Un `read_parquet` seguido 
 los dos meses enteros a memoria. Y es `semi` y no `inner` porque no duplica filas: con un `inner`,
 una partida con tres posiciones etiquetadas aparecería tres veces.
 
+</Fold>
+
 ```python title="src/rukh/data/labels.py"
 def label_subsets(frame: pl.DataFrame, fractions: list[float]) -> dict[float, pl.DataFrame]:
     """Nested subsets for the label-count curve: 10 % is inside 25 %, inside 50 %, inside 100 %.
@@ -379,6 +394,10 @@ fijo garantiza el anidamiento por construcción. `counts` publica tres denominad
 (posiciones, posiciones con etiqueta de error y errores), porque una métrica calculada sobre el
 denominador equivocado es otra métrica.
 
+El manifiesto registra con qué se construyó la tabla; fontanería de M0, saltable.
+
+<Fold summary="El manifiesto de la tabla supervisada">
+
 ```python title="src/rukh/data/labels.py"
 def run(cfg: LabelsConfig) -> Manifest:
     """Write ``out_dir/positions-labels.parquet`` plus the manifest, and return the manifest."""
@@ -414,6 +433,8 @@ El <Term id="manifiesto">manifiesto</Term> de M0 aplicado a la tabla supervisada
 etiquetas son una función pura del fichero de evaluaciones y de estas claves, dos tablas con el
 mismo manifiesto son la misma tabla. El reparto también está ahí, para que «el 10 % de validación»
 sea un hecho registrado y no una afirmación.
+
+</Fold>
 
 ## `heads.py`: los tres modos y la curva
 
@@ -459,6 +480,12 @@ Both input schemes can be fine-tuned here, which is what makes the spec's compar
 
 «`full`: best numbers» es la expectativa habitual, escrita antes de medir; la lección 11 la pone a
 prueba.
+
+Lo que va de aquí a `freeze_encoder` convierte la tabla en lotes. La idea que conviene llevarse sin
+desplegarlo: una etiqueta ausente viaja como **una máscara y un relleno**, y la pérdida mira la
+máscara antes que el valor. El resto se puede saltar en la primera lectura.
+
+<Fold summary="El dataset, el recorte de la secuencia, el lote, el DataLoader y la configuración de la tirada">
 
 ```python title="src/rukh/train/heads.py"
 from __future__ import annotations
@@ -755,6 +782,8 @@ class HeadsResult(BaseConfig):
 Cada resultado lleva la fracción y los conteos junto a las métricas: así cada punto de la curva sabe
 cuántas etiquetas vio.
 
+</Fold>
+
 ```python title="src/rukh/train/heads.py"
 def freeze_encoder(model: MultiHead, mode: Mode, last_n: int = 2) -> int:
     """Apply a fine-tuning mode and return how many encoder tensors stay trainable."""
@@ -816,6 +845,11 @@ regularización.
   tres se manifiestan igual: un tronco que «no se movía» y ya no es el que se preentrenó. Vale para
   cualquier afinado parcial, incluido el de un LLM con adaptadores.
 </Callout>
+
+Tres piezas de montaje antes de la evaluación: recortar el entrenamiento para la curva, rechazar un
+checkpoint de otro esquema y compilar. Saltables en la primera lectura.
+
+<Fold summary="build_frames, la comprobación de esquema y el sondeo de compilación">
 
 ```python title="src/rukh/train/heads.py"
 def build_frames(cfg: HeadsConfig) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -900,6 +934,8 @@ El sondeo de compilación de la lección 5, ahora con las primeras filas del pro
 las dos configuraciones del hito traen `compile: false`: en casillas no hay trabajo suficiente para
 amortizar la compilación, y en jugadas cada longitud de lote nueva provoca una recompilación.
 
+</Fold>
+
 ```python title="src/rukh/train/heads.py"
 @torch.no_grad()
 def evaluate_heads(
@@ -950,6 +986,15 @@ no para publicar. `val/blunder_acc` divide entre las filas con etiqueta, y es la
 del módulo: con los errores al 3,72 %, un detector que conteste siempre «no hay error» saca 96,3 %.
 La lección 8 la desmonta. Y `> 0` sobre el logit es umbralizar en 0,5 sin pasar por el sigmoide.
 
+Si precisión, F1 o AUC te suenan a chino, la cartilla de métricas de la
+[lección 1](/curso/m3/01-el-encoder/) las presenta con una matriz de juguete, y la
+[lección 8](/curso/m3/08-medir-sin-enganarse/) las aplica a estas cabezas.
+
+El bucle de afinado ensambla lo anterior. Puedes saltarlo, pero no el orden que fija, contado justo
+debajo.
+
+<Fold summary="train_heads, primera parte: datos, modelo, congelado, optimizador y compilación">
+
 ```python title="src/rukh/train/heads.py"
 def train_heads(
     cfg: HeadsConfig, resume: Path | None = None, device: str | None = None
@@ -995,11 +1040,18 @@ def train_heads(
 
 <Src file="src/rukh/train/heads.py" tag="p3" lines="417-423" />
 
+</Fold>
+
 En el bloque anterior, el orden de las líneas es el contenido. `freeze_encoder` va antes de
 construir el optimizador, para que `param_groups` deje fuera el tronco congelado. Y
 `set_training_mode` va después de `maybe_compile`, porque la compilación ejecuta un paso de sondeo y
 el modo tiene que quedar fijado al final. El `shuffle=False` de validación hace que los primeros
 lotes sean los mismos en todas las evaluaciones de la tirada.
+
+El resto del bucle es registro y guardado, con una línea que importa y que se cuenta después del
+pliegue.
+
+<Fold summary="train_heads, el resto: registro en MLflow, el paso, la evaluación y los checkpoints">
 
 ```python title="src/rukh/train/heads.py"
     params = {
@@ -1132,10 +1184,17 @@ que permitirá ver en la lección 11 cómo una sube mientras otra baja.
 El `return` va fuera del `with start_run(...)` para que cada ejecución de MLflow esté cerrada antes
 de que `label_curve` lance la siguiente.
 
+</Fold>
+
 La llamada a `set_training_mode` que sigue a `evaluate_heads` arregla un bug real: `evaluate_heads`
 termina con `model.train()`, y `train()` sobre el modelo entero **despierta el encoder congelado**.
 Sin esa línea, desde la primera evaluación el tronco volvería a aplicar dropout. No lanza, no cambia
 ninguna forma, y solo se nota en que el probe sale un poco peor de lo que debería.
+
+`label_curve` repite la tirada para cada fracción de etiquetas y guarda los cuatro puntos; se puede
+saltar en la primera lectura.
+
+<Fold summary="label_curve: una tirada por fracción y la curva guardada dentro de cada checkpoint">
 
 ```python title="src/rukh/train/heads.py"
 def label_curve(
@@ -1183,7 +1242,14 @@ publique. La regla del docstring vale fuera de aquí: **un número que solo ha e
 de registro es un número que nadie puede poner en una tabla**. Si la curva viviera solo en MLflow,
 publicar el modelo la dejaría atrás.
 
+</Fold>
+
 ## Los checkpoints, cuando hay tres clases de modelo
+
+Los cargadores son fontanería de un repositorio que ya tiene tres clases de modelo, y se pueden
+saltar en la primera lectura; el «Ejecútalo» de debajo comprueba que están bien.
+
+<Fold summary="checkpoint.py y el __init__: la cabeza atada, la escritura atómica y deducir el tipo de modelo de sus pesos">
 
 ```python title="src/rukh/train/checkpoint.py"
 BEST_NAME = "best.pt"
@@ -1396,6 +1462,8 @@ __all__ = [
 La superficie pública del paquete después del módulo: tres bucles donde había uno, y cinco
 cargadores de checkpoint.
 
+</Fold>
+
 <Callout kind="ejecuta" title="El preentrenamiento ya se puede probar">
   Con este `__init__.py`, `rukh.train` exporta por fin `MmmConfig`, `train_mmm` y `load_encoder`, así
   que los tests del enmascarado de la lección anterior, y el comando `rukh train encoder` que los usa,
@@ -1516,6 +1584,11 @@ compile: false # variable-length prefixes recompile on every new shape; not wort
 <Src file="configs/train/encoder-heads-moves.yaml" tag="p3" lines="38-38" />
 
 ## Los tests
+
+Los tests fijan el signo de la etiqueta, el nulo que no es cero y el reparto sin fuga; léelos al
+teclearlos.
+
+<Fold summary="tests/unit/test_labels.py y test_heads.py: el signo, el nulo, la fuga y el probe que no se mueve" label="Tests">
 
 ```python title="tests/unit/test_labels.py"
 """Tests for rukh.data.labels: the blunder sign, the split by game and the nested subsets."""
@@ -2195,6 +2268,8 @@ def test_each_scheme_only_loads_its_own_pretrained_encoder(
 
 <Src file="tests/unit/test_heads.py" tag="p3" lines="307-407" />
 
+</Fold>
+
 <Callout kind="ejecuta" title="Las etiquetas y las cabezas, en verde">
   Con `labels.py`, `heads.py`, `helpers_labels.py` y los dos ficheros de tests escritos, pásalos.
 
@@ -2209,6 +2284,10 @@ son de juguete y se escriben en un `RUKH_HOME` temporal.
 </Callout>
 
 ## El subcomando
+
+El subcomando es CLI y se puede saltar; la tirada de humo de debajo lo usa.
+
+<Fold summary="rukh train heads: la tirada suelta y la curva en un subcomando">
 
 ```python title="src/rukh/cli.py"
 @train_app.command("heads")
@@ -2274,6 +2353,8 @@ La curva y la tirada suelta devuelven la misma forma, una lista de resultados, a
 imprime es uno solo. Un `--mode` inválido sale con código 2, el que typer usa para un mal uso del
 comando, y un error de datos con 1: la distinción importa en un script que encadena comandos.
 
+</Fold>
+
 <Callout kind="ejecuta" title="Una tirada corta de las cabezas, con datos de verdad">
   El comando ya responde. Antes de los afinados de cuatro mil pasos de los labs, una tirada de humo
   sobre el esquema de casillas, que no depende de ningún checkpoint (`encoder_ckpt: null`). Necesita
@@ -2311,6 +2392,8 @@ siendo del 3-4 % y el modelo aprendería a detectar lo contrario de lo que dice 
 
 </Solution>
 </Exercise>
+
+<LessonLabs from="m3/11-labs-del-encoder" labs={['Lab 2', 'Lab 3', 'Lab 3b']} />
 
 ## Qué has aprendido
 

@@ -133,6 +133,11 @@ después. `span <= 0` devuelve el suelo: pasa cuando alguien lanza `--max-steps 
 configuración con `warmup: 500` para probar algo rápido. Y el `min(1.0, …)` deja la tasa clavada en
 el suelo pasado `max_steps`, así que una ejecución reanudada nunca recibe una tasa creciente.
 
+Los tests del planificador se pueden saltar en la primera lectura; fijan la forma de la curva de
+arriba.
+
+<Fold summary="tests/unit/test_schedule.py: warmup lineal, coseno hasta el suelo y los casos degenerados" label="Tests">
+
 ```python title="tests/unit/test_schedule.py"
 """Tests for rukh.train.schedule: linear warmup then cosine decay to a floor."""
 
@@ -198,6 +203,8 @@ suelo, la propiedad que confirma que la fórmula es la que crees) y los casos de
 es de la configuración: `TrainConfig(learning_rate=…)` tiene que explotar, porque un YAML con esa
 clave mal escrita entrenaría con 6e-4 sin decir nada.
 
+</Fold>
+
 ## `loop.py`: el bucle
 
 Buena parte del fichero es contabilidad para que una ejecución sea reproducible seis meses después.
@@ -228,6 +235,10 @@ micro-batch with fewer real tokens does not count as much as a full one.
 
 Fíjate en el párrafo de reanudar: «indistinguible de no haber parado nunca» es un requisito que el
 código cumple más abajo.
+
+Las importaciones no tienen nada que decidir:
+
+<Fold summary="loop.py: importaciones y logger">
 
 ```python title="src/rukh/train/loop.py"
 from __future__ import annotations
@@ -267,6 +278,8 @@ Batch = tuple[torch.Tensor, torch.Tensor]
 ```
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="20-53" />
+
+</Fold>
 
 ```python title="src/rukh/train/loop.py"
 class TrainConfig(BaseConfig):
@@ -358,6 +371,11 @@ El bucle cuenta pasos, no épocas, así que `forever` reinicia el cargador (y su
 se agota. En la tirada de `small` eso ocurre 4,3 veces, cifra que la última lección del módulo
 convierte en un diagnóstico.
 
+Compilar el modelo es una optimización de velocidad, no parte de la receta; puedes saltarlo en la
+primera lectura.
+
+<Fold summary="maybe_compile: forzar torch.compile al principio y caer a eager si falla">
+
 ```python title="src/rukh/train/loop.py"
 def maybe_compile(
     model: MoveDecoder, enabled: bool, sample: torch.Tensor | None = None
@@ -398,6 +416,8 @@ falle donde todavía se puede caer a modo _eager_, con un aviso. La máquina de 
 Los dos `zero_grad` importan: el lote de prueba deja gradientes, y sin borrarlos el primer paso real
 sumaría los de un lote de unos. No revienta nada, y por eso se escapa: un paso envenenado que la
 curva no deja ver.
+
+</Fold>
 
 ```python title="src/rukh/train/loop.py"
 @torch.no_grad()
@@ -451,6 +471,11 @@ Cuatro decisiones en la evaluación:
    devuelve `NaN`.
 4. El top-1 se cuenta solo sobre posiciones que no son relleno; acertar `<pad>` es gratis.
 
+Lo siguiente es la contabilidad de reanudar una ejecución cortada; se puede saltar en la primera
+lectura.
+
+<Fold summary="run_dir y skip_batches: dónde se escribe una ejecución y cómo se reanuda sin repetir lotes">
+
 ```python title="src/rukh/train/loop.py"
 def run_dir(cfg: TrainConfig, resume: Path | None = None) -> Path:
     """Where this run writes: the resumed run's folder, or ``out_dir/<run name>``.
@@ -489,6 +514,8 @@ def skip_batches(batches: Iterator[Batch], count: int) -> int:
 ventana de la primera <Term id="epoca">época</Term> y entrenaría dos veces sobre las mismas partidas
 mientras el planificador cree que va por la mitad. Adelantar es barato, porque las ventanas son
 rodajas de un memmap.
+
+</Fold>
 
 ```python title="src/rukh/train/loop.py"
 def train(cfg: TrainConfig, resume: Path | None = None, device: str | None = None) -> Path:
@@ -538,6 +565,11 @@ otro idioma, un error que después no se detecta.
 ```
 
 <Src file="src/rukh/train/loop.py" tag="p2" lines="236-248" />
+
+Antes del bucle, `train` compila y registra la ejecución en MLflow. Es fontanería: salta al bucle si
+es tu primera lectura.
+
+<Fold summary="train, la preparación: el lote de calentamiento que compila y lo que se registra de cada ejecución">
 
 ```python title="src/rukh/train/loop.py"
     use_bf16 = cfg.precision == "bf16" and where.type == "cuda"
@@ -600,6 +632,8 @@ pasada real.
 Todo lo que identifica una ejecución seis meses después: configuración, hash del vocabulario, SHA
 del manifiesto de datos, dispositivo y parámetros. `save` es una clausura porque necesita
 `this_run`, que solo existe dentro del `with`.
+
+</Fold>
 
 ```python title="src/rukh/train/loop.py"
         clock = time.perf_counter()
@@ -680,6 +714,10 @@ coincide con el último checkpoint porque la validación seguía bajando en el p
 `clock = time.perf_counter()` sacan de `tokens_per_s` el tiempo de evaluar o de escribir un
 checkpoint de 150 MB.
 
+Y la última pieza, el registro de métricas, que se puede saltar:
+
+<Fold summary="log_metrics: registrar en MLflow sin que un fallo cueste la ejecución">
+
 ```python title="src/rukh/train/loop.py"
 def log_metrics(metrics: dict[str, float], step: int) -> None:
     """Send metrics to the active MLflow run; a tracking failure never stops training."""
@@ -699,7 +737,14 @@ def log_metrics(metrics: dict[str, float], step: int) -> None:
 **Perder la traza nunca cuesta una ejecución**: un MLflow caído o una métrica `NaN` (que MLflow
 rechaza) producen un aviso y el entrenamiento sigue.
 
+</Fold>
+
 ## `checkpoint.py`: qué es un checkpoint y qué no
+
+Guardar y cargar checkpoints es entrada y salida de ficheros, no aprendizaje: puedes saltarlo en la
+primera lectura y volver cuando lo teclees. El «Ejecútalo» de debajo comprueba que está bien.
+
+<Fold summary="checkpoint.py, el __init__ del paquete y sus tests: qué se guarda para reanudar, evaluar y publicar">
 
 ```python title="src/rukh/train/checkpoint.py"
 """Checkpoints: what a run writes so it can be resumed, evaluated and published.
@@ -1121,6 +1166,8 @@ def test_a_foreign_file_is_not_a_checkpoint(tmp_path: Path) -> None:
 
 Los dos últimos cubren la procedencia ausente y un `.pt` cualquiera que no es un checkpoint de Rukh.
 
+</Fold>
+
 <Callout kind="ejecuta" title="El planificador y los checkpoints">
   Con `schedule.py`, `loop.py`, `checkpoint.py` y el `__init__.py` del paquete escritos, los dos
   ficheros de tests ya importan todo lo que necesitan:
@@ -1139,6 +1186,10 @@ checkpoints se escriben en el directorio temporal de pytest. Si falla la importa
 
 M0 dejó `start_run` escribiendo en la base SQLite local. M2 le añade lo necesario para que reanudar
 no parta la gráfica en dos.
+
+Es contabilidad del registro, y se puede saltar en la primera lectura.
+
+<Fold summary="tracking.py: reabrir la misma ejecución de MLflow al reanudar">
 
 ```python title="src/rukh/tracking.py"
 def start_run(
@@ -1186,6 +1237,8 @@ Las dos guardas aplican la misma regla: un `run_id` que no se puede reabrir cae 
 nueva con un aviso, y el error de MLflow al volver a registrar los parámetros tampoco puede costar
 el entrenamiento. Sin ellas, un MLflow borrado tiraría cuarenta minutos de GPU por un problema de
 contabilidad.
+
+</Fold>
 
 ## Las dos configuraciones
 
@@ -1266,6 +1319,10 @@ tardó 189 segundos, no los veinte minutos que promete el comentario.
 
 ## Lanzarlo
 
+El subcomando es una cáscara fina sobre `train`; se puede saltar.
+
+<Fold summary="cli.py: el subcomando rukh train, con --preset, --resume y --max-steps">
+
 ```python title="src/rukh/cli.py"
 @app.command("train")
 def train_cmd(
@@ -1317,6 +1374,8 @@ def train_cmd(
 Una cáscara fina sobre la biblioteca. `--preset` lanza la misma receta con otra talla (y pone
 `model: None`, o un `model` explícito del YAML ignoraría lo que pides), y `--max-steps` sirve para
 las pruebas de trescientos pasos del ejercicio de más abajo.
+
+</Fold>
 
 <Callout kind="ejecuta" title="Una ejecución de humo antes de la de verdad">
   Antes de gastar minutos de GPU, comprueba que el bucle arranca, evalúa y guarda con una tirada de
@@ -1474,6 +1533,8 @@ jugadores más homogéneos) y que las dos cifras no se pueden restar.
 
   </Solution>
 </Exercise>
+
+<LessonLabs from="m2/10-labs-del-decoder" labs={['Lab 4']} />
 
 ## Qué has aprendido
 

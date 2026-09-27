@@ -103,6 +103,11 @@ expone solo los campos que el cliente usa.
 
 ## El escritor de grafos, compartido
 
+El escritor de grafos es de M2 con los dos modelos pasando por él; fontanería que se puede saltar en
+la primera lectura.
+
+<Fold summary="_write_graph: el exportador moderno, la caída al antiguo y los ejes dinámicos, compartidos por los dos modelos">
+
 ```python title="src/rukh/export/onnx.py"
 def _write_graph(
     wrapper: nn.Module,
@@ -157,6 +162,8 @@ una sola función. Los dos caminos usan claves distintas para lo mismo, `dynamic
 moderno y `dynamic_axes` en el antiguo. Cualquier fallo del moderno cae al antiguo con un aviso,
 porque un fichero peor sirve; lo que no se esconde es cuál corrió, y el `ExportResult` lo dice.
 
+</Fold>
+
 ## El exportador del encoder: dos filas de ejemplo, y ninguna de relleno
 
 ```python title="src/rukh/export/onnx.py"
@@ -205,6 +212,11 @@ lección 3 rechaza.
   ejemplo cuyas dimensiones dinámicas valgan al menos dos**, y prueba el fichero con más de una
   fila.
 </Callout>
+
+El resto del exportador escribe los metadatos y comprueba el eje dinámico; se puede saltar hasta el
+segundo problema.
+
+<Fold summary="El resto de export_encoder: metadatos, tamaño y la comprobación del eje de secuencia">
 
 ```python title="src/rukh/export/onnx.py"
     exporter, warning = _write_graph(
@@ -272,6 +284,8 @@ exportador antiguo acepta la petición de un eje dinámico y luego fija la longi
 Los metadatos (`rukh_kind=encoder`, `rukh_heads=value,blunder`, `rukh_blunder=probability`, el
 esquema) hacen que un `.onnx` suelto sepa decir **qué es, qué devuelve y en qué escala**.
 
+</Fold>
+
 ```python title="src/rukh/export/onnx.py"
 def clear_value_info(path: Path) -> int:
     """Drop the graph's annotations for intermediate values; returns how many were removed.
@@ -303,6 +317,10 @@ ejemplo —dos filas de 69— en vez de la del grafo dinámico. `onnxruntime` ni
 coinciden. El int8 muere con un mensaje sobre formas que no menciona la cuantización. Como son
 opcionales, se borran.
 
+El cargador es el gemelo del de M2, y se puede saltar.
+
+<Fold summary="_load_heads: cargar el checkpoint sin arrastrar mlflow">
+
 ```python title="src/rukh/export/onnx.py"
 def _load_heads(ckpt: Path) -> MultiHead:
     from rukh.train import load_heads
@@ -315,6 +333,8 @@ def _load_heads(ckpt: Path) -> MultiHead:
 
 El gemelo del `_load` del decoder, con el `import` dentro por la razón de siempre: `rukh.train`
 arrastra `mlflow`.
+
+</Fold>
 
 ## El bug de fp16, que es un tipo mal declarado
 
@@ -356,6 +376,10 @@ El tercer problema viene de un `Cast` que el decoder no tiene: en `pool` (lecci�
 su atributo `to`, que sigue diciendo float32, y `onnxruntime` se niega a cargar el fichero. El
 docstring pega el mensaje de error tal cual, una costumbre que merece copiarse: buscar ese texto
 lleva a esta función.
+
+Aplicar el arreglo y cuantizar a int8 es M2 con una llamada más; saltable.
+
+<Fold summary="Aplicar el arreglo del Cast al pasar a fp16, y el int8 de M2">
 
 ```python title="src/rukh/export/quantize.py"
     repaired = _align_cast_outputs(converted)
@@ -405,6 +429,8 @@ def quantize_int8(path: Path, out: Path | None = None) -> QuantizeResult:
 
 La cuantización a int8 es la de M2; lo que el encoder necesitaba ya lo hizo `clear_value_info`.
 
+</Fold>
+
 ## La paridad del encoder: la decisión, no el número
 
 ```python title="src/rukh/export/parity.py"
@@ -436,6 +462,11 @@ decisión de error** y cuánto se desvía el valor como máximo. Es la misma pre
 lo mismo que el checkpoint?») sobre lo que cada modelo decide. Un int8 que mueva el valor 0,024 no
 se ve en la barra; uno que cambie el 5 % de las alertas sería inaceptable aunque el valor apenas se
 moviera.
+
+El resto de `parity.py` elige las posiciones, avisa cuando faltan y lee las salidas por su nombre.
+La decisión de fondo ya está arriba; esto se puede saltar en la primera lectura.
+
+<Fold summary="Qué posiciones mide la paridad, el aviso cuando faltan y la lectura de salidas por nombre">
 
 ```python title="src/rukh/export/parity.py"
 def label_positions(
@@ -570,7 +601,14 @@ probabilidad de error; el número saldría malo pero no absurdo, y alguien culpa
 cuantización. Si falta una salida, `missing` dice cuál. El `reshape(-1)[0]` aplana porque un escalar
 puede llegar como `(1,)` o `(1, 1)` según la versión del exportador.
 
+</Fold>
+
 ## El paquete de exportación
+
+El paquete ensambla exportar, cuantizar y comprobar para las dos familias. Tiene una trampa que
+conviene conocer (los convertidores no conservan los metadatos) y el resto es fontanería.
+
+<Fold summary="export/__init__.py: las dos familias de paridad, copiar los metadatos a fp16 e int8 y la superficie pública">
 
 ```python title="src/rukh/export/__init__.py"
 KINDS = ("decoder", "encoder")
@@ -750,6 +788,8 @@ La superficie pública es simétrica (`export_onnx` y `export_encoder_onnx`, `pa
 `encoder_parity`), más `embed_positions`, que no tiene pareja porque el decoder no produce
 embeddings.
 
+</Fold>
+
 ## Los embeddings de posición
 
 ```python title="src/rukh/export/embed.py"
@@ -805,6 +845,11 @@ Por eso cada tirada escribe dos ficheros: la matriz y un parquet de acompañamie
 Cualquier índice vectorial de un RAG guarda lo mismo: cada vector con el identificador del fragmento
 del que salió. Aquí la clave es el FEN de cuatro campos de las tablas de P1, así que el sidecar se
 une a ellas directamente.
+
+El resto de `embed.py` carga el tronco, valida la entrada y escribe los dos ficheros; se puede
+saltar.
+
+<Fold summary="embed.py: cargar el tronco, validar la tabla de posiciones y escribir la matriz con su sidecar">
 
 ```python title="src/rukh/export/embed.py"
 def fen4(fen: str) -> str:
@@ -908,7 +953,13 @@ El sidecar se llama igual que la matriz y vive a su lado, así que no se separan
 488 159 × 384 ocuparía 750 MB en vez de 375 por una precisión que nadie usa. La columna `row`, que
 parece redundante, mantiene el sidecar válido aunque una herramienta reordene sus filas.
 
+</Fold>
+
 ## Los subcomandos
+
+Los subcomandos son CLI y se pueden saltar en la primera lectura; el «Ejecútalo» de debajo los usa.
+
+<Fold summary="rukh export --kind encoder y el grupo rukh encoder embed">
 
 ```python title="src/rukh/cli.py"
     kind: Annotated[
@@ -1070,6 +1121,8 @@ def encoder_embed_cmd(
 
 La salida menciona el sidecar y sus columnas, para que nadie se lleve solo el `.npy`.
 
+</Fold>
+
 <Callout kind="ejecuta" title="El exportador, para las dos familias">
   Primero comprueba que el decoder sigue exportándose igual con el escritor compartido; después
   exporta un encoder. El segundo comando necesita un checkpoint de las cabezas (el de la tirada corta
@@ -1091,6 +1144,12 @@ de paridad, no encontró las etiquetas y no midió nada. `ls` tiene que listar `
 </Callout>
 
 ## Publicar: dos clases de modelo, un camino
+
+Publicar es el camino de M2 con una segunda clase de modelo. Dentro hay una idea que vale fuera de
+aquí (preguntarle al tensor si está atado, en vez de a la configuración); el resto es fontanería del
+Hub y se puede saltar en la primera lectura.
+
+<Fold summary="publish/model.py: config.json por familia, detectar la cabeza atada con data_ptr(), el vocabulario y la card rellenada desde results.json">
 
 ```python title="src/rukh/publish/model.py"
 Two kinds of model go out through this one path. A decoder is published with its UCI
@@ -1497,9 +1556,15 @@ revisar la card. `tied_embeddings` se publica observado, no copiado de la config
 `hasattr(model, "num_params")` está porque `MultiHead` no tiene ese método (añadírselo sería más
 limpio).
 
+</Fold>
+
 ## La plantilla de la model card
 
 La plantilla es lo que la gente va a leer en el Hub, y las decisiones están en sus condicionales.
+
+La plantilla es larga; la lista de debajo resume lo que tiene de decisión.
+
+<Fold summary="src/rukh/data/cards/encoder.md.jinja, la plantilla entera">
 
 {/* prettier-ignore */}
 ````jinja title="src/rukh/data/cards/encoder.md.jinja"
@@ -1685,6 +1750,8 @@ Generated with `rukh` {{ rukh_version }}.
 
 <Src file="src/rukh/data/cards/encoder.md.jinja" tag="p3" lines="1-178" />
 
+</Fold>
+
 Lo que en esta plantilla es decisión y no redacción:
 
 - `pipeline_tag: feature-extraction`, el tag con el que el Hub clasifica los modelos de embeddings de
@@ -1756,6 +1823,8 @@ la tabla de etiquetas: por ejemplo unas mil posiciones muestreadas de partidas r
 
 </Solution>
 </Exercise>
+
+<LessonLabs from="m3/11-labs-del-encoder" labs={['Lab 5']} />
 
 ## Qué has aprendido
 
