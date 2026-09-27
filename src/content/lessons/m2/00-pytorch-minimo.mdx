@@ -1,0 +1,525 @@
+---
+title: 'PyTorch mínimo: tensores, módulos y un bucle que aprende'
+description:
+  'Lo justo de PyTorch para leer el decoder sin darlo por bueno: tensores con forma y tipo,
+  broadcasting, indexar y gather, view y transpose, los módulos, autograd y el optimizador, y un
+  bucle de veinte líneas que entrena un bigrama de jugadas. Termina con la tabla de formas de la
+  atención que escribe la lección 2.'
+module: m2
+order: 0
+duration: 70
+level: base
+status: vigente
+updated: '2026-09-27'
+keywords:
+  - PyTorch
+  - tensor
+  - dtype
+  - broadcasting
+  - gather
+  - nn.Module
+  - autograd
+  - optimizador
+  - entropía cruzada
+  - bf16
+---
+
+## Qué vas a construir
+
+Un modelo de jugadas de juguete, entrenado por ti en un bucle de veinte líneas: lee cuatro partidas,
+aprende qué jugada suele seguir a cada una y, después de `e2e4`, propone `e7e5` dos veces de cada
+tres. Por el camino aparece todo el PyTorch que usa el decoder de las lecciones siguientes, y al
+final tendrás la tabla de formas del `forward` de la atención, el sitio donde se equivoca todo el
+mundo la primera vez.
+
+No es un tutorial de PyTorch. Es el mínimo para leer `decoder.py` y `loop.py` sabiendo qué hace cada
+línea, y ningún bloque de aquí es un fichero de `rukh`: son trozos para ejecutar y tirar. La idea de
+fondo, qué son los pesos y cómo se entrenan, la cuenta sin código el capítulo de
+[redes](/como-funciona-un-llm/#redes) de «Cómo funciona un LLM»; aquí va la parte que se teclea.
+
+<Callout kind="ejecuta" title="Dónde ejecutar los bloques">
+  `torch` ya está instalado en el entorno de `rukh` desde M0. Guarda cada bloque en un fichero suelto
+  y lánzalo con el intérprete del proyecto:
+
+```sh
+uv run python prueba.py
+```
+
+Todos corren en CPU y en un segundo. Las salidas de debajo de cada bloque son las de la máquina de
+referencia y tienen que salirte iguales, porque los que usan números al azar fijan la semilla.
+Borra el fichero al terminar: no es parte del repositorio.
+
+</Callout>
+
+## Tensores: un array con forma y tipo
+
+Un <Term id="tensor">tensor</Term> es un array de NumPy que además puede vivir en la GPU y recordar
+cómo se calculó. Si vienes de JavaScript, piensa en un `number[][]` con tres reglas: es rectangular
+(todas las filas miden lo mismo), todos sus elementos son del mismo tipo y está guardado de corrido
+en memoria. Esas tres reglas son las que lo hacen rápido.
+
+```python
+import torch
+
+x = torch.tensor([[1, 2, 3], [4, 5, 6]])
+print(x.shape, x.dtype)
+print(x.sum(dim=0), x.sum(dim=1))
+print(x.float().mean())
+```
+
+```text
+torch.Size([2, 3]) torch.int64
+tensor([5, 7, 9]) tensor([ 6, 15])
+tensor(3.5000)
+```
+
+La **forma** (`shape`) es la primera cosa que se mira de un tensor, antes que sus valores. `dim=0`
+suma a lo largo de las filas y deja una cifra por columna; `dim=1`, una por fila. `dim=-1` es
+siempre la última dimensión, y es la que más vas a ver. En el decoder hay tres formas y conviene
+tenerlas de memoria, con las letras que usa el código y los números de `small`:
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Tensor                        | Forma       | En `small`        | Tipo           |
+| ----------------------------- | ----------- | ----------------- | -------------- |
+| un lote de jugadas (ids)      | `(B, T)`    | `(64, 200)`       | `int64`        |
+| sus embeddings, y cada bloque | `(B, T, d)` | `(64, 200, 512)`  | `float`/`bf16` |
+| los logits de salida          | `(B, T, V)` | `(64, 200, 2030)` | `float`/`bf16` |
+
+</div>
+
+`B` es el <Term id="lote">lote</Term>, `T` la posición dentro de la secuencia, `d` la anchura del
+modelo y `V` el vocabulario: un logit por jugada posible en cada posición de cada partida.
+
+### El tipo, `dtype`
+
+```python
+import torch
+
+print(torch.tensor([1, 2]).dtype, torch.tensor([1.0, 2.0]).dtype)
+ids = torch.tensor([3, 7])
+print((ids / 2).dtype, (ids // 2).dtype)
+print(torch.tensor([1.0]).to(torch.bfloat16).dtype)
+```
+
+```text
+torch.int64 torch.float32
+torch.float32 torch.int64
+torch.bfloat16
+```
+
+Los ids de tokens son enteros de 64 bits porque es lo que exige la <Term id="entropia-cruzada">entropía cruzada</Term> para sus objetivos: con `int32` falla con
+`expected scalar type Long but found Int`, y por eso el loader de M1 convierte a `int64`. Los pesos
+y las activaciones son `float32` por defecto, y durante el entrenamiento se calculan en <Term id="bf16">bf16</Term>, que ocupa la mitad.
+
+## Broadcasting: operar formas distintas sin copiar
+
+```python
+import torch
+
+scores = torch.zeros(2, 3)
+bias = torch.tensor([10.0, 20.0, 30.0])  # (3,)
+print(scores + bias)  # (2, 3) + (3,) -> (2, 3)
+per_row = torch.tensor([[1.0], [2.0]])  # (2, 1)
+print(scores + per_row)  # (2, 3) + (2, 1) -> (2, 3)
+```
+
+```text
+tensor([[10., 20., 30.],
+        [10., 20., 30.]])
+tensor([[1., 1., 1.],
+        [2., 2., 2.]])
+```
+
+La regla del <Term id="broadcasting">broadcasting</Term> cabe en una línea: se alinean las formas
+por la derecha, y una dimensión de tamaño 1 (o que falta) se estira hasta la del otro. `(3,)` contra
+`(2, 3)` suma el vector a cada fila; `(2, 1)` suma un número distinto por fila. No se copia nada:
+la dimensión estirada se lee una y otra vez desde el mismo sitio.
+
+Lo vas a ver con `None` en medio de un índice, que añade una dimensión de tamaño 1 donde se escribe:
+`mask[:, None, None, :]` en el encoder de M3 y `elo[:, None] - opponents` en la lección 6 son eso,
+preparar una forma para que se estire contra otra.
+
+## Indexar: rebanadas, `argmax` y `gather`
+
+```python
+import torch
+
+logits = torch.tensor([[2.0, 0.5, -1.0, 0.1],
+                       [0.3, 1.5, 0.2, -0.4]])  # (B=2, V=4)
+print(logits[0])        # la primera fila
+print(logits[:, 1])     # la columna 1 de todas las filas
+print(logits.argmax(dim=-1))
+target = torch.tensor([2, 1])  # el token correcto de cada fila
+print(logits.gather(-1, target.unsqueeze(-1)).squeeze(-1))
+print(logits[logits > 1.0])
+```
+
+```text
+tensor([ 2.0000,  0.5000, -1.0000,  0.1000])
+tensor([0.5000, 1.5000])
+tensor([0, 1])
+tensor([-1.0000,  1.5000])
+tensor([2.0000, 1.5000])
+```
+
+Las rebanadas son las de Python con una coma por dimensión, y un tensor de booleanos entre
+corchetes se queda con los elementos donde vale `True`. `argmax(dim=-1)` es la jugada favorita de
+cada fila: el muestreo voraz de la lección 4.
+
+`gather` es el que cuesta. Dice «de cada fila, dame la columna que indica `target`»: `-1.0` es el
+logit del token 2 en la primera fila, `1.5` el del token 1 en la segunda. `unsqueeze(-1)` añade la
+dimensión que `gather` necesita y `squeeze(-1)` la quita. Es como se saca la probabilidad que el
+modelo dio a la jugada que se jugó, y en M5 lo verás en cada pérdida.
+
+## Cambiar de forma: `view`, `transpose` y `contiguous`
+
+```python
+import torch
+
+x = torch.arange(24).view(2, 3, 4)   # (B=2, T=3, d=4)
+heads = x.view(2, 3, 2, 2)           # (B, T, H=2, D=2): d partido en dos cabezas
+t = heads.transpose(1, 2)            # (B, H, T, D)
+print(t.shape, t.is_contiguous())
+try:
+    t.view(2, 3, 4)
+except RuntimeError as err:
+    print("RuntimeError:", str(err).split(" (")[0])
+back = t.transpose(1, 2).contiguous().view(2, 3, 4)
+print(back.equal(x))
+```
+
+```text
+torch.Size([2, 2, 3, 2]) False
+RuntimeError: view size is not compatible with input tensor's size and stride
+True
+```
+
+`view` reinterpreta los mismos números con otra forma, sin moverlos: `(2, 3, 4)` y `(2, 3, 2, 2)` son
+los mismos 24 enteros en el mismo orden, leídos en grupos distintos. `transpose(1, 2)` intercambia
+dos dimensiones, también sin mover nada: cambia el orden en que se recorre la memoria. Por eso, tras
+un `transpose`, `view` se niega, porque los números ya no están seguidos en el orden que pide.
+`contiguous()` hace la copia ordenada y después `view` vuelve a funcionar. Es la línea
+`out.transpose(1, 2).contiguous().view(batch, seq, -1)` del decoder, y ahora sabes por qué tiene
+tres pasos (`reshape` hace lo mismo y copia solo cuando hace falta).
+
+## `nn.Module`: una clase con pesos y un `forward`
+
+```python
+import torch
+from torch import nn
+
+
+class Bigram(nn.Module):
+    """Una tabla: fila = token actual, columnas = logits del siguiente."""
+
+    def __init__(self, vocab: int) -> None:
+        super().__init__()
+        self.table = nn.Embedding(vocab, vocab)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        return self.table(ids)  # (B, T) -> (B, T, vocab)
+
+
+torch.manual_seed(0)
+model = Bigram(5)
+print(sum(p.numel() for p in model.parameters()))
+print(model(torch.tensor([[0, 3, 1]])).shape)
+print([name for name, _ in model.named_parameters()])
+```
+
+```text
+25
+torch.Size([1, 3, 5])
+['table.weight']
+```
+
+Todo modelo de PyTorch es una subclase de `nn.Module` con dos métodos. `__init__` crea las piezas, y
+cada pieza que se asigna a `self` queda registrada: sus pesos aparecen en `parameters()` con el
+nombre del atributo (`table.weight`), que es también la clave con la que se guardan en disco. Por
+eso la lección 2 insiste en no renombrar módulos. `forward` dice qué se hace con la entrada, y se llama
+escribiendo `model(x)`, nunca `model.forward(x)`: la llamada pasa por PyTorch, que añade lo suyo
+antes y después.
+
+`nn.Embedding(vocab, d)` es una tabla de `vocab` filas: le das ids y te devuelve sus filas, un <Term id="embedding">embedding</Term> por token. Aquí la anchura es el propio vocabulario, así que
+la fila del token actual se lee directamente como los logits del siguiente: eso es un bigrama, el
+modelo de lenguaje más tonto posible. `nn.Linear(a, b)` es la otra pieza de todo el decoder:
+`x @ W.T + b`, una matriz de pesos y un sesgo.
+
+## Autograd: la pérdida sabe de dónde viene
+
+```python
+import torch
+
+w = torch.tensor(2.0, requires_grad=True)
+loss = (3 * w - 12) ** 2          # vale 36 con w = 2
+loss.backward()                   # rellena w.grad con d(loss)/dw
+print(loss.item(), w.grad)
+
+opt = torch.optim.SGD([w], lr=0.01)
+opt.step()                        # w <- w - lr * w.grad
+print(w)
+opt.zero_grad()                   # borra w.grad para el paso siguiente
+print(w.grad)
+```
+
+```text
+36.0 tensor(-36.)
+tensor(2.3600, requires_grad=True)
+None
+```
+
+Con `requires_grad=True`, cada operación sobre `w` queda anotada. `loss.backward()` recorre esas
+anotaciones hacia atrás (la <Term id="retropropagacion">retropropagación</Term>) y deja en `w.grad`
+el <Term id="gradiente">gradiente</Term>: cuánto cambia la pérdida si `w` se mueve un poco. Aquí es
+`2 · (3w − 12) · 3 = −36`: negativo, así que subir `w` baja la pérdida. El optimizador da el paso
+en sentido contrario al gradiente: `2 − 0,01 · (−36) = 2,36`. Eso es el <Term id="descenso-de-gradiente">descenso de gradiente</Term> entero; `AdamW`, el de Rukh, solo
+decide mejor el tamaño del paso de cada peso.
+
+Los parámetros de un `nn.Module` ya llevan `requires_grad=True`, así que en un modelo real no se
+escribe: se construye, se calcula la pérdida y se llama a `backward()`.
+
+<Callout kind="roto" title="El gradiente se suma, no se sustituye">
+  `backward()` **acumula** en `.grad`: llamarlo dos veces sin `zero_grad()` en medio deja `−72` en
+  `w.grad`, no `−36`. No da ningún error. El modelo entrena, la pérdida baja un rato, y cada paso
+  empuja con la suma de todos los gradientes anteriores hasta que el entrenamiento se vuelve
+  inestable sin razón aparente. Por eso todo bucle de PyTorch empieza cada paso con `zero_grad()`, y
+  por eso cuando se acumula a propósito (la{' '}
+  <Term id="acumulacion-de-gradiente">acumulación de gradiente</Term> de la lección 3, cuatro lotes
+  antes de cada paso) la llamada está justo fuera del bucle interior.
+</Callout>
+
+## La entropía cruzada, en un ejemplo
+
+```python
+import torch
+from torch.nn import functional as F
+
+logits = torch.tensor([[2.0, 0.5, -1.0, 0.1]])   # un ejemplo, cuatro tokens
+target = torch.tensor([0])                       # el correcto era el 0
+p = logits.softmax(dim=-1)
+print(p)
+print(-p[0, 0].log(), F.cross_entropy(logits, target))
+print(F.cross_entropy(logits, torch.tensor([2])))
+```
+
+```text
+tensor([[0.7030, 0.1569, 0.0350, 0.1051]])
+tensor(0.3524) tensor(0.3524)
+tensor(3.3524)
+```
+
+El <Term id="softmax">softmax</Term> convierte los logits en probabilidades y la <Term id="entropia-cruzada">entropía cruzada</Term> es menos el logaritmo de la que recibió el token
+correcto: si le dio 0,70, la pérdida es 0,35; si el correcto era el token 2, al que dio 0,035, es
+3,35. Premia la confianza cuando acierta y la castiga mucho cuando falla. `F.cross_entropy` hace el
+softmax por dentro, así que recibe logits, no probabilidades, y en el decoder lleva
+`ignore_index=0` para no aprender del relleno. El capítulo de
+[preentrenamiento](/como-funciona-un-llm/#preentrenamiento) cuenta la misma idea como «sorpresa».
+
+## El bucle: un bigrama de jugadas en veinte líneas
+
+Con las piezas de arriba ya se entrena algo. Cuatro partidas de cinco jugadas, un `<bos>` delante de
+cada una, y el objetivo de siempre: en cada posición, predecir la jugada siguiente.
+
+```python
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+games = [
+    "e2e4 e7e5 g1f3 b8c6 f1b5",
+    "e2e4 e7e5 g1f3 b8c6 f1c4",
+    "e2e4 c7c5 g1f3 d7d6 d2d4",
+    "d2d4 d7d5 c2c4 e7e6 b1c3",
+]
+vocab = ["<bos>"] + sorted({m for g in games for m in g.split()})
+ids = {move: i for i, move in enumerate(vocab)}
+seqs = [[0] + [ids[m] for m in g.split()] for g in games]
+x = torch.tensor([s[:-1] for s in seqs])  # (B=4, T=5): lo que ve el modelo
+y = torch.tensor([s[1:] for s in seqs])   # (B=4, T=5): lo que tenía que decir
+
+torch.manual_seed(0)
+model = nn.Embedding(len(vocab), len(vocab))  # el bigrama: una fila de logits por token
+opt = torch.optim.AdamW(model.parameters(), lr=0.1)
+for step in range(101):
+    logits = model(x)                                         # (4, 5, V)
+    loss = F.cross_entropy(logits.view(-1, len(vocab)), y.view(-1))
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    if step % 25 == 0:
+        print(f"step {step:3d}  loss {loss.item():.3f}")
+
+model.eval()
+with torch.no_grad():
+    probs = model(torch.tensor(ids["e2e4"])).softmax(dim=-1)
+for p, i in zip(*probs.topk(3)):
+    print(f"después de e2e4: {vocab[i]} {p:.2f}")
+```
+
+```text
+step   0  loss 3.080
+step  25  loss 0.579
+step  50  loss 0.411
+step  75  loss 0.397
+step 100  loss 0.392
+después de e2e4: e7e5 0.66
+después de e2e4: c7c5 0.33
+después de e2e4: e7e6 0.01
+```
+
+Es el `Bigram` de arriba sin la clase, y es el esqueleto de `loop.py`:
+
+1. `x` e `y` son la misma secuencia desplazada una posición, igual que en el `PackedDataset` de M1.
+2. `view(-1, V)` aplana `(B, T, V)` a `(B·T, V)` porque `cross_entropy` quiere una fila por
+   predicción: veinte predicciones, veinte filas.
+3. `zero_grad`, `backward`, `step`, en ese orden y en cada paso.
+
+La pérdida no llega a cero, y no debe: después de `e2e4` vino `e7e5` dos veces y `c7c5` una, así que
+lo mejor que se puede decir es «dos tercios, un tercio», y eso es lo que aprendió. El suelo de estos
+datos es 0,373; 0,392 a los cien pasos está a dos centésimas. Es la idea que el decoder lleva a
+escala: con doce bloques de atención en vez de una tabla, el «después de esto» puede mirar toda la
+partida y no solo la última jugada.
+
+<Exercise n="01" title="La pérdida de partida">
+  Un modelo que no sabe nada reparte la probabilidad por igual entre los 14 tokens del vocabulario
+  de juguete. ¿Qué pérdida tendría? ¿Por qué el paso 0 del bucle sale más alto, 3,080? ¿Y qué
+  número esperarías en el primer paso de `small`, con 2 030 jugadas?
+
+  <Solution>
+    Por igual es 1/14 para cada token, y la pérdida es `−ln(1/14) = ln 14 ≈ 2,64`. El paso 0 sale
+    peor porque `nn.Embedding` se inicializa con números al azar de una normal, no con ceros: el
+    modelo recién creado no es neutral, sino que está seguro de cosas al azar, y la entropía cruzada
+    castiga más estar seguro y equivocado que no saber. Para `small` la referencia es
+    `ln 2030 ≈ 7,6`; su inicialización es pequeña a propósito para empezar cerca de ella, y es el
+    número del que parten las curvas de la lección 3.
+  </Solution>
+</Exercise>
+
+## Evaluar: `eval()` y `no_grad()`
+
+El final del bucle usa dos interruptores distintos que se confunden a menudo.
+
+```python
+import torch
+from torch import nn
+
+model = nn.Sequential(nn.Linear(4, 4), nn.Dropout(0.5))
+x = torch.ones(1, 4)
+model.eval()                 # apaga el dropout: dos llamadas, la misma salida
+with torch.no_grad():        # no guarda el grafo: menos memoria, nada que derivar
+    a, b = model(x), model(x)
+print(a.equal(b), a.requires_grad)
+```
+
+```text
+True False
+```
+
+`model.eval()` cambia el **comportamiento** de las capas que se portan distinto al entrenar: el
+dropout deja de apagar neuronas al azar. `model.train()` lo devuelve. `torch.no_grad()` cambia la
+**contabilidad**: no se anota nada para `backward`, lo que ahorra memoria y tiempo. Para medir o
+jugar hacen falta los dos; en `loop.py` la evaluación los lleva ambos, el segundo escrito como
+decorador (`@torch.no_grad()`) encima de la función.
+
+## Dispositivo y precisión, en un párrafo
+
+Un tensor vive en un dispositivo, `cpu` o `cuda`, y una operación entre dos tensores exige que estén
+en el mismo: el modelo se mueve una vez con `model.to("cuda")` y cada lote con `x.to("cuda")`; si
+se te olvida uno, el error lo dice con las dos palabras. Encima, `torch.autocast(device_type="cuda",
+dtype=torch.bfloat16)` es un `with` que hace que las multiplicaciones de matrices de dentro se
+calculen en <Term id="bf16">bf16</Term> aunque los pesos se guarden en `float32`: la mitad de
+memoria por número y los núcleos rápidos de la GPU, sin tocar el código del modelo. La lección 3
+explica por qué bf16 y no fp16.
+
+## Las formas de la atención, paso a paso
+
+Lo que más cuesta leer de la lección 2 es el `forward` de la atención, porque son siete líneas que
+solo cambian formas. Con números pequeños, las mismas operaciones:
+
+```python
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+B, T, d, H = 2, 5, 16, 4
+D = d // H
+x = torch.randn(B, T, d)
+qkv = nn.Linear(d, 3 * d)
+
+q, k, v = qkv(x).split(d, dim=2)
+print("q", tuple(q.shape))
+q = q.view(B, T, H, D).transpose(1, 2)
+k = k.view(B, T, H, D).transpose(1, 2)
+v = v.view(B, T, H, D).transpose(1, 2)
+print("q por cabezas", tuple(q.shape))
+scores = q @ k.transpose(-2, -1) / D**0.5
+print("puntuaciones", tuple(scores.shape))
+out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+print("salida", tuple(out.shape))
+out = out.transpose(1, 2).contiguous().view(B, T, d)
+print("de vuelta", tuple(out.shape))
+```
+
+```text
+q (2, 5, 16)
+q por cabezas (2, 4, 5, 4)
+puntuaciones (2, 4, 5, 5)
+salida (2, 4, 5, 4)
+de vuelta (2, 5, 16)
+```
+
+Y con los números de `small` (`d = 512`, ocho cabezas de 64, lotes de 64 partidas de 200 jugadas):
+
+<div class="table-wrap" tabindex="0" role="region" aria-label="Tabla con desplazamiento horizontal">
+
+| Línea del decoder                       | Forma           | En `small`           |
+| --------------------------------------- | --------------- | -------------------- |
+| `x`, la entrada del bloque              | `(B, T, d)`     | `(64, 200, 512)`     |
+| `self.qkv(x)`, una lineal para Q, K y V | `(B, T, 3d)`    | `(64, 200, 1536)`    |
+| `.split(d, dim=2)`                      | 3 × `(B, T, d)` | 3 × `(64, 200, 512)` |
+| `.view(B, T, H, D)`                     | `(B, T, H, D)`  | `(64, 200, 8, 64)`   |
+| `.transpose(1, 2)`                      | `(B, H, T, D)`  | `(64, 8, 200, 64)`   |
+| `q @ kᵀ`, dentro de SDPA                | `(B, H, T, T)`  | `(64, 8, 200, 200)`  |
+| `softmax(…) @ v`, dentro de SDPA        | `(B, H, T, D)`  | `(64, 8, 200, 64)`   |
+| `.transpose(1, 2).contiguous().view`    | `(B, T, d)`     | `(64, 200, 512)`     |
+| `self.proj(…)`, la lineal de salida     | `(B, T, d)`     | `(64, 200, 512)`     |
+
+</div>
+
+La fila que explica el `transpose` es la de `q @ kᵀ`: el producto de matrices de PyTorch opera sobre
+las **dos últimas** dimensiones y trata las demás como lote. Con `(B, H, T, D)` delante, multiplica
+`(T, D)` por `(D, T)` para cada cabeza de cada partida y sale la tabla `(T, T)` de quién mira a
+quién, la de la [atención](/como-funciona-un-llm/#atencion) del capítulo 5. Con `(B, T, H, D)`
+multiplicaría cabezas por cabezas dentro de cada posición: la forma sale bien, el modelo entrena, y
+lo que calcula no es atención. La tabla `(T, T)` es también la que se come la memoria: 64 × 8 ×
+200 × 200 son 20 millones de números por bloque, y `scaled_dot_product_attention` puede calcularla
+por trozos sin guardarla entera.
+
+<Exercise n="02" title="Una máscara que se estira">
+  En M3, el encoder recibe una máscara de relleno `mask` de forma `(B, T)`: `True` donde hay una
+  jugada, `False` donde hay `<pad>`. Las puntuaciones de la atención tienen forma `(B, H, T, T)`.
+  ¿Qué forma tiene `mask[:, None, None, :]`, contra qué dimensión de las puntuaciones se alinea su
+  último eje, y qué significa eso?
+
+  <Solution>
+    `(B, 1, 1, T)`. Alineada por la derecha contra `(B, H, T, T)`, se estira en `H` (la misma
+    máscara para todas las cabezas) y en la penúltima `T` (la misma para todas las posiciones que
+    preguntan), y su último eje queda sobre el de las **claves**. Significa «nadie puede mirar a
+    una posición de relleno», que es exactamente lo que se quiere: una posición real puede atender
+    a cualquier jugada real, y ninguna atiende al relleno. Puedes comprobar la forma con
+    `(torch.zeros(64, 8, 200, 200) + torch.ones(64, 200)[:, None, None, :]).shape`.
+  </Solution>
+</Exercise>
+
+## Qué has aprendido
+
+Un tensor es forma más tipo, y la forma se mira antes que los valores. El broadcasting estira las
+dimensiones de tamaño 1; `gather` saca el valor de la clase correcta de cada fila; `view` y
+`transpose` cambian cómo se leen los números sin moverlos, y `contiguous` los mueve cuando hace
+falta. Un `nn.Module` registra sus pesos por nombre, y el bucle de entrenamiento es siempre
+`zero_grad`, `backward`, `step`, con `eval()` y `no_grad()` para medir.
+
+Cómo se mide: el bigrama de juguete baja de 3,08 a 0,39 y se queda a dos centésimas del suelo de
+sus datos, que es lo mejor que se puede hacer sin mirar más atrás de la última jugada. La lección
+siguiente explica qué pone el decoder en lugar de esa tabla, y la segunda lo escribe entero.
