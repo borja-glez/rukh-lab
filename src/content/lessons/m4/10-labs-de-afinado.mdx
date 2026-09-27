@@ -4,7 +4,7 @@ description:
   'Los cuatro scripts de labs/m4 enteros y los nueve laboratorios que producen cada número del
   módulo: mirar el corpus antes de culpar al modelo, descargar la mitad que faltaba, el corpus plano
   y el afinado condicionado, LoRA a mano contra peft, cuántas partidas harían falta, estilo con
-  adaptadores, Qwen3 con QLoRA y publicar los cinco artefactos.'
+  adaptadores, Qwen3 con QLoRA y publicar los cinco artefactos en seis repos del Hub.'
 module: m4
 order: 10
 duration: 100
@@ -454,7 +454,9 @@ uv run pytest -m unit -q tests/unit/test_lora.py tests/unit/test_hf_wrapper.py
 uv run python labs/m4/lora_check.py
 ```
 
-Salida en la máquina de referencia (RTX 5090), el cuarto bloque del script:
+Salida en la máquina de referencia (RTX 5090), el cuarto bloque del script. El script construye su
+decoder de juguete en CPU y no toca la GPU: en otra máquina las pérdidas pueden variar en los
+últimos decimales, pero la columna `|delta|` tiene que salir a cero igual:
 
 ```text
 4. step   ours          peft          |delta|
@@ -764,7 +766,9 @@ blocks.0.attn.qkv query slice: W is (768, 768), delta W is (768, 768)
   first singular values of delta W: [0.8338, 0.4277, 0.3592, 0.3211, 0.2811, 0.2302, 0.1991, 0.1774, 0.0, 0.0]
 ```
 
-Ocho, y el noveno es `0.0` y no algo pequeño.
+Ocho, y el noveno es `0.0` y no algo pequeño. La línea de `||delta W||_F` es el cociente de sus
+normas de Frobenius (<Term id="norma-de-frobenius">la raíz de la suma de los cuadrados</Term>): la corrección
+pesa el 4,41 % de la matriz que corrige.
 
 ```bash title="Terminal"
 uv run rukh export --ckpt checkpoints/medium-v4-<fecha>/best.pt --out artifacts/onnx/medium-lora --fp16 --int8 --check-parity --positions 1000 --adapter-inputs --adapter checkpoints/lora-e4-<fecha>
@@ -799,27 +803,63 @@ ejecución cae a bf16 y lo escribe en su `run.json`.
 
 ### Lab 9 · Publicar y encender el selector
 
-<LabOrigin lessons={['m4/06-adaptadores-y-publicacion', 'm4/08-el-selector-en-la-demo']} />
+<LabOrigin
+  lessons={[
+    'm4/06-adaptadores-y-publicacion',
+    'm4/07-diversidad-y-barridos',
+    'm4/08-el-selector-en-la-demo',
+  ]}
+/>
 
 **Objetivo:** que lo medido salga del disco, y que la demo no prometa más de lo que se midió. El
-publicador está en la lección 6 y el selector, en la 8.
+publicador está en la lección 6, `rukh eval openings` en la 7 y el selector en la 8. Son seis
+repos: los cinco artefactos entrenados del módulo y `rukh-medium-lora`, el grafo adaptable de la
+base sobre el que se montan los adaptadores. Cada `publish` lee la evaluación de su `--stage`, así
+que cada etapa va en el mismo orden: evaluar, exportar si es un modelo y publicar.
+
+Los dos modelos afinados (unos 26 minutos cada evaluación y 12 cada exportación):
 
 ```bash title="Terminal"
 uv run rukh eval --model checkpoints/medium-elo-<fecha>/step-3800.pt --config configs/eval/greedy.yaml --stage medium-elo
 uv run rukh export --ckpt checkpoints/medium-elo-<fecha>/step-3800.pt --out artifacts/onnx/medium-elo --fp16 --int8 --check-parity
 uv run rukh publish model --ckpt checkpoints/medium-elo-<fecha>/step-3800.pt --repo chorcat/rukh-medium-elo --stage medium-elo --onnx artifacts/onnx/medium-elo --dry-run
+uv run rukh eval --model checkpoints/medium-masters-<fecha>/step-3800.pt --config configs/eval/greedy.yaml --stage medium-masters
+uv run rukh export --ckpt checkpoints/medium-masters-<fecha>/step-3800.pt --out artifacts/onnx/medium-masters --fp16 --int8 --check-parity
+uv run rukh publish model --ckpt checkpoints/medium-masters-<fecha>/step-3800.pt --repo chorcat/rukh-medium-masters --stage medium-masters --onnx artifacts/onnx/medium-masters --dry-run
+```
+
+El grafo adaptable ya lo exportaste en el Lab 7; se publica con la card de su base, que lee la
+evaluación de `medium-v4`:
+
+```bash title="Terminal"
 uv run rukh publish model --ckpt checkpoints/medium-v4-<fecha>/best.pt --repo chorcat/rukh-medium-lora --stage medium-v4-greedy --onnx artifacts/onnx/medium-lora --dry-run
+```
+
+Los dos adaptadores. El `--effect` no lo escribe ningún comando: se monta a mano con la salida de
+`rukh eval openings` (primera línea de cada pareja) y con la evaluación del adaptador (segunda
+línea), como cuenta la lección 6. Si solo quieres ver las cards, trae los dos ficheros ya montados
+en vez de escribirlos: `git checkout p4 -- artifacts/publish/effects/`.
+
+```bash title="Terminal"
+uv run rukh eval openings --model checkpoints/medium-v4-<fecha>/best.pt --against checkpoints/lora-e4-<fecha>/step-1500.pt
 uv run rukh eval --model checkpoints/lora-e4-<fecha>/step-1500.pt --config configs/eval/greedy.yaml --stage lora-e4
 uv run rukh publish adapter --run checkpoints/lora-e4-<fecha> --repo chorcat/rukh-lora-e4 --base chorcat/rukh-medium --effect artifacts/publish/effects/lora-e4.json --dry-run
+uv run rukh eval openings --model checkpoints/medium-v4-<fecha>/best.pt --against checkpoints/lora-d4-<fecha>/step-1500.pt
+uv run rukh eval --model checkpoints/lora-d4-<fecha>/step-1500.pt --config configs/eval/greedy.yaml --stage lora-d4
+uv run rukh publish adapter --run checkpoints/lora-d4-<fecha> --repo chorcat/rukh-lora-d4 --base chorcat/rukh-medium --effect artifacts/publish/effects/lora-d4.json --dry-run
+```
+
+Y Qwen, cuya evaluación hiciste en el Lab 8:
+
+```bash title="Terminal"
 uv run rukh publish qwen --run checkpoints/qwen3-pgn-qlora --repo chorcat/rukh-qwen3-pgn-qlora --dry-run
 ```
 
-El `publish model` de `medium-lora` sube el grafo adaptable del Lab 7 con la card de su base. El
-`--effect` del adaptador no lo escribe ningún comando: se monta a mano con la salida de `rukh eval
-openings` (lección 7) y con la evaluación de `lora-e4` de la tercera línea, como cuenta la lección 6; en
-`p4` los dos ficheros están versionados (`git checkout p4 -- artifacts/publish/effects/`). Lo mismo
-para `medium-masters` y para `lora-d4`. Con `--dry-run` la carpeta entera queda en
-`artifacts/publish/` y la card se puede leer antes de subir nada; sin él hace falta `HF_TOKEN`.
+Con `--dry-run` cada carpeta queda en `artifacts/publish/` y la card se puede leer antes de subir
+nada. Para subir de verdad, quita `--dry-run` después de identificarte en el Hub una vez con
+`uv run hf auth login`, como en [«Publicar el dataset»](/curso/m1/08-publicar-el-dataset/) de M1:
+guarda el token en tu perfil y de ahí lo leen tanto `rukh publish` como `db.py`. Una variable de
+entorno `HF_TOKEN` hace lo mismo y, si existe, manda sobre el fichero; no hacen falta las dos.
 Para publicar en tu cuenta, cambia `chorcat` por tu usuario en cada `--repo` (un `--repo` con barra
 manda sobre el dueño por defecto) y, en `--base`, deja `chorcat/rukh-medium` o pon el tuyo si lo
 publicaste: lo explica la lección 6.

@@ -38,8 +38,10 @@ Un mes reciente ocupa unos 73 GB en <Term id="parquet">parquet</Term>. No vamos 
 <Callout kind="guia" title="Qué tecleas y qué traes">
 
 - **Tecleas**: `configs/data/lichess-2025-01-02.yaml`, `src/rukh/data/__init__.py`, `manifest.py` y
-  `fetch.py`, con sus dos tests. Al final, un parche de curso para `fetch.py` que no está en `p0`.
-- **Traes del repo**: nada.
+  `fetch.py`, con sus dos tests (plegados). Antes de la descarga, un parche de curso para `fetch.py`
+  que no está en `p0` y una configuración de prueba, `data/prueba.yaml`.
+- **Traes del repo**: nada si tecleas los tests. Si saltas su pliegue, tráelos antes del «Ejecútalo»:
+  `git checkout p0 -- tests/unit/test_fetch.py tests/unit/test_manifest.py`.
 - **Referencia**: `p0`.
 
 </Callout>
@@ -61,6 +63,12 @@ limit: null
 ```
 
 <Src file="configs/data/lichess-2025-01-02.yaml" tag="p0" lines="1-10" />
+
+El comentario de la primera línea apunta al documento de diseño de datos del repositorio de
+referencia. No lo tecleas y tu repositorio no lo tiene (en `main` ya se retiró); si quieres leerlo,
+está en [el tag `p0`](https://github.com/borja-glez/rukh/blob/p0/docs/spec/01-datos.md), o en tu
+terminal con `git show p0:docs/spec/01-datos.md`. Todo lo que decide el recorte está en la tabla de
+abajo.
 
 Cada clave es una decisión que condiciona lo que el modelo va a aprender:
 
@@ -545,7 +553,9 @@ puede comprobar.
 `tests/unit/test_fetch.py` es el test más instructivo de M0: prueba de verdad un código cuyo trabajo
 es hablar con un servidor remoto, sin red y en milisegundos.
 
-Puedes dejarlos plegados en la primera lectura; el «Ejecútalo» de abajo los pasa todos.
+Puedes dejarlos plegados en la primera lectura, pero el «Ejecútalo» de abajo los nombra uno a uno:
+si no los tecleas, pytest dice `file or directory not found`. Tráelos antes con
+`git checkout p0 -- tests/unit/test_fetch.py tests/unit/test_manifest.py`.
 
 <Fold summary="tests/unit/test_fetch.py y test_manifest.py: DuckDB y la descarga sustituidos por dobles en memoria" label="Tests">
 
@@ -918,18 +928,14 @@ verde y en segundos, sin tocar la red.
 
 </Callout>
 
-## La descarga de verdad
+## Antes de descargar: el parche y una prueba de mil partidas
 
-```bash title="Terminal"
-uv run rukh data fetch --config configs/data/lichess-2025-01-02.yaml
-```
+La descarga completa tarda una o dos horas, y en `p0` tiene un problema conocido. Antes de lanzarla
+hay dos pasos baratos: aplicar un parche a `run` y probar la tubería entera con mil partidas.
 
-Tarda entre una y dos horas en la máquina de referencia, sobre todo por la conexión. Se lanza al
-terminar esta lección y se recoge en M1; mientras corre, la lección siguiente (el tablero de la demo)
-no necesita datos.
-
-<Callout kind="roto" title="Si la descarga muere con HTTP 429">
-  Es probable que la descarga se corte a los pocos minutos con un error como este:
+<Callout kind="roto" title="La descarga tal cual se corta con HTTP 429">
+  Si lanzas la descarga con el `run` de `p0` sin tocar, es probable que se corte a los pocos minutos
+  con un error como este:
 
 ```text
 HTTPException: HTTP Error: HTTP GET error on 'https://huggingface.co/datasets/Lichess/
@@ -965,7 +971,7 @@ Deja tres hilos (con ocho, el proyecto encadenó tres `429`), sube a ocho los re
 creciente y firma las peticiones con tu token de Hugging Face, lo que sube el límite. La firma
 necesita una cuenta gratuita de Hugging Face y `uv run hf auth login` (un token de lectura basta; el
 de escritura y el resto de la cuenta se explican en M1, en
-[«Publicar el dataset»](/curso/m1/08-publicar-el-dataset/)). Sin token el parche sigue ayudando. Después relanza el mismo comando.
+[«Publicar el dataset»](/curso/m1/08-publicar-el-dataset/)). Sin token el parche sigue ayudando.
 
 Reduce mucho los `429`, pero no los elimina. En M1, `run` pasa a usar `connect(cfg.duckdb)` y el
 parche se va con ese cambio; la solución de fondo, bajar cada shard entero con `huggingface_hub` y
@@ -977,6 +983,63 @@ peticiones autenticadas. Y un trabajo largo tiene que poder reanudarse desde el 
 terminado.
 
 </Callout>
+
+Aplica el parche, pasa otra vez `uv run pytest -m unit -q` (los tests no tocan la red, así que
+siguen en verde) y haz la prueba barata. Crea una configuración de prueba, igual que la de arriba
+pero con un solo mes, `limit: 1000` y otra carpeta de salida para no mezclarla con la de verdad.
+Va dentro de `data/`, que git ignora, porque es de usar y tirar:
+
+{/* prettier-ignore */}
+```yaml title="Tuya, no está en p0: data/prueba.yaml"
+dataset: Lichess/standard-chess-games
+months: ["2025-01"]
+min_elo: 1800
+min_base_seconds: 180
+terminations: ["Normal", "Time forfeit"]
+min_plies: 20
+exclude_variants: true
+out_dir: data/prueba
+limit: 1000
+```
+
+<Callout kind="ejecuta" title="Mil partidas y la forma de una fila">
+
+```sh
+uv run rukh data fetch --config data/prueba.yaml
+uv run python -c "import duckdb; r = duckdb.read_parquet('data/prueba/year=2025/month=01/games.parquet'); print(r.columns); print(*[dict(zip(r.columns, t)) for t in r.limit(2).fetchall()], sep=chr(10))"
+```
+
+El primero tarda unos minutos y deja `data/prueba/year=2025/month=01/games.parquet` y
+`data/prueba/manifest.json` con `counts` de `2025-01: 1000`. El segundo vale igual en Git Bash y en
+PowerShell: imprime la lista de columnas y dos filas, cada una como un diccionario columna → valor
+(el `.show()` de DuckDB dibuja una tabla con caracteres que la consola de Git Bash en Windows no
+sabe imprimir, por eso no se usa aquí). Verás columnas como `White`, `Black`, `WhiteElo`,
+`BlackElo`, `Result`, `Event`, `Termination`, `TimeControl`, `ECO`, `Opening` y `movetext`, más la `month` que añade la consulta. `movetext` es la partida entera en una cadena:
+jugadas numeradas en SAN con comentarios del reloj, del tipo `1. e4 { [%clk 0:03:00] } 1... c5 …`.
+Si aquí sale un `429`, revisa el parche antes de gastar dos horas. `data/prueba/` y
+`data/prueba.yaml` se pueden borrar después.
+
+</Callout>
+
+`movetext` mezcla dos de las cuatro notaciones de ajedrez que usa el curso, y conviene separarlas
+ya. <Term id="pgn">PGN</Term> es el formato de una partida entera (cabeceras más jugadas), y lo que
+hay en `movetext` es su parte de jugadas. <Term id="san">SAN</Term> es cómo escribe una persona
+cada jugada, `Nf3` o `exd5`: corta, pero para entenderla hay que saber la posición. <Term id="uci">UCI</Term>
+es cómo la escribe un motor, casilla de origen y de destino (`g1f3`): no depende de la posición, y
+por eso es el token de Rukh desde M1. <Term id="fen">FEN</Term> no es una jugada sino una posición,
+una línea de texto con dónde está cada pieza y a quién le toca. M1 convierte `movetext` de SAN a
+UCI con python-chess.
+
+## La descarga de verdad
+
+```bash title="Terminal"
+uv run rukh data fetch --config configs/data/lichess-2025-01-02.yaml
+```
+
+Con el parche aplicado, tarda entre una y dos horas en la máquina de referencia, sobre todo por la
+conexión. Si aun así se corta con un `429`, relanza el mismo comando. Se lanza al terminar esta
+lección y se recoge en M1; mientras corre, la lección siguiente (el tablero de la demo) no necesita
+datos.
 
 ## Qué has aprendido
 

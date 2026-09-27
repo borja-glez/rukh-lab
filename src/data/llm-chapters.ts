@@ -151,7 +151,7 @@ export const CHAPTERS: Chapter[] = [
         label: 'M2 · tied embeddings: la misma tabla para leer y escribir',
       },
       {
-        lesson: 'm1/10-labs-del-pipeline',
+        lesson: 'm1/01-datos-y-tokenizacion',
         anchor: 'lectura-de-10-minutos-n-gramas-word2vec-y-rnn',
         label: 'M1 · lectura: n-gramas, word2vec y RNN',
       },
