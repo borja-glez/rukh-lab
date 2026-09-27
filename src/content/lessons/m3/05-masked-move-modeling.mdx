@@ -41,6 +41,12 @@ la pieza que quiere medir.
 
 ## `common.py`: lo que toda tirada hace igual
 
+Casi todo `common.py` es la maquinaria de cualquier tirada: configuración, compilación, carpetas,
+checkpoints y MLflow. En la primera lectura quédate con `param_groups`, que decide qué pesos se
+entrenan, y despliega el resto cuando vayas a teclearlo.
+
+<Fold summary="common.py: el docstring y la configuración base que heredan los dos bucles">
+
 ```python title="src/rukh/train/common.py"
 """What every training run in this project does the same way, whatever it is training.
 
@@ -140,6 +146,8 @@ clientes.
 tests modifican configuraciones con `model_copy` y la CLI sobrescribe `max_steps`, y un validador
 solo corre al construir el objeto.
 
+</Fold>
+
 ```python title="src/rukh/train/common.py"
 def pick_device() -> str:
     """``RUKH_DEVICE`` if set, else CUDA when available, else CPU."""
@@ -179,6 +187,10 @@ eso el optimizador se construye después de congelar.
 
 La división por dimensión es la de siempre: decaimiento en las matrices (`dim >= 2`), no en sesgos
 ni en ganancias de `LayerNorm`. Encoger una ganancia de normalización hacia cero apaga la capa.
+
+El resto del fichero es esa maquinaria compartida, y se puede saltar en la primera lectura.
+
+<Fold summary="forever, autocast, maybe_compile, run_dir, los checkpoints con procedencia y el filtro de MLflow">
 
 ```python title="src/rukh/train/common.py"
 def forever(loader: DataLoader[Batch]) -> Iterator[Batch]:
@@ -370,10 +382,17 @@ def log_metrics(metrics: dict[str, float], step: int) -> None:
 visor, y en este módulo un `nan` sale de algo tan normal como un lote donde el sorteo no tapó nada.
 De ahí el filtro.
 
+</Fold>
+
 ## Lo que queda en `loop.py`
 
 El docstring gana una frase sobre `rukh.train.common` y los imports adelgazan: lo que usaban las
 funciones que se han ido a `common.py` ya no hace falta aquí.
+
+Es el bucle de M2 con la mitad movida a `common.py`. Si solo buscas la idea del encoder, sáltalo y
+ve al «Ejecútalo», que comprueba que el refactor no cambió nada.
+
+<Fold summary="loop.py recortado: el bucle del decoder llamando a common.py">
 
 ```python title="src/rukh/train/loop.py"
 """The decoder's training loop: next-token prediction on a packed stream of move tokens.
@@ -614,6 +633,8 @@ dicen dónde y en qué paso. Lo propio del decoder es comprobar el `vocab_size` 
 `MoveDecoder` y ponderar la pérdida por tokens reales. El bucle del encoder de más abajo tiene la
 misma forma con otra línea de pérdida: esa simetría es el objetivo del refactor.
 
+</Fold>
+
 <Callout kind="ejecuta" title="El bucle del decoder, después del refactor">
   `common.py` y el `loop.py` recortado sustituyen a medio bucle de M2. Antes de escribir una línea
   del enmascarado, comprueba que el decoder sigue entrenando, reanudando y guardando igual:
@@ -707,10 +728,9 @@ Scheme = Literal["moves", "squares"]
 
 <Src file="src/rukh/train/mmm.py" tag="p3" lines="25-68" />
 
-El docstring es la sección «Masked move modeling» de la lección 1 escrita en el código, con una
-frase más: son dos diferencias con el bucle del decoder, y solo dos. Los imports lo confirman: casi
-todo viene de `rukh.train.common`. Los `import ... as` evitan que choquen el `MASK_ID` del
-vocabulario UCI y el de casillas.
+Los imports confirman las «dos diferencias, y solo dos» del docstring: casi todo viene de
+`rukh.train.common`. Los `import ... as` evitan que choquen el `MASK_ID` del vocabulario UCI y el de
+casillas.
 
 ```python title="src/rukh/train/mmm.py"
 MOVE_CONTROL_IDS: frozenset[int] = frozenset(
@@ -847,6 +867,11 @@ vocabulario de casillas (47) con el esquema de jugadas, cuyos ids de control lle
 
 ## La configuración y el bucle
 
+La configuración pydantic es fontanería; lo que importa es el paso que convierte un lote en una
+pérdida, justo debajo.
+
+<Fold summary="MmmConfig: la configuración del preentrenamiento, con la entrada fijada a jugadas">
+
 ```python title="src/rukh/train/mmm.py"
 class MmmConfig(RunConfig):
     """One masked-move pretraining run; unknown keys in the YAML are an error.
@@ -881,6 +906,8 @@ línea de casillas arranca de pesos aleatorios.
 `Field(default_factory=MaskingConfig)` evita que `= MaskingConfig()` cree una única instancia
 compartida por todas las configuraciones: el error del argumento por defecto mutable con otro
 disfraz.
+
+</Fold>
 
 ```python title="src/rukh/train/mmm.py"
 def masked_step(
@@ -974,6 +1001,11 @@ LLM fija sus preguntas y su semilla de muestreo.
 
 La pérdida se acumula ponderada por posiciones tapadas, no como media de medias, y
 `was_training` devuelve el modelo al modo en que estaba.
+
+El resto de `train_mmm` es la maquinaria del decoder alrededor de `masked_step`, y puedes saltarlo
+en la primera lectura. La cifra que importa sale al final: cuánto cómputo produce señal.
+
+<Fold summary="train_mmm: comprobar el vocabulario, compilar, reanudar, dar el paso y registrar">
 
 ```python title="src/rukh/train/mmm.py"
 def train_mmm(cfg: MmmConfig, resume: Path | None = None, device: str | None = None) -> Path:
@@ -1185,6 +1217,8 @@ ellos, el rendimiento del paso siguiente a una evaluación incluiría sus segund
 devuelve el último checkpoint, no el mejor: `best.pt` es para evaluar y publicar, `step-N.pt` para
 reanudar.
 
+</Fold>
+
 `tokens_per_s` cuenta todo lo que procesó la GPU y es comparable con el decoder;
 `masked_tokens_per_s` cuenta solo lo que puntúa. Entre las dos se ve que **el 85 % del cómputo de
 este preentrenamiento no produce señal de aprendizaje**: la diferencia de eficiencia entre el MLM y
@@ -1247,6 +1281,11 @@ Ojo a la forma del `lr`: en YAML 1.1 (el de PyYAML), `5e-4` sin punto decimal se
 Pydantic la convertiría, pero con un cargador menos estricto la tasa de aprendizaje sería texto.
 
 ## El subcomando
+
+Colgar el subcomando es trabajo de CLI, no de modelos, y se puede saltar en la primera lectura; el
+«Ejecútalo» de debajo comprueba que quedó bien.
+
+<Fold summary="El grupo train de Typer: el decoder como callback y el subcomando encoder">
 
 En M2, `train` era un comando suelto. Para colgar `rukh train encoder`, Typer pide convertirlo en un
 **grupo**: un `typer.Typer` propio montado con `add_typer`, al principio de `cli.py`, después de
@@ -1378,6 +1417,8 @@ El decoder sigue siendo `rukh train --config …`. Un `rukh train decoder` habr�
 pero habría roto todos los comandos de M2 del curso y del README. El resumen final repite la receta
 del enmascarado para que viaje con la salida cuando la pegues en un cuaderno.
 
+</Fold>
+
 <Callout kind="ejecuta" title="El grupo `train`, sin entrenar nada">
   El entrenamiento del encoder todavía no arranca: `train_mmm` y `MmmConfig` se importan de
   `rukh.train`, y el `__init__.py` que los exporta llega en la lección siguiente. Pero la forma del
@@ -1399,6 +1440,11 @@ subcomando y sin configuración. Si en vez de eso Typer dice que falta un comand
 </Callout>
 
 ## Los tests del enmascarado
+
+Los tests cuentan lo que hace el enmascarado en vez de creérselo. El ejercicio de abajo parte de
+ellos: despliégalos antes de hacerlo.
+
+<Fold summary="tests/unit/test_mmm.py: contar el 80/10/10 en vez de creérselo" label="Tests">
 
 ```python title="tests/unit/test_mmm.py"
 VOCAB = 128  # above the 62 control ids, so there are real moves to hide
@@ -1617,6 +1663,8 @@ deja sus checkpoints, un reanudado que acaba en la misma ejecución de MLflow y 
 `vocab_size` que se rechaza. El fichero entero se ejecuta en la lección siguiente, cuando llega el
 `__init__.py` que exporta `MmmConfig` y `load_encoder`.
 
+</Fold>
+
 <Exercise n="01" title="Un solo sorteo en vez de dos">
   Cambia `apply_masking` para usar un único tensor aleatorio: `draw < 0.12` para `<mask>`,
   `0.12 <= draw < 0.135` para el ruido y `0.135 <= draw < 0.15` para el intacto. Ejecuta
@@ -1638,6 +1686,8 @@ tienen la misma proporción de `<mask>`.
 
 </Solution>
 </Exercise>
+
+<LessonLabs from="m3/11-labs-del-encoder" labs={['Lab 1']} />
 
 ## Qué has aprendido
 
